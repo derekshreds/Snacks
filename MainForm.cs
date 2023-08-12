@@ -26,6 +26,9 @@ namespace Snacks
         public MainForm()
         {
             InitializeComponent();
+            // Default to showing software encoding and 2000 bitrate
+            encoderBox.SelectedIndex = 0;
+            targetBitrateBox.SelectedIndex = 2;
 
             openFileToolStripMenuItem.Click += (s, e) =>
             {
@@ -110,8 +113,8 @@ namespace Snacks
                     // Single file work
                     if (file_location != "")
                     {
-                        FfmpegVideo(logTextBox, progressBar, file_location, removeAudioBox.Checked, convertAudioBox.Checked,
-                                    removeSubtitlesBox.Checked, deleteFilesBox.Checked, useNvidiaBox.Checked);
+                        FfmpegVideo(logTextBox, progressBar, encoderBox, targetBitrateBox, file_location, removeAudioBox.Checked,
+                            convertAudioBox.Checked, removeSubtitlesBox.Checked, deleteFilesBox.Checked);
 
                         startButton.Invoke(new Action(() =>
                         {
@@ -143,8 +146,8 @@ namespace Snacks
                                 previewBox.Update();
                             }));
 
-                            FfmpegVideo(logTextBox, progressBar, file, removeAudioBox.Checked, convertAudioBox.Checked,
-                                        removeSubtitlesBox.Checked, deleteFilesBox.Checked, useNvidiaBox.Checked);
+                            FfmpegVideo(logTextBox, progressBar, encoderBox, targetBitrateBox, file, removeAudioBox.Checked,
+                                convertAudioBox.Checked, removeSubtitlesBox.Checked, deleteFilesBox.Checked);
                             hevcQueue.Remove(file);
                         }
 

@@ -12,6 +12,7 @@ using System.Windows.Forms;
 using static Snacks.Ffprobe;
 using static Snacks.Tools;
 using static Snacks.FileHandling;
+using static Snacks.FormValues;
 
 namespace Snacks
 {
@@ -64,8 +65,8 @@ namespace Snacks
         /// <param name="englishOnlySubtitles"></param>
         /// <param name="deleteOldFiles"></param>
         /// <param name="hardwareAcceleration"></param>
-        public static void FfmpegVideo(RichTextBox logTextBox, ProgressBar progressBar, string file_input, bool englishOnlyAudio,
-            bool twoChannelAudio, bool englishOnlySubtitles, bool deleteOldFiles, bool hardwareAcceleration)
+        public static void FfmpegVideo(RichTextBox logTextBox, ProgressBar progressBar, ComboBox encoderBox, ComboBox targetBitrateBox,
+            string file_input, bool englishOnlyAudio, bool twoChannelAudio, bool englishOnlySubtitles, bool deleteOldFiles)
         {
             ProbeResult probe = Probe(file_input);
             logTextBox.Invoke(new Action(() =>
@@ -96,14 +97,18 @@ namespace Snacks
                 compression_flags = "-b:v " + target_bitrate + " -minrate " + min_bitrate +
                                     " -maxrate " + target_bitrate + " -bufsize " + target_bitrate + " ";
             }
+            else
+            {
+                int br = GetBitrate(targetBitrateBox);
+                string target_bitrate = br.ToString() + "k";
+                string min_bitrate = (br - 500).ToString() + "k";
+                string max_bitrate = (br + 500).ToString() + "k";
+                compression_flags = "-b:v " + target_bitrate + " -minrate " + min_bitrate +
+                                    " -maxrate " + max_bitrate + " -bufsize " + max_bitrate + " ";
+            }
 
-            // NOTE: Default to -hwaccel auto for now on all hardware. Actually results in a better compression rate than nvenc
-            // albeit about 4-5x slower. Software decoding is tremendously slower.
-            // Not sure if this will default to software encoding only. Otherwise we need " -hwaccel auto" : "")
-            // and a separate hardware flag for AMD/Intel devices.
-
-            string init_flags = "-y" + (hardwareAcceleration ? " -hwaccel auto" : " -hwaccel auto") + " -i ";
-            string video_flags = MapVideo(probe) + " -c:v" + (hardwareAcceleration ? " hevc_nvenc" : " libx265") + " -preset medium ";
+            string init_flags = "-y" + " -hwaccel auto" + " -i ";
+            string video_flags = MapVideo(probe) + " -c:v " + GetEncoder(encoderBox) + " -preset medium ";
             string audio_flags = MapAudio(probe, englishOnlyAudio, twoChannelAudio) + " ";
             string subtitle_flags = MapSub(probe, englishOnlySubtitles) + " ";
             string var_flags = "-movflags +faststart -max_muxing_queue_size 9999 ";

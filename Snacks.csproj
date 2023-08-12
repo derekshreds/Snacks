@@ -82,6 +82,7 @@
     <Compile Include="Code\Ffmpeg.cs" />
     <Compile Include="Code\Ffprobe.cs" />
     <Compile Include="Code\FileHandling.cs" />
+    <Compile Include="Code\FormValues.cs" />
     <Compile Include="Code\HevcQueue.cs" />
     <Compile Include="Code\Tools.cs" />
     <Compile Include="MainForm.cs">

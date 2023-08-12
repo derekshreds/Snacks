@@ -244,7 +244,8 @@ namespace Snacks
                 {
                     if (probe.streams[i].codec_type == "subtitle" && probe.streams[i].tags.language == "eng")
                     {
-                        mapping = "-map 0:" + i.ToString() + " -c:s srt";
+                        // Copy instead of srt, as ffmpeg can't convert all formats to srt
+                        mapping = "-map 0:" + i.ToString() + " -c:s copy";
                         return mapping;
                     }
                 }
