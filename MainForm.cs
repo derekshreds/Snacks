@@ -13,6 +13,7 @@ using System.Windows.Forms;
 using static Snacks.Ffmpeg;
 using static Snacks.Tools;
 using static Snacks.FileHandling;
+using static Snacks.FormValues;
 using Newtonsoft.Json;
 
 namespace Snacks
@@ -47,6 +48,11 @@ namespace Snacks
                     {
                         previewBox.Image = null;
                         previewBox.Update();
+
+                        filesRemainingLabel.Invoke(new Action(() =>
+                        {
+                            filesRemainingLabel.Text = "Files Remaining: 1";
+                        }));
                     }
 
                     Thread t = new Thread(() =>
@@ -83,14 +89,21 @@ namespace Snacks
                     if (folder_location == null || folder_location == "")
                         return;
 
+                    hevcQueue.Clear();
                     var dirs = RecursivelyFindDirectories(path);
                     dirs.Add(path);
                     var files = GetAllVideoFiles(dirs);
+                    var target_bitrate = GetBitrate(targetBitrateBox);
 
                     for (int i = 0; i < files.Count; i++)
                     {
-                        hevcQueue.Add(files[i]);
+                        hevcQueue.Add(files[i], target_bitrate);
                     }
+
+                    filesRemainingLabel.Invoke(new Action(() =>
+                    {
+                        filesRemainingLabel.Text = "Files Remaining: " + hevcQueue.Count.ToString();
+                    }));
                 }
 
                 progressBar.Value = 0;
@@ -116,6 +129,11 @@ namespace Snacks
                         FfmpegVideo(logTextBox, progressBar, encoderBox, targetBitrateBox, file_location, removeAudioBox.Checked,
                             convertAudioBox.Checked, removeSubtitlesBox.Checked, deleteFilesBox.Checked);
 
+                        filesRemainingLabel.Invoke(new Action(() =>
+                        {
+                            filesRemainingLabel.Text = "Files Remaining: 0";
+                        }));
+
                         startButton.Invoke(new Action(() =>
                         {
                             startButton.Text = "Start";
@@ -132,6 +150,11 @@ namespace Snacks
 
                         while (hevcQueue.GetWorkItem() != null)
                         {
+                            filesRemainingLabel.Invoke(new Action(() =>
+                            {
+                                filesRemainingLabel.Text = "Files Remaining: " + hevcQueue.Count.ToString();
+                            }));
+
                             var file = hevcQueue.GetWorkItem();
                             string preview = GetStartupDirectory() + "preview.bmp";
 
@@ -150,6 +173,11 @@ namespace Snacks
                                 convertAudioBox.Checked, removeSubtitlesBox.Checked, deleteFilesBox.Checked);
                             hevcQueue.Remove(file);
                         }
+
+                        filesRemainingLabel.Invoke(new Action(() =>
+                        {
+                            filesRemainingLabel.Text = "Files Remaining: 0";
+                        }));
 
                         startButton.Invoke(new Action(() =>
                         {

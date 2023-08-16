@@ -7,6 +7,8 @@ using System.Threading.Tasks;
 using System.Windows.Forms;
 using static Snacks.Ffprobe;
 using static Snacks.FileHandling;
+using static Snacks.Tools;
+using static Snacks.FormValues;
 
 namespace Snacks
 {
@@ -20,6 +22,7 @@ namespace Snacks
             public string Path = "";
             public long Size = 0;
             public long Bitrate = 0;
+            public double Length = 0;
         }
 
         private List<Item> Items = new List<Item>();
@@ -51,14 +54,24 @@ namespace Snacks
         }
 
         /// <summary>
+        /// Clears the queue
+        /// </summary>
+        public void Clear()
+        {
+            Items.Clear();
+            isSorted = false;
+        }
+
+        /// <summary>
         /// Adds an item to the HEVC queue
         /// </summary>
         /// <param name="path"></param>
-        public void Add(string path)
+        public void Add(string path, int target_bitrate)
         {
             isSorted = false;
             long size;
             long bitrate;
+            double length = 0;
 
             // If ffprobe fails, assume file is corrupted
             try
@@ -72,25 +85,30 @@ namespace Snacks
 
                 for (int i = 0; i < probe.streams.Length; i++)
                 {
+                    if (probe.streams[i].codec_type == "video")
+                    {
+                        length = DurationStringToSeconds(probe.streams[i].duration);
+                    }
+
                     if (probe.streams[i].codec_name == "hevc")
                     {
                         is_hevc = true;
-                        break;
                     }
-                }
-
-                // Don't bother with stuff below 3mbps if already x265
-                if (bitrate / 1000 < 3000 && is_hevc)
-                {
-                    return;
                 }
 
                 Item item = new Item()
                 {
                     Path = path,
-                    Bitrate = bitrate,
-                    Size = size
+                    Bitrate = length > 0 ? (long)(size / length) : bitrate,
+                    Size = size,
+                    Length = length
                 };
+
+                // Don't bother with stuff below target bitrate + 700 for audio headroom if already x265
+                if (item.Bitrate / 1000 < target_bitrate + 700 && is_hevc)
+                {
+                    return;
+                }
 
                 Items.Add(item);
             }

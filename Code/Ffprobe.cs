@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
+using static Snacks.Ffprobe;
 using static Snacks.Tools;
 
 namespace Snacks
@@ -179,33 +180,46 @@ namespace Snacks
                 }
             }
 
+            string flags = "";
             if (englishOnly)
             {
+                // tuple (channels, location in collection)
+                List<(int, int)> englishChannelLocation = new List<(int, int)>();
+
                 for (int i = 0; i < probe.streams.Length; i++)
                 {
-                    if (probe.streams[i].codec_type == "audio")
+                    if (probe.streams[i].codec_type == "audio" &&
+                        probe.streams[i].tags != null &&
+                        probe.streams[i].tags.language != null &&
+                        probe.streams[i].tags.language == "eng")
                     {
+                        englishChannelLocation.Add((probe.streams[i].channels, 0 + i));
 
-                        if (probe.streams[i].tags != null &&
-                            probe.streams[i].tags.language != null &&
-                            probe.streams[i].tags.language == "eng")
+                        if (twoChannels && probe.streams[i].channels == 2)
                         {
-
-                            if (probe.streams[i].channels == 2)
-                            {
-                                return "-map 0:" + i.ToString() + " -c:a copy";
-                            }
-                            else if (twoChannels)
-                            {
-                                return "-map 0:" + i.ToString() + " -c:a aac -b:a 320k";
-                            }
-                            else
-                            {
-                                return "-map 0:" + i.ToString() + " -c:a copy";
-                            }
+                            return "-map 0:" + i.ToString() + " -c:a copy";
                         }
                     }
                 }
+
+                for (int i = 0; i < englishChannelLocation.Count(); i++)
+                {
+                    if (i > 0)
+                    {
+                        flags += " ";
+                    }
+
+                    if (twoChannels)
+                    {
+                        flags += ("-map 0:" + englishChannelLocation[i].Item2.ToString() + " -c:a aac -b:a 320k");
+                    }
+                    else
+                    {
+                        flags += ("-map 0:" + englishChannelLocation[i].Item2.ToString() + " -c:a copy");
+                    }
+                }
+
+                return flags;
             }
 
             if (twoChannels && audio_count > 0)
@@ -227,7 +241,6 @@ namespace Snacks
         /// <returns></returns>
         public static string MapSub(ProbeResult probe, bool englishOnly)
         {
-            string mapping = "-map 0:s -c:s copy";
             int subtitle_count = 0;
 
             for (int i = 0; i < probe.streams.Length; i++)
@@ -240,19 +253,26 @@ namespace Snacks
 
             if (englishOnly)
             {
+                string mapping = "";
                 for (int i = 0; i < probe.streams.Length; i++)
                 {
                     if (probe.streams[i].codec_type == "subtitle" && probe.streams[i].tags.language == "eng")
                     {
+                        if (i > 0)
+                        {
+                            mapping += " ";
+                        }
+
                         // Copy instead of srt, as ffmpeg can't convert all formats to srt
-                        mapping = "-map 0:" + i.ToString() + " -c:s copy";
-                        return mapping;
+                        mapping += "-map 0:" + i.ToString() + " -c:s copy";
                     }
                 }
+
+                return mapping;
             }
 
             if (subtitle_count > 0)
-                return mapping;
+                return "-map 0:s -c:s copy";
             else
                 return "";
         }

@@ -52,6 +52,7 @@
             this.encoderLabel = new System.Windows.Forms.Label();
             this.label1 = new System.Windows.Forms.Label();
             this.targetBitrateBox = new System.Windows.Forms.ComboBox();
+            this.filesRemainingLabel = new System.Windows.Forms.Label();
             this.menuStrip.SuspendLayout();
             ((System.ComponentModel.ISupportInitialize)(this.previewBox)).BeginInit();
             this.optionsBox.SuspendLayout();
@@ -289,12 +290,23 @@
             this.targetBitrateBox.Size = new System.Drawing.Size(121, 21);
             this.targetBitrateBox.TabIndex = 18;
             // 
+            // filesRemainingLabel
+            // 
+            this.filesRemainingLabel.AutoSize = true;
+            this.filesRemainingLabel.Font = new System.Drawing.Font("Microsoft Sans Serif", 9.75F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
+            this.filesRemainingLabel.Location = new System.Drawing.Point(380, 212);
+            this.filesRemainingLabel.Name = "filesRemainingLabel";
+            this.filesRemainingLabel.Size = new System.Drawing.Size(117, 16);
+            this.filesRemainingLabel.TabIndex = 19;
+            this.filesRemainingLabel.Text = "Files Remaining: 0";
+            // 
             // MainForm
             // 
             this.AutoScaleDimensions = new System.Drawing.SizeF(6F, 13F);
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
             this.BackColor = System.Drawing.SystemColors.ControlDark;
             this.ClientSize = new System.Drawing.Size(540, 450);
+            this.Controls.Add(this.filesRemainingLabel);
             this.Controls.Add(this.targetBitrateBox);
             this.Controls.Add(this.label1);
             this.Controls.Add(this.encoderBox);
@@ -351,5 +363,6 @@
         private System.Windows.Forms.Label encoderLabel;
         private System.Windows.Forms.Label label1;
         private System.Windows.Forms.ComboBox targetBitrateBox;
+        private System.Windows.Forms.Label filesRemainingLabel;
     }
 }

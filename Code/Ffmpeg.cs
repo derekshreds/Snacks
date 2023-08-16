@@ -101,7 +101,7 @@ namespace Snacks
             {
                 int br = GetBitrate(targetBitrateBox);
                 string target_bitrate = br.ToString() + "k";
-                string min_bitrate = (br - 500).ToString() + "k";
+                string min_bitrate = (br - 200).ToString() + "k";
                 string max_bitrate = (br + 500).ToString() + "k";
                 compression_flags = "-b:v " + target_bitrate + " -minrate " + min_bitrate +
                                     " -maxrate " + max_bitrate + " -bufsize " + max_bitrate + " ";
