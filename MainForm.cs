@@ -48,11 +48,6 @@ namespace Snacks
                     {
                         previewBox.Image = null;
                         previewBox.Update();
-
-                        filesRemainingLabel.Invoke(new Action(() =>
-                        {
-                            filesRemainingLabel.Text = "Files Remaining: 1";
-                        }));
                     }
 
                     Thread t = new Thread(() =>
@@ -68,6 +63,11 @@ namespace Snacks
                             previewBox.ImageLocation = preview;
                             previewBox.SizeMode = PictureBoxSizeMode.StretchImage;
                             previewBox.Update();
+                        }));
+
+                        filesRemainingLabel.Invoke(new Action(() =>
+                        {
+                            filesRemainingLabel.Text = "Files Remaining: 1";
                         }));
                     });
                     t.IsBackground = true;
