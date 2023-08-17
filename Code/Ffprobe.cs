@@ -269,7 +269,8 @@ namespace Snacks
                     }
                 }
 
-                return mapping;
+                if (mapping != "")
+                    return mapping;
             }
 
             if (subtitle_count > 0)
