@@ -219,7 +219,8 @@ namespace Snacks
                     }
                 }
 
-                return flags;
+                if (englishChannelLocation.Count() > 0)
+                    return flags;
             }
 
             if (twoChannels && audio_count > 0)
