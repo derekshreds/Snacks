@@ -55,6 +55,9 @@
     <GenerateSerializationAssemblies>Off</GenerateSerializationAssemblies>
   </PropertyGroup>
   <PropertyGroup>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+  <PropertyGroup>
     <StartupObject>Snacks.Program</StartupObject>
   </PropertyGroup>
   <PropertyGroup>
@@ -66,6 +69,7 @@
     </Reference>
     <Reference Include="System" />
     <Reference Include="System.Core" />
+    <Reference Include="System.DirectoryServices" />
     <Reference Include="System.Xml.Linq" />
     <Reference Include="System.Data.DataSetExtensions" />
     <Reference Include="Microsoft.CSharp" />
@@ -77,23 +81,32 @@
     <Reference Include="System.Xml" />
   </ItemGroup>
   <ItemGroup>
-    <Compile Include="Code\Delegates.cs" />
-    <Compile Include="Code\Extensions.cs" />
+    <Compile Include="Code\EncoderOptions.cs" />
     <Compile Include="Code\Ffmpeg.cs" />
     <Compile Include="Code\Ffprobe.cs" />
     <Compile Include="Code\FileHandling.cs" />
-    <Compile Include="Code\FormValues.cs" />
+    <Compile Include="Code\FormDelegates.cs" />
     <Compile Include="Code\HevcQueue.cs" />
+    <Compile Include="Code\Settings.cs" />
     <Compile Include="Code\Tools.cs" />
-    <Compile Include="MainForm.cs">
+    <Compile Include="Forms\AdvancedOptions.cs">
       <SubType>Form</SubType>
     </Compile>
-    <Compile Include="MainForm.Designer.cs">
+    <Compile Include="Forms\AdvancedOptions.Designer.cs">
+      <DependentUpon>AdvancedOptions.cs</DependentUpon>
+    </Compile>
+    <Compile Include="Forms\MainForm.cs">
+      <SubType>Form</SubType>
+    </Compile>
+    <Compile Include="Forms\MainForm.Designer.cs">
       <DependentUpon>MainForm.cs</DependentUpon>
     </Compile>
     <Compile Include="Program.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
-    <EmbeddedResource Include="MainForm.resx">
+    <EmbeddedResource Include="Forms\AdvancedOptions.resx">
+      <DependentUpon>AdvancedOptions.cs</DependentUpon>
+    </EmbeddedResource>
+    <EmbeddedResource Include="Forms\MainForm.resx">
       <DependentUpon>MainForm.cs</DependentUpon>
     </EmbeddedResource>
     <EmbeddedResource Include="Properties\Resources.resx">

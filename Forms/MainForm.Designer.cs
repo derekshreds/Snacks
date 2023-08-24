@@ -37,6 +37,8 @@
             this.selectFolderToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
             this.openFileToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
             this.openFolderToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
+            this.advancedToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
+            this.optionsToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
             this.helpToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
             this.aboutToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
             this.logLabel = new System.Windows.Forms.Label();
@@ -45,6 +47,7 @@
             this.previewLabel = new System.Windows.Forms.Label();
             this.convertAudioBox = new System.Windows.Forms.CheckBox();
             this.optionsBox = new System.Windows.Forms.GroupBox();
+            this.retryOnFailBox = new System.Windows.Forms.CheckBox();
             this.removeAudioBox = new System.Windows.Forms.CheckBox();
             this.removeSubtitlesBox = new System.Windows.Forms.CheckBox();
             this.deleteFilesBox = new System.Windows.Forms.CheckBox();
@@ -53,6 +56,7 @@
             this.label1 = new System.Windows.Forms.Label();
             this.targetBitrateBox = new System.Windows.Forms.ComboBox();
             this.filesRemainingLabel = new System.Windows.Forms.Label();
+            this.strictBitrateBox = new System.Windows.Forms.CheckBox();
             this.menuStrip.SuspendLayout();
             ((System.ComponentModel.ISupportInitialize)(this.previewBox)).BeginInit();
             this.optionsBox.SuspendLayout();
@@ -97,6 +101,7 @@
             // 
             this.menuStrip.Items.AddRange(new System.Windows.Forms.ToolStripItem[] {
             this.selectFolderToolStripMenuItem,
+            this.advancedToolStripMenuItem,
             this.helpToolStripMenuItem});
             this.menuStrip.Location = new System.Drawing.Point(0, 0);
             this.menuStrip.Name = "menuStrip";
@@ -124,6 +129,20 @@
             this.openFolderToolStripMenuItem.Name = "openFolderToolStripMenuItem";
             this.openFolderToolStripMenuItem.Size = new System.Drawing.Size(139, 22);
             this.openFolderToolStripMenuItem.Text = "Open Folder";
+            // 
+            // advancedToolStripMenuItem
+            // 
+            this.advancedToolStripMenuItem.DropDownItems.AddRange(new System.Windows.Forms.ToolStripItem[] {
+            this.optionsToolStripMenuItem});
+            this.advancedToolStripMenuItem.Name = "advancedToolStripMenuItem";
+            this.advancedToolStripMenuItem.Size = new System.Drawing.Size(72, 20);
+            this.advancedToolStripMenuItem.Text = "Advanced";
+            // 
+            // optionsToolStripMenuItem
+            // 
+            this.optionsToolStripMenuItem.Name = "optionsToolStripMenuItem";
+            this.optionsToolStripMenuItem.Size = new System.Drawing.Size(116, 22);
+            this.optionsToolStripMenuItem.Text = "Options";
             // 
             // helpToolStripMenuItem
             // 
@@ -192,6 +211,7 @@
             // 
             // optionsBox
             // 
+            this.optionsBox.Controls.Add(this.retryOnFailBox);
             this.optionsBox.Controls.Add(this.removeAudioBox);
             this.optionsBox.Controls.Add(this.removeSubtitlesBox);
             this.optionsBox.Controls.Add(this.deleteFilesBox);
@@ -203,6 +223,17 @@
             this.optionsBox.TabIndex = 12;
             this.optionsBox.TabStop = false;
             this.optionsBox.Text = "Options";
+            // 
+            // retryOnFailBox
+            // 
+            this.retryOnFailBox.AutoSize = true;
+            this.retryOnFailBox.Font = new System.Drawing.Font("Microsoft Sans Serif", 9.75F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
+            this.retryOnFailBox.Location = new System.Drawing.Point(6, 125);
+            this.retryOnFailBox.Name = "retryOnFailBox";
+            this.retryOnFailBox.Size = new System.Drawing.Size(174, 20);
+            this.retryOnFailBox.TabIndex = 14;
+            this.retryOnFailBox.Text = "Retry with software on fail";
+            this.retryOnFailBox.UseVisualStyleBackColor = true;
             // 
             // removeAudioBox
             // 
@@ -273,7 +304,6 @@
             // 
             // targetBitrateBox
             // 
-            this.targetBitrateBox.DropDownStyle = System.Windows.Forms.ComboBoxStyle.DropDownList;
             this.targetBitrateBox.FormattingEnabled = true;
             this.targetBitrateBox.Items.AddRange(new object[] {
             "1000",
@@ -286,6 +316,7 @@
             "4500",
             "5000"});
             this.targetBitrateBox.Location = new System.Drawing.Point(241, 135);
+            this.targetBitrateBox.MaxLength = 5;
             this.targetBitrateBox.Name = "targetBitrateBox";
             this.targetBitrateBox.Size = new System.Drawing.Size(121, 21);
             this.targetBitrateBox.TabIndex = 18;
@@ -300,12 +331,24 @@
             this.filesRemainingLabel.TabIndex = 19;
             this.filesRemainingLabel.Text = "Files Remaining: 0";
             // 
+            // strictBitrateBox
+            // 
+            this.strictBitrateBox.AutoSize = true;
+            this.strictBitrateBox.Font = new System.Drawing.Font("Microsoft Sans Serif", 9.75F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
+            this.strictBitrateBox.Location = new System.Drawing.Point(241, 162);
+            this.strictBitrateBox.Name = "strictBitrateBox";
+            this.strictBitrateBox.Size = new System.Drawing.Size(55, 20);
+            this.strictBitrateBox.TabIndex = 20;
+            this.strictBitrateBox.Text = "Strict";
+            this.strictBitrateBox.UseVisualStyleBackColor = true;
+            // 
             // MainForm
             // 
             this.AutoScaleDimensions = new System.Drawing.SizeF(6F, 13F);
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
             this.BackColor = System.Drawing.SystemColors.ControlDark;
             this.ClientSize = new System.Drawing.Size(540, 450);
+            this.Controls.Add(this.strictBitrateBox);
             this.Controls.Add(this.filesRemainingLabel);
             this.Controls.Add(this.targetBitrateBox);
             this.Controls.Add(this.label1);
@@ -364,5 +407,9 @@
         private System.Windows.Forms.Label label1;
         private System.Windows.Forms.ComboBox targetBitrateBox;
         private System.Windows.Forms.Label filesRemainingLabel;
+        private System.Windows.Forms.ToolStripMenuItem advancedToolStripMenuItem;
+        private System.Windows.Forms.ToolStripMenuItem optionsToolStripMenuItem;
+        private System.Windows.Forms.CheckBox retryOnFailBox;
+        private System.Windows.Forms.CheckBox strictBitrateBox;
     }
 }

@@ -6,9 +6,7 @@ using System.Text;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using static Snacks.Ffprobe;
-using static Snacks.FileHandling;
 using static Snacks.Tools;
-using static Snacks.FormValues;
 
 namespace Snacks
 {
@@ -17,21 +15,24 @@ namespace Snacks
         private bool isSorted = false;
         public int Count { get { return Items.Count; } }
 
-        private class Item
+        public class WorkItem
         {
+            public string FileName = "";
             public string Path = "";
             public long Size = 0;
             public long Bitrate = 0;
             public double Length = 0;
+            public bool IsHevc = false;
+            public ProbeResult Probe;
         }
 
-        private List<Item> Items = new List<Item>();
+        private List<WorkItem> Items = new List<WorkItem>();
 
         /// <summary>
         /// Gets the current item in need of work (largest file size first)
         /// </summary>
         /// <returns></returns>
-        public string GetWorkItem()
+        public WorkItem GetWorkItem()
         {
             if (Items.Count == 0) return null;
 
@@ -40,7 +41,7 @@ namespace Snacks
                 Sort();
             }
 
-            return Items[0].Path;
+            return Items[0];
         }
 
         /// <summary>
@@ -66,9 +67,8 @@ namespace Snacks
         /// Adds an item to the HEVC queue
         /// </summary>
         /// <param name="path"></param>
-        public void Add(string path, int target_bitrate)
+        public void Add(string path, int targetBitrate)
         {
-            isSorted = false;
             long size;
             long bitrate;
             double length = 0;
@@ -80,37 +80,44 @@ namespace Snacks
                 ProbeResult probe = Probe(path);
                 bitrate = long.Parse(probe.format.bit_rate);
                 size = f.Length;
-                int gig = 1073741824;
-                bool is_hevc = false;
+                bool isHevc = false;
 
                 for (int i = 0; i < probe.streams.Length; i++)
                 {
                     if (probe.streams[i].codec_type == "video")
                     {
-                        length = DurationStringToSeconds(probe.streams[i].duration);
-                    }
+                        if (probe.streams[i].codec_name == "hevc")
+                        {
+                            isHevc = true;
+                        }
 
-                    if (probe.streams[i].codec_name == "hevc")
-                    {
-                        is_hevc = true;
+                        double formatDuration = DurationStringToSeconds(probe.format.duration);
+                        double streamDuration = DurationStringToSeconds(probe.streams[i].duration);
+                        var duration = formatDuration > streamDuration ? formatDuration : streamDuration;
+                        length = duration;
                     }
                 }
 
-                Item item = new Item()
+                WorkItem item = new WorkItem()
                 {
+                    FileName = path.GetFileName(),
                     Path = path,
-                    Bitrate = length > 0 ? (long)(size / length) : bitrate,
+                    // Convert bytes to bits before calculating
+                    Bitrate = length > 0 ? (long)(size * 8 / length / 1000) : bitrate,
                     Size = size,
-                    Length = length
+                    Length = length,
+                    IsHevc = isHevc,
+                    Probe = probe
                 };
 
                 // Don't bother with stuff below target bitrate + 700 for audio headroom if already x265
-                if (item.Bitrate / 1000 < target_bitrate + 700 && is_hevc)
+                if (item.Bitrate < targetBitrate + 700 && isHevc)
                 {
                     return;
                 }
 
                 Items.Add(item);
+                isSorted = false;
             }
             catch { return; }
         }
@@ -119,11 +126,11 @@ namespace Snacks
         /// Removes an item from the HEVC queue
         /// </summary>
         /// <param name="path"></param>
-        public void Remove(string path)
+        public void Remove(WorkItem item)
         {
             for (int i = 0; i < Items.Count; i++)
             {
-                if (Items[i].Path == path)
+                if (Items[i].Path == item.Path)
                 {
                     Items.RemoveAt(i);
                     break;

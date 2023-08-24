@@ -5,7 +5,7 @@ using System.Diagnostics;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
-using static Snacks.Ffprobe;
+using System.Windows.Forms;
 using static Snacks.Tools;
 
 namespace Snacks
@@ -87,10 +87,10 @@ namespace Snacks
         /// </summary>
         /// <param name="file_input"></param>
         /// <returns></returns>
-        public static ProbeResult Probe(string file_input)
+        public static ProbeResult Probe(string fileInput)
         {
             string flags = "-v quiet -print_format json -show_streams -show_format \"";
-            string command = flags + file_input + "\"";
+            string command = flags + fileInput + "\"";
 
             ProcessStartInfo cmdsi = new ProcessStartInfo(GetStartupDirectory() + "ffprobe.exe");
 
@@ -118,26 +118,26 @@ namespace Snacks
             cmd.WaitForExit();
 
             // Ffprobe doesn't always output to the correct data side
-            string correct_output;
+            string correctOutput;
             if (err.Length > output.Length)
             {
-                correct_output = err;
+                correctOutput = err;
             }
             else
             {
-                correct_output = output;
+                correctOutput = output;
             }
 
-            ProbeResult probe_result = new ProbeResult();
+            ProbeResult probeResult = new ProbeResult();
             try
             {
-                int json_index = correct_output.IndexOf('{');
-                correct_output = correct_output.Substring(json_index, correct_output.Length - json_index);
-                probe_result = JsonConvert.DeserializeObject<ProbeResult>(correct_output);
+                int json_index = correctOutput.IndexOf('{');
+                correctOutput = correctOutput.Substring(json_index, correctOutput.Length - json_index);
+                probeResult = JsonConvert.DeserializeObject<ProbeResult>(correctOutput);
             }
             catch { }
 
-            return probe_result;
+            return probeResult;
         }
 
         /// <summary>
@@ -170,13 +170,13 @@ namespace Snacks
         /// <returns></returns>
         public static string MapAudio(ProbeResult probe, bool englishOnly, bool twoChannels)
         {
-            int audio_count = 0;
+            int audioCount = 0;
 
             for (int i = 0; i < probe.streams.Count(); i++)
             {
                 if (probe.streams[i].codec_type == "audio")
                 {
-                    audio_count++;
+                    audioCount++;
                 }
             }
 
@@ -223,12 +223,12 @@ namespace Snacks
                     return flags;
             }
 
-            if (twoChannels && audio_count > 0)
+            if (twoChannels && audioCount > 0)
             {
                 return "-map 0:a -c:a aac -b:a 320k";
             }
 
-            if (audio_count > 0)
+            if (audioCount > 0)
                 return "-map 0:a -c:a copy";
             else
                 return "";
@@ -242,13 +242,13 @@ namespace Snacks
         /// <returns></returns>
         public static string MapSub(ProbeResult probe, bool englishOnly)
         {
-            int subtitle_count = 0;
+            int subtitleCount = 0;
 
             for (int i = 0; i < probe.streams.Length; i++)
             {
                 if (probe.streams[i].codec_type == "subtitle")
                 {
-                    subtitle_count++;
+                    subtitleCount++;
                 }
             }
 
@@ -273,7 +273,7 @@ namespace Snacks
                     return mapping;
             }
 
-            if (subtitle_count > 0)
+            if (subtitleCount > 0)
                 return "-map 0:s -c:s copy";
             else
                 return "";
@@ -285,18 +285,16 @@ namespace Snacks
         /// <param name="input"></param>
         /// <param name="output"></param>
         /// <returns></returns>
-        public static bool ConvertedSuccessfully(string input, string output)
+        public static bool ConvertedSuccessfully(ProbeResult input, ProbeResult output)
         {
             try
             {
-                ProbeResult input_probe = Probe(input);
-                ProbeResult output_probe = Probe(output);
-                double input_duration = DurationStringToSeconds(input_probe.format.duration);
-                double output_duration = DurationStringToSeconds(output_probe.format.duration);
-                double duration_difference = Math.Abs(input_duration - output_duration);
+                double inputDuration = GetVideoDuration(input);
+                double outputDuration = GetVideoDuration(output);
+                double durationDifference = Math.Abs(inputDuration - outputDuration);
 
-                // Check for 30 seconds of difference for now
-                if (duration_difference >= 30)
+                // Check for 10 seconds of difference for now
+                if (durationDifference >= 10)
                 {
                     return false;
                 }
@@ -305,10 +303,31 @@ namespace Snacks
                     return true;
                 }
             }
-            catch (Exception ex)
+            catch { return false; }
+        }
+
+        /// <summary>
+        /// Gets the duration of a video stream
+        /// </summary>
+        /// <param name="probe"></param>
+        /// <returns></returns>
+        public static double GetVideoDuration(ProbeResult probe)
+        {
+            try
             {
-                return false;
+                for (int i = 0; i < probe.streams.Count(); i++)
+                {
+                    if (probe.streams[i].codec_type == "video")
+                    {
+                        double formatDuration = DurationStringToSeconds(probe.format.duration);
+                        double streamDuration = DurationStringToSeconds(probe.streams[i].duration);
+                        return formatDuration > streamDuration ? formatDuration : streamDuration;
+                    }
+                }
             }
+            catch { }
+
+            return 0;
         }
     }
 }

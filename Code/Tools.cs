@@ -11,7 +11,7 @@ namespace Snacks
         /// <returns></returns>
         public static string GetStartupDirectory()
         {
-            return Application.StartupPath.Replace('/', '\\') + '\\';
+            return Application.StartupPath.Replace('\\', '/') + '/';
         }
 
         /// <summary>
@@ -24,14 +24,17 @@ namespace Snacks
             double duration = 0;
             try
             {
-                string[] split = input.Split(new char[] { ':' }, StringSplitOptions.RemoveEmptyEntries);
-
-                if (split.Length == 3)
+                string[] split = input.Split(new char[] { ':', '.' }, StringSplitOptions.RemoveEmptyEntries);
+                if (split.Length >=3)
                 {
                     // Hour, Minute, Second
                     duration += double.Parse(split[0]) * 3600;
                     duration += double.Parse(split[1]) * 60;
                     duration += double.Parse(split[2]);
+                }
+                else
+                {
+                    duration = double.Parse(input);
                 }
             }
             catch { }

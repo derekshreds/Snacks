@@ -12,7 +12,7 @@ namespace Snacks
         /// </summary>
         /// <param name="input"></param>
         /// <returns></returns>
-        public static List<string> RecursivelyFindDirectories(string input)
+        public static List<string> RecursivelyFindDirectories(string input, bool top = true)
         {
             List<string> dirs = Directory.GetDirectories(input).ToList();
             // Neccessary to keep count accurate at the top level
@@ -20,7 +20,12 @@ namespace Snacks
             
             for (int i = 0; i < count; i++)
             {
-                dirs.AddRange(RecursivelyFindDirectories(dirs[i]));
+                dirs.AddRange(RecursivelyFindDirectories(dirs[i], false));
+            }
+
+            if (top)
+            {
+                dirs.Add(input);
             }
 
             return dirs;
@@ -33,21 +38,22 @@ namespace Snacks
         /// <returns></returns>
         public static List<string> GetAllVideoFiles(List<string> directories)
         {
-            var files = new List<string>();
-            var video_files = new List<string>();
+            var videoFiles = new List<string>();
 
             for (int i = 0; i < directories.Count; i++)
             {
-                files.AddRange(Directory.GetFiles(directories[i]));
+                var files = Directory.GetFiles(directories[i]);
+
+                for (int j = 0; j < files.Count(); j++)
+                {
+                    if (files[j].IsVideoFile())
+                    {
+                        videoFiles.Add(files[j]);
+                    }
+                }
             }
 
-            for (int i = 0; i < files.Count; i++)
-            {
-                if (IsVideoFile(files[i]))
-                    video_files.Add(files[i]);
-            }
-
-            return video_files;
+            return videoFiles;
         }
 
         /// <summary>
@@ -55,13 +61,12 @@ namespace Snacks
         /// </summary>
         /// <param name="input"></param>
         /// <returns></returns>
-        public static bool IsVideoFile(string input)
+        public static bool IsVideoFile(this string input)
         {
-            string extension = GetExtension(input);
+            string ext = input.GetExtension();
 
-            if (extension == "mkv" || extension == "mp4" || extension == "ts" || extension == "wmv" ||
-                extension == "avi" || extension == "m4v" || extension == "mpeg" || extension == "mov" ||
-                extension == "3gp")
+            if (ext == "mkv" || ext == "mp4" || ext == "ts" || ext == "wmv" || ext == "avi" ||
+                ext == "m4v" || ext == "mpeg" || ext == "mov" || ext == "3gp")
             {
                 return true;
             }
@@ -72,28 +77,16 @@ namespace Snacks
         }
 
         /// <summary>
-        /// Returns the current directory, or up one level if
-        /// parent is specified
+        /// Returns the directory of a file
         /// </summary>
         /// <param name="input"></param>
         /// <returns></returns>
-        public static string GetDirectory(string input, bool parent = false)
+        public static string GetDirectory(this string input)
         {
-            string _input = "" + input;
-            _input = _input.Replace('\\', '/');
-            FileAttributes attributes = File.GetAttributes(_input);
+            string dir = input.Replace('\\', '/');
+            dir = dir.Substring(0, dir.LastIndexOf('/') + 1);
 
-            if ((attributes & FileAttributes.Directory) != FileAttributes.Directory)
-            {
-                _input = _input.Substring(0, _input.LastIndexOf('/'));
-            }
-
-            if (parent)
-            {
-                _input = _input.Substring(0, _input.LastIndexOf('/'));
-            }
-
-            return _input;
+            return dir;
         }
 
         /// <summary>
@@ -101,7 +94,7 @@ namespace Snacks
         /// </summary>
         /// <param name="input"></param>
         /// <returns></returns>
-        public static string GetExtension(string input)
+        public static string GetExtension(this string input)
         {
             string[] split = input.Split(new char[] { '.' }, StringSplitOptions.RemoveEmptyEntries);
             string extension = split[split.Length - 1];
@@ -110,16 +103,41 @@ namespace Snacks
         }
 
         /// <summary>
+        /// Removes the extension from a filename
+        /// </summary>
+        /// <param name="input"></param>
+        /// <returns></returns>
+        public static string RemoveExtension(this string input)
+        {
+            return input.Substring(0, input.LastIndexOf("."));
+        }
+
+        /// <summary>
         /// Returns the file/folder name from a full path
         /// </summary>
         /// <param name="input"></param>
         /// <returns></returns>
-        public static string GetFileName(string input)
+        public static string GetFileName(this string input)
         {
             input = input.Replace('\\', '/');
             string[] split = input.Split(new char[] { '/' }, StringSplitOptions.RemoveEmptyEntries);
 
             return split[split.Length - 1];
+        }
+
+        /// <summary>
+        /// Move a file after deleting anything in the way
+        /// </summary>
+        /// <param name="input"></param>
+        /// <param name="output"></param>
+        public static void FileMove(string input, string output)
+        {
+            if (File.Exists(output))
+            {
+                File.Delete(output);
+            }
+
+            File.Move(input, output);
         }
     }
 }
