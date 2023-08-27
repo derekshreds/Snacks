@@ -69,6 +69,8 @@ namespace Snacks
         {
             logTextBox.AppendLine("Converting " + workItem.FileName);
 
+            int percentComplete = 0;
+            string allData = "";
             string targetBitrate;
             string minBitrate;
             string maxBitrate;
@@ -92,7 +94,7 @@ namespace Snacks
                 maxBitrate = (encoderOptions.TargetBitrate + 500).ToString() + "k";
             }
 
-            string compressionFlags = "-b:v " + targetBitrate + " -minrate " + minBitrate +
+            string compressionFlags = "-g 25 -b:v " + targetBitrate + " -minrate " + minBitrate +
                                        " -maxrate " + maxBitrate + " -bufsize " + maxBitrate + " ";
             string initFlags = "-y" + " -hwaccel auto" + " -i ";
             string videoFlags = MapVideo(workItem.Probe) + " -c:v " + encoderOptions.Encoder + " -preset medium ";
@@ -123,7 +125,7 @@ namespace Snacks
 
             string command = initFlags + "\"" + newFileInput + "\" " + videoFlags + compressionFlags + audioFlags + subtitleFlags +
                              varFlags + "-f matroska \"" + fileOutput + "\"";
-
+            allData += command + "\r\n";
             var startTime = DateTime.Now;
             ProcessStartInfo cmdsi = new ProcessStartInfo(GetStartupDirectory() + "ffmpeg.exe");
             cmdsi.Arguments = command;
@@ -132,10 +134,6 @@ namespace Snacks
             cmdsi.CreateNoWindow = true;
             cmdsi.RedirectStandardError = true;
             Process cmd = Process.Start(cmdsi);
-
-
-            int percentComplete = 0;
-            string allData = "";
 
             cmd.OutputDataReceived += (s, e) =>
             {

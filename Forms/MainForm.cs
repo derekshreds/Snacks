@@ -151,6 +151,7 @@ namespace Snacks
                             }
                         }
 
+                        isConverting = false;
                         filesRemainingLabel.UpdateText("Files Remaining: " + hevcQueue.Count.ToString());
                         startButton.UpdateText("Start");
                     });

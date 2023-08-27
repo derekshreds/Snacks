@@ -2,6 +2,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
@@ -31,6 +32,7 @@ namespace Snacks
             public string codec_tag_string;
             public string codec_tag;
             public int channels;
+            public string channel_layout;
             public int width;
             public int height;
             public int coded_width;
@@ -193,11 +195,22 @@ namespace Snacks
                         probe.streams[i].tags.language != null &&
                         probe.streams[i].tags.language == "eng")
                     {
-                        englishChannelLocation.Add((probe.streams[i].channels, 0 + i));
-
-                        if (twoChannels && probe.streams[i].channels == 2)
+                        // Don't keep commentary audio if tagged
+                        bool isCommentary = false;
+                        
+                        if (probe.streams[i].tags.title != null && probe.streams[i].tags.title.ToLower().Contains("comm"))
                         {
-                            return "-map 0:" + i.ToString() + " -c:a copy";
+                            isCommentary = true;
+                        }
+
+                        if (!isCommentary)
+                        {
+                            englishChannelLocation.Add((probe.streams[i].channels, 0 + i));
+
+                            if (twoChannels && probe.streams[i].channels == 2)
+                            {
+                                return "-map 0:" + i.ToString() + " -c:a copy";
+                            }
                         }
                     }
                 }
@@ -209,9 +222,11 @@ namespace Snacks
                         flags += " ";
                     }
 
+                    // Return a single downmmixed 2 channel, otherwise return all the different english channels and formats
                     if (twoChannels)
                     {
-                        flags += ("-map 0:" + englishChannelLocation[i].Item2.ToString() + " -c:a aac -b:a 320k");
+                        return ("-map 0:" + englishChannelLocation[i].Item2.ToString() + " -c:a aac -ac 2 " +
+                            GetDownmixAudioFilter(probe.streams[englishChannelLocation[i].Item2].channel_layout) + "-b:a 320k");
                     }
                     else
                     {
@@ -225,13 +240,45 @@ namespace Snacks
 
             if (twoChannels && audioCount > 0)
             {
-                return "-map 0:a -c:a aac -b:a 320k";
+                return "-map 0:a -c:a aac -ac 2 -b:a 320k";
             }
 
             if (audioCount > 0)
                 return "-map 0:a -c:a copy";
             else
                 return "";
+        }
+
+        /// <summary>
+        /// Returns an audio filter to preserve LFE when downmixing to 2 channels
+        /// </summary>
+        /// <param name="probe"></param>
+        /// <returns></returns>
+        public static string GetDownmixAudioFilter(string channelLayout)
+        {
+            switch (channelLayout)
+            {
+                case "5.1":
+                    return "-af \"pan=stereo|FL=0.374107*FC+0.529067*FL+0.458186*BL+0.264534*BR+0.374107*LFE" +
+                                           "|FR=0.374107*FC+0.529067*FR+0.458186*BR+0.264534*BL+0.374107*LFE\" ";
+                case "5.1(side)":
+                    return "-af \"pan=stereo|FL=0.374107*FC+0.529067*FL+0.458186*SL+0.264534*SR+0.374107*LFE" +
+                                           "|FR=0.374107*FC+0.529067*FR+0.458186*SR+0.264534*SL+0.374107*LFE\" ";
+                case "7.1":
+                    return "-af \"pan=stereo|FL=0.274804*FC+0.388631*FL+0.336565*SL+0.194316*SR+0.336565*BL+0.194316*BR+0.274804*LFE" +
+                                           "|FR=0.274804*FC+0.388631*FR+0.336565*SR+0.194316*SL+0.336565*BR+0.194316*BL+0.274804*LFE\" ";
+                case "7.1(wide)":
+                    return "-af \"pan=stereo|FL=0.274804*FC+0.388631*FL+0.336565*FLC+0.194316*FRC+0.336565*BL+0.194316*BR+0.274804*LFE" +
+                                           "|FR=0.274804*FC+0.388631*FR+0.336565*RFC+0.194316*FLC+0.336565*BR+0.194316*BL+0.274804*LFE\" ";
+                case "7.1(wide-side)":
+                    return "-af \"pan=stereo|FL=0.274804*FC+0.388631*FL+0.336565*FLC+0.194316*FRC+0.336565*SL+0.194316*SR+0.274804*LFE" +
+                                           "|FR=0.274804*FC+0.388631*FR+0.336565*RFC+0.194316*FLC+0.336565*SR+0.194316*SL+0.274804*LFE\" ";
+                case "7.1(top)":
+                    return "-af \"pan=stereo|FL=0.274804*FC+0.388631*FL+0.336565*TFL+0.194316*TFR+0.336565*BL+0.194316*BR+0.274804*LFE" +
+                                           "|FR=0.274804*FC+0.388631*FR+0.336565*TFR+0.194316*TFL+0.336565*BR+0.194316*BL+0.274804*LFE\" ";
+                default:
+                    return "";
+            }
         }
 
         /// <summary>

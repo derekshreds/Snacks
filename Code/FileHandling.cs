@@ -20,7 +20,7 @@ namespace Snacks
             
             for (int i = 0; i < count; i++)
             {
-                dirs.AddRange(RecursivelyFindDirectories(dirs[i], false));
+                dirs.AddRange(RecursivelyFindDirectories(dirs[i].Replace('\\', '/'), false));
             }
 
             if (top)
@@ -48,7 +48,7 @@ namespace Snacks
                 {
                     if (files[j].IsVideoFile())
                     {
-                        videoFiles.Add(files[j]);
+                        videoFiles.Add(files[j].Replace('\\', '/'));
                     }
                 }
             }
