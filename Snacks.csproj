@@ -86,7 +86,7 @@
     <Compile Include="Code\Ffprobe.cs" />
     <Compile Include="Code\FileHandling.cs" />
     <Compile Include="Code\FormDelegates.cs" />
-    <Compile Include="Code\HevcQueue.cs" />
+    <Compile Include="Code\WorkQueue.cs" />
     <Compile Include="Code\Settings.cs" />
     <Compile Include="Code\Tools.cs" />
     <Compile Include="Forms\AdvancedOptions.cs">
@@ -148,9 +148,7 @@
       <Install>false</Install>
     </BootstrapperPackage>
   </ItemGroup>
-  <ItemGroup>
-    <Folder Include="Code.Tests\" />
-  </ItemGroup>
+  <ItemGroup />
   <ItemGroup>
     <Content Include="snacks.ico" />
   </ItemGroup>

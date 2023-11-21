@@ -5,20 +5,16 @@ namespace Snacks
 {
     public static class Tools
     {
-        /// <summary>
-        /// Returns the startup directory of this application
-        /// </summary>
-        /// <returns></returns>
+        /// <summary> Returns the startup directory of this application </summary>
+        /// <returns> The startup directory of the application </returns>
         public static string GetStartupDirectory()
         {
             return Application.StartupPath.Replace('\\', '/') + '/';
         }
 
-        /// <summary>
-        /// Convert "00:00:00" duration format to total seconds
-        /// </summary>
-        /// <param name="input"></param>
-        /// <returns></returns>
+        /// <summary> Convert "00:00:00" duration format to total seconds </summary>
+        /// <param name="input"> The input string to convert </param>
+        /// <returns> The total duration in seconds </returns>
         public static double DurationStringToSeconds(string input)
         {
             double duration = 0;

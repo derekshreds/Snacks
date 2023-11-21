@@ -16,9 +16,10 @@ using Newtonsoft.Json;
 
 namespace Snacks
 {
+    /// <summary> The main form of the application </summary>
     public partial class MainForm : Form
     {
-        public HevcQueue hevcQueue = new HevcQueue();
+        public WorkQueue hevcQueue = new WorkQueue();
         public EncoderOptions encoderOptions;
         public bool isConverting = false;
         public bool breakConversion = false;
@@ -33,7 +34,10 @@ namespace Snacks
             deleteFilesBox.Checked = encoderOptions.DeleteOriginalFile;
             removeAudioBox.Checked = encoderOptions.EnglishOnlyAudio;
             removeSubtitlesBox.Checked = encoderOptions.EnglishOnlySubtitles;
+            removeBlackBordersBox.Checked = encoderOptions.RemoveBlackBorders;
             retryOnFailBox.Checked = encoderOptions.RetryOnFail;
+            formatBox.SetFormat(encoderOptions.Format);
+            codecBox.SetCodec(encoderOptions.Codec);
             encoderBox.SetEncoder(encoderOptions.Encoder);
             targetBitrateBox.SetBitrate(encoderOptions.TargetBitrate > 0 ? encoderOptions.TargetBitrate : 2000);
             strictBitrateBox.Checked = encoderOptions.StrictBitrate;
@@ -56,7 +60,7 @@ namespace Snacks
                     Thread t = new Thread(() =>
                     {
                         hevcQueue.Clear();
-                        hevcQueue.Add(fileLocation, targetBitrateBox.GetBitrate());
+                        hevcQueue.Add(fileLocation);
                         GeneratePreview(fileLocation);
                         previewBox.UpdatePicture();
                         filesRemainingLabel.UpdateText("Files Remaining: 1");
@@ -88,7 +92,7 @@ namespace Snacks
 
                         for (int i = 0; i < files.Count; i++)
                         {
-                            hevcQueue.Add(files[i], targetBitrate);
+                            hevcQueue.Add(files[i]);
                         }
 
                         filesRemainingLabel.UpdateText("Files Remaining: " + hevcQueue.Count.ToString());
@@ -114,12 +118,15 @@ namespace Snacks
 
             startButton.Click += (s, e) =>
             {
-                encoderOptions.Encoder = encoderBox.GetEncoder();
+                encoderOptions.Format = formatBox.GetFormat();
+                encoderOptions.Codec = codecBox.GetCodec();
+                encoderOptions.Encoder = encoderBox.GetEncoder(codecBox);
                 encoderOptions.TargetBitrate = targetBitrateBox.GetBitrate();
                 encoderOptions.TwoChannelAudio = convertAudioBox.Checked;
                 encoderOptions.DeleteOriginalFile = deleteFilesBox.Checked;
                 encoderOptions.EnglishOnlyAudio = removeAudioBox.Checked;
                 encoderOptions.EnglishOnlySubtitles = removeSubtitlesBox.Checked;
+                encoderOptions.RemoveBlackBorders = removeBlackBordersBox.Checked;
                 encoderOptions.RetryOnFail = retryOnFailBox.Checked;
                 encoderOptions.StrictBitrate = strictBitrateBox.Checked;
 
@@ -179,12 +186,15 @@ namespace Snacks
             {
                 try
                 {
-                    encoderOptions.Encoder = encoderBox.GetEncoder();
+                    encoderOptions.Format = formatBox.GetFormat();
+                    encoderOptions.Codec = codecBox.GetCodec();
+                    encoderOptions.Encoder = encoderBox.GetEncoder(codecBox);
                     encoderOptions.TargetBitrate = targetBitrateBox.GetBitrate();
                     encoderOptions.TwoChannelAudio = convertAudioBox.Checked;
                     encoderOptions.DeleteOriginalFile = deleteFilesBox.Checked;
                     encoderOptions.EnglishOnlyAudio = removeAudioBox.Checked;
                     encoderOptions.EnglishOnlySubtitles = removeSubtitlesBox.Checked;
+                    encoderOptions.RemoveBlackBorders = removeBlackBordersBox.Checked;
                     encoderOptions.RetryOnFail = retryOnFailBox.Checked;
                     encoderOptions.StrictBitrate = strictBitrateBox.Checked;
                     Settings.WriteSettings(encoderOptions);

@@ -13,6 +13,7 @@ using static Snacks.Tools;
 
 namespace Snacks.Forms
 {
+    /// <summary> The advanced options form which allows setting encode and output directories </summary>
     public partial class AdvancedOptions : Form
     {
         public AdvancedOptions(EncoderOptions encoderOptions)

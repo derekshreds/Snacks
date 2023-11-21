@@ -8,10 +8,8 @@ namespace Snacks
     {
         private static string SettingsFile = GetStartupDirectory() + "settings.ini";
 
-        /// <summary>
-        /// Reads the Snacks settings file
-        /// </summary>
-        /// <returns></returns>
+        /// <summary> Reads the Snacks settings file </summary>
+        /// <returns> An EncoderOptions object containing the user's settings </returns>
         public static EncoderOptions ReadSettings()
         {
             EncoderOptions encoderOptions = new EncoderOptions();
@@ -30,10 +28,8 @@ namespace Snacks
             return encoderOptions;
         }
 
-        /// <summary>
-        /// Writes current Snacks settings to file
-        /// </summary>
-        /// <param name="encoderOptions"></param>
+        /// <summary> Writes current Snacks settings to file </summary>
+        /// <param name="encoderOptions"> The EncoderOptions to write to a file </param>
         public static void WriteSettings(EncoderOptions encoderOptions)
         {
             try

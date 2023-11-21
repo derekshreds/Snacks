@@ -48,6 +48,7 @@
             this.convertAudioBox = new System.Windows.Forms.CheckBox();
             this.optionsBox = new System.Windows.Forms.GroupBox();
             this.retryOnFailBox = new System.Windows.Forms.CheckBox();
+            this.removeBlackBordersBox = new System.Windows.Forms.CheckBox();
             this.removeAudioBox = new System.Windows.Forms.CheckBox();
             this.removeSubtitlesBox = new System.Windows.Forms.CheckBox();
             this.deleteFilesBox = new System.Windows.Forms.CheckBox();
@@ -57,6 +58,10 @@
             this.targetBitrateBox = new System.Windows.Forms.ComboBox();
             this.filesRemainingLabel = new System.Windows.Forms.Label();
             this.strictBitrateBox = new System.Windows.Forms.CheckBox();
+            this.formatBox = new System.Windows.Forms.ComboBox();
+            this.formatLabel = new System.Windows.Forms.Label();
+            this.codecBox = new System.Windows.Forms.ComboBox();
+            this.label2 = new System.Windows.Forms.Label();
             this.menuStrip.SuspendLayout();
             ((System.ComponentModel.ISupportInitialize)(this.previewBox)).BeginInit();
             this.optionsBox.SuspendLayout();
@@ -64,7 +69,7 @@
             // 
             // progressBar
             // 
-            this.progressBar.Location = new System.Drawing.Point(12, 415);
+            this.progressBar.Location = new System.Drawing.Point(12, 454);
             this.progressBar.Name = "progressBar";
             this.progressBar.Size = new System.Drawing.Size(516, 23);
             this.progressBar.Step = 1;
@@ -73,7 +78,7 @@
             // startButton
             // 
             this.startButton.Font = new System.Drawing.Font("Microsoft Sans Serif", 12F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
-            this.startButton.Location = new System.Drawing.Point(398, 361);
+            this.startButton.Location = new System.Drawing.Point(398, 400);
             this.startButton.Name = "startButton";
             this.startButton.Size = new System.Drawing.Size(110, 48);
             this.startButton.TabIndex = 1;
@@ -162,7 +167,7 @@
             // 
             this.logLabel.AutoSize = true;
             this.logLabel.Font = new System.Drawing.Font("Microsoft Sans Serif", 9.75F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
-            this.logLabel.Location = new System.Drawing.Point(15, 231);
+            this.logLabel.Location = new System.Drawing.Point(15, 261);
             this.logLabel.Name = "logLabel";
             this.logLabel.Size = new System.Drawing.Size(33, 16);
             this.logLabel.TabIndex = 5;
@@ -171,9 +176,9 @@
             // logTextBox
             // 
             this.logTextBox.Font = new System.Drawing.Font("Microsoft Sans Serif", 9.75F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
-            this.logTextBox.Location = new System.Drawing.Point(12, 250);
+            this.logTextBox.Location = new System.Drawing.Point(12, 280);
             this.logTextBox.Name = "logTextBox";
-            this.logTextBox.Size = new System.Drawing.Size(362, 159);
+            this.logTextBox.Size = new System.Drawing.Size(362, 168);
             this.logTextBox.TabIndex = 6;
             this.logTextBox.Text = "";
             this.logTextBox.WordWrap = false;
@@ -204,14 +209,15 @@
             this.convertAudioBox.Font = new System.Drawing.Font("Microsoft Sans Serif", 9.75F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
             this.convertAudioBox.Location = new System.Drawing.Point(6, 21);
             this.convertAudioBox.Name = "convertAudioBox";
-            this.convertAudioBox.Size = new System.Drawing.Size(134, 20);
+            this.convertAudioBox.Size = new System.Drawing.Size(131, 20);
             this.convertAudioBox.TabIndex = 10;
-            this.convertAudioBox.Text = "Stereo Audio Only";
+            this.convertAudioBox.Text = "Stereo audio only";
             this.convertAudioBox.UseVisualStyleBackColor = true;
             // 
             // optionsBox
             // 
             this.optionsBox.Controls.Add(this.retryOnFailBox);
+            this.optionsBox.Controls.Add(this.removeBlackBordersBox);
             this.optionsBox.Controls.Add(this.removeAudioBox);
             this.optionsBox.Controls.Add(this.removeSubtitlesBox);
             this.optionsBox.Controls.Add(this.deleteFilesBox);
@@ -219,7 +225,7 @@
             this.optionsBox.Font = new System.Drawing.Font("Microsoft Sans Serif", 9.75F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
             this.optionsBox.Location = new System.Drawing.Point(12, 64);
             this.optionsBox.Name = "optionsBox";
-            this.optionsBox.Size = new System.Drawing.Size(220, 164);
+            this.optionsBox.Size = new System.Drawing.Size(220, 185);
             this.optionsBox.TabIndex = 12;
             this.optionsBox.TabStop = false;
             this.optionsBox.Text = "Options";
@@ -228,12 +234,23 @@
             // 
             this.retryOnFailBox.AutoSize = true;
             this.retryOnFailBox.Font = new System.Drawing.Font("Microsoft Sans Serif", 9.75F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
-            this.retryOnFailBox.Location = new System.Drawing.Point(6, 125);
+            this.retryOnFailBox.Location = new System.Drawing.Point(6, 151);
             this.retryOnFailBox.Name = "retryOnFailBox";
             this.retryOnFailBox.Size = new System.Drawing.Size(174, 20);
             this.retryOnFailBox.TabIndex = 14;
             this.retryOnFailBox.Text = "Retry with software on fail";
             this.retryOnFailBox.UseVisualStyleBackColor = true;
+            // 
+            // removeBlackBordersBox
+            // 
+            this.removeBlackBordersBox.AutoSize = true;
+            this.removeBlackBordersBox.Font = new System.Drawing.Font("Microsoft Sans Serif", 9.75F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
+            this.removeBlackBordersBox.Location = new System.Drawing.Point(6, 125);
+            this.removeBlackBordersBox.Name = "removeBlackBordersBox";
+            this.removeBlackBordersBox.Size = new System.Drawing.Size(164, 20);
+            this.removeBlackBordersBox.TabIndex = 15;
+            this.removeBlackBordersBox.Text = "Remove black borders";
+            this.removeBlackBordersBox.UseVisualStyleBackColor = true;
             // 
             // removeAudioBox
             // 
@@ -277,16 +294,16 @@
             "Intel QuickSync",
             "Nvidia",
             "AMD/Radeon"});
-            this.encoderBox.Location = new System.Drawing.Point(241, 83);
+            this.encoderBox.Location = new System.Drawing.Point(238, 139);
             this.encoderBox.Name = "encoderBox";
-            this.encoderBox.Size = new System.Drawing.Size(121, 21);
+            this.encoderBox.Size = new System.Drawing.Size(136, 21);
             this.encoderBox.TabIndex = 15;
             // 
             // encoderLabel
             // 
             this.encoderLabel.AutoSize = true;
             this.encoderLabel.Font = new System.Drawing.Font("Microsoft Sans Serif", 9.75F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
-            this.encoderLabel.Location = new System.Drawing.Point(238, 64);
+            this.encoderLabel.Location = new System.Drawing.Point(235, 120);
             this.encoderLabel.Name = "encoderLabel";
             this.encoderLabel.Size = new System.Drawing.Size(61, 16);
             this.encoderLabel.TabIndex = 16;
@@ -296,7 +313,7 @@
             // 
             this.label1.AutoSize = true;
             this.label1.Font = new System.Drawing.Font("Microsoft Sans Serif", 9.75F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
-            this.label1.Location = new System.Drawing.Point(238, 115);
+            this.label1.Location = new System.Drawing.Point(235, 171);
             this.label1.Name = "label1";
             this.label1.Size = new System.Drawing.Size(91, 16);
             this.label1.TabIndex = 17;
@@ -315,10 +332,10 @@
             "4000",
             "4500",
             "5000"});
-            this.targetBitrateBox.Location = new System.Drawing.Point(241, 135);
+            this.targetBitrateBox.Location = new System.Drawing.Point(238, 191);
             this.targetBitrateBox.MaxLength = 5;
             this.targetBitrateBox.Name = "targetBitrateBox";
-            this.targetBitrateBox.Size = new System.Drawing.Size(121, 21);
+            this.targetBitrateBox.Size = new System.Drawing.Size(136, 21);
             this.targetBitrateBox.TabIndex = 18;
             // 
             // filesRemainingLabel
@@ -335,19 +352,69 @@
             // 
             this.strictBitrateBox.AutoSize = true;
             this.strictBitrateBox.Font = new System.Drawing.Font("Microsoft Sans Serif", 9.75F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
-            this.strictBitrateBox.Location = new System.Drawing.Point(241, 162);
+            this.strictBitrateBox.Location = new System.Drawing.Point(238, 218);
             this.strictBitrateBox.Name = "strictBitrateBox";
             this.strictBitrateBox.Size = new System.Drawing.Size(55, 20);
             this.strictBitrateBox.TabIndex = 20;
             this.strictBitrateBox.Text = "Strict";
             this.strictBitrateBox.UseVisualStyleBackColor = true;
             // 
+            // formatBox
+            // 
+            this.formatBox.DropDownStyle = System.Windows.Forms.ComboBoxStyle.DropDownList;
+            this.formatBox.FormattingEnabled = true;
+            this.formatBox.Items.AddRange(new object[] {
+            "mkv",
+            "mp4"});
+            this.formatBox.Location = new System.Drawing.Point(238, 89);
+            this.formatBox.MaxLength = 5;
+            this.formatBox.Name = "formatBox";
+            this.formatBox.Size = new System.Drawing.Size(62, 21);
+            this.formatBox.TabIndex = 22;
+            // 
+            // formatLabel
+            // 
+            this.formatLabel.AutoSize = true;
+            this.formatLabel.Font = new System.Drawing.Font("Microsoft Sans Serif", 9.75F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
+            this.formatLabel.Location = new System.Drawing.Point(235, 69);
+            this.formatLabel.Name = "formatLabel";
+            this.formatLabel.Size = new System.Drawing.Size(52, 16);
+            this.formatLabel.TabIndex = 21;
+            this.formatLabel.Text = "Format:";
+            // 
+            // codecBox
+            // 
+            this.codecBox.DropDownStyle = System.Windows.Forms.ComboBoxStyle.DropDownList;
+            this.codecBox.FormattingEnabled = true;
+            this.codecBox.Items.AddRange(new object[] {
+            "x265",
+            "x264"});
+            this.codecBox.Location = new System.Drawing.Point(312, 89);
+            this.codecBox.MaxLength = 5;
+            this.codecBox.Name = "codecBox";
+            this.codecBox.Size = new System.Drawing.Size(62, 21);
+            this.codecBox.TabIndex = 24;
+            // 
+            // label2
+            // 
+            this.label2.AutoSize = true;
+            this.label2.Font = new System.Drawing.Font("Microsoft Sans Serif", 9.75F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
+            this.label2.Location = new System.Drawing.Point(309, 69);
+            this.label2.Name = "label2";
+            this.label2.Size = new System.Drawing.Size(50, 16);
+            this.label2.TabIndex = 23;
+            this.label2.Text = "Codec:";
+            // 
             // MainForm
             // 
             this.AutoScaleDimensions = new System.Drawing.SizeF(6F, 13F);
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
             this.BackColor = System.Drawing.SystemColors.ControlDark;
-            this.ClientSize = new System.Drawing.Size(540, 450);
+            this.ClientSize = new System.Drawing.Size(540, 487);
+            this.Controls.Add(this.codecBox);
+            this.Controls.Add(this.label2);
+            this.Controls.Add(this.formatBox);
+            this.Controls.Add(this.formatLabel);
             this.Controls.Add(this.strictBitrateBox);
             this.Controls.Add(this.filesRemainingLabel);
             this.Controls.Add(this.targetBitrateBox);
@@ -411,5 +478,10 @@
         private System.Windows.Forms.ToolStripMenuItem optionsToolStripMenuItem;
         private System.Windows.Forms.CheckBox retryOnFailBox;
         private System.Windows.Forms.CheckBox strictBitrateBox;
+        private System.Windows.Forms.CheckBox removeBlackBordersBox;
+        private System.Windows.Forms.ComboBox formatBox;
+        private System.Windows.Forms.Label formatLabel;
+        private System.Windows.Forms.ComboBox codecBox;
+        private System.Windows.Forms.Label label2;
     }
 }

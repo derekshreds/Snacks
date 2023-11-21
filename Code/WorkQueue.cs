@@ -10,10 +10,11 @@ using static Snacks.Tools;
 
 namespace Snacks
 {
-    public class HevcQueue
+    /// <summary> The class responsible for building the work queue </summary>
+    public class WorkQueue
     {
         private bool isSorted = false;
-        public int Count { get { return Items.Count; } }
+        public int Count => Items.Count;
 
         public class WorkItem
         {
@@ -28,25 +29,20 @@ namespace Snacks
 
         private List<WorkItem> Items = new List<WorkItem>();
 
-        /// <summary>
-        /// Gets the current item in need of work (largest file size first)
-        /// </summary>
-        /// <returns></returns>
+        /// <summary> Gets the current item in need of work (largest file size first) </summary>
+        /// <returns> The WorkItem at the front of the queue </returns>
         public WorkItem GetWorkItem()
         {
-            if (Items.Count == 0) return null;
+            if (Items.Count == 0)
+                return null;
 
             if (!isSorted)
-            {
                 Sort();
-            }
 
             return Items[0];
         }
 
-        /// <summary>
-        /// Sorts the items in the HEVC queue by descending bitrate
-        /// </summary>
+        /// <summary> Sorts the items in the HEVC queue by descending bitrate </summary>
         public void Sort()
         {
             var items = Items.OrderByDescending(x => x.Bitrate).ToList();
@@ -54,20 +50,16 @@ namespace Snacks
             isSorted = true;
         }
 
-        /// <summary>
-        /// Clears the queue
-        /// </summary>
+        /// <summary> Clears the queue </summary>
         public void Clear()
         {
             Items.Clear();
             isSorted = false;
         }
 
-        /// <summary>
-        /// Adds an item to the HEVC queue
-        /// </summary>
-        /// <param name="path"></param>
-        public void Add(string path, int targetBitrate)
+        /// <summary> Adds an item to the HEVC queue </summary>
+        /// <param name="path"> The path of the file to add </param>
+        public void Add(string path)
         {
             long size;
             long bitrate;
@@ -87,9 +79,7 @@ namespace Snacks
                     if (probe.streams[i].codec_type == "video")
                     {
                         if (probe.streams[i].codec_name == "hevc")
-                        {
                             isHevc = true;
-                        }
 
                         double formatDuration = DurationStringToSeconds(probe.format.duration);
                         double streamDuration = DurationStringToSeconds(probe.streams[i].duration);
@@ -110,22 +100,14 @@ namespace Snacks
                     Probe = probe
                 };
 
-                // Don't bother with stuff below target bitrate + 700 for audio headroom if already x265
-                if (item.Bitrate < targetBitrate + 700 && isHevc)
-                {
-                    return;
-                }
-
                 Items.Add(item);
                 isSorted = false;
             }
             catch { return; }
         }
 
-        /// <summary>
-        /// Removes an item from the HEVC queue
-        /// </summary>
-        /// <param name="path"></param>
+        /// <summary> Removes an item from the HEVC queue </summary>
+        /// <param name="item"> The WorkItem to remove from the queue </param>
         public void Remove(WorkItem item)
         {
             for (int i = 0; i < Items.Count; i++)

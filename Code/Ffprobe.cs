@@ -11,8 +11,10 @@ using static Snacks.Tools;
 
 namespace Snacks
 {
+    /// <summary> The class that handles ffprobe related logic </summary>
     public static class Ffprobe
     {
+        /// <summary> Json deserialization structure for ffprobe tags </summary>
         public class Tags
         {
             public string language;
@@ -21,6 +23,7 @@ namespace Snacks
             public string vendor_id;
         }
 
+        /// <summary> Json deserialization structure for ffprobe streams </summary>
         public class Stream
         {
             public int index;
@@ -64,6 +67,7 @@ namespace Snacks
             public Tags tags;
         }
 
+        /// <summary> Json deserialization structure for ffprobe format </summary>
         public class Format
         {
             public string filename;
@@ -78,17 +82,16 @@ namespace Snacks
             public int probe_score;
         }
 
+        /// <summary> Json deserialization structure for the probe result </summary>
         public class ProbeResult
         {
             public Stream[] streams;
             public Format format;
         }
 
-        /// <summary>
-        /// Probe a file and return all relevant stream information
-        /// </summary>
-        /// <param name="file_input"></param>
-        /// <returns></returns>
+        /// <summary> Probe a file and return all relevant stream information </summary>
+        /// <param name="fileInput"> The file to probe </param>
+        /// <returns> A ProbeResult of the file </returns>
         public static ProbeResult Probe(string fileInput)
         {
             string flags = "-v quiet -print_format json -show_streams -show_format \"";
@@ -122,13 +125,9 @@ namespace Snacks
             // Ffprobe doesn't always output to the correct data side
             string correctOutput;
             if (err.Length > output.Length)
-            {
                 correctOutput = err;
-            }
             else
-            {
                 correctOutput = output;
-            }
 
             ProbeResult probeResult = new ProbeResult();
             try
@@ -142,11 +141,9 @@ namespace Snacks
             return probeResult;
         }
 
-        /// <summary>
-        /// Find and map neccessary video streams
-        /// </summary>
-        /// <param name="probe"></param>
-        /// <returns></returns>
+        /// <summary> Find and map necessary video streams </summary>
+        /// <param name="probe"> The ProbeResult to map the video string from </param>
+        /// <returns> The video mapping string </returns>
         public static string MapVideo(ProbeResult probe)
         {
             string mapping = "";
@@ -163,23 +160,20 @@ namespace Snacks
             return mapping;
         }
 
-        /// <summary>
-        /// Find and map neccessary audio streams
-        /// </summary>
-        /// <param name="probe"></param>
-        /// <param name="englishOnly"></param>
-        /// <param name="twoChannels"></param>
-        /// <returns></returns>
-        public static string MapAudio(ProbeResult probe, bool englishOnly, bool twoChannels)
+        /// <summary> Find and map necessary audio streams </summary>
+        /// <param name="probe">The ProbeResult to map audio from </param>
+        /// <param name="englishOnly"> Whether only English audio should be kept </param>
+        /// <param name="twoChannels"> Whether audio should be downmixed to stereo </param>
+        /// <param name="isMatroska"> Whether the container is of matroska format </param>
+        /// <returns> The audio mapping string </returns>
+        public static string MapAudio(ProbeResult probe, bool englishOnly, bool twoChannels, bool isMatroska)
         {
             int audioCount = 0;
 
             for (int i = 0; i < probe.streams.Count(); i++)
             {
                 if (probe.streams[i].codec_type == "audio")
-                {
                     audioCount++;
-                }
             }
 
             string flags = "";
@@ -199,61 +193,56 @@ namespace Snacks
                         bool isCommentary = false;
                         
                         if (probe.streams[i].tags.title != null && probe.streams[i].tags.title.ToLower().Contains("comm"))
-                        {
                             isCommentary = true;
-                        }
 
                         if (!isCommentary)
                         {
                             englishChannelLocation.Add((probe.streams[i].channels, 0 + i));
 
-                            if (twoChannels && probe.streams[i].channels == 2)
-                            {
-                                return "-map 0:" + i.ToString() + " -c:a copy";
-                            }
+                            // Mp4's need a specific codec, matroska can be passed-through
+                            if (twoChannels && probe.streams[i].channels == 2 && isMatroska)
+                                return $"-map 0:{i} -c:a copy";
+                            else
+                                return $"-map 0:{i} -c:a aac -ac 2 -b:a 320k";
                         }
                     }
                 }
 
                 for (int i = 0; i < englishChannelLocation.Count(); i++)
                 {
-                    if (i > 0)
-                    {
-                        flags += " ";
-                    }
-
-                    // Return a single downmmixed 2 channel, otherwise return all the different english channels and formats
+                    // Return a single downmixed 2 channel, otherwise return all the different English channels and formats
                     if (twoChannels)
-                    {
-                        return ("-map 0:" + englishChannelLocation[i].Item2.ToString() + " -c:a aac -ac 2 " +
-                            GetDownmixAudioFilter(probe.streams[englishChannelLocation[i].Item2].channel_layout) + "-b:a 320k");
-                    }
-                    else
-                    {
-                        flags += ("-map 0:" + englishChannelLocation[i].Item2.ToString() + " -c:a copy");
-                    }
+                        return $"-map 0:{englishChannelLocation[i].Item2} -c:a aac -ac 2 " +
+                            GetDownmixAudioFilter(probe.streams[englishChannelLocation[i].Item2].channel_layout) + "-b:a 320k";
+
+                    flags += $"{(flags != "" ? " " : "")}-map 0:{englishChannelLocation[i].Item2}";
                 }
 
                 if (englishChannelLocation.Count() > 0)
+                {
+                    if (isMatroska)
+                        flags += " -c:a copy";
+                    else
+                        flags += " -c:a aac -b:a 320k";
+                }
                     return flags;
             }
 
             if (twoChannels && audioCount > 0)
-            {
                 return "-map 0:a -c:a aac -ac 2 -b:a 320k";
-            }
 
-            if (audioCount > 0)
+            if (audioCount > 0 && isMatroska)
                 return "-map 0:a -c:a copy";
-            else
-                return "";
+
+            if (audioCount > 0 && !isMatroska)
+                return "-map 0:a -c:a aac -b:a 320k";
+
+            return "";
         }
 
-        /// <summary>
-        /// Returns an audio filter to preserve LFE when downmixing to 2 channels
-        /// </summary>
-        /// <param name="probe"></param>
-        /// <returns></returns>
+        /// <summary> Returns an audio filter to preserve LFE when downmixing to 2 channels </summary>
+        /// <param name="channelLayout"> The channel layout to get a downmix filter for </param>
+        /// <returns> The audio downmixing filter string </returns>
         public static string GetDownmixAudioFilter(string channelLayout)
         {
             switch (channelLayout)
@@ -281,22 +270,22 @@ namespace Snacks
             }
         }
 
-        /// <summary>
-        /// Find and map neccessary subtitles
-        /// </summary>
-        /// <param name="probe"></param>
-        /// <param name="englishOnly"></param>
-        /// <returns></returns>
-        public static string MapSub(ProbeResult probe, bool englishOnly)
+        /// <summary> Find and map necessary subtitles </summary>
+        /// <param name="probe"> The ProbeResult to map the subtitles from </param>
+        /// <param name="englishOnly"> Whether only English subtitles should be mapped </param>
+        /// <param name="isMatroska"> Whether the container is of matroska format </param>
+        /// <returns> The subtitle mapping string </returns>
+        public static string MapSub(ProbeResult probe, bool englishOnly, bool isMatroska)
         {
+            if (!isMatroska)
+                return "-sn";
+
             int subtitleCount = 0;
 
             for (int i = 0; i < probe.streams.Length; i++)
             {
                 if (probe.streams[i].codec_type == "subtitle")
-                {
                     subtitleCount++;
-                }
             }
 
             if (englishOnly)
@@ -306,13 +295,7 @@ namespace Snacks
                 {
                     if (probe.streams[i].codec_type == "subtitle" && probe.streams[i].tags.language == "eng")
                     {
-                        if (i > 0)
-                        {
-                            mapping += " ";
-                        }
-
-                        // Copy instead of srt, as ffmpeg can't convert all formats to srt
-                        mapping += "-map 0:" + i.ToString() + " -c:s copy";
+                        mapping += $"{(mapping != "" ? " " : "")}-map 0:{i}";
                     }
                 }
 
@@ -321,17 +304,15 @@ namespace Snacks
             }
 
             if (subtitleCount > 0)
-                return "-map 0:s -c:s copy";
+                return " -c:s copy";
             else
                 return "";
         }
 
-        /// <summary>
-        /// Compares duration to verify there was no corruption
-        /// </summary>
-        /// <param name="input"></param>
-        /// <param name="output"></param>
-        /// <returns></returns>
+        /// <summary> Compares duration to verify there was no corruption </summary>
+        /// <param name="input"> The ProbeResult of the input file </param>
+        /// <param name="output"> The ProbeResult of the output file </param>
+        /// <returns> Boolean value of the conversion success </returns>
         public static bool ConvertedSuccessfully(ProbeResult input, ProbeResult output)
         {
             try
@@ -342,22 +323,16 @@ namespace Snacks
 
                 // Check for 10 seconds of difference for now
                 if (durationDifference >= 10)
-                {
                     return false;
-                }
                 else
-                {
                     return true;
-                }
             }
             catch { return false; }
         }
 
-        /// <summary>
-        /// Gets the duration of a video stream
-        /// </summary>
-        /// <param name="probe"></param>
-        /// <returns></returns>
+        /// <summary> Gets the duration of a video stream </summary>
+        /// <param name="probe"> The ProbeResult to get the duration from </param>
+        /// <returns> The duration of a video in seconds </returns>
         public static double GetVideoDuration(ProbeResult probe)
         {
             try
