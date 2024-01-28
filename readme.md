@@ -1,0 +1,1 @@
+[![Build Status](http://192.168.1.2:8080/job/Personal/job/Snacks/job/master/badge/icon)](http://192.168.1.2:8080/job/Personal/job/Snacks/job/master/)
