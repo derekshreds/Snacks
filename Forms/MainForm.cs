@@ -13,6 +13,7 @@ using static Snacks.FileHandling;
 using static Snacks.FormDelegates;
 using Snacks.Forms;
 using Newtonsoft.Json;
+using System.Drawing.Imaging;
 
 namespace Snacks
 {
@@ -61,7 +62,8 @@ namespace Snacks
                     {
                         hevcQueue.Clear();
                         hevcQueue.Add(fileLocation);
-                        GeneratePreview(fileLocation);
+                        var work_item = hevcQueue.GetWorkItem();
+                        GeneratePreview(fileLocation, work_item.Length);
                         previewBox.UpdatePicture();
                         filesRemainingLabel.UpdateText("Files Remaining: 1");
                     });
@@ -144,7 +146,7 @@ namespace Snacks
                             filesRemainingLabel.UpdateText("Files Remaining: " + hevcQueue.Count.ToString());
 
                             var workItem = hevcQueue.GetWorkItem();
-                            GeneratePreview(workItem.Path);
+                            GeneratePreview(workItem.Path, workItem.Length);
                             previewBox.UpdatePicture();
 
                             workItem.ConvertVideo(encoderOptions, logTextBox, progressBar);

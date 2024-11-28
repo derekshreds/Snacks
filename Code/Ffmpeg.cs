@@ -17,39 +17,34 @@ namespace Snacks
     {
         /// <summary> Generates a preview of the video file </summary>
         /// <param name="path"> The path of the file </param>
-        public static void GeneratePreview(string path)
+        public static void GeneratePreview(string path, double length)
         {
             string previewPath = GetStartupDirectory() + "preview.bmp";
 
             if (File.Exists(previewPath))
                 File.Delete(previewPath);
 
-            string command = $"-i \"{path}\" -s 145x145 -ss 00:00:30 -frames:v 1 \"{previewPath}\"";
+            string duration = Tools.SecondsToDurationString(length * 0.25);
+            // Significantly faster with the -ss param before the input
+            string command = $"-ss {duration} -i \"{path}\" -vf \"cropdetect=24:2:0,scale=500:500\" -frames:v 1 \"{previewPath}\"";
 
-            ProcessStartInfo cmdsi = new ProcessStartInfo(GetStartupDirectory() + "ffmpeg.exe");
-
-            cmdsi.Arguments = command;
-            cmdsi.UseShellExecute = false;
-            cmdsi.RedirectStandardOutput = true;
-            cmdsi.CreateNoWindow = true;
-            cmdsi.RedirectStandardError = true;
-            Process cmd = Process.Start(cmdsi);
-
-            string err = "";
-            string output = "";
-
-            cmd.OutputDataReceived += (s, e) =>
+            ProcessStartInfo cmdsi = new ProcessStartInfo(Path.Combine(GetStartupDirectory(), "ffmpeg.exe"))
             {
-                output += e.Data;
-            };
-            cmd.ErrorDataReceived += (s, e) =>
-            {
-                err += e.Data;
+                Arguments = command,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                CreateNoWindow = true,
+                RedirectStandardError = true
             };
 
-            cmd.BeginErrorReadLine();
-            cmd.BeginOutputReadLine();
-            cmd.WaitForExit();
+            using (Process cmd = Process.Start(cmdsi))
+            {
+                cmd.OutputDataReceived += (s, e) => { /* Handle output data if needed */ };
+                cmd.ErrorDataReceived += (s, e) => { /* Handle error data if needed */ };
+                cmd.BeginErrorReadLine();
+                cmd.BeginOutputReadLine();
+                cmd.WaitForExit();
+            }
         }
 
         /// <summary> Converts video using dynamic compression based on algorithms and flags </summary>
@@ -94,7 +89,8 @@ namespace Snacks
             string varFlags = "-movflags +faststart -max_muxing_queue_size 9999 ";
             string fileOutput;
 
-            if (workItem.Bitrate > encoderOptions.TargetBitrate + 700 && workItem.IsHevc && !encoderOptions.RemoveBlackBorders)
+            // If bitrate is already below target, copy instead
+            if (workItem.Bitrate < encoderOptions.TargetBitrate + 700 && workItem.IsHevc && !encoderOptions.RemoveBlackBorders)
             {
                 compressionFlags = "";
                 videoFlags = $"{MapVideo(workItem.Probe)} -c:v copy ";
@@ -185,7 +181,15 @@ namespace Snacks
                     {
                         logTextBox.AppendLine("Couldn't find output file after 10 seconds.");
 
-                        if (encoderOptions.RetryOnFail && encoderOptions.Encoder != "libx265")
+                        // Bitmap subtitles tend to fail when mapping, so try copying on fail
+                        if (encoderOptions.EnglishOnlySubtitles)
+                        {
+                            logTextBox.AppendLine("Retrying without subtitle conversion");
+                            FileMove(newFileInput, workItem.Path);
+                            encoderOptions.EnglishOnlySubtitles = false;
+                            workItem.ConvertVideo(encoderOptions, logTextBox, progressBar);
+                        }
+                        else if (encoderOptions.RetryOnFail && encoderOptions.Encoder != "libx265")
                         {
                             logTextBox.AppendLine("Retrying with software encoding.");
                             FileMove(newFileInput, workItem.Path);
@@ -273,12 +277,6 @@ namespace Snacks
                 Thread.Sleep(100);
             }
         }
-
-        /// <summary> Parses a video to find the aspect ratio for cropping out black bars </summary>
-        /// <param name="workItem"> The work item to parse </param>
-        /// <param name="encoderOptions"> The encoder options to use </param>
-        /// <param name="logTextBox"> The textbox to update </param>
-        /// <returns> A video filter string for cropping the video </returns>
         public static string GetCropParameters(this WorkQueue.WorkItem workItem, EncoderOptions encoderOptions, RichTextBox logTextBox)
         {
             logTextBox.AppendLine("Getting crop values.");
@@ -287,99 +285,45 @@ namespace Snacks
             string command = $"-y -hwaccel auto -i \"{workItem.Path}\" -ss {(length_in_mins > 20 ? "00:10:00" : "00:00:00")} -t {(length_in_mins > 20 ? "00:10:00" : $"00:{length_in_mins:D2}:00")} -vf cropdetect=24:2:8 -c:v {encoderOptions.Encoder} -f null -";
 
             var startTime = DateTime.Now;
-            ProcessStartInfo cmdsi = new ProcessStartInfo(GetStartupDirectory() + "ffmpeg.exe");
-            cmdsi.Arguments = command;
-            cmdsi.UseShellExecute = false;
-            cmdsi.RedirectStandardOutput = true;
-            cmdsi.CreateNoWindow = true;
-            cmdsi.RedirectStandardError = true;
+            ProcessStartInfo cmdsi = new ProcessStartInfo(GetStartupDirectory() + "ffmpeg.exe")
+            {
+                Arguments = command,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                CreateNoWindow = true,
+                RedirectStandardError = true
+            };
             Process cmd = Process.Start(cmdsi);
 
-            int width = 0;
-            int height = 0;
-            int x_offset = 0;
-            int y_offset = 0;
-            int w = 0;
-            int h = 0;
-            int x = 0;
-            int y = 0;
-            Dictionary<int, int> _w = new Dictionary<int, int>();
-            Dictionary<int, int> _h = new Dictionary<int, int>();
-            Dictionary<int, int> _x = new Dictionary<int, int>();
-            Dictionary<int, int> _y = new Dictionary<int, int>();
-
-            cmd.OutputDataReceived += (s, e) =>
-            {
-                // Ffmpeg only outputs to ErrorData
-            };
+            var cropValues = new Dictionary<string, int>();
 
             cmd.ErrorDataReceived += (s, e) =>
             {
-                // Parse error data so we can collect progress and update the form
-                try
+                if (e.Data != null && e.Data.Contains("crop="))
                 {
-                    if (e.Data.Contains("crop="))
-                    {
-                        var splitOutput = e.Data.Split(new string[] { "crop=" }, StringSplitOptions.None);
-
-                        if (splitOutput.Length > 1 && splitOutput[1].Contains(":"))
-                        {
-                            var secondSplit = splitOutput[1].Split(new char[] { ':' }, StringSplitOptions.RemoveEmptyEntries);
-
-                            if (secondSplit.Length > 3)
-                            {
-                                if (int.TryParse(secondSplit[0], out w) && int.TryParse(secondSplit[1], out h) &&
-                                    int.TryParse(secondSplit[2], out x) && int.TryParse(secondSplit[3], out y))
-                                {
-                                    if (!_w.TryGetValue(w, out _))
-                                        _w.Add(w, 1);
-                                    else
-                                        _w[w]++;
-
-                                    if (!_h.TryGetValue(h, out _))
-                                        _h.Add(h, 1);
-                                    else
-                                        _h[h]++;
-
-                                    if (!_x.TryGetValue(x, out _))
-                                        _x.Add(x, 1);
-                                    else
-                                        _x[x]++;
-
-                                    if (!_y.TryGetValue(y, out _))
-                                        _y.Add(y, 1);
-                                    else
-                                        _y[y]++;
-                                }
-                            }
-                        }
-                    }
+                    var crop = e.Data.Split(new string[] { "crop=" }, StringSplitOptions.None)[1].Split(' ')[0];
+                    if (cropValues.ContainsKey(crop))
+                        cropValues[crop]++;
+                    else
+                        cropValues[crop] = 1;
                 }
-                catch { }
             };
 
             cmd.BeginErrorReadLine();
             cmd.BeginOutputReadLine();
             cmd.WaitForExit();
             Thread.Sleep(5000);
-            width = GetHighestValue(_w);
-            height = GetHighestValue(_h);
-            x_offset = GetHighestValue(_x);
-            y_offset = GetHighestValue(_y);
 
-            // Don't mix with a filter, if it isn't filtering
-            if (x_offset == 0 && y_offset == 0)
+            if (cropValues.Count == 0)
                 return "";
 
-            return $"-vf \"crop={width}:{height}:{x_offset}:{y_offset}\"";
-        }
+            var bestCrop = cropValues.Aggregate((x, y) => x.Value > y.Value ? x : y).Key;
+            var cropParams = bestCrop.Split(':');
 
-        /// <summary> Gets the key with the highest value </summary>
-        /// <param name="dictionary"> The dictionary to search </param>
-        /// <returns> The key of the highest value in the dictionary </returns>
-        public static int GetHighestValue(Dictionary<int, int> dictionary)
-        {
-            return dictionary.Aggregate((x, y) => x.Value > y.Value ? x : y).Key;
+            if (cropParams.Length != 4 || cropParams[2] == "0" && cropParams[3] == "0")
+                return "";
+
+            return $"-vf \"crop={cropParams[0]}:{cropParams[1]}:{cropParams[2]}:{cropParams[3]}\"";
         }
     }
 }
