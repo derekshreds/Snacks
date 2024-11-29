@@ -202,7 +202,7 @@ namespace Snacks
                             // Mp4's need a specific codec, matroska can be passed-through
                             if (twoChannels && probe.streams[i].channels == 2 && isMatroska)
                                 return $"-map 0:{i} -c:a copy";
-                            else
+                            else if (twoChannels)
                                 return $"-map 0:{i} -c:a aac -ac 2 -b:a 320k";
                         }
                     }

@@ -11,7 +11,6 @@ namespace Snacks
         {
             return Application.StartupPath.Replace('\\', '/') + '/';
         }
-
         /// <summary> Convert "00:00:00" duration format to total seconds </summary>
         /// <param name="input"> The input string to convert </param>
         /// <returns> The total duration in seconds </returns>
@@ -36,6 +35,11 @@ namespace Snacks
             catch { }
 
             return duration;
+        }
+        public static string SecondsToDurationString(double seconds)
+        {
+            TimeSpan timeSpan = TimeSpan.FromSeconds(seconds);
+            return string.Format("{0}:{1}:{2}", timeSpan.Hours, timeSpan.Minutes, timeSpan.Seconds);
         }
     }
 }
