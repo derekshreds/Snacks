@@ -1,14 +1,14 @@
-﻿using Newtonsoft.Json;
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Threading;
 using System.Windows.Forms;
+using System.Linq;
 using static Snacks.Ffprobe;
 using static Snacks.Tools;
 using static Snacks.FileHandling;
-using System.Linq;
+using static Snacks.WorkQueue;
 
 namespace Snacks
 {
@@ -16,15 +16,15 @@ namespace Snacks
     public static class Ffmpeg
     {
         /// <summary> Generates a preview of the video file </summary>
-        /// <param name="path"> The path of the file </param>
-        public static void GeneratePreview(string path)
+        /// <param name="workItem"> The work item having a preview generated </param>
+        public static void GeneratePreview(WorkItem workItem)
         {
             string previewPath = GetStartupDirectory() + "preview.bmp";
 
             if (File.Exists(previewPath))
                 File.Delete(previewPath);
 
-            string command = $"-i \"{path}\" -s 145x145 -ss 00:00:30 -frames:v 1 \"{previewPath}\"";
+            string command = $"-ss {SecondsToDurationString(GetVideoDuration(workItem.Probe) / 2)} -i \"{workItem.Path}\" -s 145x145 -frames:v 1 \"{previewPath}\"";
 
             ProcessStartInfo cmdsi = new ProcessStartInfo(GetStartupDirectory() + "ffmpeg.exe");
 
@@ -283,103 +283,45 @@ namespace Snacks
         {
             logTextBox.AppendLine("Getting crop values.");
 
-            int length_in_mins = (int)workItem.Length / 60;
-            string command = $"-y -hwaccel auto -i \"{workItem.Path}\" -ss {(length_in_mins > 20 ? "00:10:00" : "00:00:00")} -t {(length_in_mins > 20 ? "00:10:00" : $"00:{length_in_mins:D2}:00")} -vf cropdetect=24:2:8 -c:v {encoderOptions.Encoder} -f null -";
+            int lengthInMinutes = (int)workItem.Length / 60;
+            string startTime = lengthInMinutes > 20 ? "00:10:00" : "00:00:00";
+            string duration = lengthInMinutes > 20 ? "00:10:00" : $"00:{lengthInMinutes:D2}:00";
+            string command = $"-y -hwaccel auto -ss {startTime} -i \"{workItem.Path}\" -t {duration} -vf cropdetect=24:2:8 -c:v {encoderOptions.Encoder} -f null -";
 
-            var startTime = DateTime.Now;
-            ProcessStartInfo cmdsi = new ProcessStartInfo(GetStartupDirectory() + "ffmpeg.exe");
-            cmdsi.Arguments = command;
-            cmdsi.UseShellExecute = false;
-            cmdsi.RedirectStandardOutput = true;
-            cmdsi.CreateNoWindow = true;
-            cmdsi.RedirectStandardError = true;
+            ProcessStartInfo cmdsi = new ProcessStartInfo(GetStartupDirectory() + "ffmpeg.exe")
+            {
+                Arguments = command,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                CreateNoWindow = true,
+                RedirectStandardError = true
+            };
+
             Process cmd = Process.Start(cmdsi);
 
-            int width = 0;
-            int height = 0;
-            int x_offset = 0;
-            int y_offset = 0;
-            int w = 0;
-            int h = 0;
-            int x = 0;
-            int y = 0;
-            Dictionary<int, int> _w = new Dictionary<int, int>();
-            Dictionary<int, int> _h = new Dictionary<int, int>();
-            Dictionary<int, int> _x = new Dictionary<int, int>();
-            Dictionary<int, int> _y = new Dictionary<int, int>();
-
-            cmd.OutputDataReceived += (s, e) =>
-            {
-                // Ffmpeg only outputs to ErrorData
-            };
+            var cropValues = new Dictionary<string, int>();
 
             cmd.ErrorDataReceived += (s, e) =>
             {
-                // Parse error data so we can collect progress and update the form
-                try
+                if (e.Data != null && e.Data.Contains("crop="))
                 {
-                    if (e.Data.Contains("crop="))
-                    {
-                        var splitOutput = e.Data.Split(new string[] { "crop=" }, StringSplitOptions.None);
-
-                        if (splitOutput.Length > 1 && splitOutput[1].Contains(":"))
-                        {
-                            var secondSplit = splitOutput[1].Split(new char[] { ':' }, StringSplitOptions.RemoveEmptyEntries);
-
-                            if (secondSplit.Length > 3)
-                            {
-                                if (int.TryParse(secondSplit[0], out w) && int.TryParse(secondSplit[1], out h) &&
-                                    int.TryParse(secondSplit[2], out x) && int.TryParse(secondSplit[3], out y))
-                                {
-                                    if (!_w.TryGetValue(w, out _))
-                                        _w.Add(w, 1);
-                                    else
-                                        _w[w]++;
-
-                                    if (!_h.TryGetValue(h, out _))
-                                        _h.Add(h, 1);
-                                    else
-                                        _h[h]++;
-
-                                    if (!_x.TryGetValue(x, out _))
-                                        _x.Add(x, 1);
-                                    else
-                                        _x[x]++;
-
-                                    if (!_y.TryGetValue(y, out _))
-                                        _y.Add(y, 1);
-                                    else
-                                        _y[y]++;
-                                }
-                            }
-                        }
-                    }
+                    string crop = e.Data.Split(new string[] { "crop=" }, StringSplitOptions.None)[1].Split(' ')[0];
+                    if (cropValues.ContainsKey(crop))
+                        cropValues[crop]++;
+                    else
+                        cropValues[crop] = 1;
                 }
-                catch { }
             };
 
             cmd.BeginErrorReadLine();
             cmd.BeginOutputReadLine();
             cmd.WaitForExit();
-            Thread.Sleep(5000);
-            width = GetHighestValue(_w);
-            height = GetHighestValue(_h);
-            x_offset = GetHighestValue(_x);
-            y_offset = GetHighestValue(_y);
 
-            // Don't mix with a filter, if it isn't filtering
-            if (x_offset == 0 && y_offset == 0)
+            if (cropValues.Count == 0)
                 return "";
 
-            return $"-vf \"crop={width}:{height}:{x_offset}:{y_offset}\"";
-        }
-
-        /// <summary> Gets the key with the highest value </summary>
-        /// <param name="dictionary"> The dictionary to search </param>
-        /// <returns> The key of the highest value in the dictionary </returns>
-        public static int GetHighestValue(Dictionary<int, int> dictionary)
-        {
-            return dictionary.Aggregate((x, y) => x.Value > y.Value ? x : y).Key;
+            string mostCommonCrop = cropValues.Aggregate((x, y) => x.Value > y.Value ? x : y).Key;
+            return $"-vf \"crop={mostCommonCrop}\"";
         }
     }
 }
