@@ -146,18 +146,8 @@ namespace Snacks
         /// <returns> The video mapping string </returns>
         public static string MapVideo(ProbeResult probe)
         {
-            string mapping = "";
-
-            for (int i = 0; i < probe.streams.Length; i++)
-            {
-                if (probe.streams[i].codec_type == "video")
-                {
-                    mapping = "-map 0:" + i.ToString();
-                    break;
-                }
-            }
-
-            return mapping;
+            var videoStream = probe.streams.FirstOrDefault(s => s.codec_type == "video");
+            return videoStream != null ? $"-map 0:{videoStream.index}" : "";
         }
 
         /// <summary> Find and map necessary audio streams </summary>
@@ -168,76 +158,29 @@ namespace Snacks
         /// <returns> The audio mapping string </returns>
         public static string MapAudio(ProbeResult probe, bool englishOnly, bool twoChannels, bool isMatroska)
         {
-            int audioCount = 0;
+            var audioStreams = probe.streams.Where(s => s.codec_type == "audio").ToList();
+            if (!audioStreams.Any())
+                return "";
 
-            for (int i = 0; i < probe.streams.Count(); i++)
-            {
-                if (probe.streams[i].codec_type == "audio")
-                    audioCount++;
-            }
-
-            string flags = "";
             if (englishOnly)
             {
-                // tuple (channels, location in collection)
-                List<(int, int)> englishChannelLocation = new List<(int, int)>();
+                var englishAudioStreams = audioStreams
+                    .Where(s => s.tags?.language == "eng" && (s.tags?.title == null || !s.tags.title.ToLower().Contains("comm")))
+                    .ToList();
 
-                for (int i = 0; i < probe.streams.Length; i++)
+                if (englishAudioStreams.Any())
                 {
-                    if (probe.streams[i].codec_type == "audio" &&
-                        probe.streams[i].tags != null &&
-                        probe.streams[i].tags.language != null &&
-                        probe.streams[i].tags.language == "eng")
-                    {
-                        // Don't keep commentary audio if tagged
-                        bool isCommentary = false;
-                        
-                        if (probe.streams[i].tags.title != null && probe.streams[i].tags.title.ToLower().Contains("comm"))
-                            isCommentary = true;
-
-                        if (!isCommentary)
-                        {
-                            englishChannelLocation.Add((probe.streams[i].channels, 0 + i));
-
-                            // Mp4's need a specific codec, matroska can be passed-through
-                            if (twoChannels && probe.streams[i].channels == 2 && isMatroska)
-                                return $"-map 0:{i} -c:a copy";
-                            else if (twoChannels)
-                                return $"-map 0:{i} -c:a aac -ac 2 -b:a 320k";
-                        }
-                    }
+                    var selectedStream = englishAudioStreams.FirstOrDefault(s => twoChannels && s.channels == 2 && isMatroska) ?? englishAudioStreams.First();
+                    return twoChannels && selectedStream.channels == 2 && isMatroska
+                        ? $"-map 0:{selectedStream.index} -c:a copy"
+                        : $"-map 0:{selectedStream.index} -c:a aac -ac 2 -vbr 5";
                 }
-
-                for (int i = 0; i < englishChannelLocation.Count(); i++)
-                {
-                    // Return a single downmixed 2 channel, otherwise return all the different English channels and formats
-                    if (twoChannels)
-                        return $"-map 0:{englishChannelLocation[i].Item2} -c:a aac -ac 2 " +
-                            GetDownmixAudioFilter(probe.streams[englishChannelLocation[i].Item2].channel_layout) + "-b:a 320k";
-
-                    flags += $"{(flags != "" ? " " : "")}-map 0:{englishChannelLocation[i].Item2}";
-                }
-
-                if (englishChannelLocation.Count() > 0)
-                {
-                    if (isMatroska)
-                        flags += " -c:a copy";
-                    else
-                        flags += " -c:a aac -b:a 320k";
-                }
-                    return flags;
             }
 
-            if (twoChannels && audioCount > 0)
-                return "-map 0:a -c:a aac -ac 2 -b:a 320k";
+            if (twoChannels)
+                return "-map 0:a -q:a aac -ac 2 -vbr 5";
 
-            if (audioCount > 0 && isMatroska)
-                return "-map 0:a -c:a copy";
-
-            if (audioCount > 0 && !isMatroska)
-                return "-map 0:a -c:a aac -b:a 320k";
-
-            return "";
+            return isMatroska ? "-map 0:a -c:a copy" : "-map 0:a -c:a aac -vbr 5";
         }
 
         /// <summary> Returns an audio filter to preserve LFE when downmixing to 2 channels </summary>
@@ -280,33 +223,23 @@ namespace Snacks
             if (!isMatroska)
                 return "-sn";
 
-            int subtitleCount = 0;
-
-            for (int i = 0; i < probe.streams.Length; i++)
-            {
-                if (probe.streams[i].codec_type == "subtitle")
-                    subtitleCount++;
-            }
+            var subtitleStreams = probe.streams.Where(s => s.codec_type == "subtitle").ToList();
 
             if (englishOnly)
             {
-                string mapping = "";
-                for (int i = 0; i < probe.streams.Length; i++)
+                var englishSubtitles = subtitleStreams.Where(s => s.tags?.language == "eng").ToList();
+                if (englishSubtitles.Any())
                 {
-                    if (probe.streams[i].codec_type == "subtitle" && probe.streams[i].tags.language == "eng")
-                    {
-                        mapping += $"{(mapping != "" ? " " : "")}-map 0:{i}";
-                    }
+                    return string.Join(" ", englishSubtitles.Select(s => $"-map 0:{s.index} -c:s copy"));
                 }
-
-                if (mapping != "")
-                    return mapping;
             }
 
-            if (subtitleCount > 0)
-                return " -c:s copy";
-            else
-                return "";
+            if (subtitleStreams.Any())
+            {
+                return string.Join(" ", subtitleStreams.Select(s => $"-map 0:{s.index} -c:s copy"));
+            }
+
+            return "";
         }
 
         /// <summary> Compares duration to verify there was no corruption </summary>

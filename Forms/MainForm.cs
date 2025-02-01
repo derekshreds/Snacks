@@ -62,8 +62,7 @@ namespace Snacks
                     {
                         hevcQueue.Clear();
                         hevcQueue.Add(fileLocation);
-                        var work_item = hevcQueue.GetWorkItem();
-                        GeneratePreview(fileLocation, work_item.Length);
+                        GeneratePreview(hevcQueue.GetWorkItem());
                         previewBox.UpdatePicture();
                         filesRemainingLabel.UpdateText("Files Remaining: 1");
                     });
@@ -112,7 +111,7 @@ namespace Snacks
 
             aboutToolStripMenuItem.Click += (s, e) =>
             {
-                MessageBox.Show("     2023\r\n" +
+                MessageBox.Show("     2025\r\n" +
                                 "     Created by Derek Morris     \r\n" +
                                 "     github.com/derekshreds     ");
             };
@@ -146,7 +145,7 @@ namespace Snacks
                             filesRemainingLabel.UpdateText("Files Remaining: " + hevcQueue.Count.ToString());
 
                             var workItem = hevcQueue.GetWorkItem();
-                            GeneratePreview(workItem.Path, workItem.Length);
+                            GeneratePreview(workItem);
                             previewBox.UpdatePicture();
 
                             workItem.ConvertVideo(encoderOptions, logTextBox, progressBar);

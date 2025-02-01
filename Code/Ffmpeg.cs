@@ -1,14 +1,14 @@
-﻿using Newtonsoft.Json;
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Threading;
 using System.Windows.Forms;
+using System.Linq;
 using static Snacks.Ffprobe;
 using static Snacks.Tools;
 using static Snacks.FileHandling;
-using System.Linq;
+using static Snacks.WorkQueue;
 
 namespace Snacks
 {
@@ -16,35 +16,36 @@ namespace Snacks
     public static class Ffmpeg
     {
         /// <summary> Generates a preview of the video file </summary>
-        /// <param name="path"> The path of the file </param>
-        public static void GeneratePreview(string path, double length)
+        /// <param name="workItem"> The work item having a preview generated </param>
+        public static void GeneratePreview(WorkItem workItem)
         {
             string previewPath = GetStartupDirectory() + "preview.bmp";
 
             if (File.Exists(previewPath))
                 File.Delete(previewPath);
 
-            string duration = Tools.SecondsToDurationString(length * 0.25);
-            // Significantly faster with the -ss param before the input
-            string command = $"-ss {duration} -i \"{path}\" -vf \"cropdetect=24:2:0,scale=500:500\" -frames:v 1 \"{previewPath}\"";
+            string command = $"-ss {SecondsToDurationString(GetVideoDuration(workItem.Probe) / 2)} -i \"{workItem.Path}\" -s 145x145 -frames:v 1 \"{previewPath}\"";
 
-            ProcessStartInfo cmdsi = new ProcessStartInfo(Path.Combine(GetStartupDirectory(), "ffmpeg.exe"))
+            ProcessStartInfo cmdsi = new ProcessStartInfo(GetStartupDirectory() + "ffmpeg.exe");
+
+            cmdsi.Arguments = command;
+            cmdsi.UseShellExecute = false;
+            cmdsi.RedirectStandardOutput = true;
+            cmdsi.CreateNoWindow = true;
+            cmdsi.RedirectStandardError = true;
+            Process cmd = Process.Start(cmdsi);
+
+            string err = "";
+            string output = "";
+
+            cmd.OutputDataReceived += (s, e) =>
             {
-                Arguments = command,
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                CreateNoWindow = true,
-                RedirectStandardError = true
+                output += e.Data;
             };
 
-            using (Process cmd = Process.Start(cmdsi))
-            {
-                cmd.OutputDataReceived += (s, e) => { /* Handle output data if needed */ };
-                cmd.ErrorDataReceived += (s, e) => { /* Handle error data if needed */ };
-                cmd.BeginErrorReadLine();
-                cmd.BeginOutputReadLine();
-                cmd.WaitForExit();
-            }
+            cmd.BeginErrorReadLine();
+            cmd.BeginOutputReadLine();
+            cmd.WaitForExit();
         }
 
         /// <summary> Converts video using dynamic compression based on algorithms and flags </summary>
@@ -277,14 +278,21 @@ namespace Snacks
                 Thread.Sleep(100);
             }
         }
+
+        /// <summary> Parses a video to find the aspect ratio for cropping out black bars </summary>
+        /// <param name="workItem"> The work item to parse </param>
+        /// <param name="encoderOptions"> The encoder options to use </param>
+        /// <param name="logTextBox"> The textbox to update </param>
+        /// <returns> A video filter string for cropping the video </returns>
         public static string GetCropParameters(this WorkQueue.WorkItem workItem, EncoderOptions encoderOptions, RichTextBox logTextBox)
         {
             logTextBox.AppendLine("Getting crop values.");
 
-            int length_in_mins = (int)workItem.Length / 60;
-            string command = $"-y -hwaccel auto -i \"{workItem.Path}\" -ss {(length_in_mins > 20 ? "00:10:00" : "00:00:00")} -t {(length_in_mins > 20 ? "00:10:00" : $"00:{length_in_mins:D2}:00")} -vf cropdetect=24:2:8 -c:v {encoderOptions.Encoder} -f null -";
+            int lengthInMinutes = (int)workItem.Length / 60;
+            string startTime = lengthInMinutes > 20 ? "00:10:00" : "00:00:00";
+            string duration = lengthInMinutes > 20 ? "00:10:00" : $"00:{lengthInMinutes:D2}:00";
+            string command = $"-y -hwaccel auto -ss {startTime} -i \"{workItem.Path}\" -t {duration} -vf cropdetect=24:2:8 -c:v {encoderOptions.Encoder} -f null -";
 
-            var startTime = DateTime.Now;
             ProcessStartInfo cmdsi = new ProcessStartInfo(GetStartupDirectory() + "ffmpeg.exe")
             {
                 Arguments = command,
@@ -293,6 +301,7 @@ namespace Snacks
                 CreateNoWindow = true,
                 RedirectStandardError = true
             };
+
             Process cmd = Process.Start(cmdsi);
 
             var cropValues = new Dictionary<string, int>();
@@ -301,7 +310,7 @@ namespace Snacks
             {
                 if (e.Data != null && e.Data.Contains("crop="))
                 {
-                    var crop = e.Data.Split(new string[] { "crop=" }, StringSplitOptions.None)[1].Split(' ')[0];
+                    string crop = e.Data.Split(new string[] { "crop=" }, StringSplitOptions.None)[1].Split(' ')[0];
                     if (cropValues.ContainsKey(crop))
                         cropValues[crop]++;
                     else
@@ -312,18 +321,12 @@ namespace Snacks
             cmd.BeginErrorReadLine();
             cmd.BeginOutputReadLine();
             cmd.WaitForExit();
-            Thread.Sleep(5000);
 
             if (cropValues.Count == 0)
                 return "";
 
-            var bestCrop = cropValues.Aggregate((x, y) => x.Value > y.Value ? x : y).Key;
-            var cropParams = bestCrop.Split(':');
-
-            if (cropParams.Length != 4 || cropParams[2] == "0" && cropParams[3] == "0")
-                return "";
-
-            return $"-vf \"crop={cropParams[0]}:{cropParams[1]}:{cropParams[2]}:{cropParams[3]}\"";
+            string mostCommonCrop = cropValues.Aggregate((x, y) => x.Value > y.Value ? x : y).Key;
+            return $"-vf \"crop={mostCommonCrop}\"";
         }
     }
 }

@@ -14,7 +14,7 @@ namespace Snacks
         public static List<string> RecursivelyFindDirectories(string input, bool top = true)
         {
             List<string> dirs = Directory.GetDirectories(input).ToList();
-            // Neccessary to keep count accurate at the top level
+            // Necessary to keep count accurate at the top level
             int count = dirs.Count;
             
             for (int i = 0; i < count; i++)
@@ -109,6 +109,9 @@ namespace Snacks
         {
             try
             {
+                if (input.Equals(output))
+                    return;
+
                 if (File.Exists(output))
                     File.Delete(output);
 

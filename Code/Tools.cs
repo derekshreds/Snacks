@@ -36,10 +36,17 @@ namespace Snacks
 
             return duration;
         }
-        public static string SecondsToDurationString(double seconds)
+
+        /// <summary> Convert total seconds to "00:00:00" duration format </summary>
+        /// <param name="input"> The seconds to convert </param>
+        /// <returns> The duration format string </returns>
+        public static string SecondsToDurationString(double input)
         {
-            TimeSpan timeSpan = TimeSpan.FromSeconds(seconds);
-            return string.Format("{0}:{1}:{2}", timeSpan.Hours, timeSpan.Minutes, timeSpan.Seconds);
+            int hours = (int)(input / 3600);
+            int minutes = (int)((input % 3600) / 60);
+            int seconds = (int)(input % 60);
+
+            return $"{hours:D2}:{minutes:D2}:{seconds:D2}";
         }
     }
 }
