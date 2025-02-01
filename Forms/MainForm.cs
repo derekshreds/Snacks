@@ -1,19 +1,8 @@
-﻿using System;
-using System.Collections.Generic;
-using System.ComponentModel;
-using System.Data;
-using System.Drawing;
-using System.IO;
-using System.Threading;
-using System.Threading.Tasks;
+﻿using System.Threading;
 using System.Windows.Forms;
 using static Snacks.Ffmpeg;
-using static Snacks.Tools;
 using static Snacks.FileHandling;
-using static Snacks.FormDelegates;
 using Snacks.Forms;
-using Newtonsoft.Json;
-using System.Drawing.Imaging;
 
 namespace Snacks
 {
