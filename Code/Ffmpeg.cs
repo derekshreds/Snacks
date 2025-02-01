@@ -42,10 +42,6 @@ namespace Snacks
             {
                 output += e.Data;
             };
-            cmd.ErrorDataReceived += (s, e) =>
-            {
-                err += e.Data;
-            };
 
             cmd.BeginErrorReadLine();
             cmd.BeginOutputReadLine();
@@ -94,7 +90,8 @@ namespace Snacks
             string varFlags = "-movflags +faststart -max_muxing_queue_size 9999 ";
             string fileOutput;
 
-            if (workItem.Bitrate > encoderOptions.TargetBitrate + 700 && workItem.IsHevc && !encoderOptions.RemoveBlackBorders)
+            // If bitrate is already below target, copy instead
+            if (workItem.Bitrate < encoderOptions.TargetBitrate + 700 && workItem.IsHevc && !encoderOptions.RemoveBlackBorders)
             {
                 compressionFlags = "";
                 videoFlags = $"{MapVideo(workItem.Probe)} -c:v copy ";
@@ -185,7 +182,15 @@ namespace Snacks
                     {
                         logTextBox.AppendLine("Couldn't find output file after 10 seconds.");
 
-                        if (encoderOptions.RetryOnFail && encoderOptions.Encoder != "libx265")
+                        // Bitmap subtitles tend to fail when mapping, so try copying on fail
+                        if (encoderOptions.EnglishOnlySubtitles)
+                        {
+                            logTextBox.AppendLine("Retrying without subtitle conversion");
+                            FileMove(newFileInput, workItem.Path);
+                            encoderOptions.EnglishOnlySubtitles = false;
+                            workItem.ConvertVideo(encoderOptions, logTextBox, progressBar);
+                        }
+                        else if (encoderOptions.RetryOnFail && encoderOptions.Encoder != "libx265")
                         {
                             logTextBox.AppendLine("Retrying with software encoding.");
                             FileMove(newFileInput, workItem.Path);

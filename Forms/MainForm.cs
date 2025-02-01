@@ -13,6 +13,7 @@ using static Snacks.FileHandling;
 using static Snacks.FormDelegates;
 using Snacks.Forms;
 using Newtonsoft.Json;
+using System.Drawing.Imaging;
 
 namespace Snacks
 {
