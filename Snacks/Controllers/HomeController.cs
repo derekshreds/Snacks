@@ -500,6 +500,26 @@ namespace Snacks.Controllers
             }
         }
 
+        [HttpPost]
+        public IActionResult SetPaused([FromBody] PauseRequest request)
+        {
+            try
+            {
+                _transcodingService.SetPaused(request.Paused);
+                return Json(new { success = true, paused = _transcodingService.IsPaused });
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(ex.Message);
+            }
+        }
+
+        [HttpGet]
+        public IActionResult GetPausedState()
+        {
+            return Json(new { paused = _transcodingService.IsPaused });
+        }
+
         public IActionResult Error()
         {
             return View();
@@ -532,5 +552,10 @@ namespace Snacks.Controllers
     public class AutoScanIntervalRequest
     {
         public int IntervalMinutes { get; set; }
+    }
+
+    public class PauseRequest
+    {
+        public bool Paused { get; set; }
     }
 }

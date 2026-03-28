@@ -20,6 +20,22 @@ namespace Snacks.Services
         private readonly SemaphoreSlim _processingLock = new(1, 1);
         private Process? _activeProcess;
         private WorkItem? _activeWorkItem;
+        private bool _isPaused = false;
+        private EncoderOptions? _lastOptions;
+
+        public bool IsPaused => _isPaused;
+
+        public void SetPaused(bool paused)
+        {
+            _isPaused = paused;
+            Console.WriteLine($"Queue {(paused ? "paused" : "resumed")}");
+
+            // When resuming, kick off queue processing again
+            if (!paused && _lastOptions != null)
+            {
+                _ = Task.Run(() => ProcessQueueAsync(_lastOptions));
+            }
+        }
 
         public TranscodingService(FileService fileService, FfprobeService ffprobeService, IHubContext<TranscodingHub> hubContext)
         {
@@ -198,10 +214,19 @@ namespace Snacks.Services
             if (!await _processingLock.WaitAsync(100))
                 return; // Already processing
 
+            _lastOptions = options;
+
             try
             {
                 while (true)
                 {
+                    // Check if paused before taking the next item
+                    if (_isPaused)
+                    {
+                        Console.WriteLine("Queue is paused — stopping processing loop");
+                        break;
+                    }
+
                     WorkItem? workItem = null;
                     lock (_queueLock)
                     {

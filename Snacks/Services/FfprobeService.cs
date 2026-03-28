@@ -100,18 +100,18 @@ namespace Snacks.Services
             if (englishOnly)
             {
                 var englishAudioStreams = audioStreams
-                    .Where(s => s.tags?.language == "eng" && 
+                    .Where(s => s.tags?.language == "eng" &&
                                (s.tags?.title == null || !s.tags.title.ToLower().Contains("comm")))
                     .ToList();
 
                 if (englishAudioStreams.Any())
                 {
-                    var selectedStream = englishAudioStreams.FirstOrDefault(s => 
-                        twoChannels && s.channels == 2 && isMatroska) ?? englishAudioStreams.First();
-                    
-                    return twoChannels && selectedStream.channels == 2 && isMatroska
-                        ? $"-map 0:{selectedStream.index} -c:a copy"
-                        : $"-map 0:{selectedStream.index} -c:a aac -ac 2 -vbr 5";
+                    var maps = string.Join(" ", englishAudioStreams.Select(s => $"-map 0:{s.index}"));
+
+                    if (twoChannels)
+                        return $"{maps} -c:a aac -ac 2 -vbr 5";
+
+                    return isMatroska ? $"{maps} -c:a copy" : $"{maps} -c:a aac -vbr 5";
                 }
             }
 

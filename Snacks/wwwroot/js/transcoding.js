@@ -10,11 +10,26 @@ class TranscodingManager {
         this.queuePage = 0;
         this.queuePageSize = 5;
         this.queueTotal = 0;
+        this.isPaused = false;
         this.initializeSignalR();
         this.initializeEventHandlers();
         this.restoreSettings();
         this.loadAutoScanConfig();
         this.loadWorkItems();
+        this.loadPauseState();
+
+        // iOS Safari suspends WebSockets when the tab is backgrounded.
+        // Re-check connection when the page becomes visible again.
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible') {
+                if (this.connection?.state !== 'Connected') {
+                    this.initializeSignalR();
+                } else {
+                    this.updateConnectionStatus(true);
+                }
+                this.loadWorkItems();
+            }
+        });
     }
 
     async initializeSignalR() {
@@ -42,33 +57,41 @@ class TranscodingManager {
             this.loadAutoScanConfig(false);
         });
 
+        // Register lifecycle handlers BEFORE start so they catch all events
+        this.connection.onreconnected(async () => {
+            console.log("SignalR Reconnected — resyncing state");
+            this.updateConnectionStatus(true);
+            this.loadWorkItems();
+        });
+
+        this.connection.onreconnecting(() => {
+            console.log("SignalR Reconnecting...");
+            this.updateConnectionStatus(false);
+        });
+
+        this.connection.onclose(async () => {
+            console.log("SignalR Disconnected. Attempting to reconnect...");
+            this.updateConnectionStatus(false);
+            setTimeout(() => this.initializeSignalR(), 5000);
+        });
+
         try {
             await this.connection.start();
             console.log("SignalR Connected");
             this.updateConnectionStatus(true);
-
-            // Register lifecycle handlers only after a successful connection
-            // to avoid duplicate handlers from failed connection retries
-            this.connection.onreconnected(async () => {
-                console.log("SignalR Reconnected — resyncing state");
-                this.updateConnectionStatus(true);
-                this.loadWorkItems();
-            });
-
-            this.connection.onreconnecting(() => {
-                console.log("SignalR Reconnecting...");
-                this.updateConnectionStatus(false);
-            });
-
-            this.connection.onclose(async () => {
-                console.log("SignalR Disconnected. Attempting to reconnect...");
-                this.updateConnectionStatus(false);
-                setTimeout(() => this.initializeSignalR(), 5000);
-            });
         } catch (err) {
             console.error("SignalR Connection Error: ", err);
             this.updateConnectionStatus(false);
             setTimeout(() => this.initializeSignalR(), 5000);
+        }
+
+        // Periodically sync the connection status indicator with actual state.
+        // iOS Safari can miss the initial status update due to paint timing.
+        if (!this._statusInterval) {
+            this._statusInterval = setInterval(() => {
+                const connected = this.connection?.state === 'Connected';
+                this.updateConnectionStatus(connected);
+            }, 3000);
         }
     }
 
@@ -106,6 +129,8 @@ class TranscodingManager {
                 this.getEncoderOptions('settings');
             }
         });
+
+        document.getElementById('pauseResumeBtn')?.addEventListener('click', () => this.togglePause());
 
         document.getElementById('addAutoScanDir')?.addEventListener('click', () => this.addAutoScanDirectory());
         document.getElementById('triggerAutoScan')?.addEventListener('click', () => this.triggerAutoScan());
@@ -148,7 +173,11 @@ class TranscodingManager {
 
     async loadDirectories() {
         const container = document.getElementById('directoryList');
-        
+        const fileList = document.getElementById('fileList');
+        if (fileList) fileList.innerHTML = '<div class="text-muted text-center py-4"><i class="fas fa-folder-open fa-2x mb-2"></i><br>Select a directory to view files</div>';
+        this.currentDirectory = null;
+        this.selectedFiles.clear();
+
         try {
             container.innerHTML = '<div class="text-center"><div class="spinner-border" role="status"><span class="visually-hidden">Loading...</span></div></div>';
             
@@ -166,23 +195,32 @@ class TranscodingManager {
             }
             
             const directoriesHtml = data.directories.map(dir => `
-                <div class="directory-item p-2 border-bottom" data-path="${dir.path}" data-count="${dir.videoCount}" style="cursor: pointer;">
-                    <div class="d-flex justify-content-between align-items-center">
-                        <div>
-                            <i class="fas ${dir.videoCount === 0 ? 'fa-hdd' : 'fa-folder'} text-warning me-2"></i>
-                            <span>${dir.name}</span>
-                        </div>
-                        ${dir.videoCount > 0 ? `<small class="text-muted">${dir.videoCount} videos</small>` : ''}
+                <div class="directory-item p-2 border-bottom d-flex justify-content-between align-items-center">
+                    <div class="flex-grow-1" data-path="${dir.path}" data-count="${dir.videoCount}" style="cursor: pointer;">
+                        <i class="fas ${dir.videoCount === 0 ? 'fa-hdd' : 'fa-folder'} text-warning me-2"></i>
+                        <span>${dir.name}</span>
+                        ${dir.videoCount > 0 ? `<small class="text-muted ms-2">${dir.videoCount} videos</small>` : ''}
                     </div>
+                    <button class="btn btn-sm btn-link p-0 ms-2 watch-dir-btn" data-path="${dir.path}" title="Watch (Auto-Scan)">
+                        <i class="fas fa-eye" style="color: var(--primary); opacity: 0.6;"></i>
+                    </button>
                 </div>
             `).join('');
 
             container.innerHTML = directoriesHtml;
 
-            // Add click handlers — always navigate into folder
-            container.querySelectorAll('.directory-item').forEach(item => {
+            // Click directory name to navigate into it
+            container.querySelectorAll('.directory-item .flex-grow-1[data-path]').forEach(item => {
                 item.addEventListener('click', () => {
                     this.loadSubdirectories(item.getAttribute('data-path'));
+                });
+            });
+
+            // Watch button for each directory
+            container.querySelectorAll('.watch-dir-btn').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    this.watchDirectory(btn.getAttribute('data-path'));
                 });
             });
             
@@ -627,6 +665,7 @@ class TranscodingManager {
             }
 
             this.renderPagination();
+            this.loadPauseState();
         } catch (error) {
             console.error('Error loading work items:', error);
             showToast('Error loading work items: ' + error.message, 'danger');
@@ -691,6 +730,53 @@ class TranscodingManager {
             this._refreshTimer = null;
             this.loadWorkItems();
         }, 2000);
+    }
+
+    async loadPauseState() {
+        try {
+            const response = await fetch('/Home/GetPausedState');
+            if (!response.ok) return;
+            const data = await response.json();
+            this.isPaused = data.paused;
+            this.updatePauseButton();
+        } catch (error) {
+            console.error('Error loading pause state:', error);
+        }
+    }
+
+    async togglePause() {
+        try {
+            const newState = !this.isPaused;
+            const response = await fetch('/Home/SetPaused', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ paused: newState })
+            });
+            if (!response.ok) throw new Error('Failed to set pause state');
+            const data = await response.json();
+            this.isPaused = data.paused;
+            this.updatePauseButton();
+            showToast(this.isPaused ? 'Queue paused — current encode will finish' : 'Queue resumed', 'info');
+        } catch (error) {
+            console.error('Error toggling pause:', error);
+            showToast('Error toggling pause: ' + error.message, 'danger');
+        }
+    }
+
+    updatePauseButton() {
+        const btn = document.getElementById('pauseResumeBtn');
+        const icon = document.getElementById('pauseResumeIcon');
+        if (!btn || !icon) return;
+
+        if (this.isPaused) {
+            icon.className = 'fas fa-play';
+            btn.className = 'btn btn-outline-warning btn-sm me-2';
+            btn.title = 'Resume Queue';
+        } else {
+            icon.className = 'fas fa-pause';
+            btn.className = 'btn btn-outline-secondary btn-sm me-2';
+            btn.title = 'Pause Queue';
+        }
     }
 
     // Helper method to convert numeric status to string
@@ -972,6 +1058,22 @@ class TranscodingManager {
         container.querySelectorAll('button[data-path]').forEach(btn => {
             btn.addEventListener('click', () => this.removeAutoScanDirectory(btn.getAttribute('data-path')));
         });
+    }
+
+    async watchDirectory(path) {
+        try {
+            const response = await fetch('/Home/AddAutoScanDirectory', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ path })
+            });
+            if (!response.ok) throw new Error(await response.text());
+            const dirName = path.split(/[/\\]/).filter(Boolean).pop() || path;
+            showToast(`Watching "${dirName}" for auto-scan`, 'success');
+            this.loadAutoScanConfig(false);
+        } catch (error) {
+            showToast('Error: ' + error.message, 'danger');
+        }
     }
 
     async addAutoScanDirectory() {
