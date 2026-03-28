@@ -20,6 +20,8 @@ services:
       #- /share/CACHEDEV1_DATA/snacksweb/output:/app/work/output
       ## Transcoding logs
       - /share/CACHEDEV1_DATA/snacksweb/logs:/app/work/logs
+      ## Persist encoder settings across container updates
+      - /share/CACHEDEV1_DATA/snacksweb/config:/app/work/config
     environment:
       - ASPNETCORE_ENVIRONMENT=Production
       - SNACKS_WORK_DIR=/app/work

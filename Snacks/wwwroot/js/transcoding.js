@@ -12,6 +12,7 @@ class TranscodingManager {
         this.queueTotal = 0;
         this.initializeSignalR();
         this.initializeEventHandlers();
+        this.restoreSettings();
         this.loadWorkItems();
     }
 
@@ -81,6 +82,14 @@ class TranscodingManager {
 
         document.getElementById('processDirectory').addEventListener('click', () => {
             this.processCurrentDirectory();
+        });
+
+        // Save settings on every change inside the settings modal
+        document.getElementById('settingsModal').addEventListener('change', () => {
+            this.getEncoderOptions('settings');
+        });
+        document.getElementById('settingsModal').addEventListener('input', () => {
+            this.getEncoderOptions('settings');
         });
     }
 
@@ -472,7 +481,7 @@ class TranscodingManager {
     getEncoderOptions(prefix = '') {
         const codec = document.getElementById(`${prefix}Codec`).value;
         const hwAccel = document.getElementById(`${prefix}HardwareAcceleration`).value;
-        return {
+        const options = {
             Format: document.getElementById(`${prefix}Format`).value,
             Codec: codec,
             Encoder: codec === 'h265' ? 'libx265' : 'libx264',
@@ -486,6 +495,46 @@ class TranscodingManager {
             RetryOnFail: document.getElementById(`${prefix}RetryOnFail`).checked,
             StrictBitrate: document.getElementById(`${prefix}StrictBitrate`).checked
         };
+        this.saveSettingsToServer(options);
+        return options;
+    }
+
+    async saveSettingsToServer(options) {
+        try {
+            await fetch('/Home/SaveSettings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(options)
+            });
+        } catch { }
+    }
+
+    async restoreSettings(prefix = 'settings') {
+        try {
+            const response = await fetch('/Home/GetSettings');
+            if (!response.ok) return;
+            const saved = await response.json();
+            if (!saved || Object.keys(saved).length === 0) return;
+
+            const set = (id, val) => {
+                const el = document.getElementById(`${prefix}${id}`);
+                if (!el || val === undefined) return;
+                if (el.type === 'checkbox') el.checked = val;
+                else el.value = val;
+            };
+
+            set('Format', saved.Format);
+            set('Codec', saved.Codec);
+            set('HardwareAcceleration', saved.HardwareAcceleration);
+            set('TargetBitrate', saved.TargetBitrate);
+            set('TwoChannelAudio', saved.TwoChannelAudio);
+            set('EnglishOnlyAudio', saved.EnglishOnlyAudio);
+            set('EnglishOnlySubtitles', saved.EnglishOnlySubtitles);
+            set('RemoveBlackBorders', saved.RemoveBlackBorders);
+            set('DeleteOriginalFile', saved.DeleteOriginalFile);
+            set('RetryOnFail', saved.RetryOnFail);
+            set('StrictBitrate', saved.StrictBitrate);
+        } catch { }
     }
 
     async loadWorkItems() {

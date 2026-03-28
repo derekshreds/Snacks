@@ -352,6 +352,42 @@ namespace Snacks.Controllers
             }
         }
 
+        private string GetSettingsPath()
+        {
+            var configDir = Path.Combine(_fileService.GetWorkingDirectory(), "config");
+            if (!Directory.Exists(configDir))
+                Directory.CreateDirectory(configDir);
+            return Path.Combine(configDir, "settings.json");
+        }
+
+        [HttpGet]
+        public IActionResult GetSettings()
+        {
+            var settingsPath = GetSettingsPath();
+            if (System.IO.File.Exists(settingsPath))
+            {
+                var json = System.IO.File.ReadAllText(settingsPath);
+                return Content(json, "application/json");
+            }
+            return Json(new { });
+        }
+
+        [HttpPost]
+        public IActionResult SaveSettings([FromBody] object settings)
+        {
+            try
+            {
+                var settingsPath = GetSettingsPath();
+                var json = System.Text.Json.JsonSerializer.Serialize(settings, new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
+                System.IO.File.WriteAllText(settingsPath, json);
+                return Json(new { success = true });
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(ex.Message);
+            }
+        }
+
         public IActionResult Error()
         {
             return View();
