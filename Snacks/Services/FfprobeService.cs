@@ -126,6 +126,12 @@ namespace Snacks.Services
         /// <param name="englishOnly"> Whether only English subtitles should be mapped </param>
         /// <param name="isMatroska"> Whether the container is of matroska format </param>
         /// <returns> The subtitle mapping string </returns>
+        // Bitmap subtitle codecs that can cause FFmpeg to hang with many streams
+        private static readonly HashSet<string> _bitmapSubCodecs = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "hdmv_pgs_subtitle", "pgssub", "dvd_subtitle", "dvdsub", "dvb_subtitle", "dvbsub", "xsub"
+        };
+
         public string MapSub(ProbeResult probe, bool englishOnly, bool isMatroska)
         {
             if (!isMatroska)
@@ -133,23 +139,23 @@ namespace Snacks.Services
 
             var subtitleStreams = probe.streams.Where(s => s.codec_type == "subtitle").ToList();
 
+            // Drop bitmap subtitles (PGS, VOBSUB, DVB) — they cause hangs and encoding failures
+            var keepSubs = subtitleStreams.Where(s => !_bitmapSubCodecs.Contains(s.codec_name ?? "")).ToList();
+
             if (englishOnly)
             {
-                var englishSubtitles = subtitleStreams.Where(s => s.tags?.language == "eng").ToList();
-                if (englishSubtitles.Any())
-                {
-                    var maps = string.Join(" ", englishSubtitles.Select(s => $"-map 0:{s.index}"));
-                    return $"{maps} -c:s copy";
-                }
+                var englishSubs = keepSubs.Where(s => s.tags?.language == "eng").ToList();
+                if (englishSubs.Any())
+                    keepSubs = englishSubs;
             }
 
-            if (subtitleStreams.Any())
+            if (keepSubs.Any())
             {
-                var maps = string.Join(" ", subtitleStreams.Select(s => $"-map 0:{s.index}"));
+                var maps = string.Join(" ", keepSubs.Select(s => $"-map 0:{s.index}"));
                 return $"{maps} -c:s copy";
             }
 
-            return "";
+            return "-sn";
         }
 
         /// <summary> Compares duration to verify there was no corruption </summary>

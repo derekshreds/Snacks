@@ -294,18 +294,28 @@ namespace Snacks.Services
             bool useVaapi = !videoCopy && encoder.Contains("vaapi");
 
             // VAAPI on Elkhart Lake (J6412) only supports CQP reliably.
-            // CQP is content-dependent — same QP gives different bitrates for different content.
-            // QP 24 is the "visually transparent" threshold for HEVC per industry research.
-            // Tested results at QP 24:
-            //   Action 4K (29 Mbps) → 18,400 kbps (37% reduction)
-            //   Drama 4K (27 Mbps)  → 2,594 kbps  (90% reduction)
-            //   1080p TV (691 kbps) → 464 kbps    (33% reduction)
+            // CQP is content-dependent — same QP gives wildly different bitrates per content.
+            // Do a 30-second test encode to measure actual output, then adjust QP to hit target.
             string compressionFlags;
             if (videoCopy)
                 compressionFlags = "";
             else if (useVaapi)
             {
-                compressionFlags = $"-g 25 -rc_mode CQP -global_quality 24 ";
+                long targetKbps = long.Parse(targetBitrate.TrimEnd('k'));
+                int quality = await CalibrateVaapiQualityAsync(workItem, options, workItem.Path, targetKbps);
+
+                if (quality < 0)
+                {
+                    // VAAPI can't encode this file (10-bit, HDR, Dolby Vision, etc.)
+                    // Software fallback on a NAS CPU would take days — skip the file
+                    await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id,
+                        "VAAPI cannot encode this file (likely 10-bit/HDR) — skipping. Use the desktop app for this file.");
+                    throw new Exception("VAAPI incompatible — file requires 10-bit encoding which this hardware does not support");
+                }
+                else
+                {
+                    compressionFlags = $"-g 25 -rc_mode CQP -global_quality {quality} ";
+                }
             }
             else
                 compressionFlags = $"-g 25 -b:v {targetBitrate} -minrate {minBitrate} -maxrate {maxBitrate} -bufsize {maxBitrate} ";
@@ -369,7 +379,9 @@ namespace Snacks.Services
                 }
             }
 
-            string command = $"{initFlags} -i \"{inputPath}\" {videoFlags}{compressionFlags}{audioFlags}{subtitleFlags}" +
+            // -analyzeduration and -probesize handle files with many streams (e.g. 30+ PGS subtitle tracks)
+            string analyzeFlags = "-analyzeduration 10M -probesize 50M ";
+            string command = $"{initFlags} {analyzeFlags}-i \"{inputPath}\" {videoFlags}{compressionFlags}{audioFlags}{subtitleFlags}" +
                            $"{varFlags}-f {(options.Format == "mkv" ? "matroska" : "mp4")} \"{outputPath}\"";
 
             await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id, $"Converting {workItem.FileName}");
@@ -764,6 +776,129 @@ namespace Snacks.Services
             string fileName = Path.GetFileNameWithoutExtension(snacksPath).Replace(" [snacks]", "");
             string extension = Path.GetExtension(snacksPath);
             return Path.Combine(dir, fileName + extension);
+        }
+
+        /// <summary>
+        /// Does iterative 30-second test encodes to find the right QP for the target bitrate.
+        /// Starts at QP 24, measures output, adjusts, and retests until within 15% of target
+        /// or max 3 iterations.
+        /// </summary>
+        private async Task<int> CalibrateVaapiQualityAsync(WorkItem workItem, EncoderOptions options, string inputPath, long targetKbps)
+        {
+            int currentQp = 24;
+            int testDuration = 30;
+            int maxIterations = 3;
+            double tolerance = 0.15; // within 15% of target
+
+            // Seek to 25% into the file for a representative sample
+            int seekSeconds = Math.Max(0, (int)(workItem.Length * 0.25));
+            string seekTime = $"{seekSeconds / 3600:D2}:{(seekSeconds % 3600) / 60:D2}:{seekSeconds % 60:D2}";
+
+            string initFlags = GetInitFlags(options.HardwareAcceleration);
+            string encoder = GetEncoder(options);
+            string hwFilter = "-vf format=nv12|vaapi,hwupload";
+
+            for (int iteration = 1; iteration <= maxIterations; iteration++)
+            {
+                await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id,
+                    $"Calibration pass {iteration}/{maxIterations} — testing QP {currentQp}...");
+
+                long measuredKbps = await RunTestEncodeAsync(inputPath, initFlags, encoder, hwFilter, currentQp, seekTime, testDuration);
+
+                if (measuredKbps <= 0)
+                {
+                    await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id,
+                        "VAAPI produced no measurable output — encoder incompatible with this file");
+                    return -1; // Signal to fall back to software
+                }
+
+                // Detect absurd output (more than 5x source bitrate = encoder broken for this file)
+                if (workItem.Bitrate > 0 && measuredKbps > workItem.Bitrate * 5)
+                {
+                    await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id,
+                        $"VAAPI output ({measuredKbps}kbps) is absurdly high — encoder broken for this file");
+                    return -1;
+                }
+
+                double ratio = (double)measuredKbps / targetKbps;
+                await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id,
+                    $"Pass {iteration}: QP {currentQp} → {measuredKbps}kbps (target {targetKbps}kbps, ratio {ratio:F2}x)");
+
+                // Close enough — within tolerance
+                if (ratio >= (1 - tolerance) && ratio <= (1 + tolerance))
+                {
+                    await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id,
+                        $"QP {currentQp} is within {tolerance:P0} of target. Using QP {currentQp}.");
+                    return currentQp;
+                }
+
+                // Already below target — don't compress further
+                if (measuredKbps <= targetKbps)
+                {
+                    await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id,
+                        $"QP {currentQp} already below target. Using QP {currentQp}.");
+                    return currentQp;
+                }
+
+                // Calculate adjustment: each +2 QP ≈ 0.72x bitrate
+                double qpDelta = 2.0 * Math.Log((double)targetKbps / measuredKbps) / Math.Log(0.72);
+                int adjustment = (int)Math.Round(qpDelta);
+                if (adjustment == 0) adjustment = measuredKbps > targetKbps ? 1 : -1;
+
+                currentQp = Math.Clamp(currentQp + adjustment, 18, 40);
+            }
+
+            await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id,
+                $"Calibration complete after {maxIterations} passes. Using QP {currentQp}.");
+            return currentQp;
+        }
+
+        private async Task<long> RunTestEncodeAsync(string inputPath, string initFlags, string encoder, string hwFilter, int qp, string seekTime, int duration)
+        {
+            string command = $"{initFlags} -ss {seekTime} -i \"{inputPath}\" -t {duration} " +
+                $"-c:v {encoder} -low_power 1 {hwFilter} -g 25 -rc_mode CQP -global_quality {qp} " +
+                $"-an -sn -f null -";
+
+            try
+            {
+                var psi = new ProcessStartInfo(_ffmpegPath)
+                {
+                    Arguments = command,
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                };
+
+                using var process = new Process { StartInfo = psi };
+                var output = new System.Text.StringBuilder();
+
+                process.ErrorDataReceived += (s, e) =>
+                {
+                    if (e.Data != null) output.AppendLine(e.Data);
+                };
+
+                process.Start();
+                process.BeginErrorReadLine();
+                await process.StandardOutput.ReadToEndAsync();
+
+                var completed = process.WaitForExit(120000);
+                if (!completed)
+                {
+                    try { process.Kill(entireProcessTree: true); } catch { }
+                    return -1;
+                }
+
+                var sizeMatch = Regex.Match(output.ToString(), @"video:\s*(\d+)\s*kB");
+                if (sizeMatch.Success)
+                {
+                    long outputKb = long.Parse(sizeMatch.Groups[1].Value);
+                    return outputKb * 8 / duration; // kbps
+                }
+            }
+            catch { }
+
+            return -1;
         }
 
         private async Task<string> GetCropParametersAsync(WorkItem workItem, EncoderOptions options, string inputPath)
