@@ -8,20 +8,20 @@
 ##   /share/Public
 
 services:
-  snacksweb:
-    image: derekshreds/snacksweb:latest
-    container_name: snacksweb
+  snacks:
+    image: derekshreds/snacks-docker:latest
+    container_name: snacks
     ports:
       - "6767:6767"
     volumes:
       ## CHANGE THIS to your actual media folder on the NAS
       - /share/Public/Media:/app/work/uploads
       ## Output directory for transcoded files (optional, on NAS storage)
-      #- /share/CACHEDEV1_DATA/snacksweb/output:/app/work/output
+      #- /share/CACHEDEV1_DATA/snacks/output:/app/work/output
       ## Transcoding logs
-      - /share/CACHEDEV1_DATA/snacksweb/logs:/app/work/logs
+      - /share/CACHEDEV1_DATA/snacks/logs:/app/work/logs
       ## Persist encoder settings across container updates
-      - /share/CACHEDEV1_DATA/snacksweb/config:/app/work/config
+      - /share/CACHEDEV1_DATA/snacks/config:/app/work/config
     environment:
       - ASPNETCORE_ENVIRONMENT=Production
       - SNACKS_WORK_DIR=/app/work

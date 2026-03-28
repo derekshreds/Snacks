@@ -8,11 +8,13 @@ namespace Snacks.Controllers
     {
         private readonly TranscodingService _transcodingService;
         private readonly FileService _fileService;
+        private readonly AutoScanService _autoScanService;
 
-        public HomeController(TranscodingService transcodingService, FileService fileService)
+        public HomeController(TranscodingService transcodingService, FileService fileService, AutoScanService autoScanService)
         {
             _transcodingService = transcodingService;
             _fileService = fileService;
+            _autoScanService = autoScanService;
         }
 
         public IActionResult Index()
@@ -388,6 +390,136 @@ namespace Snacks.Controllers
             }
         }
 
+        [HttpGet]
+        public IActionResult GetAutoScanConfig()
+        {
+            return Json(_autoScanService.GetConfig());
+        }
+
+        [HttpPost]
+        public IActionResult SetAutoScanEnabled([FromBody] AutoScanEnabledRequest request)
+        {
+            try
+            {
+                _autoScanService.SetEnabled(request.Enabled);
+                return Json(new { success = true });
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(ex.Message);
+            }
+        }
+
+        [HttpPost]
+        public IActionResult AddAutoScanDirectory([FromBody] AutoScanDirectoryRequest request)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(request.Path))
+                    return BadRequest("Path is required");
+
+                if (!Directory.Exists(request.Path))
+                    return BadRequest($"Directory does not exist: {request.Path}");
+
+                // Security check - ensure directory is within allowed paths
+                if (!_fileService.AllowAllPaths())
+                {
+                    var inputDir = _fileService.GetUploadsDirectory();
+                    var fullRequestPath = Path.GetFullPath(request.Path);
+                    var fullInputDir = Path.GetFullPath(inputDir);
+
+                    if (!fullRequestPath.StartsWith(fullInputDir))
+                        return BadRequest("Directory is not within allowed library path");
+                }
+
+                _autoScanService.AddDirectory(request.Path);
+                return Json(new { success = true });
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(ex.Message);
+            }
+        }
+
+        [HttpPost]
+        public IActionResult RemoveAutoScanDirectory([FromBody] AutoScanDirectoryRequest request)
+        {
+            try
+            {
+                _autoScanService.RemoveDirectory(request.Path);
+                return Json(new { success = true });
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(ex.Message);
+            }
+        }
+
+        [HttpPost]
+        public IActionResult SetAutoScanInterval([FromBody] AutoScanIntervalRequest request)
+        {
+            try
+            {
+                if (request.IntervalMinutes < 1 || request.IntervalMinutes > 1440)
+                    return BadRequest("Interval must be between 1 and 1440 minutes");
+
+                _autoScanService.SetInterval(request.IntervalMinutes);
+                return Json(new { success = true });
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(ex.Message);
+            }
+        }
+
+        [HttpPost]
+        public IActionResult TriggerAutoScan()
+        {
+            try
+            {
+                _autoScanService.TriggerScanNow();
+                return Json(new { success = true });
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(ex.Message);
+            }
+        }
+
+        [HttpPost]
+        public IActionResult ClearAutoScanHistory()
+        {
+            try
+            {
+                _autoScanService.ClearHistory();
+                return Json(new { success = true });
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(ex.Message);
+            }
+        }
+
+        [HttpPost]
+        public IActionResult SetPaused([FromBody] PauseRequest request)
+        {
+            try
+            {
+                _transcodingService.SetPaused(request.Paused);
+                return Json(new { success = true, paused = _transcodingService.IsPaused });
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(ex.Message);
+            }
+        }
+
+        [HttpGet]
+        public IActionResult GetPausedState()
+        {
+            return Json(new { paused = _transcodingService.IsPaused });
+        }
+
         public IActionResult Error()
         {
             return View();
@@ -405,5 +537,25 @@ namespace Snacks.Controllers
     {
         public string FilePath { get; set; } = "";
         public EncoderOptions Options { get; set; } = new();
+    }
+
+    public class AutoScanEnabledRequest
+    {
+        public bool Enabled { get; set; }
+    }
+
+    public class AutoScanDirectoryRequest
+    {
+        public string Path { get; set; } = "";
+    }
+
+    public class AutoScanIntervalRequest
+    {
+        public int IntervalMinutes { get; set; }
+    }
+
+    public class PauseRequest
+    {
+        public bool Paused { get; set; }
     }
 }

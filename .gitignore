@@ -370,3 +370,6 @@ settings.ini
 ffmpeg.exe
 ffprobe.exe
 *.dll.config
+
+# Claude Code
+.claude/

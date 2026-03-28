@@ -1,9 +1,9 @@
 services:
-  snacksweb:
+  snacks:
     build:
       context: .
       dockerfile: Snacks/Dockerfile
-    container_name: snacksweb
+    container_name: snacks
     ports:
       - "8080:8080"
     volumes:

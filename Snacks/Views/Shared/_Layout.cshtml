@@ -12,16 +12,17 @@
 <body class="d-flex flex-column">
     <nav class="navbar navbar-expand-sm navbar-dark border-bottom fixed-top">
         <div class="container">
-            <a class="navbar-brand d-flex align-items-center" href="/">
+            <span class="navbar-brand d-flex align-items-center" style="cursor: default;">
                 <img src="~/images/snacks.ico" alt="Snacks" style="height: 24px; width: 24px;" class="me-2">
                 <span class="fw-bold">Snacks</span>
-            </a>
+            </span>
             <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target=".navbar-collapse">
                 <span class="navbar-toggler-icon"></span>
             </button>
             <div class="navbar-collapse collapse">
                 <ul class="navbar-nav ms-auto">
                     <li class="nav-item me-3">
+                        <button class="btn btn-outline-secondary btn-sm me-2" id="pauseResumeBtn" title="Pause/Resume Queue"><i class="fas fa-pause" id="pauseResumeIcon"></i></button>
                         <button class="btn btn-outline-secondary btn-sm me-2" data-bs-toggle="modal" data-bs-target="#settingsModal"><i class="fas fa-cog"></i></button>
                         <button class="btn btn-primary btn-sm me-3" data-bs-toggle="modal" data-bs-target="#libraryModal"><i class="fas fa-folder-plus me-1"></i><span class="d-none d-sm-inline">Browse Library</span><span class="d-sm-none">Library</span></button>
                     </li>
