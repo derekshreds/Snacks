@@ -1,6 +1,6 @@
 @echo off
 REM Snacks - Build and Push to Docker Hub
-REM Builds the Docker image and pushes to derekshreds/snacksweb
+REM Builds the Docker image and pushes to derekshreds/snacks-docker
 
 echo Snacks - Build and Push
 echo ==========================
@@ -8,7 +8,7 @@ echo.
 
 REM Build the image
 echo [1/2] Building Docker image...
-docker buildx build --tag derekshreds/snacksweb:latest --load --provenance=false --sbom=false -f Snacks/Dockerfile .
+docker buildx build --tag derekshreds/snacks-docker:latest --load --provenance=false --sbom=false -f Snacks/Dockerfile .
 if %errorlevel% neq 0 (
     echo ERROR: Docker build failed.
     pause
@@ -19,7 +19,7 @@ echo.
 
 REM Push to Docker Hub
 echo [2/2] Pushing to Docker Hub...
-docker push derekshreds/snacksweb:latest
+docker push derekshreds/snacks-docker:latest
 if %errorlevel% neq 0 (
     echo ERROR: Docker push failed. Make sure you are logged in:
     echo   docker login

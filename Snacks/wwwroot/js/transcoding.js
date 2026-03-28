@@ -13,6 +13,7 @@ class TranscodingManager {
         this.initializeSignalR();
         this.initializeEventHandlers();
         this.restoreSettings();
+        this.loadAutoScanConfig();
         this.loadWorkItems();
     }
 
@@ -34,6 +35,11 @@ class TranscodingManager {
 
         this.connection.on("TranscodingLog", (workItemId, message) => {
             this.addLogMessage(workItemId, message);
+        });
+
+        this.connection.on("AutoScanCompleted", (newFiles, total) => {
+            showToast(`Auto-scan complete: ${newFiles} new file(s) found`, newFiles > 0 ? 'success' : 'info');
+            this.loadAutoScanConfig(false);
         });
 
         try {
@@ -80,17 +86,48 @@ class TranscodingManager {
             this.processSelectedFiles();
         });
 
+        // Reload auto-scan config when settings modal opens
+        document.getElementById('settingsModal')?.addEventListener('show.bs.modal', () => {
+            this.loadAutoScanConfig();
+        });
+
         document.getElementById('processDirectory').addEventListener('click', () => {
             this.processCurrentDirectory();
         });
 
-        // Save settings on every change inside the settings modal
-        document.getElementById('settingsModal').addEventListener('change', () => {
-            this.getEncoderOptions('settings');
+        // Save encoder settings on change (exclude auto-scan inputs)
+        document.getElementById('settingsModal').addEventListener('change', (e) => {
+            if (!e.target.id.startsWith('autoScan')) {
+                this.getEncoderOptions('settings');
+            }
         });
-        document.getElementById('settingsModal').addEventListener('input', () => {
-            this.getEncoderOptions('settings');
+        document.getElementById('settingsModal').addEventListener('input', (e) => {
+            if (!e.target.id.startsWith('autoScan')) {
+                this.getEncoderOptions('settings');
+            }
         });
+
+        document.getElementById('addAutoScanDir')?.addEventListener('click', () => this.addAutoScanDirectory());
+        document.getElementById('triggerAutoScan')?.addEventListener('click', () => this.triggerAutoScan());
+        document.getElementById('clearScanHistory')?.addEventListener('click', () => this.clearAutoScanHistory());
+        document.getElementById('autoScanEnabled')?.addEventListener('change', (e) => this.setAutoScanEnabled(e.target.checked));
+        const intervalInput = document.getElementById('autoScanInterval');
+        if (intervalInput) {
+            let intervalTimer = null;
+            intervalInput.addEventListener('input', (e) => {
+                clearTimeout(intervalTimer);
+                intervalTimer = setTimeout(() => {
+                    const val = parseInt(e.target.value);
+                    if (isNaN(val) || val < 1 || val > 1440) {
+                        showToast('Interval must be between 1 and 1440 minutes', 'danger');
+                        intervalInput.value = Math.max(1, Math.min(1440, val || 1));
+                        this.setAutoScanInterval(parseInt(intervalInput.value));
+                    } else {
+                        this.setAutoScanInterval(val);
+                    }
+                }, 1000);
+            });
+        }
     }
 
     updateConnectionStatus(connected) {
@@ -179,6 +216,10 @@ class TranscodingManager {
                 <i class="fas fa-layer-group text-success me-2"></i><span>Process Folder + Subfolders</span>
             </div>`;
 
+            html += `<div class="directory-item p-2 border-bottom" id="dirWatch" style="cursor:pointer; opacity: 0.8;">
+                <i class="fas fa-eye me-2" style="color: var(--primary);"></i><span>Watch This Folder (Auto-Scan)</span>
+            </div>`;
+
             if (data.directories.length === 0) {
                 html += '<div class="text-muted text-center py-3"><small>No subdirectories</small></div>';
             } else {
@@ -210,6 +251,22 @@ class TranscodingManager {
             // Process folder + subfolders (recursive)
             document.getElementById('dirProcessRecursive').addEventListener('click', () => {
                 this.processCurrentDirectory(true);
+            });
+
+            // Watch this folder (add to auto-scan)
+            document.getElementById('dirWatch').addEventListener('click', async () => {
+                try {
+                    const response = await fetch('/Home/AddAutoScanDirectory', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ path: directoryPath })
+                    });
+                    if (!response.ok) throw new Error(await response.text());
+                    showToast(`Added "${directoryPath.split(/[/\\]/).pop() || directoryPath}" to auto-scan`, 'success');
+                    this.loadAutoScanConfig(false);
+                } catch (error) {
+                    showToast('Error adding directory: ' + error.message, 'danger');
+                }
             });
 
             // Subdirectory click handlers
@@ -855,6 +912,189 @@ class TranscodingManager {
     updateStatistics() {
         // Delegate to refreshStats which fetches real counts from the server
         this.refreshStats();
+    }
+
+    // --- Auto-Scan methods ---
+
+    async loadAutoScanConfig(fullLoad = true) {
+        try {
+            const response = await fetch('/Home/GetAutoScanConfig');
+            if (!response.ok) return;
+            const config = await response.json();
+
+            // Only set form inputs on full load (page init), not after every action
+            if (fullLoad) {
+                const enabledEl = document.getElementById('autoScanEnabled');
+                const intervalEl = document.getElementById('autoScanInterval');
+                if (enabledEl) enabledEl.checked = !!config.enabled;
+                if (intervalEl) intervalEl.value = config.intervalMinutes > 0 ? config.intervalMinutes : 60;
+            }
+
+            // Always refresh directory list and status
+            this.renderAutoScanDirectories(config.directories || []);
+
+            const statusEl = document.getElementById('autoScanStatus');
+            if (statusEl) {
+                if (config.lastScanTime) {
+                    const scanDate = new Date(config.lastScanTime);
+                    const ago = this.formatTimeAgo(scanDate);
+                    const newFiles = config.lastScanNewFiles ?? 0;
+                    statusEl.textContent = `Last scan: ${ago} — Found ${newFiles} new file(s)`;
+                } else {
+                    statusEl.textContent = 'Last scan: Never';
+                }
+            }
+        } catch (error) {
+            console.error('Error loading auto-scan config:', error);
+        }
+    }
+
+    renderAutoScanDirectories(directories) {
+        const container = document.getElementById('autoScanDirectories');
+        if (!container) return;
+
+        if (!directories || directories.length === 0) {
+            container.innerHTML = '<div class="text-muted text-center py-2"><small>No directories added</small></div>';
+            return;
+        }
+
+        container.innerHTML = directories.map(dir => `
+            <div class="d-flex justify-content-between align-items-center py-1 px-2 border-bottom">
+                <small class="text-truncate me-2" title="${escapeHtml(dir)}">
+                    <i class="fas fa-folder text-warning me-1"></i>${escapeHtml(dir)}
+                </small>
+                <button class="btn btn-sm btn-outline-danger border-0 p-0 px-1" data-path="${escapeHtml(dir)}" title="Remove">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+        `).join('');
+
+        container.querySelectorAll('button[data-path]').forEach(btn => {
+            btn.addEventListener('click', () => this.removeAutoScanDirectory(btn.getAttribute('data-path')));
+        });
+    }
+
+    async addAutoScanDirectory() {
+        const input = document.getElementById('autoScanDirInput');
+        const path = input?.value?.trim();
+        if (!path) {
+            showToast('Please enter a directory path', 'warning');
+            return;
+        }
+
+        try {
+            const response = await fetch('/Home/AddAutoScanDirectory', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ path })
+            });
+            if (!response.ok) {
+                const error = await response.text();
+                throw new Error(error);
+            }
+            input.value = '';
+            await this.loadAutoScanConfig(false);
+        } catch (error) {
+            showToast('Error adding directory: ' + error.message, 'danger');
+        }
+    }
+
+    async removeAutoScanDirectory(path) {
+        try {
+            const response = await fetch('/Home/RemoveAutoScanDirectory', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ path })
+            });
+            if (!response.ok) {
+                const error = await response.text();
+                throw new Error(error);
+            }
+            await this.loadAutoScanConfig(false);
+        } catch (error) {
+            showToast('Error removing directory: ' + error.message, 'danger');
+        }
+    }
+
+    async setAutoScanEnabled(enabled) {
+        try {
+            const response = await fetch('/Home/SetAutoScanEnabled', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ enabled })
+            });
+            if (!response.ok) {
+                const error = await response.text();
+                throw new Error(error);
+            }
+        } catch (error) {
+            showToast('Error updating auto-scan: ' + error.message, 'danger');
+        }
+    }
+
+    async setAutoScanInterval(minutes) {
+        if (isNaN(minutes) || minutes < 1) return;
+        try {
+            const response = await fetch('/Home/SetAutoScanInterval', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ intervalMinutes: minutes })
+            });
+            if (!response.ok) {
+                const error = await response.text();
+                throw new Error(error);
+            }
+        } catch (error) {
+            showToast('Error updating scan interval: ' + error.message, 'danger');
+        }
+    }
+
+    async triggerAutoScan() {
+        try {
+            showToast('Starting auto-scan...', 'info');
+            const response = await fetch('/Home/TriggerAutoScan', {
+                method: 'POST'
+            });
+            if (!response.ok) {
+                const error = await response.text();
+                throw new Error(error);
+            }
+            showToast('Auto-scan triggered successfully', 'success');
+        } catch (error) {
+            showToast('Error triggering scan: ' + error.message, 'danger');
+        }
+    }
+
+    async clearAutoScanHistory() {
+        if (!confirm('Clear all auto-scan history? This cannot be undone.')) return;
+        try {
+            const response = await fetch('/Home/ClearAutoScanHistory', {
+                method: 'POST'
+            });
+            if (!response.ok) {
+                const error = await response.text();
+                throw new Error(error);
+            }
+            await this.loadAutoScanConfig(false);
+            showToast('Scan history cleared', 'success');
+        } catch (error) {
+            showToast('Error clearing history: ' + error.message, 'danger');
+        }
+    }
+
+    formatTimeAgo(date) {
+        const now = new Date();
+        const diffMs = now - date;
+        const diffSec = Math.floor(diffMs / 1000);
+        const diffMin = Math.floor(diffSec / 60);
+        const diffHr = Math.floor(diffMin / 60);
+        const diffDays = Math.floor(diffHr / 24);
+
+        if (diffSec < 60) return 'just now';
+        if (diffMin < 60) return `${diffMin} minute${diffMin !== 1 ? 's' : ''} ago`;
+        if (diffHr < 24) return `${diffHr} hour${diffHr !== 1 ? 's' : ''} ago`;
+        if (diffDays < 7) return `${diffDays} day${diffDays !== 1 ? 's' : ''} ago`;
+        return date.toLocaleString();
     }
 
     // Helper method to format file size

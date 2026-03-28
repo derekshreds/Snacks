@@ -67,9 +67,9 @@ if docker-compose ps | grep -q "Up"; then
     echo "  4. Files are processed IN-PLACE unless you specify an output directory"
     echo "  5. Original files are backed up with '-OG' suffix during processing"
     echo ""
-    echo "To view logs: docker-compose logs -f snacksweb"
+    echo "To view logs: docker-compose logs -f snacks"
     echo "To stop: docker-compose down"
 else
     echo "? Failed to start Snacks. Check logs:"
-    docker-compose logs snacksweb
+    docker-compose logs snacks
 fi

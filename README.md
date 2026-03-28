@@ -27,6 +27,7 @@
 - **Batch processing** -- process individual files, folders, or entire libraries
 - **NAS-friendly** -- designed for QNAP, Synology, and other Docker-capable NAS devices
 - **Desktop app** -- native Windows installer with local GPU support
+- **Automatic scanning** -- watch directories for automatic re-scanning on a configurable interval
 - **Dark mode UI** -- clean, modern interface that works on desktop and mobile
 
 ---
@@ -40,7 +41,7 @@ Snacks runs as a Docker container with your video library mounted as a volume.
 **1. Pull the image:**
 
 ```bash
-docker pull derekshreds/snacksweb:latest
+docker pull derekshreds/snacks-docker:latest
 ```
 
 **2. Create the application** in Container Station (QNAP) or Docker (Synology) using this compose config:
@@ -48,23 +49,30 @@ docker pull derekshreds/snacksweb:latest
 ```yaml
 services:
   snacks:
-    image: derekshreds/snacksweb:latest
+    image: derekshreds/snacks-docker:latest
     container_name: snacks
     ports:
       - "6767:6767"
     volumes:
-      # Point this to your media library
+      ## CHANGE THIS to your actual media folder on the NAS
       - /share/Public/Media:/app/work/uploads
-      # Logs (optional)
+      ## Output directory for transcoded files (optional, on NAS storage)
+      #- /share/CACHEDEV1_DATA/snacks/output:/app/work/output
+      ## Transcoding logs
       - /share/CACHEDEV1_DATA/snacks/logs:/app/work/logs
+      ## Persist encoder settings across container updates
+      - /share/CACHEDEV1_DATA/snacks/config:/app/work/config
     environment:
       - ASPNETCORE_ENVIRONMENT=Production
       - SNACKS_WORK_DIR=/app/work
       - FFMPEG_PATH=/usr/lib/jellyfin-ffmpeg/ffmpeg
       - FFPROBE_PATH=/usr/lib/jellyfin-ffmpeg/ffprobe
+      ## VAAPI driver — auto-detection tries iHD then i965. Override here if needed:
+      #- LIBVA_DRIVER_NAME=iHD
     devices:
-      # GPU passthrough for hardware acceleration
+      ## Intel QSV hardware acceleration (TS-453E J6412)
       - /dev/dri:/dev/dri
+    ## QNAP lacks standard video/render groups — privileged grants /dev/dri access
     privileged: true
     restart: unless-stopped
     healthcheck:
@@ -143,6 +151,17 @@ Click the **gear icon** to open encoding settings:
 | Remove Black Borders | Auto-detect and crop letterboxing |
 | Delete Original File | Replace original with encoded version |
 | Retry on Failure | Fall back to software encoding if hardware fails |
+
+### Automatic Scanning
+
+Snacks can watch directories and automatically re-scan them on a configurable interval.
+
+- Open the **Settings** panel and enable **Auto Scan**
+- Set the scan interval (how often Snacks checks for new or changed files)
+- Add directories to the watch list using the **Watch This Folder** button in the directory browser
+- Snacks keeps a persistent scan history so previously processed files are not re-queued
+
+Settings are saved server-side in `settings.json` and persist across container restarts and devices.
 
 ### Monitor
 
@@ -236,7 +255,7 @@ Check that the backend is running and SignalR is connected (green dot in the nav
 Snacks/
   Snacks/                 ASP.NET Core 8.0 backend + web UI
     Controllers/           API endpoints
-    Services/              Transcoding, file handling, FFprobe
+    Services/              Transcoding, file handling, FFprobe, AutoScanService
     Hubs/                  SignalR real-time communication
     Views/                 Razor pages
     wwwroot/               Static assets (JS, CSS, fonts)
@@ -249,6 +268,8 @@ Snacks/
   build-electron.bat      Build Electron app
   run-electron-dev.bat    Run desktop app in dev mode
   deploy-compose.yml      Docker Compose for NAS deployment
+  start-snacks.bat     Start backend (Windows)
+  start-snacks.sh      Start backend (Linux/Docker)
 ```
 
 ---
@@ -261,7 +282,7 @@ Snacks/
 build-and-export.bat
 ```
 
-Builds the Docker image and pushes to Docker Hub as `derekshreds/snacksweb:latest`.
+Builds the Docker image and pushes to Docker Hub as `derekshreds/snacks-docker:latest`.
 
 ### Windows Installer
 

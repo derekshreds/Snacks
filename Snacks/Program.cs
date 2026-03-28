@@ -37,6 +37,8 @@ builder.Services.AddSignalR()
 builder.Services.AddSingleton<FfprobeService>();
 builder.Services.AddSingleton<FileService>();
 builder.Services.AddSingleton<TranscodingService>();
+builder.Services.AddSingleton<AutoScanService>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<AutoScanService>());
 
 var app = builder.Build();
 
