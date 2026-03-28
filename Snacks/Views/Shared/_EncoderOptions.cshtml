@@ -1,0 +1,146 @@
+@{
+    string formPrefix = ViewData["FormPrefix"]?.ToString() ?? "";
+}
+
+<div class="row g-4">
+    <div class="col-md-6">
+        <div class="encoder-panel rounded">
+            <h6 class="fw-bold mb-3 d-flex align-items-center">
+                <i class="fas fa-cogs me-2 text-primary"></i>
+                Video Settings
+            </h6>
+            
+            <div class="mb-3">
+                <label for="@(formPrefix)Format" class="form-label">
+                    <i class="fas fa-file-video me-1"></i> Output Format
+                </label>
+                <select class="form-select" id="@(formPrefix)Format" name="Format">
+                    <option value="mkv" selected>MKV (Matroska)</option>
+                    <option value="mp4">MP4</option>
+                </select>
+                <div class="form-text">
+                    <i class="fas fa-info-circle me-1"></i>
+                    MP4 is widely compatible with most devices
+                </div>
+            </div>
+
+            <div class="mb-3">
+                <label for="@(formPrefix)Codec" class="form-label">
+                    <i class="fas fa-microchip me-1"></i> Video Codec
+                </label>
+                <select class="form-select" id="@(formPrefix)Codec" name="Codec">
+                    <option value="h265" selected>H.265/HEVC (Better Quality)</option>
+                    <option value="h264">H.264/AVC (Faster)</option>
+                </select>
+                <div class="form-text">
+                    <i class="fas fa-info-circle me-1"></i>
+                    H.265 provides better compression with same quality
+                </div>
+            </div>
+
+            <div class="mb-3">
+                <label for="@(formPrefix)HardwareAcceleration" class="form-label">
+                    <i class="fas fa-bolt me-1"></i> Hardware Acceleration
+                </label>
+                <select class="form-select" id="@(formPrefix)HardwareAcceleration" name="HardwareAcceleration">
+                    <option value="auto" selected>Auto Detect</option>
+                    <option value="intel">Intel Quick Sync (QSV)</option>
+                    <option value="amd">AMD Video Acceleration (VAAPI)</option>
+                    <option value="nvidia">NVIDIA NVENC</option>
+                    <option value="none">None (Software Only)</option>
+                </select>
+                <div class="form-text">
+                    <i class="fas fa-info-circle me-1"></i>
+                    Hardware acceleration speeds up encoding
+                </div>
+            </div>
+
+            <div class="mb-3">
+                <label for="@(formPrefix)TargetBitrate" class="form-label">
+                    <i class="fas fa-tachometer-alt me-1"></i> Target Bitrate (kbps)
+                </label>
+                <input type="number" class="form-control" id="@(formPrefix)TargetBitrate" name="TargetBitrate" value="3500" min="500" max="50000" step="100">
+                <div class="form-text">
+                    <i class="fas fa-info-circle me-1"></i>
+                    Higher bitrate = better quality, larger file size
+                </div>
+            </div>
+
+            <div class="form-check mb-2">
+                <input class="form-check-input" type="checkbox" id="@(formPrefix)StrictBitrate" name="StrictBitrate">
+                <label class="form-check-label" for="@(formPrefix)StrictBitrate">
+                    <i class="fas fa-lock me-1"></i> Strict Bitrate Control
+                </label>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-md-6">
+        <div class="encoder-panel rounded">
+            <h6 class="fw-bold mb-3 d-flex align-items-center">
+                <i class="fas fa-sliders-h me-2 text-success"></i>
+                Processing Options
+            </h6>
+
+            <div class="form-check mb-3">
+                <input class="form-check-input" type="checkbox" id="@(formPrefix)TwoChannelAudio" name="TwoChannelAudio">
+                <label class="form-check-label" for="@(formPrefix)TwoChannelAudio">
+                    <i class="fas fa-volume-up me-1"></i> Convert to Stereo Audio
+                </label>
+                <div class="form-text ms-4">
+                    Downmix multi-channel audio to 2.0 stereo
+                </div>
+            </div>
+
+            <div class="form-check mb-3">
+                <input class="form-check-input" type="checkbox" id="@(formPrefix)EnglishOnlyAudio" name="EnglishOnlyAudio">
+                <label class="form-check-label" for="@(formPrefix)EnglishOnlyAudio">
+                    <i class="fas fa-language me-1"></i> Keep English Audio Only
+                </label>
+                <div class="form-text ms-4">
+                    Remove non-English audio tracks
+                </div>
+            </div>
+
+            <div class="form-check mb-3">
+                <input class="form-check-input" type="checkbox" id="@(formPrefix)EnglishOnlySubtitles" name="EnglishOnlySubtitles">
+                <label class="form-check-label" for="@(formPrefix)EnglishOnlySubtitles">
+                    <i class="fas fa-closed-captioning me-1"></i> Keep English Subtitles Only
+                </label>
+                <div class="form-text ms-4">
+                    Remove non-English subtitle tracks
+                </div>
+            </div>
+
+            <div class="form-check mb-3">
+                <input class="form-check-input" type="checkbox" id="@(formPrefix)RemoveBlackBorders" name="RemoveBlackBorders">
+                <label class="form-check-label" for="@(formPrefix)RemoveBlackBorders">
+                    <i class="fas fa-crop me-1"></i> Remove Black Borders
+                </label>
+                <div class="form-text ms-4">
+                    Automatically crop black bars from video
+                </div>
+            </div>
+
+            <div class="form-check mb-3">
+                <input class="form-check-input" type="checkbox" id="@(formPrefix)DeleteOriginalFile" name="DeleteOriginalFile">
+                <label class="form-check-label" for="@(formPrefix)DeleteOriginalFile">
+                    <i class="fas fa-trash-alt me-1 text-danger"></i> Delete Original Files
+                </label>
+                <div class="form-text ms-4 text-danger">
+                    <strong>Warning:</strong> This cannot be undone!
+                </div>
+            </div>
+
+            <div class="form-check mb-2">
+                <input class="form-check-input" type="checkbox" id="@(formPrefix)RetryOnFail" name="RetryOnFail" checked>
+                <label class="form-check-label" for="@(formPrefix)RetryOnFail">
+                    <i class="fas fa-redo me-1"></i> Retry on Failure
+                </label>
+                <div class="form-text ms-4">
+                    Automatically retry failed encodings
+                </div>
+            </div>
+        </div>
+    </div>
+</div>

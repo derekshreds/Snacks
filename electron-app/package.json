@@ -1,0 +1,55 @@
+{
+  "name": "snacks",
+  "version": "2.0.0",
+  "description": "Snacks - Automated video transcoding",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder",
+    "build:win": "electron-builder --win"
+  },
+  "dependencies": {
+    "tree-kill": "^1.2.2"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.1.8"
+  },
+  "author": "Derek Morris",
+  "build": {
+    "appId": "com.snacks.transcoder",
+    "productName": "Snacks",
+    "publish": null,
+    "win": {
+      "target": "nsis",
+      "icon": "icons/snacks.ico",
+      "publisherName": "Derek Morris"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Snacks",
+      "installerIcon": "icons/snacks.ico",
+      "uninstallerIcon": "icons/snacks.ico",
+      "installerHeaderIcon": "icons/snacks.ico"
+    },
+    "extraResources": [
+      {
+        "from": "backend",
+        "to": "backend",
+        "filter": ["**/*"]
+      },
+      {
+        "from": "ffmpeg",
+        "to": "ffmpeg",
+        "filter": ["**/*"]
+      }
+    ],
+    "files": [
+      "main.js",
+      "icons/**/*"
+    ]
+  }
+}

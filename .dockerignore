@@ -1,0 +1,71 @@
+# .NET build artifacts
+**/bin/
+**/obj/
+**/out/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.cache
+*.docstates
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Bb]in/
+[Oo]bj/
+
+# Docker
+**/Dockerfile*
+**/docker-compose*
+**/.dockerignore
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# IDE
+**/.vscode/
+**/.idea/
+
+# OS
+**/.DS_Store
+**/Thumbs.db
+
+# Documentation
+**/README*.md
+**/*.md
+
+# Logs
+**/logs/
+**/log/
+**/*.log
+
+# Test results
+**/[Tt]est[Rr]esult*/
+**/[Bb]uild[Ll]og.*
+
+# NuGet
+**/packages/
+**/*.nupkg
+**/nuget.exe
+
+# Node.js (if any)
+**/node_modules/
+**/npm-debug.log*
+
+# Temporary files
+**/tmp/
+**/temp/
+
+# Video library and data (mounted as volumes, not needed in build)
+video-library/
+data/
+
+# Electron app (not needed for Docker build)
+electron-app/
+
+# Batch scripts
+*.bat

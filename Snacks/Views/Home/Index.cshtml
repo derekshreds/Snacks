@@ -1,0 +1,201 @@
+@{
+    ViewData["Title"] = "Video Transcoding Service";
+    Layout = "~/Views/Shared/_Layout.cshtml";
+}
+
+<!-- Mobile Stats Strip -->
+<div class="stats-strip d-md-none mb-3">
+    <div class="stats-strip-item"><i class="fas fa-clock" style="color: var(--warning-color);"></i><span id="pendingCountMobile">0</span></div>
+    <div class="stats-strip-item"><i class="fas fa-cog" style="color: var(--info-color);"></i><span id="processingCountMobile">0</span></div>
+    <div class="stats-strip-item"><i class="fas fa-check-circle" style="color: var(--success-color);"></i><span id="completedCountMobile">0</span></div>
+    <div class="stats-strip-item"><i class="fas fa-times-circle" style="color: var(--danger-color);"></i><span id="failedCountMobile">0</span></div>
+</div>
+
+<!-- Desktop Stats Cards -->
+<div class="row mb-3 g-2 d-none d-md-flex">
+    <div class="col-3">
+        <div class="card hover-lift stats-card">
+            <div class="card-body text-center">
+                <div class="mb-3"><i class="fas fa-clock fa-3x" style="color: var(--warning-color);"></i></div>
+                <h5 class="card-title mb-1" id="pendingCount">0</h5>
+                <p class="card-text text-muted mb-0">Pending</p>
+            </div>
+        </div>
+    </div>
+    <div class="col-3">
+        <div class="card hover-lift stats-card">
+            <div class="card-body text-center">
+                <div class="mb-3"><i class="fas fa-cog fa-spin fa-3x" style="color: var(--info-color);"></i></div>
+                <h5 class="card-title mb-1" id="processingCount">0</h5>
+                <p class="card-text text-muted mb-0">Processing</p>
+            </div>
+        </div>
+    </div>
+    <div class="col-3">
+        <div class="card hover-lift stats-card">
+            <div class="card-body text-center">
+                <div class="mb-3"><i class="fas fa-check-circle fa-3x" style="color: var(--success-color);"></i></div>
+                <h5 class="card-title mb-1" id="completedCount">0</h5>
+                <p class="card-text text-muted mb-0">Completed</p>
+            </div>
+        </div>
+    </div>
+    <div class="col-3">
+        <div class="card hover-lift stats-card">
+            <div class="card-body text-center">
+                <div class="mb-3"><i class="fas fa-exclamation-circle fa-3x" style="color: var(--danger-color);"></i></div>
+                <h5 class="card-title mb-1" id="failedCount">0</h5>
+                <p class="card-text text-muted mb-0">Failed</p>
+            </div>
+        </div>
+    </div>
+</div>
+
+
+<!-- Now Processing Section -->
+<div class="row mb-4" id="processingSection" style="display: none;">
+    <div class="col-md-12">
+        <div class="card border-info">
+            <div class="card-header">
+                <h5 class="mb-0">
+                    <i class="fas fa-cog fa-spin me-2 text-info"></i>
+                    Now Processing
+                </h5>
+            </div>
+            <div class="card-body" id="processingContainer">
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Work Queue Section -->
+<div class="row">
+    <div class="col-md-12">
+        <div class="card">
+            <div class="card-header">
+                <div class="d-flex justify-content-between align-items-center flex-wrap">
+                    <h5 class="mb-0">
+                        <i class="fas fa-list-ul me-2"></i>
+                        Queue
+                    </h5>
+                    <button class="btn btn-sm btn-outline-secondary mt-2 mt-md-0" onclick="window.transcodingManager.loadWorkItems()">
+                        <i class="fas fa-sync-alt me-1"></i> Refresh
+                    </button>
+                </div>
+            </div>
+            <div class="card-body">
+                <div id="workItemsContainer" style="min-height: 100px;">
+                    <div class="text-center text-muted py-5">
+                        <i class="fas fa-inbox fa-4x mb-3" style="opacity: 0.3;"></i>
+                        <h5>No work items yet</h5>
+                        <p>Click "Browse Library" to add videos to the transcoding queue</p>
+                    </div>
+                </div>
+                <div id="queuePagination"></div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Library Browser Modal -->
+<div class="modal fade" id="libraryModal" tabindex="-1">
+    <div class="modal-dialog modal-xl">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">
+                    <i class="fas fa-folder-open me-2"></i>
+                    Video Library Browser
+                </h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div class="row">
+                    <div class="col-md-4">
+                        <h6><i class="fas fa-folder me-2"></i>Directories</h6>
+                        <div id="directoryList" class="border rounded p-3" style="height: 450px; overflow-y: auto;">
+                            <div class="text-center">
+                                <div class="spinner-border" role="status">
+                                    <span class="visually-hidden">Loading...</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-md-8">
+                        <div class="d-flex justify-content-between align-items-center mb-3">
+                            <h6><i class="fas fa-file-video me-2"></i>Video Files</h6>
+                            <div>
+                                <button id="selectAllFiles" class="btn btn-sm btn-outline-secondary me-2">
+                                    <i class="fas fa-check-square me-1"></i> Select All
+                                </button>
+                                <button id="processSelectedFiles" class="btn btn-sm btn-primary" disabled>
+                                    <i class="fas fa-play me-1"></i> Process Selected
+                                </button>
+                            </div>
+                        </div>
+                        <div id="fileList" class="border rounded p-3" style="height: 450px; overflow-y: auto;">
+                            <div class="text-muted text-center py-4">
+                                <i class="fas fa-folder-open fa-2x mb-2"></i><br>
+                                Select a directory to view files
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                <button type="button" class="btn btn-primary" id="processDirectory">
+                    <i class="fas fa-folder-plus me-2"></i>
+                    Process Entire Directory
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Settings Modal -->
+<div class="modal fade" id="settingsModal" tabindex="-1">
+    <div class="modal-dialog modal-xl">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">
+                    <i class="fas fa-cog me-2"></i>
+                    Encoder Settings
+                </h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                @await Html.PartialAsync("_EncoderOptions", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Log Modal -->
+<div class="modal fade" id="logModal" tabindex="-1">
+    <div class="modal-dialog modal-xl">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">
+                    <i class="fas fa-terminal me-2"></i>
+                    Transcoding Log
+                </h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div id="logContent">
+                    <!-- Log content will be loaded here -->
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+@section Scripts {
+    <script src="~/js/transcoding.js"></script>
+}

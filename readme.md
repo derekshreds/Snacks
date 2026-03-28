@@ -1,1 +1,0 @@
-[![Build Status](https://jenkins.cheapstockdata.com/job/Personal/job/Snacks/job/master/badge/icon)](https://jenkins.cheapstockdata.com/job/Personal/job/Snacks/job/master/)

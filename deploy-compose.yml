@@ -1,0 +1,41 @@
+## Snacks v2.0.0 - QNAP NAS Deployment
+## Copy this into Container Station > Applications > Create
+##
+## IMPORTANT: Update the video library path below to match your NAS.
+## Common QNAP paths:
+##   /share/CACHEDEV1_DATA/Multimedia/Movies
+##   /share/CACHEDEV1_DATA/Media
+##   /share/Public
+
+services:
+  snacksweb:
+    image: derekshreds/snacksweb:latest
+    container_name: snacksweb
+    ports:
+      - "6767:6767"
+    volumes:
+      ## CHANGE THIS to your actual media folder on the NAS
+      - /share/Public/Media:/app/work/uploads
+      ## Output directory for transcoded files (optional, on NAS storage)
+      #- /share/CACHEDEV1_DATA/snacksweb/output:/app/work/output
+      ## Transcoding logs
+      - /share/CACHEDEV1_DATA/snacksweb/logs:/app/work/logs
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - SNACKS_WORK_DIR=/app/work
+      - FFMPEG_PATH=/usr/lib/jellyfin-ffmpeg/ffmpeg
+      - FFPROBE_PATH=/usr/lib/jellyfin-ffmpeg/ffprobe
+      ## VAAPI driver — auto-detection tries iHD then i965. Override here if needed:
+      #- LIBVA_DRIVER_NAME=iHD
+    devices:
+      ## Intel QSV hardware acceleration (TS-453E J6412)
+      - /dev/dri:/dev/dri
+    ## QNAP lacks standard video/render groups — privileged grants /dev/dri access
+    privileged: true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6767/Home/Health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s

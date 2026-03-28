@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="dark">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Snacks - Automated Video Library Encoder</title>
+    <link rel="icon" type="image/x-icon" href="~/favicon.ico">
+    <link href="~/lib/bootstrap.min.css" rel="stylesheet">
+    <link href="~/lib/fontawesome.min.css" rel="stylesheet">
+    <link href="~/css/site.css" rel="stylesheet" />
+</head>
+<body class="d-flex flex-column">
+    <nav class="navbar navbar-expand-sm navbar-dark border-bottom fixed-top">
+        <div class="container">
+            <a class="navbar-brand d-flex align-items-center" href="/">
+                <img src="~/images/snacks.ico" alt="Snacks" style="height: 24px; width: 24px;" class="me-2">
+                <span class="fw-bold">Snacks</span>
+            </a>
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target=".navbar-collapse">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+            <div class="navbar-collapse collapse">
+                <ul class="navbar-nav ms-auto">
+                    <li class="nav-item me-3">
+                        <button class="btn btn-outline-secondary btn-sm me-2" data-bs-toggle="modal" data-bs-target="#settingsModal"><i class="fas fa-cog"></i></button>
+                        <button class="btn btn-primary btn-sm me-3" data-bs-toggle="modal" data-bs-target="#libraryModal"><i class="fas fa-folder-plus me-1"></i><span class="d-none d-sm-inline">Browse Library</span><span class="d-sm-none">Library</span></button>
+                    </li>
+                    <li class="nav-item">
+                        <span class="nav-link" id="connectionStatus">
+                            <i class="fas fa-circle text-danger me-1" id="connectionDot" style="font-size: 0.5rem;"></i>
+                            <small id="connectionText">Connecting...</small>
+                        </span>
+                    </li>
+                </ul>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container" style="margin-top: 80px; margin-bottom: 60px;">
+        @RenderBody()
+    </main>
+
+    <footer class="footer mt-auto py-3 border-top">
+        <div class="container text-center">
+            <span class="text-muted">
+                <img src="~/images/snacks.ico" alt="Snacks" style="height: 18px; width: 18px;" class="me-2">
+                <strong>Snacks</strong> &copy; @DateTime.Now.Year - <a href="https://technobitch.com" target="_blank" class="text-muted text-decoration-none">Derek Morris</a>
+            </span>
+        </div>
+    </footer>
+
+    <script src="~/lib/bootstrap.bundle.min.js"></script>
+    <script src="~/lib/signalr.min.js"></script>
+    <script src="~/js/site.js"></script>
+    @await RenderSectionAsync("Scripts", required: false)
+</body>
+</html>

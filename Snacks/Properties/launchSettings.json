@@ -1,0 +1,12 @@
+{
+  "profiles": {
+    "Snacks": {
+      "commandName": "Project",
+      "launchBrowser": true,
+      "environmentVariables": {
+        "ASPNETCORE_ENVIRONMENT": "Development"
+      },
+      "applicationUrl": "https://localhost:49210;http://localhost:49211"
+    }
+  }
+}

@@ -1,0 +1,41 @@
+services:
+  snacksweb:
+    build:
+      context: .
+      dockerfile: Snacks/Dockerfile
+    container_name: snacksweb
+    ports:
+      - "8080:8080"
+    volumes:
+      # Mount your video library directory (read-write for in-place processing)
+      - ./video-library:/app/work/uploads
+      # Optional: Separate output directory for transcoded files (if specified in encoder options)
+      - ./data/output:/app/work/output
+      # Transcoding logs
+      - ./data/logs:/app/work/logs
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - SNACKS_WORK_DIR=/app/work
+      - FFMPEG_PATH=/usr/bin/ffmpeg
+      - FFPROBE_PATH=/usr/bin/ffprobe
+    devices:
+      # Intel QSV / VAAPI — pass through entire /dev/dri for GPU access
+      - /dev/dri:/dev/dri
+    # Ensure container user can access /dev/dri devices
+    group_add:
+      - video
+      - render
+    privileged: false
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/Home/Health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+    # For NVIDIA GPU support (uncomment if using NVIDIA GPU)
+    # runtime: nvidia
+    # environment:
+    #   - NVIDIA_VISIBLE_DEVICES=all
+    #   - NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
