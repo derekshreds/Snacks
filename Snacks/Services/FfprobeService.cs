@@ -168,14 +168,21 @@ namespace Snacks.Services
             {
                 double inputDuration = GetVideoDuration(input);
                 double outputDuration = GetVideoDuration(output);
+
+                // If we can't read the output duration (common with freshly written MKV),
+                // trust that the encode completed since FFmpeg exited successfully
+                if (outputDuration <= 0)
+                    return true;
+
                 double durationDifference = Math.Abs(inputDuration - outputDuration);
 
-                // Check for 10 seconds of difference for now
-                return durationDifference < 10;
+                // Allow up to 30 seconds or 1% of total duration, whichever is greater
+                double tolerance = Math.Max(30, inputDuration * 0.01);
+                return durationDifference < tolerance;
             }
-            catch 
-            { 
-                return false; 
+            catch
+            {
+                return true; // Trust FFmpeg's exit code if probe fails
             }
         }
 

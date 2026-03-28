@@ -43,6 +43,14 @@ namespace Snacks.Services
             _ffprobeService = ffprobeService;
             _hubContext = hubContext;
             _ffmpegPath = Environment.GetEnvironmentVariable("FFMPEG_PATH") ?? "ffmpeg";
+
+            // Detect hardware acceleration eagerly so the filter in AddFileAsync
+            // can skip files that VAAPI can't handle before they enter the queue
+            _ = Task.Run(async () =>
+            {
+                try { await DetectHardwareAccelerationAsync(); }
+                catch { }
+            });
         }
 
         public async Task<string> AddFileAsync(string filePath, EncoderOptions options)
@@ -97,8 +105,11 @@ namespace Snacks.Services
                     return workItem.Id;
                 }
 
-                // Skip low-bitrate non-HEVC files only when using VAAPI CQP — it can't target specific bitrates
-                bool isVaapiMode = IsVaapiAcceleration(options.HardwareAcceleration);
+                // Skip low-bitrate non-HEVC files when using VAAPI CQP — it can't target specific bitrates.
+                // Check both explicit VAAPI selection and "auto" (which resolves to VAAPI on Linux NAS).
+                bool isVaapiMode = IsVaapiAcceleration(options.HardwareAcceleration) ||
+                    (options.HardwareAcceleration.Equals("auto", StringComparison.OrdinalIgnoreCase) &&
+                     _detectedHardware != null && IsVaapiAcceleration(_detectedHardware));
                 if (isVaapiMode && !isHevc && targetIsHevc && bitrate > 0 && bitrate <= options.TargetBitrate && !isHighDef)
                 {
                     Console.WriteLine($"Skipping {workItem.FileName}: VAAPI can't compress {bitrate}kbps H.264 below target");
@@ -170,6 +181,14 @@ namespace Snacks.Services
         {
             _workItems.TryGetValue(id, out var workItem);
             return workItem;
+        }
+
+        public bool IsFileQueued(string filePath)
+        {
+            var normalizedPath = Path.GetFullPath(filePath);
+            return _workItems.Values.Any(w =>
+                Path.GetFullPath(w.Path).Equals(normalizedPath, StringComparison.OrdinalIgnoreCase) &&
+                w.Status is WorkItemStatus.Pending or WorkItemStatus.Processing);
         }
 
         public List<WorkItem> GetAllWorkItems()

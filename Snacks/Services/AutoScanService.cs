@@ -41,6 +41,14 @@ namespace Snacks.Services
         {
             LoadConfig();
             ScheduleTimer();
+
+            // Run an immediate scan on startup if enabled, so files pending
+            // from before a restart get re-queued without waiting for the interval
+            if (_config.Enabled && _config.Directories.Count > 0)
+            {
+                _ = Task.Run(() => TriggerScanNow());
+            }
+
             return Task.CompletedTask;
         }
 
@@ -166,13 +174,55 @@ namespace Snacks.Services
                     }
                 }
 
-                // Add ALL found files (including already-seen) to SeenFiles
+                // Only mark files as seen if they were skipped by AddFileAsync
+                // (already meet requirements) or have a [snacks] output.
+                // Files that were queued for encoding are NOT marked — if the
+                // container restarts before they finish, the next scan re-queues them.
                 foreach (var file in allVideoFiles)
                 {
-                    _config.SeenFiles.Add(file);
+                    // File was already in the queue/completed from a prior scan
+                    if (_config.SeenFiles.Contains(file))
+                        continue;
+
+                    // Check if a [snacks] encoded version already exists
+                    var dir = Path.GetDirectoryName(file) ?? "";
+                    var baseName = Path.GetFileNameWithoutExtension(file);
+                    var snacksExists = Directory.GetFiles(dir, $"{baseName} [snacks].*")
+                        .Any(f => _fileService.IsVideoFile(f) || f.EndsWith(".mkv", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".mp4", StringComparison.OrdinalIgnoreCase));
+
+                    if (snacksExists)
+                    {
+                        _config.SeenFiles.Add(file);
+                        continue;
+                    }
+
+                    // Check if AddFileAsync skipped it (not in the work queue = was filtered out)
+                    if (!_transcodingService.IsFileQueued(file))
+                    {
+                        _config.SeenFiles.Add(file);
+                    }
+                    // else: file is in the queue — don't mark as seen until it completes
                 }
 
-                // Prune SeenFiles entries where the file no longer exists on disk
+                // Prune SeenFiles entries where the file no longer exists on disk,
+                // but first check if a replacement file exists (delete-original renames the output).
+                // Add the replacement path so the file stays "seen" after pruning.
+                var toAdd = new List<string>();
+                foreach (var seenFile in _config.SeenFiles.Where(f => !File.Exists(f)).ToList())
+                {
+                    var dir = Path.GetDirectoryName(seenFile) ?? "";
+                    var baseName = Path.GetFileNameWithoutExtension(seenFile);
+                    // Look for any video file with the same base name (different extension = format change)
+                    var replacement = Directory.Exists(dir)
+                        ? Directory.GetFiles(dir, $"{baseName}.*")
+                            .FirstOrDefault(f => _fileService.IsVideoFile(f))
+                        : null;
+                    if (replacement != null)
+                        toAdd.Add(replacement);
+                }
+                foreach (var f in toAdd)
+                    _config.SeenFiles.Add(f);
+
                 _config.SeenFiles.RemoveWhere(f => !File.Exists(f));
 
                 _config.LastScanTime = DateTime.UtcNow;
