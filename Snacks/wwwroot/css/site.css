@@ -137,6 +137,7 @@ footer a.text-muted:hover {
     box-shadow: var(--shadow-sm);
     background: var(--bg-surface);
     transition: box-shadow 0.2s ease, transform 0.2s ease;
+    overflow: hidden;
 }
 
 .card:hover {

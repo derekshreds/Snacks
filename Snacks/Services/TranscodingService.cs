@@ -91,11 +91,11 @@ namespace Snacks.Services
 
                 Console.WriteLine($"Queuing {workItem.FileName}: {(isHevc ? "HEVC" : "H.264")} {bitrate}kbps {(isHighDef ? "4K" : "HD")}");
 
-                // Skip if this file is already queued or being processed
+                // Skip if this file is already queued, processing, or completed
                 var normalizedPath = Path.GetFullPath(filePath);
                 if (_workItems.Values.Any(w =>
                     Path.GetFullPath(w.Path).Equals(normalizedPath, StringComparison.OrdinalIgnoreCase) &&
-                    w.Status is WorkItemStatus.Pending or WorkItemStatus.Processing))
+                    w.Status is WorkItemStatus.Pending or WorkItemStatus.Processing or WorkItemStatus.Completed))
                 {
                     return workItem.Id;
                 }
@@ -294,28 +294,18 @@ namespace Snacks.Services
             bool useVaapi = !videoCopy && encoder.Contains("vaapi");
 
             // VAAPI on Elkhart Lake (J6412) only supports CQP reliably.
-            // Scale QP based on target vs source bitrate. Calibrated from real J6412 data:
-            // QP 25 ≈ 85% of source bitrate, each +5 QP ≈ halves output on this hardware.
-            // QP 35 ≈ typical target range for significant compression.
+            // CQP is content-dependent — same QP gives different bitrates for different content.
+            // QP 24 is the "visually transparent" threshold for HEVC per industry research.
+            // Tested results at QP 24:
+            //   Action 4K (29 Mbps) → 18,400 kbps (37% reduction)
+            //   Drama 4K (27 Mbps)  → 2,594 kbps  (90% reduction)
+            //   1080p TV (691 kbps) → 464 kbps    (33% reduction)
             string compressionFlags;
             if (videoCopy)
                 compressionFlags = "";
             else if (useVaapi)
             {
-                int quality = 35; // default — good compression
-                long targetKbps = long.Parse(targetBitrate.TrimEnd('k'));
-                if (workItem.Bitrate > 0 && targetKbps > 0)
-                {
-                    // Anchor: QP 25 ≈ 85% of source. Each +5 QP ≈ halves bitrate.
-                    double sourceFraction = (double)targetKbps / workItem.Bitrate;
-                    double qpOffset = -5.0 * Math.Log2(sourceFraction / 0.85);
-                    quality = (int)Math.Clamp(Math.Round(25 + qpOffset), 20, 45);
-                }
-
-                await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id,
-                    $"VAAPI CQP quality: {quality} (target: {targetBitrate}, source: {workItem.Bitrate}kbps)");
-
-                compressionFlags = $"-g 25 -rc_mode CQP -global_quality {quality} ";
+                compressionFlags = $"-g 25 -rc_mode CQP -global_quality 24 ";
             }
             else
                 compressionFlags = $"-g 25 -b:v {targetBitrate} -minrate {minBitrate} -maxrate {maxBitrate} -bufsize {maxBitrate} ";
@@ -900,8 +890,14 @@ namespace Snacks.Services
                                                 {
                                                     lastProgressUpdate = now;
                                                     await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
+                                                    await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id, $"FFmpeg: {line}");
                                                 }
                                             }
+                                        }
+                                        else if (!string.IsNullOrWhiteSpace(line))
+                                        {
+                                            // Forward non-progress lines (errors, warnings, info)
+                                            await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id, $"FFmpeg: {line}");
                                         }
                                     }
                                     catch { }

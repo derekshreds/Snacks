@@ -98,13 +98,13 @@ class TranscodingManager {
         const text = document.getElementById('connectionText');
         if (dot && text) {
             if (connected) {
-                dot.classList.remove('text-danger');
+                dot.classList.remove('text-danger', 'text-warning');
                 dot.classList.add('text-success');
                 text.textContent = 'Connected';
             } else {
-                dot.classList.remove('text-success');
+                dot.classList.remove('text-success', 'text-warning');
                 dot.classList.add('text-danger');
-                text.textContent = 'Disconnected';
+                text.textContent = 'Reconnecting...';
             }
         }
     }
