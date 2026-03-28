@@ -306,11 +306,10 @@ namespace Snacks.Services
 
                 if (quality < 0)
                 {
-                    // VAAPI can't encode this file (10-bit, HDR, Dolby Vision, etc.)
-                    // Software fallback on a NAS CPU would take days — skip the file
+                    // VAAPI truly can't encode this file even with correct pixel format — skip it
                     await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id,
-                        "VAAPI cannot encode this file (likely 10-bit/HDR) — skipping. Use the desktop app for this file.");
-                    throw new Exception("VAAPI incompatible — file requires 10-bit encoding which this hardware does not support");
+                        "VAAPI cannot encode this file — skipping. Use the desktop app for this file.");
+                    throw new Exception("VAAPI incompatible with this file");
                 }
                 else
                 {
@@ -320,8 +319,13 @@ namespace Snacks.Services
             else
                 compressionFlags = $"-g 25 -b:v {targetBitrate} -minrate {minBitrate} -maxrate {maxBitrate} -bufsize {maxBitrate} ";
 
+            // Detect 10-bit content — VAAPI needs p010 format instead of nv12 for 10-bit
+            bool is10Bit = workItem.Probe?.streams?.Any(s =>
+                s.codec_type == "video" && (s.pix_fmt?.Contains("10") == true || s.profile?.Contains("10") == true)) == true;
+
             string initFlags = useVaapi ? GetInitFlags(options.HardwareAcceleration) : GetInitFlags("none");
-            string hwFilter = useVaapi ? "-vf format=nv12|vaapi,hwupload " : "";
+            string vaapiFormat = is10Bit ? "p010" : "nv12";
+            string hwFilter = useVaapi ? $"-vf format={vaapiFormat}|vaapi,hwupload " : "";
             string presetFlag = useVaapi ? "-low_power 1 " : "-preset medium ";
             string videoFlags = videoCopy ?
                 $"{_ffprobeService.MapVideo(workItem.Probe)} -c:v copy " :
@@ -796,7 +800,11 @@ namespace Snacks.Services
 
             string initFlags = GetInitFlags(options.HardwareAcceleration);
             string encoder = GetEncoder(options);
-            string hwFilter = "-vf format=nv12|vaapi,hwupload";
+            // Use p010 for 10-bit content, nv12 for 8-bit
+            bool is10Bit = workItem.Probe?.streams?.Any(s =>
+                s.codec_type == "video" && (s.pix_fmt?.Contains("10") == true || s.profile?.Contains("10") == true)) == true;
+            string vaapiFormat = is10Bit ? "p010" : "nv12";
+            string hwFilter = $"-vf format={vaapiFormat}|vaapi,hwupload";
 
             for (int iteration = 1; iteration <= maxIterations; iteration++)
             {
@@ -871,16 +879,12 @@ namespace Snacks.Services
                 };
 
                 using var process = new Process { StartInfo = psi };
-                var output = new System.Text.StringBuilder();
-
-                process.ErrorDataReceived += (s, e) =>
-                {
-                    if (e.Data != null) output.AppendLine(e.Data);
-                };
-
                 process.Start();
-                process.BeginErrorReadLine();
-                await process.StandardOutput.ReadToEndAsync();
+
+                // Read all stderr (contains FFmpeg output including summary line)
+                var stderrTask = process.StandardError.ReadToEndAsync();
+                // Drain stdout to prevent deadlock
+                var stdoutTask = process.StandardOutput.ReadToEndAsync();
 
                 var completed = process.WaitForExit(120000);
                 if (!completed)
@@ -889,14 +893,20 @@ namespace Snacks.Services
                     return -1;
                 }
 
-                var sizeMatch = Regex.Match(output.ToString(), @"video:\s*(\d+)\s*kB");
+                var outputText = await stderrTask;
+                var sizeMatch = Regex.Match(outputText, @"video:\s*(\d+)\s*(?:kB|KiB)");
                 if (sizeMatch.Success)
                 {
                     long outputKb = long.Parse(sizeMatch.Groups[1].Value);
                     return outputKb * 8 / duration; // kbps
                 }
+
+                // Log last few lines if no size found — helps diagnose failures
+                var lines = outputText.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+                var tail = string.Join("\n", lines.TakeLast(5));
+                Console.WriteLine($"Calibration test produced no measurable output. Last lines:\n{tail}");
             }
-            catch { }
+            catch (Exception ex) { Console.WriteLine($"Calibration test exception: {ex.Message}"); }
 
             return -1;
         }
