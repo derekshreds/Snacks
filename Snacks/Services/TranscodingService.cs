@@ -833,13 +833,15 @@ namespace Snacks.Services
         /// </summary>
         private async Task<int> CalibrateVaapiQualityAsync(WorkItem workItem, EncoderOptions options, string inputPath, long targetKbps)
         {
-            int currentQp = 24;
-            int testDuration = 30;
-            int maxIterations = 3;
-            double tolerance = 0.15; // within 15% of target
+            // 4K content needs a much higher starting QP since raw bitrates are 4x+ higher
+            bool is4K = workItem.Probe?.streams?.Any(s => s.codec_type == "video" && s.width > 1920) == true;
+            int currentQp = is4K ? 30 : 24;
+            int testDuration = 60;
+            int maxIterations = 6;
+            double tolerance = 0.20; // within 20% of target
 
-            // Seek to 25% into the file for a representative sample
-            int seekSeconds = Math.Max(0, (int)(workItem.Length * 0.25));
+            // Seek to ~40% into the file for a representative sample (avoids intros/credits)
+            int seekSeconds = Math.Max(0, (int)(workItem.Length * 0.40));
             string seekTime = $"{seekSeconds / 3600:D2}:{(seekSeconds % 3600) / 60:D2}:{seekSeconds % 60:D2}";
 
             string initFlags = GetInitFlags(options.HardwareAcceleration);
@@ -897,7 +899,7 @@ namespace Snacks.Services
                 int adjustment = (int)Math.Round(qpDelta);
                 if (adjustment == 0) adjustment = measuredKbps > targetKbps ? 1 : -1;
 
-                currentQp = Math.Clamp(currentQp + adjustment, 18, 40);
+                currentQp = Math.Clamp(currentQp + adjustment, 18, 51);
             }
 
             await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id,
@@ -1030,7 +1032,8 @@ namespace Snacks.Services
             var lastProgressUpdate = DateTime.MinValue;
             var lastReportedProgress = -1;
             var lastActivity = DateTime.UtcNow;
-            const int stallTimeoutSeconds = 30;
+            // Final muxing phase produces no output — slow NAS drives need extra time
+            const int stallTimeoutSeconds = 300;
 
             process.Start();
 

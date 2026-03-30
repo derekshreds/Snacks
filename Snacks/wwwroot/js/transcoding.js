@@ -10,6 +10,7 @@ class TranscodingManager {
         this.queuePage = 0;
         this.queuePageSize = 5;
         this.queueTotal = 0;
+        this.queueFilter = null; // null = all, 'Pending', 'Completed', 'Failed'
         this.isPaused = false;
         this.initializeSignalR();
         this.initializeEventHandlers();
@@ -635,24 +636,38 @@ class TranscodingManager {
     async loadWorkItems() {
         try {
             const skip = this.queuePage * this.queuePageSize;
+            const filterParam = this.queueFilter ? `&status=${this.queueFilter}` : '';
             const [statsResponse, itemsResponse] = await Promise.all([
                 fetch('/Home/GetWorkStats'),
-                fetch(`/Home/GetWorkItems?limit=${this.queuePageSize}&skip=${skip}`)
+                fetch(`/Home/GetWorkItems?limit=${this.queuePageSize}&skip=${skip}${filterParam}`)
             ]);
 
             const stats = await statsResponse.json();
             const data = await itemsResponse.json();
-            const workItems = data.items;
+            const queueItems = data.items;
+            const processingItems = data.processing || [];
             this.queueTotal = data.total;
 
-            // Clear existing items
+            // Clear queue container only — processing is handled separately
             this.workItems.clear();
             document.getElementById('workItemsContainer').innerHTML = '';
-            document.getElementById('processingContainer').innerHTML = '';
-            document.getElementById('processingSection').style.display = 'none';
 
-            // Add each work item
-            for (const workItem of workItems) {
+            // Render processing items (always shown regardless of page/filter)
+            const processingContainer = document.getElementById('processingContainer');
+            const processingSection = document.getElementById('processingSection');
+            processingContainer.innerHTML = '';
+            if (processingItems.length > 0) {
+                processingSection.style.display = '';
+                for (const item of processingItems) {
+                    this.workItems.set(item.id, item);
+                    this.renderWorkItem(item);
+                }
+            } else {
+                processingSection.style.display = 'none';
+            }
+
+            // Render queue items
+            for (const workItem of queueItems) {
                 this.workItems.set(workItem.id, workItem);
                 this.renderWorkItem(workItem);
             }
@@ -660,16 +675,50 @@ class TranscodingManager {
             // Update stats (desktop + mobile)
             this.updateStatCounters(stats);
 
-            if (workItems.length === 0 && this.queuePage === 0) {
-                document.getElementById('workItemsContainer').innerHTML = '<div class="text-muted text-center py-4"><i class="fas fa-inbox fa-2x mb-2"></i><br>No files in queue</div>';
+            if (queueItems.length === 0) {
+                const msg = this.queueFilter
+                    ? `No ${this.queueFilter.toLowerCase()} items`
+                    : 'No files in queue';
+                document.getElementById('workItemsContainer').innerHTML = `<div class="text-muted text-center py-4"><i class="fas fa-inbox fa-2x mb-2"></i><br>${msg}</div>`;
             }
 
             this.renderPagination();
+            this.renderFilterTabs(stats);
             this.loadPauseState();
         } catch (error) {
             console.error('Error loading work items:', error);
             showToast('Error loading work items: ' + error.message, 'danger');
         }
+    }
+
+    setFilter(filter) {
+        this.queueFilter = filter;
+        this.queuePage = 0;
+        this.loadWorkItems();
+    }
+
+    renderFilterTabs(stats) {
+        const container = document.getElementById('queueFilterTabs');
+        if (!container) return;
+
+        const filters = [
+            { label: 'All', value: null, count: (stats.pending || 0) + (stats.completed || 0) + (stats.failed || 0) },
+            { label: 'Pending', value: 'Pending', count: stats.pending || 0 },
+            { label: 'Completed', value: 'Completed', count: stats.completed || 0 },
+            { label: 'Failed', value: 'Failed', count: stats.failed || 0 },
+        ];
+
+        container.innerHTML = filters.map(f => {
+            const active = this.queueFilter === f.value ? 'active' : '';
+            return `<button class="btn btn-sm btn-outline-secondary ${active} queue-filter-btn" data-filter="${f.value ?? ''}">${f.label} <span class="badge bg-secondary ms-1">${f.count}</span></button>`;
+        }).join('');
+
+        container.querySelectorAll('.queue-filter-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const val = btn.dataset.filter;
+                this.setFilter(val === '' ? null : val);
+            });
+        });
     }
 
     renderPagination() {
@@ -687,6 +736,9 @@ class TranscodingManager {
             <nav class="d-flex justify-content-between align-items-center mt-3">
                 <small class="text-muted">${this.queueTotal} items</small>
                 <div class="btn-group btn-group-sm">
+                    <button class="btn btn-outline-secondary" ${page === 0 ? 'disabled' : ''} id="pageFirst" title="First page">
+                        <i class="fas fa-angle-double-left"></i>
+                    </button>
                     <button class="btn btn-outline-secondary" ${page === 0 ? 'disabled' : ''} id="pagePrev">
                         <i class="fas fa-chevron-left"></i>
                     </button>
@@ -694,15 +746,24 @@ class TranscodingManager {
                     <button class="btn btn-outline-secondary" ${page >= totalPages - 1 ? 'disabled' : ''} id="pageNext">
                         <i class="fas fa-chevron-right"></i>
                     </button>
+                    <button class="btn btn-outline-secondary" ${page >= totalPages - 1 ? 'disabled' : ''} id="pageLast" title="Last page">
+                        <i class="fas fa-angle-double-right"></i>
+                    </button>
                 </div>
             </nav>
         `;
 
+        document.getElementById('pageFirst')?.addEventListener('click', () => {
+            if (this.queuePage > 0) { this.queuePage = 0; this.loadWorkItems(); }
+        });
         document.getElementById('pagePrev')?.addEventListener('click', () => {
             if (this.queuePage > 0) { this.queuePage--; this.loadWorkItems(); }
         });
         document.getElementById('pageNext')?.addEventListener('click', () => {
             if (this.queuePage < totalPages - 1) { this.queuePage++; this.loadWorkItems(); }
+        });
+        document.getElementById('pageLast')?.addEventListener('click', () => {
+            if (this.queuePage < totalPages - 1) { this.queuePage = totalPages - 1; this.loadWorkItems(); }
         });
     }
 

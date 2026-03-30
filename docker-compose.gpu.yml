@@ -1,0 +1,9 @@
+services:
+  snacks:
+    devices:
+      # Intel QSV / VAAPI — pass through entire /dev/dri for GPU access
+      - /dev/dri:/dev/dri
+    # Ensure container user can access /dev/dri devices
+    group_add:
+      - video
+      - render

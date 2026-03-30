@@ -472,6 +472,20 @@ footer a.text-muted:hover {
 }
 
 /* ===========================
+   Queue Filter Tabs
+   =========================== */
+.queue-filter-btn.active {
+    background-color: var(--accent-primary) !important;
+    border-color: var(--accent-primary) !important;
+    color: #fff !important;
+}
+
+.queue-filter-btn .badge {
+    font-size: 0.7rem;
+    vertical-align: middle;
+}
+
+/* ===========================
    File and Duration Info
    =========================== */
 .file-size, .duration {

@@ -32,16 +32,16 @@ docker-compose ps | findstr "Up" >nul
 if %errorlevel% == 0 (
     echo ? Snacks is running successfully!
     echo.
-    echo ?? Web Interface: http://localhost:8080
+    echo ?? Web Interface: http://localhost:6767
     echo ?? Video Library: .\video-library (READ-WRITE)
     echo ?? Optional Output: .\data\output (for separate output)
     echo ?? Logs Directory: .\data\logs
     echo.
-    echo ?? Health Check: http://localhost:8080/Home/Health
+    echo ?? Health Check: http://localhost:6767/Home/Health
     echo.
     echo ?? Usage Instructions:
     echo   1. Place your video files in the 'video-library' folder
-    echo   2. Open the web interface at http://localhost:8080
+    echo   2. Open the web interface at http://localhost:6767
     echo   3. Use 'Browse Library' to select files for transcoding
     echo   4. Files are processed IN-PLACE unless you specify an output directory
     echo   5. Original files are backed up with '-OG' suffix during processing
@@ -50,7 +50,7 @@ if %errorlevel% == 0 (
     echo To stop: docker-compose down
     echo.
     echo Opening browser...
-    start http://localhost:8080
+    start http://localhost:6767
 ) else (
     echo ? Failed to start Snacks. Check logs:
     docker-compose logs snacks

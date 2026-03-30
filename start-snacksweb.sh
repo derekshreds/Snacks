@@ -42,15 +42,15 @@ fi
 
 # Build and start the container
 echo "?? Building and starting Snacks container..."
-docker-compose down 2>/dev/null
-docker-compose up -d --build
+docker-compose -f docker-compose.yml -f docker-compose.gpu.yml down 2>/dev/null
+docker-compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
 
 # Wait for container to be ready
 echo "? Waiting for container to start..."
 sleep 15
 
 # Check container status
-if docker-compose ps | grep -q "Up"; then
+if docker-compose -f docker-compose.yml -f docker-compose.gpu.yml ps | grep -q "Up"; then
     echo "? Snacks is running successfully!"
     echo ""
     echo "?? Web Interface: http://localhost:8080"
@@ -67,9 +67,9 @@ if docker-compose ps | grep -q "Up"; then
     echo "  4. Files are processed IN-PLACE unless you specify an output directory"
     echo "  5. Original files are backed up with '-OG' suffix during processing"
     echo ""
-    echo "To view logs: docker-compose logs -f snacks"
-    echo "To stop: docker-compose down"
+    echo "To view logs: docker-compose -f docker-compose.yml -f docker-compose.gpu.yml logs -f snacks"
+    echo "To stop: docker-compose -f docker-compose.yml -f docker-compose.gpu.yml down"
 else
     echo "? Failed to start Snacks. Check logs:"
-    docker-compose logs snacks
+    docker-compose -f docker-compose.yml -f docker-compose.gpu.yml logs snacks
 fi

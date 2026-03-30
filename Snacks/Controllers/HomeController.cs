@@ -196,20 +196,31 @@ namespace Snacks.Controllers
         }
 
         [HttpGet]
-        public IActionResult GetWorkItems(int? limit = null, int skip = 0)
+        public IActionResult GetWorkItems(int? limit = null, int skip = 0, string? status = null)
         {
-            // Processing first, then pending by highest bitrate, then completed/failed
-            var workItems = _transcodingService.GetAllWorkItems();
-            workItems.Sort((a, b) =>
+            var allItems = _transcodingService.GetAllWorkItems();
+
+            // Processing items are always returned separately so they don't affect pagination
+            var processingItems = allItems.Where(w => w.Status == WorkItemStatus.Processing).ToList();
+
+            // Queue items exclude processing — filter by status if requested
+            var queueItems = allItems.Where(w => w.Status != WorkItemStatus.Processing).ToList();
+
+            if (!string.IsNullOrEmpty(status))
+            {
+                if (Enum.TryParse<WorkItemStatus>(status, true, out var filterStatus))
+                    queueItems = queueItems.Where(w => w.Status == filterStatus).ToList();
+            }
+
+            queueItems.Sort((a, b) =>
             {
                 int StatusPriority(WorkItemStatus s) => s switch
                 {
-                    WorkItemStatus.Processing => 0,
-                    WorkItemStatus.Pending => 1,
-                    WorkItemStatus.Completed => 2,
-                    WorkItemStatus.Failed => 3,
-                    WorkItemStatus.Cancelled => 4,
-                    _ => 5
+                    WorkItemStatus.Pending => 0,
+                    WorkItemStatus.Completed => 1,
+                    WorkItemStatus.Failed => 2,
+                    WorkItemStatus.Cancelled => 3,
+                    _ => 4
                 };
 
                 int cmp = StatusPriority(a.Status).CompareTo(StatusPriority(b.Status));
@@ -219,11 +230,11 @@ namespace Snacks.Controllers
                 return b.Bitrate.CompareTo(a.Bitrate);
             });
 
-            var total = workItems.Count;
-            workItems = workItems.Skip(skip).ToList();
+            var total = queueItems.Count;
+            queueItems = queueItems.Skip(skip).ToList();
             if (limit.HasValue)
-                workItems = workItems.Take(limit.Value).ToList();
-            return Json(new { items = workItems, total });
+                queueItems = queueItems.Take(limit.Value).ToList();
+            return Json(new { items = queueItems, total, processing = processingItems });
         }
 
         [HttpGet]

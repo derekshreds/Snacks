@@ -1,8 +1,7 @@
 # Use the official ASP.NET Core runtime as base image
 FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS base
 WORKDIR /app
-EXPOSE 8080
-EXPOSE 8081
+EXPOSE 6767
 
 # Enable non-free repos for Intel media drivers
 RUN sed -i 's/^Components: main$/Components: main contrib non-free non-free-firmware/' /etc/apt/sources.list.d/debian.sources

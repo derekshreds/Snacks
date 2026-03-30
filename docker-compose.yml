@@ -5,7 +5,7 @@ services:
       dockerfile: Snacks/Dockerfile
     container_name: snacks
     ports:
-      - "8080:8080"
+      - "6767:6767"
     volumes:
       # Mount your video library directory (read-write for in-place processing)
       - ./video-library:/app/work/uploads
@@ -18,17 +18,11 @@ services:
       - SNACKS_WORK_DIR=/app/work
       - FFMPEG_PATH=/usr/bin/ffmpeg
       - FFPROBE_PATH=/usr/bin/ffprobe
-    devices:
-      # Intel QSV / VAAPI — pass through entire /dev/dri for GPU access
-      - /dev/dri:/dev/dri
-    # Ensure container user can access /dev/dri devices
-    group_add:
-      - video
-      - render
+    # GPU passthrough is configured in docker-compose.gpu.yml (Linux NAS only)
     privileged: false
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/Home/Health"]
+      test: ["CMD", "curl", "-f", "http://localhost:6767/Home/Health"]
       interval: 30s
       timeout: 10s
       retries: 3
