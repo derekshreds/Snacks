@@ -34,49 +34,61 @@ class TranscodingManager {
     }
 
     async initializeSignalR() {
-        this.connection = new signalR.HubConnectionBuilder()
-            .withUrl("/transcodingHub")
-            .withAutomaticReconnect([0, 2000, 5000, 10000, 30000])
-            .build();
-
-        // Handle work item events
-        this.connection.on("WorkItemAdded", (workItem) => {
-            this.addWorkItem(workItem);
-        });
-
-        this.connection.on("WorkItemUpdated", (workItem) => {
-            console.log('WorkItemUpdated', workItem.id, 'status:', workItem.status, 'progress:', workItem.progress);
-            this.updateWorkItem(workItem);
-        });
-
-        this.connection.on("TranscodingLog", (workItemId, message) => {
-            this.addLogMessage(workItemId, message);
-        });
-
-        this.connection.on("AutoScanCompleted", (newFiles, total) => {
-            showToast(`Auto-scan complete: ${newFiles} new file(s) found`, newFiles > 0 ? 'success' : 'info');
-            this.loadAutoScanConfig(false);
-        });
-
-        // Register lifecycle handlers BEFORE start so they catch all events
-        this.connection.onreconnected(async () => {
-            console.log("SignalR Reconnected — resyncing state");
-            this.updateConnectionStatus(true);
-            this.loadWorkItems();
-        });
-
-        this.connection.onreconnecting(() => {
-            console.log("SignalR Reconnecting...");
-            this.updateConnectionStatus(false);
-        });
-
-        this.connection.onclose(async () => {
-            console.log("SignalR Disconnected. Attempting to reconnect...");
-            this.updateConnectionStatus(false);
-            setTimeout(() => this.initializeSignalR(), 5000);
-        });
+        // Prevent concurrent initialization
+        if (this._signalingInit) return;
+        this._signalingInit = true;
 
         try {
+            // Stop any existing connection before creating a new one to prevent duplicate handlers
+            if (this.connection) {
+                this._intentionalStop = true;
+                try { await this.connection.stop(); } catch { /* already stopped */ }
+                this._intentionalStop = false;
+            }
+
+            this.connection = new signalR.HubConnectionBuilder()
+                .withUrl("/transcodingHub")
+                .withAutomaticReconnect([0, 2000, 5000, 10000, 30000])
+                .build();
+
+            // Handle work item events
+            this.connection.on("WorkItemAdded", (workItem) => {
+                this.addWorkItem(workItem);
+            });
+
+            this.connection.on("WorkItemUpdated", (workItem) => {
+                console.log('WorkItemUpdated', workItem.id, 'status:', workItem.status, 'progress:', workItem.progress);
+                this.updateWorkItem(workItem);
+            });
+
+            this.connection.on("TranscodingLog", (workItemId, message) => {
+                this.addLogMessage(workItemId, message);
+            });
+
+            this.connection.on("AutoScanCompleted", (newFiles, total) => {
+                showToast(`Auto-scan complete: ${newFiles} new file(s) found`, newFiles > 0 ? 'success' : 'info');
+                this.loadAutoScanConfig(false);
+            });
+
+            // Register lifecycle handlers BEFORE start so they catch all events
+            this.connection.onreconnected(async () => {
+                console.log("SignalR Reconnected — resyncing state");
+                this.updateConnectionStatus(true);
+                this.loadWorkItems();
+            });
+
+            this.connection.onreconnecting(() => {
+                console.log("SignalR Reconnecting...");
+                this.updateConnectionStatus(false);
+            });
+
+            this.connection.onclose(async () => {
+                if (this._intentionalStop) return;
+                console.log("SignalR Disconnected. Attempting to reconnect...");
+                this.updateConnectionStatus(false);
+                setTimeout(() => this.initializeSignalR(), 5000);
+            });
+
             await this.connection.start();
             console.log("SignalR Connected");
             this.updateConnectionStatus(true);
@@ -84,6 +96,8 @@ class TranscodingManager {
             console.error("SignalR Connection Error: ", err);
             this.updateConnectionStatus(false);
             setTimeout(() => this.initializeSignalR(), 5000);
+        } finally {
+            this._signalingInit = false;
         }
 
         // Periodically sync the connection status indicator with actual state.
@@ -874,10 +888,6 @@ class TranscodingManager {
         const processingSection = document.getElementById('processingSection');
         const statusString = this.getStatusString(workItem.status);
 
-        // Remove empty state message if present
-        const emptyMsg = queueContainer.querySelector('.text-muted.text-center');
-        if (emptyMsg) emptyMsg.remove();
-
         let element = document.getElementById(`work-item-${workItem.id}`);
 
         if (!element) {
@@ -889,8 +899,6 @@ class TranscodingManager {
         // Move element to the correct container based on status
         if (statusString === 'Processing') {
             if (element.parentNode !== processingContainer) {
-                // Remove existing children individually instead of innerHTML = ''
-                // to avoid destroying elements that may be referenced elsewhere
                 while (processingContainer.firstChild) {
                     processingContainer.removeChild(processingContainer.firstChild);
                 }
@@ -901,11 +909,14 @@ class TranscodingManager {
             // If it was in the processing container, move it out
             if (element.parentNode === processingContainer) {
                 element.remove();
-                // Hide processing section if empty
                 if (processingContainer.children.length === 0) {
                     processingSection.style.display = 'none';
                 }
             }
+            // Remove empty state message only when adding a real item to the queue
+            const emptyMsg = queueContainer.querySelector('.text-muted.text-center');
+            if (emptyMsg) emptyMsg.remove();
+
             // Add to queue container if not already there
             if (!element.parentNode || element.parentNode !== queueContainer) {
                 queueContainer.appendChild(element);

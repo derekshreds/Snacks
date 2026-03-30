@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-2.0.1-8b5cf6?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-2.0.2-8b5cf6?style=flat-square" alt="Version">
   <img src="https://img.shields.io/badge/.NET-8.0-512bd4?style=flat-square" alt=".NET 8">
   <img src="https://img.shields.io/badge/Electron-33-47848f?style=flat-square" alt="Electron">
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License">
@@ -109,7 +109,7 @@ Snacks can run as a standalone desktop app with native GPU acceleration.
 2. Download FFmpeg from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) (release full build)
 3. Place `ffmpeg.exe` and `ffprobe.exe` in `electron-app/ffmpeg/`
 4. Run `build-installer.bat`
-5. Install from `electron-app/dist/Snacks Setup 2.0.1.exe`
+5. Install from `electron-app/dist/Snacks Setup 2.0.2.exe`
 
 **For development:**
 
@@ -194,7 +194,7 @@ Click the terminal icon on any item to view detailed FFmpeg logs.
 
 Files are automatically skipped if they already meet requirements:
 
-- Already HEVC and below target bitrate (1080p: 1.5x target, 4K: 3x target)
+- Already HEVC and below target bitrate (1080p: 1.5x target, 4K: 4x target)
 - Already encoded (filename contains `[snacks]`)
 
 ---
@@ -213,6 +213,7 @@ Files are automatically skipped if they already meet requirements:
 ### NAS Notes
 
 - **QNAP TS-453E (J6412)**: Uses VAAPI with CQP rate control. VBR is not supported on Elkhart Lake.
+- **Software decode fallback**: Codecs that VAAPI can't decode (e.g., AV1 on older Intel hardware) are automatically decoded in software while still using VAAPI for hardware encoding.
 - The container uses [jellyfin-ffmpeg](https://github.com/jellyfin/jellyfin-ffmpeg) which includes full VAAPI/QSV support.
 - `privileged: true` is required on QNAP for `/dev/dri` access.
 - Hardware detection runs automatically on first encode and caches the result.
@@ -297,5 +298,5 @@ Creates a self-contained Windows installer at `electron-app/dist/` with the .NET
 ---
 
 <p align="center">
-  <strong>Snacks</strong> v2.0.1 &copy; 2026 Derek Morris
+  <strong>Snacks</strong> v2.0.2 &copy; 2026 Derek Morris
 </p>
