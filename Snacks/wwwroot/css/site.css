@@ -471,6 +471,12 @@ footer a.text-muted:hover {
     border: 1px solid rgba(107, 114, 128, 0.3);
 }
 
+.status-stopped {
+    background: rgba(234, 179, 8, 0.15);
+    color: #facc15;
+    border: 1px solid rgba(234, 179, 8, 0.3);
+}
+
 /* ===========================
    Queue Filter Tabs
    =========================== */
@@ -870,6 +876,64 @@ footer a.text-muted:hover {
     color: var(--text-primary);
 }
 
+/* ===========================
+   Tablet (768px - 1199px)
+   =========================== */
+@media (max-width: 1199px) {
+    /* Tighter modal padding at tablet sizes */
+    .modal-body {
+        padding: 0.75rem;
+    }
+
+    .modal-footer {
+        padding: 0.5rem 0.75rem;
+    }
+
+    /* Library browser: reduce inner padding */
+    #directoryList,
+    #fileList {
+        padding: 0.5rem !important;
+    }
+
+    /* Encoder options panels need less padding */
+    .encoder-panel {
+        padding: 0.75rem;
+    }
+
+    .encoder-panel .mb-3 {
+        margin-bottom: 0.5rem !important;
+    }
+
+    .encoder-panel .form-text {
+        font-size: 0.75rem;
+    }
+}
+
+/* Library browser: compact directory action items */
+@media (max-width: 1199px) {
+    .directory-item {
+        font-size: 0.85rem;
+        padding: 0.35rem 0.5rem !important;
+    }
+}
+
+/* Tablet: shorter lists when library browser stacks (below lg breakpoint) */
+@media (max-width: 991px) {
+    #directoryList {
+        height: 200px !important;
+    }
+
+    #fileList {
+        height: 300px !important;
+        margin-top: 0.5rem;
+    }
+
+    /* Settings: stack to single column below lg */
+    #settingsModal .col-md-6 {
+        width: 100%;
+    }
+}
+
 @media (max-width: 768px) {
     /* Compact header */
     .display-6 {
@@ -926,17 +990,21 @@ footer a.text-muted:hover {
         font-size: 0.75rem;
     }
 
-    /* Modal fullscreen on mobile */
-    .modal-dialog {
+    /* Complex modals go fullscreen on mobile — simple dialogs stay normal */
+    .modal-fullscreen-mobile .modal-dialog {
         margin: 0;
         max-width: 100%;
         height: 100%;
     }
 
-    .modal-content {
+    .modal-fullscreen-mobile .modal-content {
         height: 100%;
         border: none;
         border-radius: 0;
+    }
+
+    .modal-body {
+        padding: 0.5rem;
     }
 
     /* Log viewer */

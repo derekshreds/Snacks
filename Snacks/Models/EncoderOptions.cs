@@ -17,5 +17,7 @@ namespace Snacks.Models
         public string? EncodeDirectory { get; set; }
         public bool StrictBitrate { get; set; } = false;
         public string HardwareAcceleration { get; set; } = "auto"; // auto, intel, amd, nvidia, none
+        public int FourKBitrateMultiplier { get; set; } = 4; // multiplier for 4K content (2-8x)
+        public bool Skip4K { get; set; } = false; // skip 4K videos entirely
     }
 }

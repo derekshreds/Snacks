@@ -1,14 +1,18 @@
 using Microsoft.AspNetCore.SignalR;
+using Snacks.Data;
 using Snacks.Hubs;
 using Snacks.Models;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace Snacks.Services
 {
     public class AutoScanService : IHostedService, IDisposable
     {
         private readonly FileService _fileService;
+        private readonly FfprobeService _ffprobeService;
         private readonly TranscodingService _transcodingService;
+        private readonly MediaFileRepository _mediaFileRepo;
         private readonly IHubContext<TranscodingHub> _hubContext;
         private readonly SemaphoreSlim _scanLock = new(1, 1);
         private readonly string _configPath;
@@ -22,10 +26,14 @@ namespace Snacks.Services
         private AutoScanConfig _config = new();
         private Timer? _timer;
 
-        public AutoScanService(FileService fileService, TranscodingService transcodingService, IHubContext<TranscodingHub> hubContext)
+        public AutoScanService(FileService fileService, FfprobeService ffprobeService,
+            TranscodingService transcodingService, MediaFileRepository mediaFileRepo,
+            IHubContext<TranscodingHub> hubContext)
         {
             _fileService = fileService;
+            _ffprobeService = ffprobeService;
             _transcodingService = transcodingService;
+            _mediaFileRepo = mediaFileRepo;
             _hubContext = hubContext;
 
             var workDir = _fileService.GetWorkingDirectory();
@@ -40,7 +48,18 @@ namespace Snacks.Services
         public Task StartAsync(CancellationToken cancellationToken)
         {
             LoadConfig();
+            MigrateSeenFilesIfNeeded();
             ScheduleTimer();
+
+            // Restore pause state from last session
+            if (_config.QueuePaused)
+            {
+                _transcodingService.SetPaused(true);
+                Console.WriteLine("Queue was paused when app last shut down — staying paused.");
+            }
+
+            // Resume any items that were queued or mid-encode when the app last shut down
+            _ = Task.Run(ResumeQueueFromDatabaseAsync);
 
             // Run an immediate scan on startup if enabled, so files pending
             // from before a restart get re-queued without waiting for the interval
@@ -100,14 +119,70 @@ namespace Snacks.Services
             ScheduleTimer();
         }
 
+        public void SetQueuePaused(bool paused)
+        {
+            _config.QueuePaused = paused;
+            SaveConfig();
+        }
+
+        public bool IsQueuePaused => _config.QueuePaused;
+
         public async Task TriggerScanNow()
         {
             await RunScan();
         }
 
-        public void ClearHistory()
+        /// <summary>
+        /// Restores the queue from the database on startup. Files that were Queued or Processing
+        /// when the app last shut down get re-added to the in-memory queue.
+        /// </summary>
+        private async Task ResumeQueueFromDatabaseAsync()
         {
-            _config.SeenFiles.Clear();
+            try
+            {
+                var options = LoadEncoderOptions();
+                var queued = await _mediaFileRepo.GetFilesWithStatusAsync(MediaFileStatus.Queued);
+                var processing = await _mediaFileRepo.GetFilesWithStatusAsync(MediaFileStatus.Processing);
+                var toResume = queued.Concat(processing).ToList();
+
+                if (toResume.Count == 0)
+                    return;
+
+                Console.WriteLine($"Resuming {toResume.Count} items from database...");
+
+                foreach (var file in toResume)
+                {
+                    if (!File.Exists(file.FilePath))
+                    {
+                        // File no longer exists — mark as unseen so it gets pruned
+                        await _mediaFileRepo.SetStatusAsync(file.FilePath, MediaFileStatus.Unseen);
+                        continue;
+                    }
+
+                    // Reset to Unseen so AddFileAsync can pick it up fresh
+                    await _mediaFileRepo.SetStatusAsync(file.FilePath, MediaFileStatus.Unseen);
+
+                    try
+                    {
+                        await _transcodingService.AddFileAsync(file.FilePath, options);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Resume: Failed to re-add {file.FileName}: {ex.Message}");
+                    }
+                }
+
+                Console.WriteLine("Queue resume complete.");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Resume: Error restoring queue: {ex.Message}");
+            }
+        }
+
+        public async Task ClearHistoryAsync()
+        {
+            await _mediaFileRepo.ResetAllStatusesAsync();
             _config.LastScanTime = null;
             _config.LastScanNewFiles = 0;
             SaveConfig();
@@ -143,26 +218,113 @@ namespace Snacks.Services
                     allVideoFiles.AddRange(files);
                 }
 
-                // A file is "seen" if:
-                // 1. Its exact path is in SeenFiles, OR
-                // 2. Its base name (without extension) matches a seen file's base name in the same directory
-                //    (handles format changes like movie.mp4 → movie.mkv after delete-original)
-                var seenBaseNames = new HashSet<string>(
-                    _config.SeenFiles.Select(f => Path.Combine(
-                        Path.GetDirectoryName(f) ?? "",
-                        Path.GetFileNameWithoutExtension(f))),
-                    StringComparer.OrdinalIgnoreCase);
+                // Load all known file info from DB in one batch for performance
+                var scannedDirs = allVideoFiles
+                    .Select(f => Path.GetDirectoryName(f) ?? "")
+                    .Distinct()
+                    .ToList();
+                var knownPaths = await _mediaFileRepo.GetFileInfoBatchAsync(scannedDirs);
+                var knownBaseNames = await _mediaFileRepo.GetBaseNameStatusBatchAsync(scannedDirs);
 
-                var newFiles = allVideoFiles.Where(f =>
-                    !_config.SeenFiles.Contains(f) &&
-                    !seenBaseNames.Contains(Path.Combine(
-                        Path.GetDirectoryName(f) ?? "",
-                        Path.GetFileNameWithoutExtension(f)))
-                ).ToList();
+                var newFiles = new List<string>();
+                foreach (var file in allVideoFiles)
+                {
+                    var normalizedPath = Path.GetFullPath(file);
+
+                    // Check by exact path
+                    if (knownPaths.TryGetValue(normalizedPath, out var info) &&
+                        info.Status is not MediaFileStatus.Unseen)
+                    {
+                        // Change detection: if size changed significantly, file was likely replaced.
+                        // Small changes (metadata edits, remux) are ignored.
+                        try
+                        {
+                            var fi = new FileInfo(normalizedPath);
+                            double sizeDelta = info.FileSize > 0 ? Math.Abs(1.0 - (double)fi.Length / info.FileSize) : 0;
+                            if (sizeDelta > 0.10) // >10% size change
+                            {
+                                Console.WriteLine($"AutoScan: File changed on disk: {Path.GetFileName(file)} ({sizeDelta:P0} size change) — re-queuing");
+                                await _mediaFileRepo.ResetFileAsync(normalizedPath);
+                                newFiles.Add(file);
+                            }
+                        }
+                        catch { }
+                        continue;
+                    }
+
+                    // Check by base name in same directory (handles extension changes after replace-original)
+                    var dir = Path.GetDirectoryName(normalizedPath) ?? "";
+                    var baseName = Path.GetFileNameWithoutExtension(normalizedPath);
+                    var baseKey = $"{dir}|{baseName}".ToLowerInvariant();
+                    if (knownBaseNames.TryGetValue(baseKey, out var baseStatus) &&
+                        baseStatus is not MediaFileStatus.Unseen)
+                    {
+                        continue;
+                    }
+
+                    newFiles.Add(file);
+                }
 
                 int newFileCount = 0;
                 foreach (var file in newFiles)
                 {
+                    // Skip files that were recently modified — they may still be transferring
+                    try
+                    {
+                        var lastWrite = File.GetLastWriteTimeUtc(file);
+                        if (DateTime.UtcNow - lastWrite < TimeSpan.FromMinutes(30))
+                        {
+                            Console.WriteLine($"AutoScan: Skipping {Path.GetFileName(file)}: modified {(int)(DateTime.UtcNow - lastWrite).TotalMinutes}m ago, may still be transferring");
+                            continue;
+                        }
+                    }
+                    catch { continue; }
+
+                    // Before queueing, check if a [snacks] file already exists and validate it
+                    var dir = Path.GetDirectoryName(file) ?? "";
+                    var baseName = Path.GetFileNameWithoutExtension(file);
+                    var snacksFiles = Directory.Exists(dir)
+                        ? Directory.GetFiles(dir, $"{baseName} [snacks].*")
+                            .Where(f => _fileService.IsVideoFile(f))
+                            .ToList()
+                        : new List<string>();
+
+                    if (snacksFiles.Count > 0)
+                    {
+                        // Validate the [snacks] file — it may be a partial from an interrupted encode
+                        bool validSnacksExists = false;
+                        foreach (var snacksFile in snacksFiles)
+                        {
+                            try
+                            {
+                                var originalProbe = await _ffprobeService.ProbeAsync(file);
+                                var snacksProbe = await _ffprobeService.ProbeAsync(snacksFile);
+                                if (_ffprobeService.ConvertedSuccessfully(originalProbe, snacksProbe))
+                                {
+                                    validSnacksExists = true;
+                                    break;
+                                }
+                                else
+                                {
+                                    Console.WriteLine($"AutoScan: Partial [snacks] file detected, deleting: {snacksFile}");
+                                    try { File.Delete(snacksFile); } catch { }
+                                }
+                            }
+                            catch
+                            {
+                                Console.WriteLine($"AutoScan: Corrupt [snacks] file detected, deleting: {snacksFile}");
+                                try { File.Delete(snacksFile); } catch { }
+                            }
+                        }
+
+                        if (validSnacksExists)
+                        {
+                            // Mark as completed in DB — valid output already exists
+                            await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(file), MediaFileStatus.Completed);
+                            continue;
+                        }
+                    }
+
                     try
                     {
                         await _transcodingService.AddFileAsync(file, options);
@@ -174,56 +336,8 @@ namespace Snacks.Services
                     }
                 }
 
-                // Only mark files as seen if they were skipped by AddFileAsync
-                // (already meet requirements) or have a [snacks] output.
-                // Files that were queued for encoding are NOT marked — if the
-                // container restarts before they finish, the next scan re-queues them.
-                foreach (var file in allVideoFiles)
-                {
-                    // File was already in the queue/completed from a prior scan
-                    if (_config.SeenFiles.Contains(file))
-                        continue;
-
-                    // Check if a [snacks] encoded version already exists
-                    var dir = Path.GetDirectoryName(file) ?? "";
-                    var baseName = Path.GetFileNameWithoutExtension(file);
-                    var snacksExists = Directory.GetFiles(dir, $"{baseName} [snacks].*")
-                        .Any(f => _fileService.IsVideoFile(f) || f.EndsWith(".mkv", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".mp4", StringComparison.OrdinalIgnoreCase));
-
-                    if (snacksExists)
-                    {
-                        _config.SeenFiles.Add(file);
-                        continue;
-                    }
-
-                    // Check if AddFileAsync skipped it (not in the work queue = was filtered out)
-                    if (!_transcodingService.IsFileQueued(file))
-                    {
-                        _config.SeenFiles.Add(file);
-                    }
-                    // else: file is in the queue — don't mark as seen until it completes
-                }
-
-                // Prune SeenFiles entries where the file no longer exists on disk,
-                // but first check if a replacement file exists (delete-original renames the output).
-                // Add the replacement path so the file stays "seen" after pruning.
-                var toAdd = new List<string>();
-                foreach (var seenFile in _config.SeenFiles.Where(f => !File.Exists(f)).ToList())
-                {
-                    var dir = Path.GetDirectoryName(seenFile) ?? "";
-                    var baseName = Path.GetFileNameWithoutExtension(seenFile);
-                    // Look for any video file with the same base name (different extension = format change)
-                    var replacement = Directory.Exists(dir)
-                        ? Directory.GetFiles(dir, $"{baseName}.*")
-                            .FirstOrDefault(f => _fileService.IsVideoFile(f))
-                        : null;
-                    if (replacement != null)
-                        toAdd.Add(replacement);
-                }
-                foreach (var f in toAdd)
-                    _config.SeenFiles.Add(f);
-
-                _config.SeenFiles.RemoveWhere(f => !File.Exists(f));
+                // Prune DB entries for files that no longer exist on disk
+                await _mediaFileRepo.PruneDeletedFilesAsync();
 
                 _config.LastScanTime = DateTime.UtcNow;
                 _config.LastScanNewFiles = newFileCount;
@@ -238,6 +352,47 @@ namespace Snacks.Services
             finally
             {
                 _scanLock.Release();
+            }
+        }
+
+        /// <summary>
+        /// One-time migration: moves SeenFiles from the old autoscan.json into the database.
+        /// </summary>
+        private void MigrateSeenFilesIfNeeded()
+        {
+            if (!File.Exists(_configPath))
+                return;
+
+            try
+            {
+                var json = File.ReadAllText(_configPath);
+                using var doc = JsonDocument.Parse(json);
+
+                if (!doc.RootElement.TryGetProperty("SeenFiles", out var seenFilesElement) &&
+                    !doc.RootElement.TryGetProperty("seenFiles", out seenFilesElement))
+                    return;
+
+                var seenFiles = new List<string>();
+                foreach (var item in seenFilesElement.EnumerateArray())
+                {
+                    var path = item.GetString();
+                    if (!string.IsNullOrEmpty(path))
+                        seenFiles.Add(path);
+                }
+
+                if (seenFiles.Count > 0)
+                {
+                    Console.WriteLine($"AutoScan: Migrating {seenFiles.Count} SeenFiles entries to database...");
+                    _mediaFileRepo.BulkInsertSeenFilesAsync(seenFiles).GetAwaiter().GetResult();
+                    Console.WriteLine("AutoScan: Migration complete.");
+
+                    // Re-save config without SeenFiles (the property no longer exists on the model)
+                    SaveConfig();
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"AutoScan: SeenFiles migration failed (non-fatal): {ex.Message}");
             }
         }
 

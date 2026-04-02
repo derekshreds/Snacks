@@ -192,6 +192,7 @@ class TranscodingManager {
         if (fileList) fileList.innerHTML = '<div class="text-muted text-center py-4"><i class="fas fa-folder-open fa-2x mb-2"></i><br>Select a directory to view files</div>';
         this.currentDirectory = null;
         this.selectedFiles.clear();
+        this.updateProcessButton();
 
         try {
             container.innerHTML = '<div class="text-center"><div class="spinner-border" role="status"><span class="visually-hidden">Loading...</span></div></div>';
@@ -591,10 +592,11 @@ class TranscodingManager {
     getEncoderOptions(prefix = '') {
         const codec = document.getElementById(`${prefix}Codec`).value;
         const hwAccel = document.getElementById(`${prefix}HardwareAcceleration`).value;
+        const encoderMap = { 'h265': 'libx265', 'h264': 'libx264', 'av1': 'libsvtav1' };
         const options = {
             Format: document.getElementById(`${prefix}Format`).value,
             Codec: codec,
-            Encoder: codec === 'h265' ? 'libx265' : 'libx264',
+            Encoder: encoderMap[codec] || 'libx265',
             HardwareAcceleration: hwAccel,
             TargetBitrate: parseInt(document.getElementById(`${prefix}TargetBitrate`).value),
             TwoChannelAudio: document.getElementById(`${prefix}TwoChannelAudio`).checked,
@@ -603,7 +605,10 @@ class TranscodingManager {
             RemoveBlackBorders: document.getElementById(`${prefix}RemoveBlackBorders`).checked,
             DeleteOriginalFile: document.getElementById(`${prefix}DeleteOriginalFile`).checked,
             RetryOnFail: document.getElementById(`${prefix}RetryOnFail`).checked,
-            StrictBitrate: document.getElementById(`${prefix}StrictBitrate`).checked
+            StrictBitrate: document.getElementById(`${prefix}StrictBitrate`).checked,
+            FourKBitrateMultiplier: parseInt(document.getElementById(`${prefix}FourKBitrateMultiplier`)?.value || '4'),
+            Skip4K: document.getElementById(`${prefix}Skip4K`)?.checked || false,
+            OutputDirectory: document.getElementById(`${prefix}OutputDirectory`)?.value || ''
         };
         this.saveSettingsToServer(options);
         return options;
@@ -633,17 +638,20 @@ class TranscodingManager {
                 else el.value = val;
             };
 
-            set('Format', saved.Format);
-            set('Codec', saved.Codec);
-            set('HardwareAcceleration', saved.HardwareAcceleration);
-            set('TargetBitrate', saved.TargetBitrate);
-            set('TwoChannelAudio', saved.TwoChannelAudio);
-            set('EnglishOnlyAudio', saved.EnglishOnlyAudio);
-            set('EnglishOnlySubtitles', saved.EnglishOnlySubtitles);
-            set('RemoveBlackBorders', saved.RemoveBlackBorders);
-            set('DeleteOriginalFile', saved.DeleteOriginalFile);
-            set('RetryOnFail', saved.RetryOnFail);
-            set('StrictBitrate', saved.StrictBitrate);
+            set('Format', saved.Format || saved.format);
+            set('Codec', saved.Codec || saved.codec);
+            set('HardwareAcceleration', saved.HardwareAcceleration || saved.hardwareAcceleration);
+            set('TargetBitrate', saved.TargetBitrate || saved.targetBitrate);
+            set('TwoChannelAudio', saved.TwoChannelAudio ?? saved.twoChannelAudio);
+            set('EnglishOnlyAudio', saved.EnglishOnlyAudio ?? saved.englishOnlyAudio);
+            set('EnglishOnlySubtitles', saved.EnglishOnlySubtitles ?? saved.englishOnlySubtitles);
+            set('RemoveBlackBorders', saved.RemoveBlackBorders ?? saved.removeBlackBorders);
+            set('DeleteOriginalFile', saved.DeleteOriginalFile ?? saved.deleteOriginalFile);
+            set('RetryOnFail', saved.RetryOnFail ?? saved.retryOnFail);
+            set('StrictBitrate', saved.StrictBitrate ?? saved.strictBitrate);
+            set('FourKBitrateMultiplier', saved.FourKBitrateMultiplier || saved.fourKBitrateMultiplier);
+            set('Skip4K', saved.Skip4K ?? saved.skip4K);
+            set('OutputDirectory', saved.OutputDirectory || saved.outputDirectory || '');
         } catch { }
     }
 
@@ -858,10 +866,11 @@ class TranscodingManager {
     getStatusString(status) {
         const statusMap = {
             0: 'Pending',
-            1: 'Processing', 
+            1: 'Processing',
             2: 'Completed',
             3: 'Failed',
-            4: 'Cancelled'
+            4: 'Cancelled',
+            5: 'Stopped'
         };
         
         return typeof status === 'string' ? status : statusMap[status] || 'Unknown';
@@ -927,9 +936,9 @@ class TranscodingManager {
         element.innerHTML = this.getWorkItemHtml({...workItem, status: statusString});
 
         // Add event listeners
-        const cancelBtn = element.querySelector('.cancel-btn');
-        if (cancelBtn) {
-            cancelBtn.addEventListener('click', () => this.cancelWorkItem(workItem.id));
+        const removeBtn = element.querySelector('.remove-btn');
+        if (removeBtn) {
+            removeBtn.addEventListener('click', () => this.showStopCancelDialog(workItem.id));
         }
 
         const logBtn = element.querySelector('.log-btn');
@@ -988,11 +997,11 @@ class TranscodingManager {
     getActionButtons(workItem) {
         switch (workItem.status) {
             case 'Pending':
-                return '<button class="btn btn-sm btn-outline-danger cancel-btn" title="Cancel"><i class="fas fa-times"></i></button>';
+                return '<button class="btn btn-sm btn-outline-danger remove-btn" title="Remove from queue"><i class="fas fa-times"></i></button>';
             case 'Processing':
                 return `
                     <div class="btn-group" role="group">
-                        <button class="btn btn-sm btn-outline-danger cancel-btn" title="Cancel"><i class="fas fa-times"></i></button>
+                        <button class="btn btn-sm btn-outline-danger remove-btn" title="Stop/Cancel"><i class="fas fa-times"></i></button>
                         <button class="btn btn-sm btn-outline-info log-btn" title="View Log"><i class="fas fa-terminal"></i></button>
                     </div>
                 `;
@@ -1000,23 +1009,53 @@ class TranscodingManager {
                 return '<button class="btn btn-sm btn-outline-info log-btn" title="View Log"><i class="fas fa-terminal"></i></button>';
             case 'Failed':
             case 'Cancelled':
+            case 'Stopped':
                 return '<button class="btn btn-sm btn-outline-info log-btn" title="View Log"><i class="fas fa-terminal"></i></button>';
             default:
                 return '';
         }
     }
 
+    showStopCancelDialog(workItemId) {
+        const modalEl = document.getElementById('stopCancelModal');
+        const modal = bootstrap.Modal.getOrCreateInstance(modalEl);
+
+        // Clone and replace buttons to remove old event listeners
+        const stopBtn = document.getElementById('stopCancelStop');
+        const cancelBtn = document.getElementById('stopCancelCancel');
+        const newStop = stopBtn.cloneNode(true);
+        const newCancel = cancelBtn.cloneNode(true);
+        stopBtn.replaceWith(newStop);
+        cancelBtn.replaceWith(newCancel);
+
+        newStop.addEventListener('click', async () => {
+            modal.hide();
+            await this.stopWorkItem(workItemId);
+        });
+
+        newCancel.addEventListener('click', async () => {
+            modal.hide();
+            await this.cancelWorkItem(workItemId);
+        });
+
+        modal.show();
+    }
+
+    async stopWorkItem(id) {
+        try {
+            const response = await fetch(`/Home/StopWorkItem?id=${id}`, { method: 'POST' });
+            if (!response.ok) throw new Error('Failed to stop work item');
+            showToast('Work item stopped \u2014 will be re-queued on next scan', 'info');
+        } catch (error) {
+            showToast('Error stopping work item: ' + error.message, 'danger');
+        }
+    }
+
     async cancelWorkItem(id) {
         try {
-            const response = await fetch(`/Home/CancelWorkItem?id=${id}`, {
-                method: 'POST'
-            });
-
-            if (!response.ok) {
-                throw new Error('Failed to cancel work item');
-            }
-
-            showToast('Work item cancelled', 'info');
+            const response = await fetch(`/Home/CancelWorkItem?id=${id}`, { method: 'POST' });
+            if (!response.ok) throw new Error('Failed to cancel work item');
+            showToast('Work item cancelled \u2014 will not be reprocessed', 'info');
         } catch (error) {
             showToast('Error cancelling work item: ' + error.message, 'danger');
         }
@@ -1026,44 +1065,75 @@ class TranscodingManager {
         if (!this.logs.has(workItemId)) {
             this.logs.set(workItemId, []);
         }
-        
+
         this.logs.get(workItemId).push({
             timestamp: new Date(),
             message: message
         });
 
-        // Update log modal if it's open for this work item
+        // Append to log modal if it's open for this work item (don't replace everything)
         const logModal = document.getElementById('logModal');
         if (logModal.getAttribute('data-work-item-id') === workItemId) {
-            this.updateLogModal(workItemId);
+            const logContent = document.getElementById('logContent');
+            const wasAtBottom = logContent.scrollHeight - logContent.scrollTop - logContent.clientHeight < 50;
+
+            const entry = document.createElement('div');
+            entry.className = 'log-entry';
+            entry.innerHTML = `<span class="text-muted">[${new Date().toLocaleTimeString('en-GB')}]</span> ${escapeHtml(message)}`;
+            logContent.appendChild(entry);
+
+            if (wasAtBottom) {
+                logContent.scrollTop = logContent.scrollHeight;
+            }
         }
     }
 
-    showLog(workItemId) {
+    async showLog(workItemId) {
         const workItem = this.workItems.get(workItemId);
         const logModal = document.getElementById('logModal');
         const logModalTitle = logModal.querySelector('.modal-title');
-        
+
         logModalTitle.innerHTML = `
             <i class="fas fa-terminal me-2"></i>
-            Transcoding Log - ${workItem.fileName}
+            Transcoding Log - ${workItem?.fileName || 'Unknown'}
         `;
-        
+
         logModal.setAttribute('data-work-item-id', workItemId);
+
+        // Load persisted logs from server, then overlay any in-memory entries
+        await this.loadLogsFromServer(workItemId);
         this.updateLogModal(workItemId);
-        
-        new bootstrap.Modal(logModal).show();
+
+        bootstrap.Modal.getOrCreateInstance(logModal).show();
+    }
+
+    async loadLogsFromServer(workItemId) {
+        try {
+            const response = await fetch(`/Home/GetWorkItemLogs?id=${workItemId}`);
+            if (!response.ok) return;
+            const serverLogs = await response.json();
+            if (serverLogs.length > 0) {
+                // Replace in-memory logs with server-persisted ones
+                this.logs.set(workItemId, serverLogs.map(line => ({
+                    timestamp: null,
+                    message: line,
+                    fromServer: true
+                })));
+            }
+        } catch { }
     }
 
     updateLogModal(workItemId) {
         const logContent = document.getElementById('logContent');
         const logs = this.logs.get(workItemId) || [];
-        
+
         logContent.innerHTML = logs.map(log =>
-            `<div class="log-entry"><span class="text-muted">[${log.timestamp.toLocaleTimeString()}]</span> ${escapeHtml(log.message)}</div>`
+            log.fromServer
+                ? `<div class="log-entry">${escapeHtml(log.message)}</div>`
+                : `<div class="log-entry"><span class="text-muted">[${log.timestamp.toLocaleTimeString('en-GB')}]</span> ${escapeHtml(log.message)}</div>`
         ).join('');
-        
-        // Auto-scroll to bottom
+
+        // Scroll to bottom on initial load
         logContent.scrollTop = logContent.scrollHeight;
     }
 

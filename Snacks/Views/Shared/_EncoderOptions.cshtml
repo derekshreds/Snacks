@@ -9,7 +9,7 @@
                 <i class="fas fa-cogs me-2 text-primary"></i>
                 Video Settings
             </h6>
-            
+
             <div class="mb-3">
                 <label for="@(formPrefix)Format" class="form-label">
                     <i class="fas fa-file-video me-1"></i> Output Format
@@ -31,10 +31,11 @@
                 <select class="form-select" id="@(formPrefix)Codec" name="Codec">
                     <option value="h265" selected>H.265/HEVC (Better Quality)</option>
                     <option value="h264">H.264/AVC (Faster)</option>
+                    <option value="av1">AV1 (Best Compression)</option>
                 </select>
                 <div class="form-text">
                     <i class="fas fa-info-circle me-1"></i>
-                    H.265 provides better compression with same quality
+                    AV1 offers the best compression but is slower to encode
                 </div>
             </div>
 
@@ -71,6 +72,34 @@
                 <label class="form-check-label" for="@(formPrefix)StrictBitrate">
                     <i class="fas fa-lock me-1"></i> Strict Bitrate Control
                 </label>
+            </div>
+
+            <div class="mb-3 mt-3">
+                <label for="@(formPrefix)FourKBitrateMultiplier" class="form-label">
+                    <i class="fas fa-expand me-1"></i> 4K Bitrate Multiplier
+                </label>
+                <select class="form-select" id="@(formPrefix)FourKBitrateMultiplier" name="FourKBitrateMultiplier">
+                    <option value="2">2x</option>
+                    <option value="3">3x</option>
+                    <option value="4" selected>4x (Default)</option>
+                    <option value="5">5x</option>
+                    <option value="6">6x</option>
+                    <option value="8">8x</option>
+                </select>
+                <div class="form-text">
+                    <i class="fas fa-info-circle me-1"></i>
+                    Multiplies target bitrate for 4K content
+                </div>
+            </div>
+
+            <div class="form-check mb-2">
+                <input class="form-check-input" type="checkbox" id="@(formPrefix)Skip4K" name="Skip4K">
+                <label class="form-check-label" for="@(formPrefix)Skip4K">
+                    <i class="fas fa-ban me-1"></i> Skip 4K Videos
+                </label>
+                <div class="form-text ms-4">
+                    Leave 4K content untouched
+                </div>
             </div>
         </div>
     </div>
@@ -125,10 +154,21 @@
             <div class="form-check mb-3">
                 <input class="form-check-input" type="checkbox" id="@(formPrefix)DeleteOriginalFile" name="DeleteOriginalFile">
                 <label class="form-check-label" for="@(formPrefix)DeleteOriginalFile">
-                    <i class="fas fa-trash-alt me-1 text-danger"></i> Delete Original Files
+                    <i class="fas fa-exchange-alt me-1 text-danger"></i> Replace Original Files
                 </label>
                 <div class="form-text ms-4 text-danger">
-                    <strong>Warning:</strong> This cannot be undone!
+                    <strong>Warning:</strong> Deletes original and moves encoded file to its location. This cannot be undone!
+                </div>
+            </div>
+
+            <div class="mb-3">
+                <label for="@(formPrefix)OutputDirectory" class="form-label">
+                    <i class="fas fa-folder me-1"></i> Output Directory
+                </label>
+                <input type="text" class="form-control" id="@(formPrefix)OutputDirectory" name="OutputDirectory" placeholder="Leave blank to output next to originals">
+                <div class="form-text">
+                    <i class="fas fa-info-circle me-1"></i>
+                    Where encoded files are saved. If Replace is enabled, files are moved back to the original location after encoding.
                 </div>
             </div>
 

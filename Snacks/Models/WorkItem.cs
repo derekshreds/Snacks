@@ -24,6 +24,7 @@ namespace Snacks.Models
         Processing,
         Completed,
         Failed,
-        Cancelled
+        Cancelled,
+        Stopped
     }
 }

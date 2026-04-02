@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.SignalR;
+using Snacks.Data;
 using Snacks.Hubs;
 using Snacks.Models;
 using System.Collections.Concurrent;
@@ -16,6 +17,7 @@ namespace Snacks.Services
         private readonly FileService _fileService;
         private readonly FfprobeService _ffprobeService;
         private readonly IHubContext<TranscodingHub> _hubContext;
+        private readonly MediaFileRepository _mediaFileRepo;
         private readonly string _ffmpegPath;
         private readonly SemaphoreSlim _processingLock = new(1, 1);
         private Process? _activeProcess;
@@ -37,11 +39,12 @@ namespace Snacks.Services
             }
         }
 
-        public TranscodingService(FileService fileService, FfprobeService ffprobeService, IHubContext<TranscodingHub> hubContext)
+        public TranscodingService(FileService fileService, FfprobeService ffprobeService, IHubContext<TranscodingHub> hubContext, MediaFileRepository mediaFileRepo)
         {
             _fileService = fileService;
             _ffprobeService = ffprobeService;
             _hubContext = hubContext;
+            _mediaFileRepo = mediaFileRepo;
             _ffmpegPath = Environment.GetEnvironmentVariable("FFMPEG_PATH") ?? "ffmpeg";
 
             // Detect hardware acceleration eagerly so the filter in AddFileAsync
@@ -53,7 +56,47 @@ namespace Snacks.Services
             });
         }
 
-        public async Task<string> AddFileAsync(string filePath, EncoderOptions options)
+        private async Task LogAsync(string workItemId, string message)
+        {
+            await _hubContext.Clients.All.SendAsync("TranscodingLog", workItemId, message);
+
+            // Persist to per-item log file (named after the video file for easy disk browsing)
+            try
+            {
+                var logPath = GetLogFilePath(workItemId);
+                if (logPath != null)
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(logPath)!);
+                    await File.AppendAllTextAsync(logPath, $"[{DateTime.Now:HH:mm:ss}] {message}\n");
+                }
+            }
+            catch { }
+        }
+
+        public List<string> GetWorkItemLogs(string workItemId)
+        {
+            var logPath = GetLogFilePath(workItemId);
+            if (logPath != null && File.Exists(logPath))
+            {
+                try { return File.ReadAllLines(logPath).ToList(); }
+                catch { }
+            }
+            return new List<string>();
+        }
+
+        private string? GetLogFilePath(string workItemId)
+        {
+            if (!_workItems.TryGetValue(workItemId, out var workItem))
+                return null;
+
+            var logsDir = Path.Combine(_fileService.GetWorkingDirectory(), "logs");
+            var safeName = string.Join("_", _fileService.RemoveExtension(workItem.FileName).Split(Path.GetInvalidFileNameChars()));
+            var shortId = workItemId.Length > 8 ? workItemId[..8] : workItemId;
+            return Path.Combine(logsDir, $"{safeName}_{shortId}.log");
+        }
+
+        /// <param name="force">When true, bypasses DB status checks — used for explicit user selection.</param>
+        public async Task<string> AddFileAsync(string filePath, EncoderOptions options, bool force = false)
         {
             try
             {
@@ -89,21 +132,60 @@ namespace Snacks.Services
                 };
 
                 // Don't add items that already meet the requirements.
-                // If the target codec is HEVC, non-HEVC files always get queued for re-encoding.
-                // If the target codec is H.264, non-H.264 files still get queued (likely already HEVC, skip those only if below target).
                 bool targetIsHevc = options.Encoder.Contains("265");
-                bool alreadyTargetCodec = targetIsHevc ? isHevc : !isHevc; // H.264 check: !isHevc means it's likely H.264/other
+                bool targetIsAv1 = options.Encoder.Contains("av1") || options.Encoder.Contains("svt");
+                bool isAv1 = sourceCodec == "av1";
+                bool alreadyTargetCodec = targetIsAv1 ? isAv1 : (targetIsHevc ? isHevc : !isHevc);
                 bool isHighDef = probe.streams.Any(s => s.codec_type == "video" && s.width > 1920);
 
-                if (alreadyTargetCodec && bitrate > 0 && bitrate <= options.TargetBitrate * 1.5 && !isHighDef)
+                var videoStream = probe.streams.FirstOrDefault(s => s.codec_type == "video");
+                var normalizedPath = Path.GetFullPath(filePath);
+
+                // Helper to persist skipped file info to the database
+                async Task MarkSkippedInDb()
                 {
-                    Console.WriteLine($"Skipping {workItem.FileName}: already {(isHevc ? "HEVC" : "H.264")} at {bitrate}kbps (target {options.TargetBitrate}kbps)");
+                    await _mediaFileRepo.UpsertAsync(new MediaFile
+                    {
+                        FilePath = normalizedPath,
+                        Directory = Path.GetDirectoryName(normalizedPath) ?? "",
+                        FileName = Path.GetFileName(normalizedPath),
+                        BaseName = Path.GetFileNameWithoutExtension(normalizedPath),
+                        FileSize = fileInfo.Length,
+                        Bitrate = bitrate,
+                        Codec = sourceCodec,
+                        Width = videoStream?.width ?? 0,
+                        Height = videoStream?.height ?? 0,
+                        PixelFormat = videoStream?.pix_fmt,
+                        Duration = length,
+                        IsHevc = isHevc,
+                        Is4K = isHighDef,
+                        Status = MediaFileStatus.Skipped,
+                        LastScannedAt = DateTime.UtcNow,
+                        FileMtime = fileInfo.LastWriteTimeUtc.Ticks
+                    });
+                }
+
+                // Skip 4K videos entirely if the option is enabled
+                if (options.Skip4K && isHighDef)
+                {
+                    Console.WriteLine($"Skipping {workItem.FileName}: 4K video (Skip 4K enabled)");
+                    await MarkSkippedInDb();
                     return workItem.Id;
                 }
 
-                if (alreadyTargetCodec && isHighDef && bitrate > 0 && bitrate <= options.TargetBitrate * 4)
+                string targetCodecLabel = targetIsAv1 ? "AV1" : (isHevc ? "HEVC" : "H.264");
+                if (alreadyTargetCodec && bitrate > 0 && bitrate <= options.TargetBitrate * 1.2 && !isHighDef)
                 {
-                    Console.WriteLine($"Skipping {workItem.FileName}: already {(isHevc ? "HEVC" : "H.264")} 4K at {bitrate}kbps (target {options.TargetBitrate}kbps)");
+                    Console.WriteLine($"Skipping {workItem.FileName}: already {targetCodecLabel} at {bitrate}kbps (target {options.TargetBitrate}kbps)");
+                    await MarkSkippedInDb();
+                    return workItem.Id;
+                }
+
+                int fourKMultiplier = Math.Clamp(options.FourKBitrateMultiplier, 2, 8);
+                if (alreadyTargetCodec && isHighDef && bitrate > 0 && bitrate <= options.TargetBitrate * fourKMultiplier)
+                {
+                    Console.WriteLine($"Skipping {workItem.FileName}: already {targetCodecLabel} 4K at {bitrate}kbps (target {options.TargetBitrate}kbps)");
+                    await MarkSkippedInDb();
                     return workItem.Id;
                 }
 
@@ -115,19 +197,77 @@ namespace Snacks.Services
                 if (isVaapiMode && !isHevc && targetIsHevc && bitrate > 0 && bitrate <= options.TargetBitrate && !isHighDef)
                 {
                     Console.WriteLine($"Skipping {workItem.FileName}: VAAPI can't compress {bitrate}kbps H.264 below target");
+                    await MarkSkippedInDb();
                     return workItem.Id;
                 }
 
                 Console.WriteLine($"Queuing {workItem.FileName}: {sourceCodec} {bitrate}kbps {(isHighDef ? "4K" : "HD")}");
 
-                // Skip if this file is already queued, processing, or completed
-                var normalizedPath = Path.GetFullPath(filePath);
+                // Skip if this file is already in the active in-memory queue
                 if (_workItems.Values.Any(w =>
                     Path.GetFullPath(w.Path).Equals(normalizedPath, StringComparison.OrdinalIgnoreCase) &&
-                    w.Status is WorkItemStatus.Pending or WorkItemStatus.Processing or WorkItemStatus.Completed))
+                    w.Status is WorkItemStatus.Pending or WorkItemStatus.Processing))
                 {
                     return workItem.Id;
                 }
+
+                // Check the database for existing records
+                var dbFile = await _mediaFileRepo.GetByPathAsync(normalizedPath);
+                if (dbFile != null)
+                {
+                    // Change detection: if the file's size changed significantly or duration differs,
+                    // it's been replaced with a different file — treat as new.
+                    // Small changes (metadata edits, remux) are ignored to avoid false positives.
+                    double sizeDelta = dbFile.FileSize > 0 ? Math.Abs(1.0 - (double)fileInfo.Length / dbFile.FileSize) : 0;
+                    double durationDelta = dbFile.Duration > 0 && length > 0 ? Math.Abs(dbFile.Duration - length) : 0;
+                    bool fileChanged = sizeDelta > 0.10 || durationDelta > 30; // >10% size change or >30s duration change
+
+                    if (fileChanged)
+                    {
+                        Console.WriteLine($"File changed on disk: {workItem.FileName} (size: {dbFile.FileSize}→{fileInfo.Length}) — resetting");
+                        await _mediaFileRepo.ResetFileAsync(normalizedPath);
+                    }
+                    else if (!force && dbFile.Status is MediaFileStatus.Failed or MediaFileStatus.Cancelled)
+                    {
+                        Console.WriteLine($"Skipping {workItem.FileName}: previously {dbFile.Status} ({dbFile.FailureCount} failures)");
+                        return workItem.Id;
+                    }
+                    else if (!force && dbFile.Status is MediaFileStatus.Completed)
+                    {
+                        Console.WriteLine($"Skipping {workItem.FileName}: already completed");
+                        return workItem.Id;
+                    }
+                }
+
+                // If force, also clear any in-memory completed/failed items so they can be re-added
+                if (force)
+                {
+                    var existing = _workItems.Values.FirstOrDefault(w =>
+                        Path.GetFullPath(w.Path).Equals(normalizedPath, StringComparison.OrdinalIgnoreCase));
+                    if (existing != null)
+                        _workItems.TryRemove(existing.Id, out _);
+                }
+
+                // Persist to database as Queued
+                await _mediaFileRepo.UpsertAsync(new MediaFile
+                {
+                    FilePath = normalizedPath,
+                    Directory = Path.GetDirectoryName(normalizedPath) ?? "",
+                    FileName = Path.GetFileName(normalizedPath),
+                    BaseName = Path.GetFileNameWithoutExtension(normalizedPath),
+                    FileSize = fileInfo.Length,
+                    Bitrate = bitrate,
+                    Codec = sourceCodec,
+                    Width = videoStream?.width ?? 0,
+                    Height = videoStream?.height ?? 0,
+                    PixelFormat = videoStream?.pix_fmt,
+                    Duration = length,
+                    IsHevc = isHevc,
+                    Is4K = isHighDef,
+                    Status = MediaFileStatus.Queued,
+                    LastScannedAt = DateTime.UtcNow,
+                    FileMtime = fileInfo.LastWriteTimeUtc.Ticks
+                });
 
                 _workItems[workItem.Id] = workItem;
                 lock (_queueLock)
@@ -198,6 +338,9 @@ namespace Snacks.Services
             return _workItems.Values.OrderByDescending(x => x.CreatedAt).ToList();
         }
 
+        /// <summary>
+        /// Cancel a work item permanently — it will NOT be reprocessed unless manually reset.
+        /// </summary>
         public async Task CancelWorkItemAsync(string id)
         {
             if (!_workItems.TryGetValue(id, out var workItem))
@@ -207,26 +350,71 @@ namespace Snacks.Services
             {
                 workItem.Status = WorkItemStatus.Cancelled;
                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
+                await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Cancelled);
             }
             else if (workItem.Status == WorkItemStatus.Processing && _activeWorkItem?.Id == id)
             {
-                // Kill the active FFmpeg process
-                try
-                {
-                    if (_activeProcess != null && !_activeProcess.HasExited)
-                    {
-                        _activeProcess.Kill(entireProcessTree: true);
-                        await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id, "Encoding cancelled by user.");
-                    }
-                }
-                catch (Exception ex)
-                {
-                    await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id, $"Error killing process: {ex.Message}");
-                }
-
+                await KillActiveProcess(workItem, "Encoding cancelled by user.");
                 workItem.Status = WorkItemStatus.Cancelled;
                 workItem.CompletedAt = DateTime.UtcNow;
                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
+                await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Cancelled);
+            }
+        }
+
+        /// <summary>
+        /// Stop a work item — removes from queue so it can be reprocessed later (next scan or manual add).
+        /// </summary>
+        public async Task StopWorkItemAsync(string id)
+        {
+            if (!_workItems.TryGetValue(id, out var workItem))
+                return;
+
+            if (workItem.Status == WorkItemStatus.Pending)
+            {
+                workItem.Status = WorkItemStatus.Stopped;
+                await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
+                // Mark as Unseen so it gets picked up again on next scan
+                await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Unseen);
+            }
+            else if (workItem.Status == WorkItemStatus.Processing && _activeWorkItem?.Id == id)
+            {
+                await KillActiveProcess(workItem, "Encoding stopped by user — will retry later.");
+                workItem.Status = WorkItemStatus.Stopped;
+                workItem.CompletedAt = DateTime.UtcNow;
+                await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
+                await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Unseen);
+            }
+        }
+
+        /// <summary>
+        /// Reset a previously failed or cancelled file so it can be reprocessed.
+        /// </summary>
+        public async Task RetryFileAsync(string filePath)
+        {
+            var normalizedPath = Path.GetFullPath(filePath);
+            await _mediaFileRepo.ResetFileAsync(normalizedPath);
+
+            // Also remove from in-memory work items so AddFileAsync won't skip it
+            var existing = _workItems.Values.FirstOrDefault(w =>
+                Path.GetFullPath(w.Path).Equals(normalizedPath, StringComparison.OrdinalIgnoreCase));
+            if (existing != null)
+                _workItems.TryRemove(existing.Id, out _);
+        }
+
+        private async Task KillActiveProcess(WorkItem workItem, string logMessage)
+        {
+            try
+            {
+                if (_activeProcess != null && !_activeProcess.HasExited)
+                {
+                    _activeProcess.Kill(entireProcessTree: true);
+                    await LogAsync(workItem.Id, logMessage);
+                }
+            }
+            catch (Exception ex)
+            {
+                await LogAsync(workItem.Id, $"Error killing process: {ex.Message}");
             }
         }
 
@@ -256,7 +444,7 @@ namespace Snacks.Services
                         _workQueue.RemoveAt(0);
                     }
 
-                    if (workItem.Status == WorkItemStatus.Cancelled)
+                    if (workItem.Status is WorkItemStatus.Cancelled or WorkItemStatus.Stopped)
                         continue;
 
                     // Clone options so retries don't mutate settings for subsequent queue items
@@ -275,7 +463,9 @@ namespace Snacks.Services
                         OutputDirectory = options.OutputDirectory,
                         EncodeDirectory = options.EncodeDirectory,
                         StrictBitrate = options.StrictBitrate,
-                        HardwareAcceleration = options.HardwareAcceleration
+                        HardwareAcceleration = options.HardwareAcceleration,
+                        FourKBitrateMultiplier = options.FourKBitrateMultiplier,
+                        Skip4K = options.Skip4K
                     };
                     await ProcessWorkItemAsync(workItem, itemOptions);
                 }
@@ -295,12 +485,14 @@ namespace Snacks.Services
                 workItem.StartedAt = DateTime.UtcNow;
                 workItem.Progress = 0;
                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
+                await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Processing);
 
                 await ConvertVideoAsync(workItem, options);
 
                 workItem.Status = WorkItemStatus.Completed;
                 workItem.CompletedAt = DateTime.UtcNow;
                 workItem.Progress = 100;
+                await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Completed);
             }
             catch (OperationCanceledException)
             {
@@ -313,6 +505,7 @@ namespace Snacks.Services
                 workItem.Status = WorkItemStatus.Failed;
                 workItem.ErrorMessage = ex.Message;
                 workItem.CompletedAt = DateTime.UtcNow;
+                await _mediaFileRepo.IncrementFailureCountAsync(Path.GetFullPath(workItem.Path), ex.Message);
             }
             finally
             {
@@ -323,15 +516,15 @@ namespace Snacks.Services
             await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
         }
 
-        private async Task ConvertVideoAsync(WorkItem workItem, EncoderOptions options, bool stripSubtitles = false)
+        private async Task ConvertVideoAsync(WorkItem workItem, EncoderOptions options, bool stripSubtitles = false, bool forceSwDecode = false)
         {
             if (workItem.Probe == null)
                 throw new Exception("No probe data available");
 
             // Resolve "auto" to a concrete hardware type before building the command
             await ResolveHardwareAccelerationAsync(options);
-            await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id, $"Hardware acceleration: {options.HardwareAcceleration}");
-            await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id, $"Current Bitrate: {workItem.Bitrate}kbps");
+            await LogAsync(workItem.Id, $"Hardware acceleration: {options.HardwareAcceleration}");
+            await LogAsync(workItem.Id, $"Current Bitrate: {workItem.Bitrate}kbps");
 
             var (targetBitrate, minBitrate, maxBitrate, videoCopy) = CalculateBitrates(workItem, options);
 
@@ -354,7 +547,7 @@ namespace Snacks.Services
                 if (quality < 0)
                 {
                     // VAAPI truly can't encode this file even with correct pixel format — skip it
-                    await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id,
+                    await LogAsync(workItem.Id,
                         "VAAPI cannot encode this file — skipping. Use the desktop app for this file.");
                     throw new Exception("VAAPI incompatible with this file");
                 }
@@ -363,6 +556,15 @@ namespace Snacks.Services
                     compressionFlags = $"-g 25 -rc_mode CQP -global_quality {quality} ";
                 }
             }
+            else if (encoder == "libsvtav1")
+            {
+                // SVT-AV1 doesn't support forced keyframes in VBR mode.
+                // Use CRF with a bitrate cap — CRF 30 is a good middle ground,
+                // and maxrate constrains output to our target. This gives quality-adaptive
+                // encoding that won't exceed the target bitrate.
+                int maxBitrateVal = int.Parse(maxBitrate.TrimEnd('k'));
+                compressionFlags = $"-crf 30 -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
+            }
             else
                 compressionFlags = $"-g 25 -b:v {targetBitrate} -minrate {minBitrate} -maxrate {maxBitrate} -bufsize {maxBitrate} ";
 
@@ -370,22 +572,33 @@ namespace Snacks.Services
             bool is10Bit = workItem.Probe?.streams?.Any(s =>
                 s.codec_type == "video" && (s.pix_fmt?.Contains("10") == true || s.profile?.Contains("10") == true)) == true;
 
-            bool canHwDecode = CanVaapiDecode(workItem.Probe);
+            // forceSwDecode overrides hardware decode — used as a retry when VAAPI hwaccel
+            // fails mid-stream due to format changes (keeps VAAPI encoder, uses software decoder)
+            bool canHwDecode = forceSwDecode ? false : CanVaapiDecode(workItem.Probe);
+            if (forceSwDecode && useVaapi)
+            {
+                await LogAsync(workItem.Id,
+                    "Using software decode + VAAPI encode (hwaccel decode disabled)");
+            }
+
             string initFlags = useVaapi ? GetInitFlags(options.HardwareAcceleration, canHwDecode) : GetInitFlags("none");
             string vaapiFormat = is10Bit ? "p010" : "nv12";
             string hwFilter = useVaapi ? $"-vf format={vaapiFormat}|vaapi,hwupload " : "";
-            string presetFlag = useVaapi ? (useLowPower ? "-low_power 1 " : "") : "-preset medium ";
+            bool isSvtAv1 = encoder == "libsvtav1";
+            string presetFlag = useVaapi
+                ? (useLowPower ? "-low_power 1 " : "")
+                : isSvtAv1 ? "-preset 6 " : "-preset medium ";
             string videoFlags = videoCopy ?
-                $"{_ffprobeService.MapVideo(workItem.Probe)} -c:v copy " :
-                $"{_ffprobeService.MapVideo(workItem.Probe)} -c:v {encoder} {presetFlag}{hwFilter}";
+                $"{_ffprobeService.MapVideo(workItem.Probe!)} -c:v copy " :
+                $"{_ffprobeService.MapVideo(workItem.Probe!)} -c:v {encoder} {presetFlag}{hwFilter}";
 
-            string audioFlags = _ffprobeService.MapAudio(workItem.Probe, options.EnglishOnlyAudio,
+            string audioFlags = _ffprobeService.MapAudio(workItem.Probe!, options.EnglishOnlyAudio,
                 options.TwoChannelAudio, options.Format == "mkv") + " ";
 
             // If retrying without subtitles, force -sn to strip all subtitle streams
             string subtitleFlags = stripSubtitles
                 ? "-sn "
-                : _ffprobeService.MapSub(workItem.Probe, options.EnglishOnlySubtitles, options.Format == "mkv") + " ";
+                : _ffprobeService.MapSub(workItem.Probe!, options.EnglishOnlySubtitles, options.Format == "mkv") + " ";
 
             string varFlags = options.Format == "mkv" ? "-max_muxing_queue_size 9999 " : "-movflags +faststart -max_muxing_queue_size 9999 ";
 
@@ -398,9 +611,22 @@ namespace Snacks.Services
                 throw new Exception($"Source file not found: {inputPath}");
             }
 
-            await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id,
+            // Clean up any existing partial output from a previous interrupted encode
+            if (File.Exists(outputPath))
+            {
+                await LogAsync(workItem.Id,
+                    "Deleting existing partial output from prior run...");
+                try { await _fileService.FileDeleteAsync(outputPath); }
+                catch (Exception ex)
+                {
+                    await LogAsync(workItem.Id,
+                        $"Warning: Could not delete existing output: {ex.Message}");
+                }
+            }
+
+            await LogAsync(workItem.Id,
                 $"Encoding from: {inputPath}");
-            await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id,
+            await LogAsync(workItem.Id,
                 $"Output to: {outputPath}");
 
             // Handle crop filter properly
@@ -416,9 +642,10 @@ namespace Snacks.Services
                         string cropHwFilter = useVaapi
                             ? $"-vf {cropFilter.Replace("-vf ", "")},format=nv12|vaapi,hwupload "
                             : $"{cropFilter} ";
-                        videoFlags = $"{_ffprobeService.MapVideo(workItem.Probe)} -c:v {encoder} {presetFlag}{cropHwFilter}";
+                        videoFlags = $"{_ffprobeService.MapVideo(workItem.Probe!)} -c:v {encoder} {presetFlag}{cropHwFilter}";
                         compressionFlags = useVaapi
                             ? $"-g 25 -rc_mode CQP -global_quality 25 "
+                            : isSvtAv1 ? $"-crf 30 -maxrate {maxBitrate} -bufsize {int.Parse(maxBitrate.TrimEnd('k')) * 2}k "
                             : $"-g 25 -b:v {targetBitrate} -minrate {minBitrate} -maxrate {maxBitrate} -bufsize {maxBitrate} ";
                     }
                     else
@@ -426,7 +653,7 @@ namespace Snacks.Services
                         string cropHwFilter = useVaapi
                             ? $"-vf {cropFilter.Replace("-vf ", "")},format=nv12|vaapi,hwupload "
                             : $"{cropFilter} ";
-                        videoFlags = $"{_ffprobeService.MapVideo(workItem.Probe)} -c:v {encoder} {presetFlag}{cropHwFilter}";
+                        videoFlags = $"{_ffprobeService.MapVideo(workItem.Probe!)} -c:v {encoder} {presetFlag}{cropHwFilter}";
                     }
                 }
             }
@@ -436,8 +663,8 @@ namespace Snacks.Services
             string command = $"{initFlags} {analyzeFlags}-i \"{inputPath}\" {videoFlags}{compressionFlags}{audioFlags}{subtitleFlags}" +
                            $"{varFlags}-f {(options.Format == "mkv" ? "matroska" : "mp4")} \"{outputPath}\"";
 
-            await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id, $"Converting {workItem.FileName}");
-            await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id, $"Command: ffmpeg {command}");
+            await LogAsync(workItem.Id, $"Converting {workItem.FileName}");
+            await LogAsync(workItem.Id, $"Command: ffmpeg {command}");
 
             var startTime = DateTime.Now;
 
@@ -452,7 +679,7 @@ namespace Snacks.Services
             }
             catch (Exception ex)
             {
-                await HandleConversionFailure(workItem, options, outputPath, ex.Message, stripSubtitles);
+                await HandleConversionFailure(workItem, options, outputPath, ex.Message, stripSubtitles, forceSwDecode);
                 return;
             }
 
@@ -461,14 +688,14 @@ namespace Snacks.Services
 
             if (!File.Exists(outputPath))
             {
-                await HandleConversionFailure(workItem, options, outputPath, "Output file not found", stripSubtitles);
+                await HandleConversionFailure(workItem, options, outputPath, "Output file not found", stripSubtitles, forceSwDecode);
                 return;
             }
 
             var outputProbe = await _ffprobeService.ProbeAsync(outputPath);
-            if (!_ffprobeService.ConvertedSuccessfully(workItem.Probe, outputProbe))
+            if (!_ffprobeService.ConvertedSuccessfully(workItem.Probe!, outputProbe))
             {
-                await HandleConversionFailure(workItem, options, outputPath, "Duration mismatch detected", stripSubtitles);
+                await HandleConversionFailure(workItem, options, outputPath, "Duration mismatch detected", stripSubtitles, forceSwDecode);
                 return;
             }
 
@@ -477,12 +704,12 @@ namespace Snacks.Services
             float savings = (workItem.Size - outputSize) / 1048576f;
             float percent = 1 - ((float)outputSize / workItem.Size);
 
-            await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id,
+            await LogAsync(workItem.Id,
                 $"Converted successfully in {DateTime.Now.Subtract(startTime).TotalMinutes:0.00} minutes.");
 
             if (savings > 0 || videoCopy)
             {
-                await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id,
+                await LogAsync(workItem.Id,
                     $"{savings:0,0}mb / {percent:P} saved.");
 
                 // Handle output file placement
@@ -490,13 +717,13 @@ namespace Snacks.Services
             }
             else
             {
-                await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id,
+                await LogAsync(workItem.Id,
                     "No savings realized. Deleting conversion.");
 
                 try { await _fileService.FileDeleteAsync(outputPath); }
                 catch (Exception ex)
                 {
-                    await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id, $"Error cleaning up output: {ex.Message}");
+                    await LogAsync(workItem.Id, $"Error cleaning up output: {ex.Message}");
                 }
             }
         }
@@ -514,7 +741,8 @@ namespace Snacks.Services
             }
             else if (workItem.Probe!.streams.Any(x => x.width > 1920)) // 4k
             {
-                int hdBitrate = options.TargetBitrate * 4;
+                int multiplier = Math.Clamp(options.FourKBitrateMultiplier, 2, 8);
+                int hdBitrate = options.TargetBitrate * multiplier;
                 targetBitrate = $"{hdBitrate}k";
                 minBitrate = $"{hdBitrate - 500}k";
                 maxBitrate = $"{hdBitrate + 1000}k";
@@ -791,19 +1019,29 @@ namespace Snacks.Services
         private string GetEncoder(EncoderOptions options)
         {
             bool isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+            bool isAv1 = options.Encoder.Contains("av1") || options.Encoder.Contains("svt");
+            bool isH265 = !isAv1 && options.Encoder.Contains("265");
+            bool isH264 = !isAv1 && options.Encoder.Contains("264");
 
             return options.HardwareAcceleration.ToLower() switch
             {
-                "intel" when isWindows && options.Encoder.Contains("265") => "hevc_qsv",
-                "intel" when isWindows && options.Encoder.Contains("264") => "h264_qsv",
-                "amd" when isWindows && options.Encoder.Contains("265") => "hevc_amf",
-                "amd" when isWindows && options.Encoder.Contains("264") => "h264_amf",
-                "intel" when options.Encoder.Contains("265") => "hevc_vaapi",
-                "intel" when options.Encoder.Contains("264") => "h264_vaapi",
-                "amd" when options.Encoder.Contains("265") => "hevc_vaapi",
-                "amd" when options.Encoder.Contains("264") => "h264_vaapi",
-                "nvidia" when options.Encoder.Contains("265") => "hevc_nvenc",
-                "nvidia" when options.Encoder.Contains("264") => "h264_nvenc",
+                // AV1 encoders
+                "intel" when isWindows && isAv1 => "av1_qsv",
+                "amd" when isWindows && isAv1 => "av1_amf",
+                "intel" when isAv1 => "av1_vaapi",
+                "amd" when isAv1 => "av1_vaapi",
+                "nvidia" when isAv1 => "av1_nvenc",
+                // H.265 encoders
+                "intel" when isWindows && isH265 => "hevc_qsv",
+                "intel" when isWindows && isH264 => "h264_qsv",
+                "amd" when isWindows && isH265 => "hevc_amf",
+                "amd" when isWindows && isH264 => "h264_amf",
+                "intel" when isH265 => "hevc_vaapi",
+                "intel" when isH264 => "h264_vaapi",
+                "amd" when isH265 => "hevc_vaapi",
+                "amd" when isH264 => "h264_vaapi",
+                "nvidia" when isH265 => "hevc_nvenc",
+                "nvidia" when isH264 => "h264_nvenc",
                 _ => options.Encoder
             };
         }
@@ -874,7 +1112,7 @@ namespace Snacks.Services
 
                 for (int iteration = 1; iteration <= maxIterations; iteration++)
                 {
-                    await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id,
+                    await LogAsync(workItem.Id,
                         $"Calibration pass {iteration}/{maxIterations} ({modeLabel}) — testing QP {currentQp}...");
 
                     long measuredKbps = await RunTestEncodeAsync(inputPath, initFlags, encoder, hwFilter, lpFlag, currentQp, seekTime, testDuration);
@@ -883,11 +1121,11 @@ namespace Snacks.Services
                     {
                         if (lowPower)
                         {
-                            await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id,
+                            await LogAsync(workItem.Id,
                                 "LP mode produced no output — retrying without low_power...");
                             break; // try next mode
                         }
-                        await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id,
+                        await LogAsync(workItem.Id,
                             "VAAPI produced no measurable output — encoder incompatible with this file");
                         return (-1, false);
                     }
@@ -897,23 +1135,23 @@ namespace Snacks.Services
                     {
                         if (lowPower)
                         {
-                            await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id,
+                            await LogAsync(workItem.Id,
                                 $"LP mode output ({measuredKbps}kbps) is absurdly high — retrying without low_power...");
                             break;
                         }
-                        await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id,
+                        await LogAsync(workItem.Id,
                             $"VAAPI output ({measuredKbps}kbps) is absurdly high — encoder broken for this file");
                         return (-1, false);
                     }
 
                     double ratio = (double)measuredKbps / targetKbps;
-                    await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id,
+                    await LogAsync(workItem.Id,
                         $"Pass {iteration}: QP {currentQp} → {measuredKbps}kbps (target {targetKbps}kbps, ratio {ratio:F2}x)");
 
                     // Close enough — within tolerance
                     if (ratio >= (1 - tolerance) && ratio <= (1 + tolerance))
                     {
-                        await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id,
+                        await LogAsync(workItem.Id,
                             $"QP {currentQp} is within {tolerance:P0} of target. Using QP {currentQp} ({modeLabel}).");
                         return (currentQp, lowPower);
                     }
@@ -921,7 +1159,7 @@ namespace Snacks.Services
                     // Already below target and at minimum QP — can't increase quality further
                     if (measuredKbps <= targetKbps && currentQp <= 18)
                     {
-                        await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id,
+                        await LogAsync(workItem.Id,
                             $"QP {currentQp} already at minimum and below target. Using QP {currentQp} ({modeLabel}).");
                         return (currentQp, lowPower);
                     }
@@ -935,7 +1173,7 @@ namespace Snacks.Services
                 }
 
                 // Completed all iterations without early return — use final QP
-                await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id,
+                await LogAsync(workItem.Id,
                     $"Calibration complete after {maxIterations} passes. Using QP {currentQp} ({modeLabel}).");
                 return (currentQp, lowPower);
             }
@@ -1004,7 +1242,7 @@ namespace Snacks.Services
 
         private async Task<string> GetCropParametersAsync(WorkItem workItem, EncoderOptions options, string inputPath)
         {
-            await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id, "Getting crop values.");
+            await LogAsync(workItem.Id, "Getting crop values.");
 
             int lengthInMinutes = (int)workItem.Length / 60;
             string startTime = lengthInMinutes > 20 ? "00:10:00" : "00:00:00";
@@ -1048,7 +1286,7 @@ namespace Snacks.Services
             if (!completed)
             {
                 try { process.Kill(entireProcessTree: true); } catch { }
-                await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id, "Crop detection timed out, skipping.");
+                await LogAsync(workItem.Id, "Crop detection timed out, skipping.");
                 return "";
             }
 
@@ -1056,7 +1294,7 @@ namespace Snacks.Services
                 return "";
 
             string mostCommonCrop = cropValues.Aggregate((x, y) => x.Value > y.Value ? x : y).Key;
-            await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id, $"Detected crop: {mostCommonCrop}");
+            await LogAsync(workItem.Id, $"Detected crop: {mostCommonCrop}");
             return $"-vf crop={mostCommonCrop}";
         }
 
@@ -1075,7 +1313,6 @@ namespace Snacks.Services
             _activeProcess = process;
             var errorOutput = new ConcurrentQueue<string>();
             var lastProgressUpdate = DateTime.MinValue;
-            var lastReportedProgress = -1;
             var lastActivity = DateTime.UtcNow;
             // Final muxing phase produces no output — slow NAS drives need extra time
             const int stallTimeoutSeconds = 300;
@@ -1092,10 +1329,9 @@ namespace Snacks.Services
                     var lineBuilder = new System.Text.StringBuilder();
                     var stream = process.StandardError;
 
-                    while (!stream.EndOfStream)
+                    int read;
+                    while ((read = await stream.ReadAsync(buffer, 0, buffer.Length)) > 0)
                     {
-                        int read = await stream.ReadAsync(buffer, 0, buffer.Length);
-                        if (read == 0) break;
 
                         for (int i = 0; i < read; i++)
                         {
@@ -1127,14 +1363,14 @@ namespace Snacks.Services
                                                 {
                                                     lastProgressUpdate = now;
                                                     await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
-                                                    await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id, $"FFmpeg: {line}");
+                                                    await LogAsync(workItem.Id, $"FFmpeg: {line}");
                                                 }
                                             }
                                         }
                                         else if (!string.IsNullOrWhiteSpace(line))
                                         {
                                             // Forward non-progress lines (errors, warnings, info)
-                                            await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id, $"FFmpeg: {line}");
+                                            await LogAsync(workItem.Id, $"FFmpeg: {line}");
                                         }
                                     }
                                     catch { }
@@ -1166,7 +1402,7 @@ namespace Snacks.Services
                     // Still running — check for stall
                     if ((DateTime.UtcNow - lastActivity).TotalSeconds >= stallTimeoutSeconds)
                     {
-                        await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id,
+                        await LogAsync(workItem.Id,
                             $"FFmpeg stalled (no output for {stallTimeoutSeconds} seconds). Killing process.");
                         try { process.Kill(entireProcessTree: true); } catch { }
                         await exitTask; // Wait for kill to complete
@@ -1177,7 +1413,7 @@ namespace Snacks.Services
 
             _activeProcess = null;
 
-            if (workItem.Status == WorkItemStatus.Cancelled)
+            if (workItem.Status is WorkItemStatus.Cancelled or WorkItemStatus.Stopped)
             {
                 throw new OperationCanceledException("Encoding was cancelled.");
             }
@@ -1185,51 +1421,77 @@ namespace Snacks.Services
             if (process.ExitCode != 0)
             {
                 var errorText = string.Join("\n", errorOutput.ToArray().TakeLast(10));
-                await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id, $"FFmpeg failed with exit code {process.ExitCode}");
-                await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id, $"Last error lines:\n{errorText}");
+                await LogAsync(workItem.Id, $"FFmpeg failed with exit code {process.ExitCode}");
+                await LogAsync(workItem.Id, $"Last error lines:\n{errorText}");
                 throw new Exception($"FFmpeg exited with code {process.ExitCode}. Error: {errorText}");
             }
         }
 
-        private async Task HandleConversionFailure(WorkItem workItem, EncoderOptions options, string outputPath, string reason, bool subtitlesWereStripped)
+        private async Task HandleConversionFailure(WorkItem workItem, EncoderOptions options, string outputPath, string reason, bool subtitlesWereStripped, bool swDecodeWasForced = false)
         {
-            await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id, $"Conversion failed: {reason}");
+            await LogAsync(workItem.Id, $"Conversion failed: {reason}");
 
             // Clean up the failed/partial output file
             try
             {
                 await _fileService.FileDeleteAsync(outputPath);
-                await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id, "Cleaned up failed output file.");
+                await LogAsync(workItem.Id, "Cleaned up failed output file.");
             }
             catch (Exception ex)
             {
-                await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id, $"Warning: Could not clean up output file: {ex.Message}");
+                await LogAsync(workItem.Id, $"Warning: Could not clean up output file: {ex.Message}");
             }
 
             // Retry 1: Strip all subtitles (covers bitmap subs, broken streams, etc.)
             if (!subtitlesWereStripped)
             {
-                await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id, "Retrying without subtitles...");
+                await LogAsync(workItem.Id, "Retrying without subtitles...");
                 workItem.Progress = 0;
                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
                 await ConvertVideoAsync(workItem, options, stripSubtitles: true);
                 return;
             }
 
-            // Retry 2: Fall back to software encoding (resets subtitle stripping to try subs first on software)
-            if (options.RetryOnFail && !options.Encoder.Contains("libx265"))
+            // Retry 2: Software decode + VAAPI encode for hwaccel filter graph errors
+            // This keeps GPU encoding but avoids the problematic hardware decoder that crashes
+            // on mid-stream format/resolution changes
+            bool isHwaccelError = reason.Contains("hwaccel", StringComparison.OrdinalIgnoreCase)
+                || reason.Contains("filter graph", StringComparison.OrdinalIgnoreCase)
+                || reason.Contains("Impossible to convert", StringComparison.OrdinalIgnoreCase)
+                || reason.Contains("hwupload", StringComparison.OrdinalIgnoreCase)
+                || reason.Contains("Reconfiguring filter", StringComparison.OrdinalIgnoreCase);
+
+            bool isVaapi = IsVaapiAcceleration(options.HardwareAcceleration);
+
+            if (isHwaccelError && isVaapi && !swDecodeWasForced)
             {
-                await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id, "Retrying with software encoding...");
+                await LogAsync(workItem.Id,
+                    "Retrying with software decode + VAAPI encode...");
                 workItem.Progress = 0;
                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
-                options.Encoder = "libx265";
+                await ConvertVideoAsync(workItem, options, stripSubtitles: subtitlesWereStripped, forceSwDecode: true);
+                return;
+            }
+
+            // Retry 3: Fall back to software encoding (resets subtitle stripping to try subs first on software)
+            // Check the actual resolved encoder, not options.Encoder (which is the user's base preference
+            // like "libsvtav1" that GetEncoder() maps to hardware variants like "av1_nvenc")
+            bool isAlreadySoftware = options.HardwareAcceleration.Equals("none", StringComparison.OrdinalIgnoreCase);
+            if (options.RetryOnFail && !isAlreadySoftware)
+            {
+                await LogAsync(workItem.Id, "Retrying with software encoding...");
+                workItem.Progress = 0;
+                await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
+                // Use the correct software encoder for the target codec
+                bool isAv1Target = options.Encoder.Contains("av1") || options.Encoder.Contains("svt") || options.Codec == "av1";
+                options.Encoder = isAv1Target ? "libsvtav1" : "libx265";
                 options.HardwareAcceleration = "none";
                 await ConvertVideoAsync(workItem, options, stripSubtitles: false);
                 return;
             }
 
             // All retries exhausted — original file is untouched
-            await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id, "All retries exhausted. Original file is unchanged.");
+            await LogAsync(workItem.Id, "All retries exhausted. Original file is unchanged.");
             throw new Exception($"Conversion failed after retries: {reason}");
         }
 
@@ -1244,26 +1506,29 @@ namespace Snacks.Services
                     if (!string.IsNullOrEmpty(options.EncodeDirectory))
                     {
                         string finalSnacksPath = Path.Combine(options.OutputDirectory, Path.GetFileName(outputPath));
-                        await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id, $"Moving to output directory: {finalSnacksPath}");
+                        await LogAsync(workItem.Id, $"Moving to output directory: {finalSnacksPath}");
                         await _fileService.FileMoveAsync(outputPath, finalSnacksPath);
                         outputPath = finalSnacksPath;
                     }
 
                     if (options.DeleteOriginalFile)
                     {
-                        // Delete original and remove [snacks] tag from output
-                        await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id, "Deleting original file");
+                        // Replace original: delete it, then move encoded file back to original location
+                        await LogAsync(workItem.Id, "Replacing original file");
                         await _fileService.FileDeleteAsync(workItem.Path);
 
-                        string cleanPath = GetCleanOutputName(outputPath);
-                        await _fileService.FileMoveAsync(outputPath, cleanPath);
-                        await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id, $"Final output: {cleanPath}");
+                        // Move back to the original's directory with a clean name (no [snacks] tag)
+                        string originalDir = _fileService.GetDirectory(workItem.Path);
+                        string cleanName = Path.GetFileNameWithoutExtension(outputPath).Replace(" [snacks]", "") + Path.GetExtension(outputPath);
+                        string finalPath = Path.Combine(originalDir, cleanName);
+                        await _fileService.FileMoveAsync(outputPath, finalPath);
+                        await LogAsync(workItem.Id, $"Final output: {finalPath}");
                     }
                     else
                     {
-                        await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id,
+                        await LogAsync(workItem.Id,
                             $"Original kept at: {workItem.Path}");
-                        await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id,
+                        await LogAsync(workItem.Id,
                             $"Transcoded file at: {outputPath}");
                     }
                 }
@@ -1272,27 +1537,27 @@ namespace Snacks.Services
                     // In-place processing — output is in the same directory as the original with [snacks] tag
                     if (options.DeleteOriginalFile)
                     {
-                        // Delete original and rename transcoded file to take its place (without [snacks] tag)
-                        await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id, "Deleting original and replacing with transcoded version");
+                        // Replace original: delete it and rename transcoded file to take its place
+                        await LogAsync(workItem.Id, "Replacing original with transcoded version");
                         await _fileService.FileDeleteAsync(workItem.Path);
 
                         string cleanPath = GetCleanOutputName(outputPath);
                         await _fileService.FileMoveAsync(outputPath, cleanPath);
-                        await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id, $"Final output: {cleanPath}");
+                        await LogAsync(workItem.Id, $"Final output: {cleanPath}");
                     }
                     else
                     {
                         // Keep both — original untouched, transcoded file has [snacks] tag
-                        await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id,
+                        await LogAsync(workItem.Id,
                             $"Original kept at: {workItem.Path}");
-                        await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id,
+                        await LogAsync(workItem.Id,
                             $"Transcoded file at: {outputPath}");
                     }
                 }
             }
             catch (Exception ex)
             {
-                await _hubContext.Clients.All.SendAsync("TranscodingLog", workItem.Id, $"Error handling output placement: {ex.Message}");
+                await LogAsync(workItem.Id, $"Error handling output placement: {ex.Message}");
                 throw;
             }
         }

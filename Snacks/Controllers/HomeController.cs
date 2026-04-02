@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.Mvc;
+using Snacks.Data;
 using Snacks.Models;
 using Snacks.Services;
 
@@ -9,12 +10,15 @@ namespace Snacks.Controllers
         private readonly TranscodingService _transcodingService;
         private readonly FileService _fileService;
         private readonly AutoScanService _autoScanService;
+        private readonly MediaFileRepository _mediaFileRepo;
 
-        public HomeController(TranscodingService transcodingService, FileService fileService, AutoScanService autoScanService)
+        public HomeController(TranscodingService transcodingService, FileService fileService,
+            AutoScanService autoScanService, MediaFileRepository mediaFileRepo)
         {
             _transcodingService = transcodingService;
             _fileService = fileService;
             _autoScanService = autoScanService;
+            _mediaFileRepo = mediaFileRepo;
         }
 
         public IActionResult Index()
@@ -42,7 +46,7 @@ namespace Snacks.Controllers
                 {
                     // Desktop mode: list available drive roots
                     var directories = DriveInfo.GetDrives()
-                        .Where(d => d.IsReady && (d.DriveType == DriveType.Fixed || d.DriveType == DriveType.Removable))
+                        .Where(d => d.IsReady && d.DriveType is DriveType.Fixed or DriveType.Removable or DriveType.Network)
                         .Select(d => new
                         {
                             path = d.RootDirectory.FullName,
@@ -171,7 +175,8 @@ namespace Snacks.Controllers
                     }
                 }
 
-                var workItemId = await _transcodingService.AddFileAsync(request.FilePath, request.Options);
+                // User explicitly selected this file — force overrides DB status (failed/cancelled/completed)
+                var workItemId = await _transcodingService.AddFileAsync(request.FilePath, request.Options, force: true);
                 return Json(new { success = true, workItemId });
             }
             catch (Exception ex)
@@ -193,6 +198,55 @@ namespace Snacks.Controllers
             {
                 return BadRequest(ex.Message);
             }
+        }
+
+        [HttpPost]
+        public async Task<IActionResult> StopWorkItem(string id)
+        {
+            try
+            {
+                await _transcodingService.StopWorkItemAsync(id);
+                return Json(new { success = true });
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(ex.Message);
+            }
+        }
+
+        [HttpPost]
+        public async Task<IActionResult> RetryFailedFile([FromBody] RetryRequest request)
+        {
+            try
+            {
+                await _transcodingService.RetryFileAsync(request.FilePath);
+                return Json(new { success = true });
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(ex.Message);
+            }
+        }
+
+        [HttpGet]
+        public async Task<IActionResult> GetFailedFiles()
+        {
+            try
+            {
+                var files = await _mediaFileRepo.GetFailedFilesAsync();
+                return Json(files);
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(ex.Message);
+            }
+        }
+
+        [HttpGet]
+        public IActionResult GetWorkItemLogs(string id)
+        {
+            var logs = _transcodingService.GetWorkItemLogs(id);
+            return Json(logs);
         }
 
         [HttpGet]
@@ -377,10 +431,23 @@ namespace Snacks.Controllers
         public IActionResult GetSettings()
         {
             var settingsPath = GetSettingsPath();
-            if (System.IO.File.Exists(settingsPath))
+            var backupPath = settingsPath + ".bak";
+
+            // Try primary settings file, fall back to backup if corrupted
+            foreach (var path in new[] { settingsPath, backupPath })
             {
-                var json = System.IO.File.ReadAllText(settingsPath);
-                return Content(json, "application/json");
+                if (!System.IO.File.Exists(path)) continue;
+                try
+                {
+                    var json = System.IO.File.ReadAllText(path);
+                    // Verify it's valid JSON
+                    System.Text.Json.JsonDocument.Parse(json);
+                    return Content(json, "application/json");
+                }
+                catch
+                {
+                    Console.WriteLine($"Settings file corrupted: {path}");
+                }
             }
             return Json(new { });
         }
@@ -391,8 +458,16 @@ namespace Snacks.Controllers
             try
             {
                 var settingsPath = GetSettingsPath();
+                var backupPath = settingsPath + ".bak";
+                var tempPath = settingsPath + ".tmp";
                 var json = System.Text.Json.JsonSerializer.Serialize(settings, new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
-                System.IO.File.WriteAllText(settingsPath, json);
+
+                // Atomic write: write to .tmp, rename current to .bak, rename .tmp to settings.json
+                System.IO.File.WriteAllText(tempPath, json);
+                if (System.IO.File.Exists(settingsPath))
+                    System.IO.File.Copy(settingsPath, backupPath, overwrite: true);
+                System.IO.File.Move(tempPath, settingsPath, overwrite: true);
+
                 return Json(new { success = true });
             }
             catch (Exception ex)
@@ -484,11 +559,11 @@ namespace Snacks.Controllers
         }
 
         [HttpPost]
-        public IActionResult TriggerAutoScan()
+        public async Task<IActionResult> TriggerAutoScan()
         {
             try
             {
-                _autoScanService.TriggerScanNow();
+                await _autoScanService.TriggerScanNow();
                 return Json(new { success = true });
             }
             catch (Exception ex)
@@ -498,11 +573,11 @@ namespace Snacks.Controllers
         }
 
         [HttpPost]
-        public IActionResult ClearAutoScanHistory()
+        public async Task<IActionResult> ClearAutoScanHistory()
         {
             try
             {
-                _autoScanService.ClearHistory();
+                await _autoScanService.ClearHistoryAsync();
                 return Json(new { success = true });
             }
             catch (Exception ex)
@@ -517,6 +592,7 @@ namespace Snacks.Controllers
             try
             {
                 _transcodingService.SetPaused(request.Paused);
+                _autoScanService.SetQueuePaused(request.Paused);
                 return Json(new { success = true, paused = _transcodingService.IsPaused });
             }
             catch (Exception ex)
@@ -568,5 +644,10 @@ namespace Snacks.Controllers
     public class PauseRequest
     {
         public bool Paused { get; set; }
+    }
+
+    public class RetryRequest
+    {
+        public string FilePath { get; set; } = "";
     }
 }

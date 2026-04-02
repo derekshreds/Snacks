@@ -371,5 +371,11 @@ ffmpeg.exe
 ffprobe.exe
 *.dll.config
 
+# Video library (local dev testing)
+video-library/
+
+# Code signing certificates
+signing/
+
 # Claude Code
 .claude/

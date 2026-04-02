@@ -10,9 +10,9 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-2.0.2-8b5cf6?style=flat-square" alt="Version">
-  <img src="https://img.shields.io/badge/.NET-8.0-512bd4?style=flat-square" alt=".NET 8">
-  <img src="https://img.shields.io/badge/Electron-33-47848f?style=flat-square" alt="Electron">
+  <img src="https://img.shields.io/badge/version-2.1.0-8b5cf6?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/.NET-10.0-512bd4?style=flat-square" alt=".NET 10">
+  <img src="https://img.shields.io/badge/Electron-41-47848f?style=flat-square" alt="Electron">
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License">
 </p>
 
@@ -21,14 +21,22 @@
 ## Features
 
 - **Hardware accelerated encoding** -- NVIDIA NVENC, Intel QSV/VAAPI, AMD AMF/VAAPI
+- **H.265, H.264, and AV1** -- encode to any modern codec with hardware or software
 - **Smart filtering** -- skips files that already meet your quality targets
-- **Retry with fallback** -- strips subtitles, falls back to software encoding on failure
+- **Persistent database** -- SQLite tracks all files across restarts, no re-scanning needed
+- **Retry with fallback** -- strips subtitles, tries software decode + HW encode, then full software
 - **Real-time progress** -- live encoding progress via SignalR WebSockets
 - **Batch processing** -- process individual files, folders, or entire libraries
 - **NAS-friendly** -- designed for QNAP, Synology, and other Docker-capable NAS devices
 - **Desktop app** -- native Windows installer with local GPU support
 - **Automatic scanning** -- watch directories for automatic re-scanning on a configurable interval
-- **Dark mode UI** -- clean, modern interface that works on desktop and mobile
+- **4K controls** -- configurable bitrate multiplier or skip 4K content entirely
+- **Per-file logging** -- every encode writes a log file to disk, viewable in the app or on the NAS
+- **Stop vs Cancel** -- stop an encode for later, or cancel it permanently
+- **Change detection** -- replaced files are automatically detected and re-queued
+- **Transfer-safe scanning** -- files modified within the last 30 minutes are skipped to avoid mid-transfer processing
+- **Settings backup** -- atomic writes with `.bak` fallback for crash resilience
+- **Dark mode UI** -- clean, responsive interface that works on desktop, tablet, and mobile
 
 ---
 
@@ -56,11 +64,9 @@ services:
     volumes:
       ## CHANGE THIS to your actual media folder on the NAS
       - /share/Public/Media:/app/work/uploads
-      ## Output directory for transcoded files (optional, on NAS storage)
-      #- /share/CACHEDEV1_DATA/snacks/output:/app/work/output
       ## Transcoding logs
       - /share/CACHEDEV1_DATA/snacks/logs:/app/work/logs
-      ## Persist encoder settings across container updates
+      ## Persist settings and database across container updates
       - /share/CACHEDEV1_DATA/snacks/config:/app/work/config
     environment:
       - ASPNETCORE_ENVIRONMENT=Production
@@ -109,7 +115,7 @@ Snacks can run as a standalone desktop app with native GPU acceleration.
 2. Download FFmpeg from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) (release full build)
 3. Place `ffmpeg.exe` and `ffprobe.exe` in `electron-app/ffmpeg/`
 4. Run `build-installer.bat`
-5. Install from `electron-app/dist/Snacks Setup 2.0.2.exe`
+5. Install from `electron-app/dist/Snacks Setup 2.1.0.exe`
 
 **For development:**
 
@@ -143,13 +149,16 @@ Click the **gear icon** to open encoding settings:
 | Setting | Description |
 |---------|-------------|
 | Output Format | MKV (default) or MP4 |
-| Video Codec | H.265/HEVC or H.264/AVC |
+| Video Codec | H.265/HEVC, H.264/AVC, or AV1 |
 | Hardware Acceleration | Auto Detect, Intel QSV, AMD VAAPI, NVIDIA NVENC, or None |
 | Target Bitrate | Default 3500 kbps -- files above this get compressed |
+| 4K Bitrate Multiplier | 2x--8x multiplier for 4K content (default 4x) |
+| Skip 4K Videos | Leave 4K content untouched |
 | English Only Audio | Remove non-English audio tracks |
 | English Only Subtitles | Keep only English subtitle tracks |
 | Remove Black Borders | Auto-detect and crop letterboxing |
-| Delete Original File | Replace original with encoded version |
+| Output Directory | Where encoded files are saved (blank = same as original) |
+| Replace Original Files | Delete original and move encoded file to its location |
 | Retry on Failure | Fall back to software encoding if hardware fails |
 
 ### Automatic Scanning
@@ -159,9 +168,13 @@ Snacks can watch directories and automatically re-scan them on a configurable in
 - Open the **Settings** panel and enable **Auto Scan**
 - Set the scan interval (how often Snacks checks for new or changed files)
 - Add directories to the watch list using the **Watch This Folder** button in the directory browser
-- Snacks keeps a persistent scan history so previously processed files are not re-queued
+- Snacks tracks all file states in a SQLite database so previously processed files are never re-scanned
+- Failed files are tracked with failure counts and won't be endlessly retried
+- Files modified within the last 30 minutes are skipped to avoid processing mid-transfer
+- If a file is replaced with a significantly different version (>10% size change), it's automatically re-queued
+- Partial `[snacks]` files from interrupted encodes are detected, deleted, and the original is re-queued
 
-Settings are saved server-side in `settings.json` and persist across container restarts and devices.
+Settings are saved server-side in `settings.json` (with automatic `.bak` backup) and persist across container restarts and devices.
 
 ### Monitor
 
@@ -171,7 +184,20 @@ The main dashboard shows:
 - **Stats** -- pending, processing, completed, and failed counts
 - **Pagination** -- first/prev/next/last page navigation
 
-Click the terminal icon on any item to view detailed FFmpeg logs.
+Click the terminal icon on any item to view detailed FFmpeg logs -- logs are persisted to disk and viewable even after a restart.
+
+### Queue Management
+
+- **Stop (Encode Later)** -- removes an item from the queue with a yellow "Stopped" badge. It will be re-queued on the next auto-scan.
+- **Cancel (Don't Reprocess)** -- permanently cancels an item. It will not be re-queued unless you manually select it again.
+- **Process Selected override** -- explicitly selecting a file in the browser always queues it, regardless of its database status (failed, cancelled, completed).
+- **Pause/Resume** -- pause state is saved across restarts. If the queue was paused when the container stopped, it stays paused.
+
+### Logs
+
+- Every encode writes a log file to the `logs` directory (e.g., `The Matrix (1999)_a3f2b1c4.log`)
+- Logs are viewable in the app by clicking the terminal icon on any queue item
+- On NAS deployments, logs are accessible via the mounted logs volume
 
 ---
 
@@ -181,20 +207,20 @@ Click the terminal icon on any item to view detailed FFmpeg logs.
 2. **Filter** -- Files already meeting your quality targets are skipped automatically
 3. **Encode** -- FFmpeg encodes with hardware acceleration when available, falling back to software
 4. **Validate** -- Output is verified by comparing duration to the original
-5. **Retry** -- On failure, retries without subtitles, then with software encoding
+5. **Retry** -- On failure, retries without subtitles, then software decode + HW encode, then full software
 6. **Clean up** -- Original files are never modified; encoded files get a `[snacks]` tag
 
 ### File Naming
 
-- Encoded files are saved as `Movie Name [snacks].mkv` alongside the original
-- If **Delete Original** is enabled, the original is removed and the `[snacks]` tag is stripped
-- Original files are never moved or renamed during encoding
+- Encoded files are saved as `Movie Name [snacks].mkv` alongside the original (or in the output directory if configured)
+- If **Replace Original Files** is enabled, the original is deleted and the encoded file is moved to the original's location without the `[snacks]` tag
+- Original files are never modified during encoding
 
 ### Smart Filtering
 
 Files are automatically skipped if they already meet requirements:
 
-- Already HEVC and below target bitrate (1080p: 1.5x target, 4K: 4x target)
+- Already target codec and below target bitrate (1080p: 1.2x target, 4K: configurable multiplier)
 - Already encoded (filename contains `[snacks]`)
 
 ---
@@ -208,7 +234,7 @@ Files are automatically skipped if they already meet requirements:
 | NVIDIA NVENC | CUDA | CUDA |
 | Intel | VAAPI (CQP) | QSV (VBR) |
 | AMD | VAAPI (CQP) | AMF (VBR) |
-| Software (x265) | Always available | Always available |
+| Software (x265/SVT-AV1) | Always available | Always available |
 
 ### NAS Notes
 
@@ -255,12 +281,15 @@ Check that the backend is running and SignalR is connected (green dot in the nav
 
 ```
 Snacks/
-  Snacks/                 ASP.NET Core 8.0 backend + web UI
+  Snacks/                 ASP.NET Core 10.0 backend + web UI
     Controllers/           API endpoints
-    Services/              Transcoding, file handling, FFprobe, AutoScanService
+    Services/              Transcoding, file handling, FFprobe, AutoScanService, logging
+    Data/                  SQLite database context, migrations, repository
+    Models/                WorkItem, MediaFile, EncoderOptions, AutoScanConfig
     Hubs/                  SignalR real-time communication
     Views/                 Razor pages
     wwwroot/               Static assets (JS, CSS, fonts)
+  release-notes/          Per-version release notes
   electron-app/           Electron desktop wrapper
     main.js               Electron main process
     backend/              Published .NET backend (gitignored)
@@ -298,5 +327,5 @@ Creates a self-contained Windows installer at `electron-app/dist/` with the .NET
 ---
 
 <p align="center">
-  <strong>Snacks</strong> v2.0.2 &copy; 2026 Derek Morris
+  <strong>Snacks</strong> v2.1.0 &copy; 2026 Derek Morris
 </p>

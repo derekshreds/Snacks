@@ -15,7 +15,7 @@ if %errorlevel% neq 0 (
     pause
     exit /b 1
 )
-xcopy "Snacks\bin\Release\net8.0\win-x64\publish" "electron-app\backend\" /E /I /Q /Y >nul
+xcopy "Snacks\bin\Release\net10.0\win-x64\publish" "electron-app\backend\" /E /I /Q /Y >nul
 if %errorlevel% neq 0 (
     echo ERROR: dotnet publish failed.
     pause

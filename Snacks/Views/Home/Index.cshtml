@@ -96,7 +96,7 @@
 </div>
 
 <!-- Library Browser Modal -->
-<div class="modal fade" id="libraryModal" tabindex="-1">
+<div class="modal fade modal-fullscreen-mobile" id="libraryModal" tabindex="-1">
     <div class="modal-dialog modal-xl">
         <div class="modal-content">
             <div class="modal-header">
@@ -108,9 +108,9 @@
             </div>
             <div class="modal-body">
                 <div class="row">
-                    <div class="col-md-4">
+                    <div class="col-lg-4">
                         <h6><i class="fas fa-folder me-2"></i>Directories</h6>
-                        <div id="directoryList" class="border rounded p-3" style="height: 450px; overflow-y: auto;">
+                        <div id="directoryList" class="border rounded p-2" style="height: 450px; overflow-y: auto;">
                             <div class="text-center">
                                 <div class="spinner-border" role="status">
                                     <span class="visually-hidden">Loading...</span>
@@ -118,7 +118,7 @@
                             </div>
                         </div>
                     </div>
-                    <div class="col-md-8">
+                    <div class="col-lg-8">
                         <div class="d-flex justify-content-between align-items-center mb-3">
                             <h6><i class="fas fa-file-video me-2"></i>Video Files</h6>
                             <div>
@@ -130,7 +130,7 @@
                                 </button>
                             </div>
                         </div>
-                        <div id="fileList" class="border rounded p-3" style="height: 450px; overflow-y: auto;">
+                        <div id="fileList" class="border rounded p-2" style="height: 450px; overflow-y: auto;">
                             <div class="text-muted text-center py-4">
                                 <i class="fas fa-folder-open fa-2x mb-2"></i><br>
                                 Select a directory to view files
@@ -151,7 +151,7 @@
 </div>
 
 <!-- Settings Modal -->
-<div class="modal fade" id="settingsModal" tabindex="-1">
+<div class="modal fade modal-fullscreen-mobile" id="settingsModal" tabindex="-1">
     <div class="modal-dialog modal-xl">
         <div class="modal-content">
             <div class="modal-header">
@@ -171,8 +171,34 @@
     </div>
 </div>
 
+<!-- Stop/Cancel Modal -->
+<div class="modal fade" id="stopCancelModal" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">
+                    <i class="fas fa-question-circle me-2"></i>
+                    Remove from Queue
+                </h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <p class="mb-0">What would you like to do with this item?</p>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-warning" id="stopCancelStop">
+                    <i class="fas fa-pause me-1"></i>Stop (Encode Later)
+                </button>
+                <button type="button" class="btn btn-danger" id="stopCancelCancel">
+                    <i class="fas fa-ban me-1"></i>Cancel (Don't Reprocess)
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
 <!-- Log Modal -->
-<div class="modal fade" id="logModal" tabindex="-1">
+<div class="modal fade modal-fullscreen-mobile" id="logModal" tabindex="-1">
     <div class="modal-dialog modal-xl">
         <div class="modal-content">
             <div class="modal-header">

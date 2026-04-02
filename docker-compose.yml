@@ -9,15 +9,15 @@ services:
     volumes:
       # Mount your video library directory (read-write for in-place processing)
       - ./video-library:/app/work/uploads
-      # Optional: Separate output directory for transcoded files (if specified in encoder options)
-      - ./data/output:/app/work/output
       # Transcoding logs
       - ./data/logs:/app/work/logs
+      # Persist settings and database across container updates
+      - ./data/config:/app/work/config
     environment:
       - ASPNETCORE_ENVIRONMENT=Production
       - SNACKS_WORK_DIR=/app/work
-      - FFMPEG_PATH=/usr/bin/ffmpeg
-      - FFPROBE_PATH=/usr/bin/ffprobe
+      - FFMPEG_PATH=/usr/lib/jellyfin-ffmpeg/ffmpeg
+      - FFPROBE_PATH=/usr/lib/jellyfin-ffmpeg/ffprobe
     # GPU passthrough is configured in docker-compose.gpu.yml (Linux NAS only)
     privileged: false
     restart: unless-stopped

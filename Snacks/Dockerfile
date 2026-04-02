@@ -1,19 +1,16 @@
-# Use the official ASP.NET Core runtime as base image
-FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS base
+# Use the official ASP.NET Core runtime as base image (Ubuntu Noble 24.04)
+FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS base
 WORKDIR /app
 EXPOSE 6767
-
-# Enable non-free repos for Intel media drivers
-RUN sed -i 's/^Components: main$/Components: main contrib non-free non-free-firmware/' /etc/apt/sources.list.d/debian.sources
 
 # Add Jellyfin repo for jellyfin-ffmpeg (custom FFmpeg with full VAAPI/QSV support)
 RUN apt-get update && apt-get install -y curl gnupg && \
     mkdir -p /etc/apt/keyrings && \
     curl -fsSL https://repo.jellyfin.org/jellyfin_team.gpg.key | gpg --dearmor -o /etc/apt/keyrings/jellyfin.gpg && \
-    echo "Types: deb\nURIs: https://repo.jellyfin.org/debian\nSuites: bookworm\nComponents: main\nArchitectures: amd64\nSigned-By: /etc/apt/keyrings/jellyfin.gpg" \
+    printf "Types: deb\nURIs: https://repo.jellyfin.org/ubuntu\nSuites: noble\nComponents: main\nArchitectures: amd64\nSigned-By: /etc/apt/keyrings/jellyfin.gpg\n" \
     > /etc/apt/sources.list.d/jellyfin.sources
 
-# Install jellyfin-ffmpeg7, Intel VAAPI drivers, and supporting libraries
+# Install jellyfin-ffmpeg7 (latest available for Noble), Intel VAAPI drivers, and supporting libraries
 RUN apt-get update && apt-get install -y \
     jellyfin-ffmpeg7 \
     intel-media-va-driver-non-free \
@@ -32,7 +29,7 @@ RUN /usr/lib/jellyfin-ffmpeg/ffmpeg -encoders 2>/dev/null | grep vaapi && echo "
 RUN mkdir -p /app/work/uploads /app/work/output /app/work/logs
 
 # Use the SDK image to build the application
-FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 ARG BUILD_CONFIGURATION=Release
 WORKDIR /src
 COPY ["Snacks/Snacks.csproj", "Snacks/"]

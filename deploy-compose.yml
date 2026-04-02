@@ -1,4 +1,4 @@
-## Snacks v2.0.0 - QNAP NAS Deployment
+## Snacks - QNAP NAS Deployment
 ## Copy this into Container Station > Applications > Create
 ##
 ## IMPORTANT: Update the video library path below to match your NAS.
@@ -16,11 +16,9 @@ services:
     volumes:
       ## CHANGE THIS to your actual media folder on the NAS
       - /share/Public/Media:/app/work/uploads
-      ## Output directory for transcoded files (optional, on NAS storage)
-      #- /share/CACHEDEV1_DATA/snacks/output:/app/work/output
       ## Transcoding logs
       - /share/CACHEDEV1_DATA/snacks/logs:/app/work/logs
-      ## Persist encoder settings across container updates
+      ## Persist settings and database across container updates
       - /share/CACHEDEV1_DATA/snacks/config:/app/work/config
     environment:
       - ASPNETCORE_ENVIRONMENT=Production

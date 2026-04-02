@@ -1,0 +1,8 @@
+{
+  "Enabled": false,
+  "IntervalMinutes": 60,
+  "Directories": [],
+  "LastScanTime": null,
+  "LastScanNewFiles": 0,
+  "QueuePaused": false
+}

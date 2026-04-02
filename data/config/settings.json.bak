@@ -1,0 +1,17 @@
+{
+  "Format": "mp4",
+  "Codec": "h265",
+  "Encoder": "libx265",
+  "HardwareAcceleration": "auto",
+  "TargetBitrate": 1500,
+  "TwoChannelAudio": false,
+  "EnglishOnlyAudio": true,
+  "EnglishOnlySubtitles": true,
+  "RemoveBlackBorders": false,
+  "DeleteOriginalFile": false,
+  "RetryOnFail": true,
+  "StrictBitrate": false,
+  "FourKBitrateMultiplier": 4,
+  "Skip4K": false,
+  "OutputDirectory": ""
+}
