@@ -7,43 +7,85 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 
-namespace Snacks.Services
-{
-    public class TranscodingService
+namespace Snacks.Services;
+
+/// <summary>
+///     Core transcoding service that manages the in-memory work queue, drives FFmpeg encoding,
+///     handles hardware acceleration detection and calibration, and supports cluster integration
+///     for distributed encoding across master and worker nodes.
+/// </summary>
+public class TranscodingService
     {
+        /// <summary>All known work items keyed by ID, including completed and failed items.</summary>
         private readonly ConcurrentDictionary<string, WorkItem> _workItems = new();
+
+        /// <summary>Ordered list of pending work items; sorted by bitrate descending.</summary>
         private readonly List<WorkItem> _workQueue = new();
+
+        /// <summary>Lock protecting access to <see cref="_workQueue"/>.</summary>
         private readonly object _queueLock = new();
+
         private readonly FileService _fileService;
         private readonly FfprobeService _ffprobeService;
         private readonly IHubContext<TranscodingHub> _hubContext;
         private readonly MediaFileRepository _mediaFileRepo;
+
+        /// <summary>Path to the FFmpeg binary, resolved from the <c>FFMPEG_PATH</c> environment variable.</summary>
         private readonly string _ffmpegPath;
+
+        /// <summary>Ensures only one local encoding job runs at a time.</summary>
         private readonly SemaphoreSlim _processingLock = new(1, 1);
+
+        /// <summary>The currently running FFmpeg process, or <c>null</c> when idle.</summary>
         private Process? _activeProcess;
+
+        /// <summary>The work item currently being encoded locally, or <c>null</c> when idle.</summary>
         private WorkItem? _activeWorkItem;
+
+        /// <summary>Whether the local processing loop is paused by user request.</summary>
         private bool _isPaused = false;
+
+        /// <summary>Whether local encoding is suspended so the cluster dispatch loop can handle items instead.</summary>
         private bool _localEncodingPaused = false;
+
+        /// <summary>The encoder options from the most recently started queue run. Used when resuming after unpause.</summary>
         private EncoderOptions? _lastOptions;
+
+        /// <summary>Optional callback to forward encoding progress to the master node.</summary>
         private Func<string, int, Task>? _progressCallback;
+
+        /// <summary>Optional callback to forward FFmpeg log lines to the master node.</summary>
         private Func<string, string, Task>? _logCallback;
+
+        /// <summary>Optional callback to cancel a remote job on a cluster node.</summary>
         private Func<string, string, Task>? _remoteJobCanceller;
+
+        /// <summary>Optional callback for the cluster to check whether a file is already assigned remotely.</summary>
         private Func<string, bool>? _isRemoteJobChecker;
 
+        /// <summary>Whether the encoding queue is paused by user request.</summary>
         public bool IsPaused => _isPaused;
 
+        /// <summary>
+        /// Pauses or resumes the encoding queue. When resuming, restarts the processing loop
+        /// if <see cref="_lastOptions"/> is available.
+        /// </summary>
+        /// <param name="paused">Whether to pause processing.</param>
         public void SetPaused(bool paused)
         {
             _isPaused = paused;
             Console.WriteLine($"Queue {(paused ? "paused" : "resumed")}");
 
-            // When resuming, kick off queue processing again
             if (!paused && _lastOptions != null)
             {
                 _ = Task.Run(() => ProcessQueueAsync(_lastOptions));
             }
         }
 
+        /// <summary>
+        /// Initializes the service and eagerly starts hardware acceleration detection in the background
+        /// so that the first queue item doesn't pay the detection cost.
+        /// </summary>
         public TranscodingService(FileService fileService, FfprobeService ffprobeService, IHubContext<TranscodingHub> hubContext, MediaFileRepository mediaFileRepo)
         {
             _fileService = fileService;
@@ -52,8 +94,6 @@ namespace Snacks.Services
             _mediaFileRepo = mediaFileRepo;
             _ffmpegPath = Environment.GetEnvironmentVariable("FFMPEG_PATH") ?? "ffmpeg";
 
-            // Detect hardware acceleration eagerly so the filter in AddFileAsync
-            // can skip files that VAAPI can't handle before they enter the queue
             _ = Task.Run(async () =>
             {
                 try { await DetectHardwareAccelerationAsync(); }
@@ -61,15 +101,18 @@ namespace Snacks.Services
             });
         }
 
+        /// <summary>
+        /// Sends a log line to all SignalR clients, forwards it to the master node if this is
+        /// a remote job, and appends it to the per-item log file on disk.
+        /// </summary>
         private async Task LogAsync(string workItemId, string message)
         {
             await _hubContext.Clients.All.SendAsync("TranscodingLog", workItemId, message);
 
-            // Forward log to master if this is a remote job
             if (_logCallback != null)
                 _ = _logCallback(workItemId, message);
 
-            // Persist to per-item log file (named after the video file for easy disk browsing)
+            // Log files are named after the source video so they can be matched by eye when browsing the logs directory.
             try
             {
                 var logPath = GetLogFilePath(workItemId);
@@ -82,6 +125,8 @@ namespace Snacks.Services
             catch { }
         }
 
+        /// <summary>Returns all persisted log lines for a work item, or an empty list if none exist.</summary>
+        /// <param name="workItemId">The work item ID to retrieve logs for.</param>
         public List<string> GetWorkItemLogs(string workItemId)
         {
             var logPath = GetLogFilePath(workItemId);
@@ -93,6 +138,10 @@ namespace Snacks.Services
             return new List<string>();
         }
 
+        /// <summary>
+        /// Returns the log file path for a work item, named after the video file for easy browsing.
+        /// Returns <c>null</c> if the work item ID is not found in the dictionary.
+        /// </summary>
         private string? GetLogFilePath(string workItemId)
         {
             if (!_workItems.TryGetValue(workItemId, out var workItem))
@@ -104,7 +153,15 @@ namespace Snacks.Services
             return Path.Combine(logsDir, $"{safeName}_{shortId}.log");
         }
 
-        /// <param name="force">When true, bypasses DB status checks — used for explicit user selection.</param>
+        /// <summary>
+        /// Probes a file, checks skip conditions (already target codec, 4K skip, VAAPI limits),
+        /// performs DB change detection, and enqueues the file for encoding if eligible.
+        /// Starts the processing loop in the background.
+        /// </summary>
+        /// <param name="filePath">Absolute path to the video file.</param>
+        /// <param name="options">Encoder options for this job.</param>
+        /// <param name="force">When <c>true</c>, bypasses DB status checks — used for explicit user selection.</param>
+        /// <returns>The work item ID (may be a previously existing ID if the file was already tracked).</returns>
         public async Task<string> AddFileAsync(string filePath, EncoderOptions options, bool force = false)
         {
             try
@@ -116,17 +173,16 @@ namespace Snacks.Services
                 var isHevc = false;
                 string sourceCodec = "unknown";
 
-                foreach (var stream in probe.streams)
+                foreach (var stream in probe.Streams)
                 {
-                    if (stream.codec_type == "video")
+                    if (stream.CodecType == "video")
                     {
-                        isHevc = stream.codec_name == "hevc";
-                        sourceCodec = stream.codec_name ?? "unknown";
+                        isHevc = stream.CodecName == "hevc";
+                        sourceCodec = stream.CodecName ?? "unknown";
                         break;
                     }
                 }
 
-                // Calculate bitrate in kbps from file size and duration
                 long bitrate = length > 0 ? (long)(fileInfo.Length * 8 / length / 1000) : 0;
 
                 var workItem = new WorkItem
@@ -145,12 +201,11 @@ namespace Snacks.Services
                 bool targetIsAv1 = options.Encoder.Contains("av1") || options.Encoder.Contains("svt");
                 bool isAv1 = sourceCodec == "av1";
                 bool alreadyTargetCodec = targetIsAv1 ? isAv1 : (targetIsHevc ? isHevc : !isHevc);
-                bool isHighDef = probe.streams.Any(s => s.codec_type == "video" && s.width > 1920);
+                bool isHighDef = probe.Streams.Any(s => s.CodecType == "video" && s.Width > 1920);
 
-                var videoStream = probe.streams.FirstOrDefault(s => s.codec_type == "video");
+                var videoStream = probe.Streams.FirstOrDefault(s => s.CodecType == "video");
                 var normalizedPath = Path.GetFullPath(filePath);
 
-                // Helper to persist skipped file info to the database
                 async Task MarkSkippedInDb()
                 {
                     await _mediaFileRepo.UpsertAsync(new MediaFile
@@ -162,9 +217,9 @@ namespace Snacks.Services
                         FileSize = fileInfo.Length,
                         Bitrate = bitrate,
                         Codec = sourceCodec,
-                        Width = videoStream?.width ?? 0,
-                        Height = videoStream?.height ?? 0,
-                        PixelFormat = videoStream?.pix_fmt,
+                        Width = videoStream?.Width ?? 0,
+                        Height = videoStream?.Height ?? 0,
+                        PixelFormat = videoStream?.PixFmt,
                         Duration = length,
                         IsHevc = isHevc,
                         Is4K = isHighDef,
@@ -174,7 +229,6 @@ namespace Snacks.Services
                     });
                 }
 
-                // Skip 4K videos entirely if the option is enabled
                 if (options.Skip4K && isHighDef)
                 {
                     Console.WriteLine($"Skipping {workItem.FileName}: 4K video (Skip 4K enabled)");
@@ -212,7 +266,6 @@ namespace Snacks.Services
 
                 Console.WriteLine($"Queuing {workItem.FileName}: {sourceCodec} {bitrate}kbps {(isHighDef ? "4K" : "HD")}");
 
-                // Skip if this file is already in the active in-memory queue
                 if (_workItems.Values.Any(w =>
                     Path.GetFullPath(w.Path).Equals(normalizedPath, StringComparison.OrdinalIgnoreCase) &&
                     w.Status is WorkItemStatus.Pending or WorkItemStatus.Processing))
@@ -220,14 +273,12 @@ namespace Snacks.Services
                     return workItem.Id;
                 }
 
-                // Skip if this file is currently being processed as a remote job on a cluster node
                 if (_isRemoteJobChecker?.Invoke(normalizedPath) == true)
                 {
                     Console.WriteLine($"Skipping {workItem.FileName}: already active as a remote job");
                     return workItem.Id;
                 }
 
-                // Check the database for existing records
                 var dbFile = await _mediaFileRepo.GetByPathAsync(normalizedPath);
                 if (dbFile != null)
                 {
@@ -255,7 +306,7 @@ namespace Snacks.Services
                     }
                 }
 
-                // If force, also clear any in-memory completed/failed items so they can be re-added
+                // Force-add must clear any stale in-memory entry so AddFileAsync won't skip it on the duplicate path check.
                 if (force)
                 {
                     var existing = _workItems.Values.FirstOrDefault(w =>
@@ -264,7 +315,6 @@ namespace Snacks.Services
                         _workItems.TryRemove(existing.Id, out _);
                 }
 
-                // Persist to database as Queued
                 await _mediaFileRepo.UpsertAsync(new MediaFile
                 {
                     FilePath = normalizedPath,
@@ -274,9 +324,9 @@ namespace Snacks.Services
                     FileSize = fileInfo.Length,
                     Bitrate = bitrate,
                     Codec = sourceCodec,
-                    Width = videoStream?.width ?? 0,
-                    Height = videoStream?.height ?? 0,
-                    PixelFormat = videoStream?.pix_fmt,
+                    Width = videoStream?.Width ?? 0,
+                    Height = videoStream?.Height ?? 0,
+                    PixelFormat = videoStream?.PixFmt,
                     Duration = length,
                     IsHevc = isHevc,
                     Is4K = isHighDef,
@@ -305,6 +355,15 @@ namespace Snacks.Services
             }
         }
 
+        /// <summary>
+        /// Adds all video files in a directory to the encoding queue.
+        /// Files are probed sequentially to avoid overwhelming NAS storage.
+        /// Encoding starts as soon as the first file is scanned — no waiting for the full batch.
+        /// </summary>
+        /// <param name="directoryPath">The directory to scan for video files.</param>
+        /// <param name="options">Encoder options to apply to all files.</param>
+        /// <param name="recursive">When <c>true</c>, subdirectories are also scanned.</param>
+        /// <returns>A summary message with the count of files added.</returns>
         public async Task<string> AddDirectoryAsync(string directoryPath, EncoderOptions options, bool recursive = true)
         {
             List<string> directories;
@@ -335,13 +394,21 @@ namespace Snacks.Services
             return $"Added {addedCount} files from directory";
         }
 
+        /// <summary>Returns the work item with the specified ID, or <c>null</c> if not found.</summary>
+        /// <param name="id">The work item ID.</param>
         public WorkItem? GetWorkItem(string id)
         {
             _workItems.TryGetValue(id, out var workItem);
             return workItem;
         }
 
-        /// <summary>Replace a work item's ID in the tracking dictionary (used to reuse IDs across restarts).</summary>
+        /// <summary>
+        ///     Replaces a work item's key in the tracking dictionary, used during crash recovery
+        ///     to reassign a persisted job ID from a previous run.
+        /// </summary>
+        /// <param name="oldId"> The existing key to remove. </param>
+        /// <param name="newId"> The replacement key to insert under. </param>
+        /// <param name="workItem"> The work item whose <c>Id</c> property will also be updated. </param>
         public void ReplaceWorkItemId(string oldId, string newId, WorkItem workItem)
         {
             _workItems.TryRemove(oldId, out _);
@@ -349,6 +416,8 @@ namespace Snacks.Services
             _workItems[newId] = workItem;
         }
 
+        /// <summary>Returns <c>true</c> if the specified file path is currently Pending or Processing in the queue.</summary>
+        /// <param name="filePath">The file path to check.</param>
         public bool IsFileQueued(string filePath)
         {
             var normalizedPath = Path.GetFullPath(filePath);
@@ -357,14 +426,17 @@ namespace Snacks.Services
                 w.Status is WorkItemStatus.Pending or WorkItemStatus.Processing);
         }
 
+        /// <summary>Returns all known work items ordered by creation time descending.</summary>
         public List<WorkItem> GetAllWorkItems()
         {
             return _workItems.Values.OrderByDescending(x => x.CreatedAt).ToList();
         }
 
         /// <summary>
-        /// Cancel a work item permanently — it will NOT be reprocessed unless manually reset.
+        ///     Permanently cancels a work item. The file will not be reprocessed unless explicitly reset.
+        ///     For remote items, the cancellation is forwarded to the assigned cluster node.
         /// </summary>
+        /// <param name="id"> The ID of the work item to cancel. </param>
         public async Task CancelWorkItemAsync(string id)
         {
             if (!_workItems.TryGetValue(id, out var workItem))
@@ -378,7 +450,6 @@ namespace Snacks.Services
             }
             else if (workItem.Status == WorkItemStatus.Processing && workItem.IsRemote)
             {
-                // Cancel remote job on the node
                 if (_remoteJobCanceller != null && workItem.AssignedNodeId != null)
                     await _remoteJobCanceller.Invoke(id, workItem.AssignedNodeId);
                 workItem.Status = WorkItemStatus.Cancelled;
@@ -400,8 +471,10 @@ namespace Snacks.Services
         }
 
         /// <summary>
-        /// Stop a work item — removes from queue so it can be reprocessed later (next scan or manual add).
+        ///     Stops a work item and returns it to an unprocessed state so it can be requeued on the
+        ///     next scan or manual add. Unlike cancellation, stopped items are not permanently excluded.
         /// </summary>
+        /// <param name="id"> The ID of the work item to stop. </param>
         public async Task StopWorkItemAsync(string id)
         {
             if (!_workItems.TryGetValue(id, out var workItem))
@@ -415,7 +488,6 @@ namespace Snacks.Services
             }
             else if (workItem.Status == WorkItemStatus.Processing && workItem.IsRemote)
             {
-                // Stop remote job on the node
                 if (_remoteJobCanceller != null && workItem.AssignedNodeId != null)
                     await _remoteJobCanceller.Invoke(id, workItem.AssignedNodeId);
                 workItem.Status = WorkItemStatus.Stopped;
@@ -437,20 +509,22 @@ namespace Snacks.Services
         }
 
         /// <summary>
-        /// Reset a previously failed or cancelled file so it can be reprocessed.
+        ///     Resets a previously failed or cancelled file in both the database and the in-memory
+        ///     tracking dictionary so it will be accepted by <see cref="AddFileAsync"/> on the next attempt.
         /// </summary>
+        /// <param name="filePath"> Absolute path to the file to reset. </param>
         public async Task RetryFileAsync(string filePath)
         {
             var normalizedPath = Path.GetFullPath(filePath);
             await _mediaFileRepo.ResetFileAsync(normalizedPath);
 
-            // Also remove from in-memory work items so AddFileAsync won't skip it
             var existing = _workItems.Values.FirstOrDefault(w =>
                 Path.GetFullPath(w.Path).Equals(normalizedPath, StringComparison.OrdinalIgnoreCase));
             if (existing != null)
                 _workItems.TryRemove(existing.Id, out _);
         }
 
+        /// <summary>Kills the active FFmpeg process and logs the reason. Safe to call when no process is running.</summary>
         private async Task KillActiveProcess(WorkItem workItem, string logMessage)
         {
             try
@@ -467,6 +541,11 @@ namespace Snacks.Services
             }
         }
 
+        /// <summary>
+        /// Main queue processing loop. Dequeues items one at a time and encodes them locally.
+        /// Stops if the queue is paused or local encoding is suspended for cluster dispatch.
+        /// The <see cref="_processingLock"/> semaphore guarantees only one instance runs at a time.
+        /// </summary>
         private async Task ProcessQueueAsync(EncoderOptions options)
         {
             if (!await _processingLock.WaitAsync(100))
@@ -478,7 +557,6 @@ namespace Snacks.Services
             {
                 while (true)
                 {
-                    // Check if paused before taking the next item
                     if (_isPaused)
                     {
                         Console.WriteLine("Queue is paused — stopping processing loop");
@@ -530,6 +608,10 @@ namespace Snacks.Services
             }
         }
 
+        /// <summary>
+        /// Transitions a work item to Processing, runs the conversion, and handles success/failure outcomes.
+        /// On cancellation, cleans up the partial output file. On failure, increments the DB failure count.
+        /// </summary>
         private async Task ProcessWorkItemAsync(WorkItem workItem, EncoderOptions options)
         {
             _activeWorkItem = workItem;
@@ -570,7 +652,18 @@ namespace Snacks.Services
             await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
         }
 
-        private async Task ConvertVideoAsync(WorkItem workItem, EncoderOptions options, bool stripSubtitles = false, bool forceSwDecode = false)
+        /// <summary>
+        /// Builds and executes an FFmpeg command for the given work item.
+        /// Handles hardware acceleration setup, VAAPI quality calibration, bitrate calculation,
+        /// stream mapping, and post-conversion validation and file placement.
+        /// On failure, invokes the retry chain (no subs → sw decode → sw encode).
+        /// </summary>
+        /// <param name="workItem">The item to encode.</param>
+        /// <param name="options">Encoding options (may be mutated by retry logic).</param>
+        /// <param name="stripSubtitles">When <c>true</c>, forces <c>-sn</c> to drop all subtitle streams.</param>
+        /// <param name="forceSwDecode">When <c>true</c>, disables VAAPI hardware decoding while keeping VAAPI encoding.</param>
+        /// <param name="cancellationToken">Token to abort the encode mid-stream.</param>
+        private async Task ConvertVideoAsync(WorkItem workItem, EncoderOptions options, bool stripSubtitles = false, bool forceSwDecode = false, CancellationToken cancellationToken = default)
         {
             if (workItem.Probe == null)
                 throw new Exception("No probe data available");
@@ -623,8 +716,8 @@ namespace Snacks.Services
                 compressionFlags = $"-g 25 -b:v {targetBitrate} -minrate {minBitrate} -maxrate {maxBitrate} -bufsize {maxBitrate} ";
 
             // Detect 10-bit content — VAAPI needs p010 format instead of nv12 for 10-bit
-            bool is10Bit = workItem.Probe?.streams?.Any(s =>
-                s.codec_type == "video" && (s.pix_fmt?.Contains("10") == true || s.profile?.Contains("10") == true)) == true;
+            bool is10Bit = workItem.Probe?.Streams?.Any(s =>
+                s.CodecType == "video" && (s.PixFmt?.Contains("10") == true || s.Profile?.Contains("10") == true)) == true;
 
             // forceSwDecode overrides hardware decode — used as a retry when VAAPI hwaccel
             // fails mid-stream due to format changes (keeps VAAPI encoder, uses software decoder)
@@ -649,7 +742,6 @@ namespace Snacks.Services
             string audioFlags = _ffprobeService.MapAudio(workItem.Probe!, options.EnglishOnlyAudio,
                 options.TwoChannelAudio, options.Format == "mkv") + " ";
 
-            // If retrying without subtitles, force -sn to strip all subtitle streams
             string subtitleFlags = stripSubtitles
                 ? "-sn "
                 : _ffprobeService.MapSub(workItem.Probe!, options.EnglishOnlySubtitles, options.Format == "mkv") + " ";
@@ -659,7 +751,6 @@ namespace Snacks.Services
             string outputPath = GetOutputPath(workItem, options);
             string inputPath = workItem.Path;
 
-            // Verify source file exists
             if (!File.Exists(inputPath))
             {
                 throw new Exception($"Source file not found: {inputPath}");
@@ -683,7 +774,6 @@ namespace Snacks.Services
             await LogAsync(workItem.Id,
                 $"Output to: {outputPath}");
 
-            // Handle crop filter properly
             if (options.RemoveBlackBorders)
             {
                 var cropFilter = await GetCropParametersAsync(workItem, options, inputPath);
@@ -725,7 +815,7 @@ namespace Snacks.Services
             // Run FFmpeg — catch failures so we can retry and clean up
             try
             {
-                await RunFfmpegAsync(command, workItem);
+                await RunFfmpegAsync(command, workItem, cancellationToken);
             }
             catch (OperationCanceledException)
             {
@@ -737,8 +827,7 @@ namespace Snacks.Services
                 return;
             }
 
-            // Verify conversion
-            await Task.Delay(5000); // Wait for file to be fully written
+            await Task.Delay(5000); // Wait for the filesystem to finish flushing the output before probing it.
 
             if (!File.Exists(outputPath))
             {
@@ -753,7 +842,6 @@ namespace Snacks.Services
                 return;
             }
 
-            // Calculate savings
             var outputSize = new FileInfo(outputPath).Length;
             float savings = (workItem.Size - outputSize) / 1048576f;
             float percent = 1 - ((float)outputSize / workItem.Size);
@@ -766,7 +854,6 @@ namespace Snacks.Services
                 await LogAsync(workItem.Id,
                     $"{savings:0,0}mb / {percent:P} saved.");
 
-                // Handle output file placement
                 await HandleOutputPlacement(outputPath, workItem, options);
             }
             else
@@ -782,6 +869,12 @@ namespace Snacks.Services
             }
         }
 
+        /// <summary>
+        /// Calculates target, min, and max bitrate strings for FFmpeg's VBR mode, and determines
+        /// whether to copy the video stream instead of re-encoding (when source is already HEVC at low bitrate).
+        /// 4K content uses the configured multiplier; source bitrate is always respected as an upper cap.
+        /// </summary>
+        /// <returns>A tuple of (targetBitrate, minBitrate, maxBitrate, videoCopy).</returns>
         private (string target, string min, string max, bool copy) CalculateBitrates(WorkItem workItem, EncoderOptions options)
         {
             bool videoCopy = false;
@@ -793,7 +886,7 @@ namespace Snacks.Services
                 minBitrate = targetBitrate;
                 maxBitrate = targetBitrate;
             }
-            else if (workItem.Probe!.streams.Any(x => x.width > 1920)) // 4k
+            else if (workItem.Probe!.Streams.Any(x => x.Width > 1920)) // 4k
             {
                 int multiplier = Math.Clamp(options.FourKBitrateMultiplier, 2, 8);
                 int hdBitrate = options.TargetBitrate * multiplier;
@@ -843,7 +936,6 @@ namespace Snacks.Services
             {
                 Console.WriteLine("Auto-detect: Running on Windows, testing GPU encoders...");
 
-                // Test NVIDIA NVENC
                 if (await TestEncoderAsync("-hwaccel cuda", "hevc_nvenc"))
                 {
                     Console.WriteLine("Auto-detect: NVIDIA NVENC available");
@@ -851,7 +943,6 @@ namespace Snacks.Services
                     return _detectedHardware;
                 }
 
-                // Test Intel QSV
                 if (await TestEncoderAsync("-hwaccel qsv -qsv_device auto", "hevc_qsv"))
                 {
                     Console.WriteLine("Auto-detect: Intel QSV available");
@@ -859,7 +950,6 @@ namespace Snacks.Services
                     return _detectedHardware;
                 }
 
-                // Test AMD AMF
                 if (await TestEncoderAsync("-hwaccel auto", "hevc_amf"))
                 {
                     Console.WriteLine("Auto-detect: AMD AMF available");
@@ -898,7 +988,6 @@ namespace Snacks.Services
                 }
             }
 
-            // Test NVIDIA
             if (await TestEncoderAsync("-hwaccel cuda", "hevc_nvenc"))
             {
                 Console.WriteLine("Auto-detect: NVIDIA NVENC available");
@@ -922,13 +1011,11 @@ namespace Snacks.Services
 
             try
             {
-                // Check device exists and permissions
                 if (File.Exists("/dev/dri/renderD128"))
                     Console.WriteLine("Auto-detect: /dev/dri/renderD128 exists");
                 else
                 {
                     Console.WriteLine("Auto-detect: /dev/dri/renderD128 NOT FOUND");
-                    // List what's in /dev/dri
                     if (Directory.Exists("/dev/dri"))
                     {
                         var entries = Directory.GetFileSystemEntries("/dev/dri");
@@ -939,7 +1026,6 @@ namespace Snacks.Services
                     return;
                 }
 
-                // Run vainfo for diagnostics
                 var psi = new ProcessStartInfo("vainfo")
                 {
                     Arguments = "--display drm --device /dev/dri/renderD128",
@@ -999,7 +1085,6 @@ namespace Snacks.Services
 
                 var stderr = await process.StandardError.ReadToEndAsync();
 
-                // Give it 10 seconds max
                 var completed = process.WaitForExit(10000);
                 if (!completed)
                 {
@@ -1036,6 +1121,10 @@ namespace Snacks.Services
             }
         }
 
+        /// <summary>
+        /// Returns <c>true</c> if the specified hardware acceleration mode maps to VAAPI (Intel/AMD on Linux).
+        /// Always returns <c>false</c> on Windows since VAAPI is Linux-only.
+        /// </summary>
         private bool IsVaapiAcceleration(string hardwareAcceleration)
         {
             // VAAPI only exists on Linux — never use VAAPI paths on Windows
@@ -1045,13 +1134,23 @@ namespace Snacks.Services
             return hardwareAcceleration.ToLower() is "intel" or "amd";
         }
 
+        /// <summary>
+        /// Returns <c>true</c> if the source video codec is supported by VAAPI hardware decoding
+        /// on Elkhart Lake (J6412) hardware (h264, hevc, mpeg2, vp8, vp9, mjpeg).
+        /// </summary>
         private static bool CanVaapiDecode(ProbeResult? probe)
         {
-            var codec = probe?.streams?.FirstOrDefault(s => s.codec_type == "video")?.codec_name;
+            var codec = probe?.Streams?.FirstOrDefault(s => s.CodecType == "video")?.CodecName;
             // J6412 (Elkhart Lake) VAAPI decode: h264, hevc, mpeg2, vp8, vp9, jpeg
             return codec is "h264" or "hevc" or "mpeg2video" or "vp8" or "vp9" or "mjpeg";
         }
 
+        /// <summary>
+        /// Returns the FFmpeg initialization flags for the specified hardware acceleration mode.
+        /// On Windows, maps Intel → QSV and AMD → AMF. On Linux, maps Intel/AMD → VAAPI.
+        /// When <paramref name="hwDecode"/> is <c>false</c>, initializes the VAAPI device but skips
+        /// forcing hardware decode (software decode + VAAPI encode mode).
+        /// </summary>
         private string GetInitFlags(string hardwareAcceleration, bool hwDecode = true)
         {
             bool isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
@@ -1070,6 +1169,10 @@ namespace Snacks.Services
             };
         }
 
+        /// <summary>
+        /// Maps the user's encoder preference and hardware acceleration setting to the
+        /// concrete FFmpeg encoder name (e.g., <c>"hevc_vaapi"</c>, <c>"hevc_nvenc"</c>, <c>"libx265"</c>).
+        /// </summary>
         private string GetEncoder(EncoderOptions options)
         {
             bool isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
@@ -1100,6 +1203,11 @@ namespace Snacks.Services
             };
         }
 
+        /// <summary>
+        /// Computes the output file path for a work item.
+        /// Prefers <c>EncodeDirectory</c>, then <c>OutputDirectory</c>, then the source file's directory.
+        /// Output file is named <c>"{basename} [snacks].{ext}"</c>.
+        /// </summary>
         private string GetOutputPath(WorkItem workItem, EncoderOptions options)
         {
             string fileName = _fileService.RemoveExtension(workItem.FileName);
@@ -1151,8 +1259,8 @@ namespace Snacks.Services
             string initFlags = GetInitFlags(options.HardwareAcceleration, canHwDecode);
             string encoder = GetEncoder(options);
             // Use p010 for 10-bit content, nv12 for 8-bit
-            bool is10Bit = workItem.Probe?.streams?.Any(s =>
-                s.codec_type == "video" && (s.pix_fmt?.Contains("10") == true || s.profile?.Contains("10") == true)) == true;
+            bool is10Bit = workItem.Probe?.Streams?.Any(s =>
+                s.CodecType == "video" && (s.PixFmt?.Contains("10") == true || s.Profile?.Contains("10") == true)) == true;
             string vaapiFormat = is10Bit ? "p010" : "nv12";
             string hwFilter = $"-vf format={vaapiFormat}|vaapi,hwupload";
 
@@ -1202,7 +1310,6 @@ namespace Snacks.Services
                     await LogAsync(workItem.Id,
                         $"Pass {iteration}: QP {currentQp} → {measuredKbps}kbps (target {targetKbps}kbps, ratio {ratio:F2}x)");
 
-                    // Close enough — within tolerance
                     if (ratio >= (1 - tolerance) && ratio <= (1 + tolerance))
                     {
                         await LogAsync(workItem.Id,
@@ -1236,6 +1343,10 @@ namespace Snacks.Services
             return (-1, false);
         }
 
+        /// <summary>
+        /// Runs a short test encode to measure the actual output bitrate for a given VAAPI QP value.
+        /// Returns the measured bitrate in kbps, or 0 if the encode produced no output.
+        /// </summary>
         private async Task<long> RunTestEncodeAsync(string inputPath, string initFlags, string encoder, string hwFilter, string lpFlag, int qp, string seekTime, int duration)
         {
             string command = $"{initFlags} -ss {seekTime} -i \"{inputPath}\" -t {duration} " +
@@ -1352,7 +1463,7 @@ namespace Snacks.Services
             return $"-vf crop={mostCommonCrop}";
         }
 
-        private async Task RunFfmpegAsync(string command, WorkItem workItem)
+        private async Task RunFfmpegAsync(string command, WorkItem workItem, CancellationToken cancellationToken = default)
         {
             var processStartInfo = new ProcessStartInfo(_ffmpegPath)
             {
@@ -1419,7 +1530,6 @@ namespace Snacks.Services
                                                     await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
                                                     await LogAsync(workItem.Id, $"FFmpeg: {line}");
 
-                                                    // Report progress to master if this is a remote job
                                                     if (_progressCallback != null)
                                                         _ = _progressCallback(workItem.Id, progress);
                                                 }
@@ -1444,7 +1554,7 @@ namespace Snacks.Services
                 catch { }
             });
 
-            // Discard stdout
+            // Drain stdout to prevent the process from blocking on a full pipe buffer.
             _ = Task.Run(async () =>
             {
                 try { await process.StandardOutput.ReadToEndAsync(); } catch { }
@@ -1454,10 +1564,17 @@ namespace Snacks.Services
             var exitTask = process.WaitForExitAsync();
             while (!exitTask.IsCompleted)
             {
-                var winner = await Task.WhenAny(exitTask, Task.Delay(30000));
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    await LogAsync(workItem.Id, "Cancellation requested — killing FFmpeg process.");
+                    try { process.Kill(entireProcessTree: true); } catch { }
+                    await exitTask; // Wait for kill to complete
+                    throw new OperationCanceledException("Encoding was cancelled.");
+                }
+
+                var winner = await Task.WhenAny(exitTask, Task.Delay(30000, cancellationToken));
                 if (winner != exitTask && !process.HasExited)
                 {
-                    // Still running — check for stall
                     if ((DateTime.UtcNow - lastActivity).TotalSeconds >= stallTimeoutSeconds)
                     {
                         await LogAsync(workItem.Id,
@@ -1489,7 +1606,6 @@ namespace Snacks.Services
         {
             await LogAsync(workItem.Id, $"Conversion failed: {reason}");
 
-            // Clean up the failed/partial output file
             try
             {
                 await _fileService.FileDeleteAsync(outputPath);
@@ -1506,7 +1622,7 @@ namespace Snacks.Services
                 await LogAsync(workItem.Id, "Retrying without subtitles...");
                 workItem.Progress = 0;
                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
-                await ConvertVideoAsync(workItem, options, stripSubtitles: true);
+                await ConvertVideoAsync(workItem, options, stripSubtitles: true, cancellationToken: cancellationToken);
                 return;
             }
 
@@ -1527,7 +1643,7 @@ namespace Snacks.Services
                     "Retrying with software decode + VAAPI encode...");
                 workItem.Progress = 0;
                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
-                await ConvertVideoAsync(workItem, options, stripSubtitles: subtitlesWereStripped, forceSwDecode: true);
+                await ConvertVideoAsync(workItem, options, stripSubtitles: subtitlesWereStripped, forceSwDecode: true, cancellationToken: cancellationToken);
                 return;
             }
 
@@ -1544,7 +1660,7 @@ namespace Snacks.Services
                 bool isAv1Target = options.Encoder.Contains("av1") || options.Encoder.Contains("svt") || options.Codec == "av1";
                 options.Encoder = isAv1Target ? "libsvtav1" : "libx265";
                 options.HardwareAcceleration = "none";
-                await ConvertVideoAsync(workItem, options, stripSubtitles: false);
+                await ConvertVideoAsync(workItem, options, stripSubtitles: false, cancellationToken: cancellationToken);
                 return;
             }
 
@@ -1553,51 +1669,62 @@ namespace Snacks.Services
             throw new Exception($"Conversion failed after retries: {reason}");
         }
 
-        // --- Cluster support methods ---
-
+        /// <summary>Returns the work item currently being encoded locally, or <c>null</c> when idle.</summary>
         public WorkItem? GetActiveWorkItem() => _activeWorkItem;
+
+        /// <summary>Returns the encoder options from the most recently started queue run.</summary>
         public EncoderOptions? GetLastOptions() => _lastOptions;
 
         /// <summary>
-        /// When true, the local processing loop will not dequeue items.
-        /// Items stay in the queue for the cluster dispatch loop to pick up.
+        ///     Suspends or resumes the local processing loop. When suspended, pending items remain
+        ///     in the queue for the cluster dispatch loop to assign to remote nodes instead.
         /// </summary>
+        /// <param name="paused"> <see langword="true"/> to suspend local encoding; <see langword="false"/> to resume it. </param>
         public void SetLocalEncodingPaused(bool paused)
         {
             _localEncodingPaused = paused;
             Console.WriteLine($"Cluster: Local encoding {(paused ? "paused" : "resumed")}");
         }
 
+        /// <summary>Returns the detected hardware acceleration type (e.g., <c>"nvidia"</c>, <c>"intel"</c>, <c>"none"</c>), or <c>null</c> if detection hasn't completed.</summary>
         public string? GetDetectedHardware() => _detectedHardware;
 
+        /// <summary>Sets the callback invoked on each progress update when running as a cluster node.</summary>
+        /// <param name="callback">Delegate receiving (workItemId, progressPercent).</param>
         public void SetProgressCallback(Func<string, int, Task>? callback)
         {
             _progressCallback = callback;
         }
 
+        /// <summary>Sets the callback invoked for each FFmpeg log line when running as a cluster node.</summary>
+        /// <param name="callback">Delegate receiving (workItemId, logLine).</param>
         public void SetLogCallback(Func<string, string, Task>? callback)
         {
             _logCallback = callback;
         }
 
+        /// <summary>Sets the callback used by the cluster service to cancel a remote job on a specific node.</summary>
+        /// <param name="canceller">Delegate receiving (jobId, nodeId).</param>
         public void SetRemoteJobCanceller(Func<string, string, Task>? canceller)
         {
             _remoteJobCanceller = canceller;
         }
 
+        /// <summary>Sets the callback the cluster service uses to check whether a file is already assigned to a remote node.</summary>
+        /// <param name="checker">Delegate receiving (filePath), returning <c>true</c> if currently remote.</param>
         public void SetRemoteJobChecker(Func<string, bool>? checker)
         {
             _isRemoteJobChecker = checker;
         }
 
         /// <summary>
-        /// Stops all processing and clears the queue. Used when switching to node mode.
+        ///     Kills any active FFmpeg process, clears the pending queue, and resets all in-memory
+        ///     state. Called when the master switches to node mode and must hand off processing.
         /// </summary>
         public async Task StopAndClearQueue()
         {
             Console.WriteLine("Cluster: Stopping all processing and clearing queue...");
 
-            // Kill active FFmpeg process
             if (_activeWorkItem != null && _activeProcess != null)
             {
                 try
@@ -1607,7 +1734,6 @@ namespace Snacks.Services
                 }
                 catch { }
 
-                // Clean up partial output
                 if (_lastOptions != null)
                 {
                     var outputPath = GetOutputPath(_activeWorkItem, _lastOptions);
@@ -1627,7 +1753,6 @@ namespace Snacks.Services
                 _activeProcess = null;
             }
 
-            // Clear the queue
             List<WorkItem> pendingItems;
             lock (_queueLock)
             {
@@ -1635,7 +1760,7 @@ namespace Snacks.Services
                 _workQueue.Clear();
             }
 
-            // Mark all pending items as unseen in DB (so they won't be resumed in node mode)
+            // Reset all pending items to Unseen so the node doesn't inherit master-mode queue state.
             foreach (var item in pendingItems)
             {
                 item.Status = WorkItemStatus.Stopped;
@@ -1647,15 +1772,16 @@ namespace Snacks.Services
                 catch { }
             }
 
-            // Clear in-memory work items
             _workItems.Clear();
 
             Console.WriteLine($"Cluster: Queue cleared ({pendingItems.Count} items stopped)");
         }
 
         /// <summary>
-        /// Dequeue a pending item for remote processing on a cluster node.
+        ///     Atomically dequeues the next pending work item and marks it as Processing,
+        ///     making it available for dispatch to a cluster node.
         /// </summary>
+        /// <returns> The next pending <see cref="WorkItem"/>, or <see langword="null"/> if the queue is empty. </returns>
         public WorkItem? DequeueForRemoteProcessing()
         {
             lock (_queueLock)
@@ -1671,8 +1797,10 @@ namespace Snacks.Services
         }
 
         /// <summary>
-        /// Re-queue a work item that failed on a remote node.
+        ///     Returns a work item to the pending queue after a remote node failure,
+        ///     clearing node assignment metadata so it can be dispatched again.
         /// </summary>
+        /// <param name="item"> The work item to requeue. </param>
         public void RequeueWorkItem(WorkItem item)
         {
             item.Status = WorkItemStatus.Pending;
@@ -1692,11 +1820,14 @@ namespace Snacks.Services
         }
 
         /// <summary>
-        /// Handle completion of a remote job — validate output and perform file placement.
+        ///     Finalizes a job completed on a remote cluster node by calculating space savings,
+        ///     performing file placement, and updating the work item status to Completed.
         /// </summary>
+        /// <param name="workItem"> The work item that was encoded remotely. </param>
+        /// <param name="outputPath"> Local path to the encoded output file transferred from the node. </param>
+        /// <param name="options"> The encoder options that were used for the job. </param>
         public async Task HandleRemoteCompletion(WorkItem workItem, string outputPath, EncoderOptions options)
         {
-            // Calculate savings
             var outputSize = new FileInfo(outputPath).Length;
             float savings = (workItem.Size - outputSize) / 1048576f;
             float percent = 1 - ((float)outputSize / workItem.Size);
@@ -1723,8 +1854,11 @@ namespace Snacks.Services
         }
 
         /// <summary>
-        /// Mark a work item as failed (used by cluster for remote failures).
+        ///     Marks a work item as failed and records the error in the database.
+        ///     Used by the cluster service to propagate remote node failures back to the master.
         /// </summary>
+        /// <param name="workItemId"> The ID of the work item that failed. </param>
+        /// <param name="errorMessage"> The error message to record. </param>
         public async Task MarkWorkItemFailed(string workItemId, string errorMessage)
         {
             if (_workItems.TryGetValue(workItemId, out var workItem))
@@ -1738,9 +1872,13 @@ namespace Snacks.Services
         }
 
         /// <summary>
-        /// Reconstruct a WorkItem with a specific ID from a file on disk.
-        /// Used during crash recovery to preserve the job ID so nodes can resume.
+        ///     Probes a file on disk and constructs a <see cref="WorkItem"/> with a predetermined ID.
+        ///     Used during crash recovery so that a restarted master can hand the original job ID
+        ///     back to the cluster node that was already encoding it.
         /// </summary>
+        /// <param name="id"> The job ID to assign to the reconstructed work item. </param>
+        /// <param name="filePath"> Absolute path to the source video file. </param>
+        /// <returns> The reconstructed <see cref="WorkItem"/>, or <see langword="null"/> if the file does not exist or probing fails. </returns>
         public async Task<WorkItem?> CreateWorkItemWithIdAsync(string id, string filePath)
         {
             try
@@ -1753,11 +1891,11 @@ namespace Snacks.Services
 
                 var isHevc = false;
                 long bitrate = 0;
-                foreach (var stream in probe.streams)
+                foreach (var stream in probe.Streams)
                 {
-                    if (stream.codec_type == "video")
+                    if (stream.CodecType == "video")
                     {
-                        isHevc = stream.codec_name == "hevc";
+                        isHevc = stream.CodecName == "hevc";
                         break;
                     }
                 }
@@ -1790,16 +1928,20 @@ namespace Snacks.Services
         }
 
         /// <summary>
-        /// Run ConvertVideoAsync for a remote job (node-side encoding).
+        /// Runs the encoding pipeline for a job received from a master node.
+        /// Registers the work item so logging works, then delegates to <see cref="ConvertVideoAsync"/>.
+        /// The work item is kept in the dictionary after completion so the output remains accessible for download.
         /// </summary>
-        public async Task ConvertVideoForRemoteAsync(WorkItem workItem, EncoderOptions options)
+        /// <param name="workItem">The work item to encode.</param>
+        /// <param name="options">Encoding options from the master's job assignment.</param>
+        /// <param name="cancellationToken">Token to abort encoding if the job is cancelled.</param>
+        public async Task ConvertVideoForRemoteAsync(WorkItem workItem, EncoderOptions options, CancellationToken cancellationToken = default)
         {
-            // Register the work item so logging works
             _workItems[workItem.Id] = workItem;
 
             try
             {
-                await ConvertVideoAsync(workItem, options);
+                await ConvertVideoAsync(workItem, options, cancellationToken: cancellationToken);
             }
             finally
             {
@@ -1807,6 +1949,11 @@ namespace Snacks.Services
             }
         }
 
+        /// <summary>
+        /// Moves the encoded output to its final destination, optionally deletes the original,
+        /// and renames the file from the <c>[snacks]</c> staging name to the clean final name.
+        /// No-op if the output file produced no size savings (already handled by the caller).
+        /// </summary>
         private async Task HandleOutputPlacement(string outputPath, WorkItem workItem, EncoderOptions options)
         {
             try
@@ -1874,4 +2021,3 @@ namespace Snacks.Services
             }
         }
     }
-}

@@ -11,43 +11,78 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 
-namespace Snacks.Services
+namespace Snacks.Services;
+
+/// <summary>
+///     Manages the distributed encoding cluster — node discovery, heartbeat monitoring,
+///     job dispatch, file transfer, and crash recovery.
+///
+///     <para><b>Architecture:</b></para>
+///     <list type="bullet">
+///       <item>
+///           <description>Master mode: Coordinates jobs, dispatches to worker nodes, monitors health</description>
+///       </item>
+///       <item>
+///           <description>Node mode: Receives jobs, encodes, reports progress/completion</description>
+///       </item>
+///       <item><description>Standalone: No clustering, all encoding is local</description></item>
+///     </list>
+///
+///     <para><b>Resilience Features:</b></para>
+///     <list type="bullet">
+///       <item><description>Chunked file transfer with SHA256 hash verification</description></item>
+///       <item><description>Resume support for uploads and downloads</description></item>
+///       <item><description>Crash recovery via SQLite database on startup</description></item>
+///       <item><description>Persistent completion tracking on nodes</description></item>
+///       <item><description>Graceful shutdown with transfer completion</description></item>
+///       <item><description>Node temp file TTL cleanup</description></item>
+///     </list>
+/// </summary>
+public sealed class ClusterService : IHostedService, IDisposable
 {
-    public class ClusterService : IHostedService, IDisposable
+    private readonly TranscodingService  _transcodingService;
+    private readonly FfprobeService      _ffprobeService;
+    private readonly FileService         _fileService;
+    private readonly IHubContext<TranscodingHub> _hubContext;
+    private readonly IHttpClientFactory  _httpClientFactory;
+    private readonly MediaFileRepository _mediaFileRepo;
+    private readonly ConcurrentDictionary<string, ClusterNode>              _nodes              = new();
+    private readonly ConcurrentDictionary<string, WorkItem>                 _remoteJobs         = new();
+    private readonly ConcurrentDictionary<string, bool>                     _activeDownloads    = new();
+    private readonly ConcurrentDictionary<string, bool>                     _activeUploads      = new();
+    private readonly ConcurrentDictionary<string, int>                      _downloadRetryCounts = new();
+    private readonly ConcurrentDictionary<string, CancellationTokenSource>  _jobCts             = new();
+    private readonly string _configPath;
+    private readonly string _workDir;
+    private readonly JsonSerializerOptions _jsonOptions = new()
     {
-        private readonly TranscodingService _transcodingService;
-        private readonly FfprobeService _ffprobeService;
-        private readonly FileService _fileService;
-        private readonly IHubContext<TranscodingHub> _hubContext;
-        private readonly IHttpClientFactory _httpClientFactory;
-        private readonly MediaFileRepository _mediaFileRepo;
-        private readonly ConcurrentDictionary<string, ClusterNode> _nodes = new();
-        private readonly ConcurrentDictionary<string, WorkItem> _remoteJobs = new(); // Runtime cache — rebuilt from DB on startup
-        private readonly ConcurrentDictionary<string, bool> _activeDownloads = new();
-        private readonly ConcurrentDictionary<string, bool> _activeUploads = new();
-        private readonly ConcurrentDictionary<string, int> _downloadRetryCounts = new();
-        private readonly ConcurrentDictionary<string, CancellationTokenSource> _jobCts = new();
-        private readonly string _configPath;
-        private readonly string _workDir;
-        private readonly JsonSerializerOptions _jsonOptions = new()
-        {
-            PropertyNameCaseInsensitive = true,
-            WriteIndented = true,
-            PropertyNamingPolicy = JsonNamingPolicy.CamelCase
-        };
+        PropertyNameCaseInsensitive = true,
+        WriteIndented               = true,
+        PropertyNamingPolicy        = JsonNamingPolicy.CamelCase
+    };
 
-        private ClusterConfig _config = new();
-        private Timer? _heartbeatTimer;
-        private Timer? _dispatchTimer;
-        private UdpClient? _udpListener;
-        private CancellationTokenSource? _cts;
-        private Task? _discoveryTask;
-        private string? _detectedGpuVendor;
-        private List<string>? _supportedEncoders;
-        private TaskCompletionSource _recoveryComplete = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        public Task RecoveryCompleteTask => _recoveryComplete.Task;
+    private ClusterConfig            _config          = new();
+    private Timer?                   _heartbeatTimer;
+    private Timer?                   _dispatchTimer;
+    private UdpClient?               _udpListener;
+    private CancellationTokenSource? _cts;
+    private Task?                    _discoveryTask;
+    private string?                  _detectedGpuVendor;
+    private List<string>?            _supportedEncoders;
+    private TaskCompletionSource     _recoveryComplete = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        public ClusterService(
+    /// <summary> Completes when crash recovery of remote jobs has finished on startup. </summary>
+    public Task RecoveryCompleteTask => _recoveryComplete.Task;
+
+    /******************************************************************
+     *  Constructor
+     ******************************************************************/
+
+    /// <summary>
+    ///     Initializes the service, resolves configuration file paths, and wires up
+    ///     the pending-completions persistence path used by node-side job tracking.
+    /// </summary>
+    public ClusterService(
             TranscodingService transcodingService,
             FfprobeService ffprobeService,
             FileService fileService,
@@ -55,26 +90,32 @@ namespace Snacks.Services
             IHttpClientFactory httpClientFactory,
             MediaFileRepository mediaFileRepo)
         {
-            _transcodingService = transcodingService;
-            _ffprobeService = ffprobeService;
-            _fileService = fileService;
-            _hubContext = hubContext;
-            _httpClientFactory = httpClientFactory;
-            _mediaFileRepo = mediaFileRepo;
+        _transcodingService = transcodingService;
+        _ffprobeService     = ffprobeService;
+        _fileService        = fileService;
+        _hubContext         = hubContext;
+        _httpClientFactory  = httpClientFactory;
+        _mediaFileRepo      = mediaFileRepo;
 
-            _workDir = _fileService.GetWorkingDirectory();
-            var configDir = Path.Combine(_workDir, "config");
-            Directory.CreateDirectory(configDir);
-            _configPath = Path.Combine(configDir, "cluster.json");
-        }
+        _workDir = _fileService.GetWorkingDirectory();
+        var configDir = Path.Combine(_workDir, "config");
+        Directory.CreateDirectory(configDir);
+        _configPath             = Path.Combine(configDir, "cluster.json");
+        _pendingCompletionsPath = Path.Combine(_workDir, "config", "pending-completions.json");
+    }
 
+    /******************************************************************
+     *  IHostedService
+     ******************************************************************/
 
-
-        // --- Lifecycle ---
-
-        public Task StartAsync(CancellationToken cancellationToken)
-        {
-            LoadConfig();
+    /// <summary>
+    ///     Called when the application starts. Loads cluster configuration and begins
+    ///     cluster operations if enabled. For master nodes, triggers crash recovery
+    ///     of any in-flight remote jobs from the previous session.
+    /// </summary>
+    public Task StartAsync(CancellationToken cancellationToken)
+    {
+        LoadConfig();
             Console.WriteLine($"Cluster: Config loaded — enabled={_config.Enabled}, role={_config.Role}, nodeId={_config.NodeId}");
 
             if (_config.Enabled && _config.Role != "standalone")
@@ -103,21 +144,115 @@ namespace Snacks.Services
             return Task.CompletedTask;
         }
 
+        /// <summary> Stops all cluster operations gracefully when the application shuts down. </summary>
         public async Task StopAsync(CancellationToken cancellationToken)
         {
             Console.WriteLine("Cluster: Shutting down...");
             await StopClusterOperationsAsync();
         }
 
-        public void Dispose()
+    /******************************************************************
+     *  Cluster Lifecycle
+     ******************************************************************/
+
+        /// <summary>
+        ///     Initiates a graceful or immediate shutdown. In graceful mode, pauses all nodes, waits
+        ///     for active transfers to complete up to <paramref name="timeoutSeconds"/>, then stops.
+        /// </summary>
+        /// <param name="graceful">When <see langword="true"/>, waits for active transfers to finish.</param>
+        /// <param name="timeoutSeconds">Maximum seconds to wait for transfers before forcing shutdown.</param>
+        public async Task InitiateShutdownAsync(bool graceful, int timeoutSeconds)
         {
-            StopClusterOperationsAsync().GetAwaiter().GetResult();
+            Console.WriteLine($"Cluster: Initiating {(graceful ? "graceful" : "immediate")} shutdown (timeout: {timeoutSeconds}s)");
+
+            if (graceful && IsMasterMode)
+            {
+                // Tell all nodes to pause so they can finish current work
+                foreach (var node in _nodes.Values.Where(n => n.Role == "node"))
+                {
+                    try
+                    {
+                        await SetRemoteNodePausedAsync(node.NodeId, true);
+                    }
+                    catch { }
+                }
+
+                // Wait for active transfers to complete (up to timeout)
+                var deadline = DateTime.UtcNow.AddSeconds(timeoutSeconds);
+                while (DateTime.UtcNow < deadline)
+                {
+                    var activeTransfers = _activeUploads.Count + _activeDownloads.Count;
+                    if (activeTransfers == 0) break;
+                    Console.WriteLine($"Cluster: Waiting for {activeTransfers} active transfer(s) to complete...");
+                    await Task.Delay(TimeSpan.FromSeconds(5));
+                }
+            }
+
+            // Persist all state to DB — cleanup old transitions
+            try { await _mediaFileRepo.CleanupOldTransitionsAsync(); } catch { }
+
+            await StopClusterOperationsAsync();
         }
 
-        // --- Config ---
+        /// <summary> Deletes remote job temp directories that are older than <paramref name="ttlHours"/> hours. </summary>
+        /// <param name="ttlHours">Directories last written more than this many hours ago are deleted.</param>
+        public void CleanupOldRemoteJobs(int ttlHours)
+        {
+            var workDir = Environment.GetEnvironmentVariable("SNACKS_WORK_DIR")
+                ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Snacks", "work");
+            var baseDir = string.IsNullOrWhiteSpace(_config.NodeTempDirectory)
+                ? Path.Combine(workDir, "remote-jobs")
+                : _config.NodeTempDirectory;
 
+            if (!Directory.Exists(baseDir)) return;
+
+            var cutoff = DateTime.UtcNow.AddHours(-ttlHours);
+            int cleaned = 0;
+
+            foreach (var dir in Directory.GetDirectories(baseDir))
+            {
+                try
+                {
+                    var dirInfo = new DirectoryInfo(dir);
+                    if (dirInfo.LastWriteTimeUtc < cutoff)
+                    {
+                        Directory.Delete(dir, true);
+                        cleaned++;
+                    }
+                }
+                catch (IOException ex)
+                {
+                    Console.WriteLine($"Cluster: Could not delete {dir}: {ex.Message}");
+                }
+            }
+
+            if (cleaned > 0)
+                Console.WriteLine($"Cluster: Cleaned up {cleaned} remote job directories older than {ttlHours}h");
+        }
+
+        /// <summary> Disposes the service, stopping all cluster operations. </summary>
+        public void Dispose()
+        {
+            _cts?.Cancel();
+            _heartbeatTimer?.Dispose();
+            _dispatchTimer?.Dispose();
+            _udpListener?.Close();
+            _udpListener?.Dispose();
+            _cts?.Dispose();
+        }
+
+    /******************************************************************
+     *  Configuration
+     ******************************************************************/
+
+        /// <summary> Returns the current cluster configuration. </summary>
         public ClusterConfig GetConfig() => _config;
 
+        /// <summary>
+        ///     Persists a new cluster configuration and restarts cluster operations immediately.
+        ///     Handles role transitions, such as switching from master to node mode.
+        /// </summary>
+        /// <param name="newConfig">The new configuration to apply.</param>
         public async Task SaveConfigAndApplyAsync(ClusterConfig newConfig)
         {
             var oldRole = _config.Role;
@@ -154,38 +289,66 @@ namespace Snacks.Services
             });
         }
 
+        /// <summary> Returns a snapshot of all currently known cluster nodes. </summary>
         public IReadOnlyList<ClusterNode> GetNodes() => _nodes.Values.ToList();
 
+        /// <summary> Whether this instance is running as a worker node. </summary>
         public bool IsNodeMode => _config.Enabled && _config.Role == "node";
+
+        /// <summary> Whether this instance is running as the master coordinator. </summary>
         public bool IsMasterMode => _config.Enabled && _config.Role == "master";
 
-        /// <summary>Check if a file path is currently being handled as a remote job.</summary>
+        /// <summary>
+        ///     Returns the phase of a remote job, or <see langword="null"/> if the job is not tracked.
+        ///     Used for idempotency checks on completion reports.
+        /// </summary>
+        /// <param name="jobId">The job ID to look up.</param>
+        /// <returns>The current phase string (e.g. "Uploading", "Encoding"), or <see langword="null"/>.</returns>
+        public string? GetRemoteJobPhase(string jobId)
+        {
+            return _remoteJobs.TryGetValue(jobId, out var w) ? w.RemoteJobPhase : null;
+        }
+
+        /// <summary>
+        ///     Checks if a file path is currently being handled as a remote job.
+        ///     Uses the in-memory cache for speed, then the database for an authoritative answer.
+        /// </summary>
+        /// <param name="filePath">The absolute file path to check.</param>
+        /// <returns><see langword="true"/> if the file is assigned to a remote node.</returns>
         public bool IsRemoteJob(string filePath)
         {
             var normalized = Path.GetFullPath(filePath);
 
-            // Fast path: check in-memory cache
             if (_remoteJobs.Values.Any(w =>
                 Path.GetFullPath(w.Path).Equals(normalized, StringComparison.OrdinalIgnoreCase)))
                 return true;
 
-            // Authoritative check: query the database
+            // DB is the authoritative source — in-memory cache may not yet reflect a recovered job.
             return _mediaFileRepo.IsRemoteJobAsync(normalized).GetAwaiter().GetResult();
         }
 
-        // --- Node pause (local) ---
+    /******************************************************************
+     *  Node Pause
+     ******************************************************************/
 
         private bool _nodePaused = false;
+
+        /// <summary> Whether this node is paused and not accepting new jobs. </summary>
         public bool IsNodePaused => _nodePaused;
 
-        private string? _completedJobId; // Set after encoding, cleared on cleanup
+        /// <summary> Job ID retained after encoding completes, until the master acknowledges and cleans up. </summary>
+        private string? _completedJobId;
 
+        /// <summary> Returns the current remote job ID, spanning the active, receiving, and completed states. </summary>
+        /// <returns>The job ID, or <see langword="null"/> if no remote job is tracked.</returns>
         public string? GetCurrentRemoteJobId() => _currentRemoteJob?.Id ?? _receivingJobId ?? _completedJobId;
+
+        /// <summary> Returns the encoding progress percentage of the current remote job. </summary>
+        /// <returns>A value from 0 to 100, or 0 if no job is active.</returns>
         public int GetCurrentRemoteJobProgress() => _currentRemoteJob?.Progress ?? 0;
 
-        /// <summary>
-        /// Pause/resume this node. When paused, the node won't accept new jobs.
-        /// </summary>
+        /// <summary> Pauses or resumes this node's ability to accept new jobs. </summary>
+        /// <param name="paused">When <see langword="true"/>, the node will not accept new job offers.</param>
         public void SetNodePaused(bool paused)
         {
             _nodePaused = paused;
@@ -195,9 +358,11 @@ namespace Snacks.Services
         }
 
         /// <summary>
-        /// Master: pause/resume a specific remote node. Sends a pause command to the node
-        /// and updates the local registry.
+        ///     Sends a pause or resume command to a specific remote node and updates its entry
+        ///     in the local node registry.
         /// </summary>
+        /// <param name="nodeId">The ID of the node to pause or resume.</param>
+        /// <param name="paused">When <see langword="true"/>, the node will stop accepting new jobs.</param>
         public async Task SetRemoteNodePausedAsync(string nodeId, bool paused)
         {
             if (!_nodes.TryGetValue(nodeId, out var node)) return;
@@ -223,8 +388,14 @@ namespace Snacks.Services
             Console.WriteLine($"Cluster: Node {node.Hostname} {(paused ? "paused" : "resumed")} by master");
         }
 
-        // --- Discovery ---
+    /******************************************************************
+     *  Discovery
+     ******************************************************************/
 
+        /// <summary>
+        ///     Starts UDP discovery, heartbeat monitoring, job dispatch (master only),
+        ///     and manual node connections based on the current configuration.
+        /// </summary>
         private void StartClusterOperations()
         {
             if (string.IsNullOrEmpty(_config.SharedSecret))
@@ -242,9 +413,11 @@ namespace Snacks.Services
             if (needsDiscovery)
                 _discoveryTask = Task.Run(() => RunDiscoveryAsync(_cts.Token));
 
-            // Heartbeat monitoring
+            // Heartbeat monitoring — add jitter to the initial delay to prevent thundering herd
+            // when multiple nodes start simultaneously
             var heartbeatInterval = TimeSpan.FromSeconds(_config.HeartbeatIntervalSeconds);
-            _heartbeatTimer = new Timer(async _ => await RunHeartbeatAsync(), null, heartbeatInterval, heartbeatInterval);
+            var jitter = TimeSpan.FromMilliseconds(Random.Shared.Next(0, (int)heartbeatInterval.TotalMilliseconds));
+            _heartbeatTimer = new Timer(async _ => await RunHeartbeatAsync(), null, jitter, heartbeatInterval);
 
             // Job dispatch (master only)
             if (_config.Role == "master")
@@ -277,6 +450,7 @@ namespace Snacks.Services
             Console.WriteLine($"Cluster started: role={_config.Role}, localIp={localIp}, port={port}, discovery={needsDiscovery}");
         }
 
+        /// <summary> Cancels all timers, closes the UDP listener, and awaits the discovery task. </summary>
         private async Task StopClusterOperationsAsync()
         {
             _cts?.Cancel();
@@ -304,6 +478,8 @@ namespace Snacks.Services
             Console.WriteLine("Cluster: Stopped");
         }
 
+        /// <summary> Binds the UDP socket and runs the broadcast and listen loops in parallel. </summary>
+        /// <param name="ct">Cancelled when the cluster is stopping.</param>
         private async Task RunDiscoveryAsync(CancellationToken ct)
         {
             try
@@ -327,6 +503,11 @@ namespace Snacks.Services
             }
         }
 
+        /// <summary>
+        ///     Announces this node's presence via UDP every 15 seconds, sending to all subnet
+        ///     broadcast addresses to maximise reachability across multi-adapter hosts.
+        /// </summary>
+        /// <param name="ct">Cancelled when the cluster is stopping.</param>
         private async Task BroadcastLoopAsync(CancellationToken ct)
         {
             using var broadcastClient = new UdpClient();
@@ -376,6 +557,11 @@ namespace Snacks.Services
             }
         }
 
+        /// <summary>
+        ///     Listens for UDP announcements from peer nodes and initiates a handshake
+        ///     with any newly discovered node whose secret hash matches.
+        /// </summary>
+        /// <param name="ct">Cancelled when the cluster is stopping.</param>
         private async Task ListenLoopAsync(CancellationToken ct)
         {
             Console.WriteLine("Cluster: Listening for UDP announcements on port 6768");
@@ -472,6 +658,8 @@ namespace Snacks.Services
             return addresses;
         }
 
+        /// <summary> Attempts a handshake with each manually configured node URL. </summary>
+        /// <param name="ct">Cancelled when the cluster is stopping.</param>
         private async Task ConnectToManualNodesAsync(CancellationToken ct)
         {
             foreach (var node in _config.ManualNodes)
@@ -488,6 +676,8 @@ namespace Snacks.Services
             }
         }
 
+        /// <summary> Repeatedly attempts to register with the master, retrying every 10 seconds until successful or cancelled. </summary>
+        /// <param name="ct">Cancelled when the cluster is stopping.</param>
         private async Task RegisterWithMasterAsync(CancellationToken ct)
         {
             while (!ct.IsCancellationRequested)
@@ -505,6 +695,12 @@ namespace Snacks.Services
             }
         }
 
+        /// <summary>
+        ///     Posts this node's info to the remote node's handshake endpoint and registers
+        ///     the remote node's response locally.
+        /// </summary>
+        /// <param name="baseUrl">Base URL of the remote node (e.g. <c>http://192.168.1.5:6767</c>).</param>
+        /// <param name="ct">Cancelled when the cluster is stopping.</param>
         private async Task PerformHandshakeAsync(string baseUrl, CancellationToken ct)
         {
             var url = $"{baseUrl.TrimEnd('/')}/api/cluster/handshake";
@@ -541,6 +737,10 @@ namespace Snacks.Services
             }
         }
 
+        /// <summary>
+        /// Builds a <see cref="ClusterNode"/> representing this instance.
+        /// Used during handshake and heartbeat responses.
+        /// </summary>
         public ClusterNode BuildSelfNode()
         {
             return new ClusterNode
@@ -557,6 +757,11 @@ namespace Snacks.Services
             };
         }
 
+        /// <summary>
+        /// Returns the hardware and software capabilities of this node.
+        /// Re-checks hardware detection each time since eager detection
+        /// may not have finished on first call.
+        /// </summary>
         public WorkerCapabilities GetCapabilities()
         {
             // Re-check hardware detection each time — the eager detection in
@@ -578,6 +783,7 @@ namespace Snacks.Services
             };
         }
 
+        /// <summary> Builds and caches the list of encoder identifiers supported by this node's hardware. </summary>
         private List<string> BuildSupportedEncodersList()
         {
             var encoders = new List<string> { "libx265", "libx264", "libsvtav1" };
@@ -595,8 +801,20 @@ namespace Snacks.Services
             return encoders;
         }
 
-        // --- Node registration ---
+    /******************************************************************
+     *  Node Registration
+     ******************************************************************/
 
+        /// <summary>
+        ///     Registers a new node or refreshes an existing one. A handshake always updates
+        ///     <see cref="ClusterNode.LastHeartbeat"/>; a non-handshake update preserves the
+        ///     existing timestamp so only successful HTTP heartbeats advance it.
+        /// </summary>
+        /// <param name="node">The node data received from the remote peer.</param>
+        /// <param name="fromHandshake">
+        ///     When <see langword="true"/>, resets <see cref="ClusterNode.LastHeartbeat"/> to now
+        ///     because a successful handshake confirms the node is alive.
+        /// </param>
         public void RegisterOrUpdateNode(ClusterNode node, bool fromHandshake = false)
         {
             var isNew = !_nodes.ContainsKey(node.NodeId);
@@ -618,6 +836,9 @@ namespace Snacks.Services
             }
         }
 
+        /// <summary>
+        /// Updates the status of a cluster node and broadcasts the change to all connected clients.
+        /// </summary>
         public void UpdateNodeStatus(string nodeId, NodeStatus status, string? workItemId = null,
             string? fileName = null, int progress = 0)
         {
@@ -632,8 +853,14 @@ namespace Snacks.Services
             }
         }
 
-        // --- Heartbeat ---
+    /******************************************************************
+     *  Heartbeat
+     ******************************************************************/
 
+        /// <summary>
+        /// Runs the heartbeat monitoring loop. Pings all nodes periodically,
+        /// detects timeouts, and reconciles job state.
+        /// </summary>
         private async Task RunHeartbeatAsync()
         {
             // Don't run reconciliation until recovery is complete — recovery may not have
@@ -730,16 +957,26 @@ namespace Snacks.Services
                             }
 
                             // Reconciliation: node says it's working on a job the master doesn't know about
-                            // Skip during recovery — recovery may not have added the job to _remoteJobs yet
+                            // CRITICAL: Check DB before cancelling — recovery may be in progress for this job.
+                            // Don't cancel jobs that have a DB record with AssignedNodeId set.
                             if (nodeJobId != null && !_remoteJobs.ContainsKey(nodeJobId))
                             {
-                                Console.WriteLine($"Cluster: Node {node.Hostname} is working on unknown job {nodeJobId} — telling it to cancel");
-                                try
+                                var dbFile = await _mediaFileRepo.GetByRemoteWorkItemIdAsync(nodeJobId);
+                                if (dbFile?.AssignedNodeId != null)
                                 {
-                                    await client.DeleteAsync($"{baseUrl}/api/cluster/jobs/{nodeJobId}");
-                                    await client.DeleteAsync($"{baseUrl}/api/cluster/files/{nodeJobId}");
+                                    // Job is in DB as assigned — don't cancel, recovery may be in progress
+                                    Console.WriteLine($"Cluster: Node {node.Hostname} is working on DB-assigned job {nodeJobId} — skipping cancellation (recovery in progress)");
                                 }
-                                catch { }
+                                else
+                                {
+                                    Console.WriteLine($"Cluster: Node {node.Hostname} is working on unknown job {nodeJobId} — telling it to cancel");
+                                    try
+                                    {
+                                        await client.DeleteAsync($"{baseUrl}/api/cluster/jobs/{nodeJobId}");
+                                        await client.DeleteAsync($"{baseUrl}/api/cluster/files/{nodeJobId}");
+                                    }
+                                    catch (Exception ex) { Console.WriteLine($"Cluster: Failed to cancel unknown job {nodeJobId} on {node.Hostname}: {ex.Message}"); }
+                                }
                             }
                         }
                         else
@@ -787,10 +1024,13 @@ namespace Snacks.Services
             }
         }
 
-        // --- Job dispatch (master only) ---
+    /******************************************************************
+     *  Job Dispatch
+     ******************************************************************/
 
         private readonly SemaphoreSlim _dispatchLock = new(1, 1);
 
+        /// <summary> Dequeues pending work items and dispatches one to each available worker node. </summary>
         private async Task RunDispatchAsync()
         {
             if (!IsMasterMode) return;
@@ -836,9 +1076,20 @@ namespace Snacks.Services
             }
         }
 
+        /// <summary>
+        /// Maximum number of upload retry attempts.
+        /// </summary>
         private const int MaxUploadRetries = 5;
-        private const int ChunkSize = 50 * 1024 * 1024; // 50MB chunks
 
+        /// <summary>
+        /// Chunk size for file transfers (50MB).
+        /// </summary>
+        private const int ChunkSize = 50 * 1024 * 1024;
+
+        /// <summary>
+        /// Uploads a source file to a worker node in 50MB chunks with SHA256 verification.
+        /// Supports resume from last received byte.
+        /// </summary>
         private async Task UploadFileToNodeAsync(HttpClient client, string baseUrl, WorkItem workItem, CancellationToken ct = default)
         {
             var totalSize = workItem.Size;
@@ -947,19 +1198,32 @@ namespace Snacks.Services
             Console.WriteLine($"Cluster: Upload of {workItem.FileName} complete ({totalSize / 1048576}MB)");
         }
 
+        /// <summary>
+        /// Downloads an encoded output file from a worker node in 50MB chunks with SHA256 verification.
+        /// Supports resume from last received byte.
+        /// </summary>
         private async Task DownloadFileFromNodeAsync(string nodeBaseUrl, string jobId, string outputPath, WorkItem workItem, CancellationToken ct = default)
         {
             long offset = 0;
             long totalSize = 0;
             int consecutiveFailures = 0;
             const int MaxConsecutiveFailures = 120; // 10 minutes at 5s intervals before giving up
+            string? expectedFileHash = null;
 
-            // If a partial download exists, resume from where we left off
+            // If a partial download exists, resume from the last chunk boundary.
+            // Round down to discard any partially-written chunk from a killed process —
+            // the last partial chunk may be corrupt (same approach as upload resume).
             if (File.Exists(outputPath))
             {
-                offset = new FileInfo(outputPath).Length;
+                long rawOffset = new FileInfo(outputPath).Length;
+                offset = (rawOffset / ChunkSize) * ChunkSize;
                 if (offset > 0)
-                    Console.WriteLine($"Cluster: Resuming download at {offset / 1048576}MB");
+                {
+                    // Truncate the file to the aligned offset so we re-download the last partial chunk
+                    using (var truncStream = new FileStream(outputPath, FileMode.Open, FileAccess.Write))
+                        truncStream.SetLength(offset);
+                    Console.WriteLine($"Cluster: Resuming download at {offset / 1048576}MB (aligned from {rawOffset / 1048576}MB)");
+                }
             }
 
             while (true)
@@ -984,6 +1248,10 @@ namespace Snacks.Services
                     if (response.Headers.TryGetValues("X-Total-Size", out var sizeValues) &&
                         long.TryParse(sizeValues.FirstOrDefault(), out var ts))
                         totalSize = ts;
+
+                    // Get full file hash from first response for end-to-end verification
+                    if (expectedFileHash == null && response.Headers.TryGetValues("X-File-Hash", out var fileHashValues))
+                        expectedFileHash = fileHashValues.FirstOrDefault();
 
                     // Get chunk hash for verification
                     string? expectedHash = null;
@@ -1044,15 +1312,33 @@ namespace Snacks.Services
                     await Task.Delay(TimeSpan.FromSeconds(delay), ct);
 
                     // Re-check if partial file still exists (could have been cleaned up)
+                    // Align to chunk boundary to discard any partially-written chunk
                     if (File.Exists(outputPath))
-                        offset = new FileInfo(outputPath).Length;
+                        offset = (new FileInfo(outputPath).Length / ChunkSize) * ChunkSize;
                 }
+            }
+
+            // Verify complete file hash for end-to-end integrity
+            if (!string.IsNullOrEmpty(expectedFileHash))
+            {
+                using var verifyFs = new FileStream(outputPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+                var actualFileHash = Convert.ToHexString(await SHA256.HashDataAsync(verifyFs)).ToLower();
+                if (actualFileHash != expectedFileHash)
+                {
+                    try { File.Delete(outputPath); } catch { }
+                    throw new Exception($"File hash mismatch after download — expected {expectedFileHash}, got {actualFileHash}");
+                }
+                Console.WriteLine($"Cluster: File hash verified for {workItem.FileName}");
             }
 
             workItem.ErrorMessage = null;
             Console.WriteLine($"Cluster: Download of result complete ({offset / 1048576}MB)");
         }
 
+        /// <summary>
+        /// Checks how many bytes of a file have been received by a node.
+        /// Used for resume support.
+        /// </summary>
         private async Task<long> GetNodeReceivedBytesAsync(HttpClient client, string baseUrl, string jobId)
         {
             try
@@ -1071,6 +1357,10 @@ namespace Snacks.Services
             return 0;
         }
 
+        /// <summary>
+        /// Dispatches a work item to a worker node: uploads the source file,
+        /// verifies the upload, and sends the job assignment.
+        /// </summary>
         private async Task DispatchToNodeAsync(ClusterNode node, WorkItem workItem, EncoderOptions options)
         {
             // Prevent concurrent dispatches for the same job
@@ -1105,17 +1395,17 @@ namespace Snacks.Services
                 workItem.RemoteJobPhase = "Uploading";
                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
 
-                // Track remote job — DB is the source of truth for crash recovery
-                _remoteJobs[workItem.Id] = workItem;
+                // Track remote job — DB first (source of truth for crash recovery),
+                // then in-memory cache. If DB write fails, we never populate the cache.
                 await _mediaFileRepo.AssignToRemoteNodeAsync(
                     Path.GetFullPath(workItem.Path), workItem.Id, node.NodeId, node.Hostname,
                     node.IpAddress, node.Port, "Uploading");
+                _remoteJobs[workItem.Id] = workItem;
                 UpdateNodeStatus(node.NodeId, NodeStatus.Busy, workItem.Id, workItem.FileName);
 
-                // Step 1: Upload source file with chunked transfer, retry, and resume
                 await UploadFileToNodeAsync(CreateAuthenticatedClient(), baseUrl, workItem, jobCts.Token);
 
-                // Step 2: Verify the upload completed — compare sizes
+                // Confirm byte count before submitting the job offer — prevents encoding corrupt/partial uploads.
                 var receivedBytes = await GetNodeReceivedBytesAsync(CreateAuthenticatedClient(), baseUrl, workItem.Id);
                 if (receivedBytes != workItem.Size)
                 {
@@ -1125,11 +1415,13 @@ namespace Snacks.Services
                     throw new Exception("Upload verification failed");
                 }
 
-                // Step 3: Send job assignment — only after verified upload
                 workItem.RemoteJobPhase = "Encoding";
                 workItem.TransferProgress = 0;
                 await _mediaFileRepo.UpdateRemoteJobPhaseAsync(Path.GetFullPath(workItem.Path), "Encoding");
                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
+
+                // Compute source file hash for end-to-end integrity verification
+                var sourceFileHash = await ComputeFileHashAsync(workItem.Path);
 
                 var assignment = new JobAssignment
                 {
@@ -1140,7 +1432,8 @@ namespace Snacks.Services
                     Probe = workItem.Probe,
                     Duration = workItem.Length,
                     Bitrate = workItem.Bitrate,
-                    IsHevc = workItem.IsHevc
+                    IsHevc = workItem.IsHevc,
+                    SourceFileHash = sourceFileHash
                 };
 
                 var assignContent = new StringContent(
@@ -1190,8 +1483,13 @@ namespace Snacks.Services
             }
         }
 
-        // --- Remote job completion (called by ClusterController) ---
+    /******************************************************************
+     *  Remote Job Completion
+     ******************************************************************/
 
+        /// <summary> Applies an encoding progress update received from a worker node. </summary>
+        /// <param name="jobId">The job ID reported by the node.</param>
+        /// <param name="progress">The progress payload from the node.</param>
         public async Task HandleRemoteProgressAsync(string jobId, JobProgress progress)
         {
             if (!_remoteJobs.TryGetValue(jobId, out var workItem)) return;
@@ -1204,6 +1502,10 @@ namespace Snacks.Services
                 await _hubContext.Clients.All.SendAsync("TranscodingLog", jobId, progress.LogLine);
         }
 
+        /// <summary>
+        /// Handles completion of a remote job: downloads the output,
+        /// validates it, and performs file placement.
+        /// </summary>
         public async Task HandleRemoteCompletionAsync(string jobId, string nodeBaseUrl)
         {
             if (!_remoteJobs.TryGetValue(jobId, out var workItem)) return;
@@ -1363,6 +1665,12 @@ namespace Snacks.Services
             }
         }
 
+        /// <summary>
+        ///     Handles a failure report from a worker node. Checks whether a completed output
+        ///     already exists on the node before re-queuing or marking the job as permanently failed.
+        /// </summary>
+        /// <param name="jobId">The ID of the failed job.</param>
+        /// <param name="errorMessage">The error message reported by the node, if any.</param>
         public async Task HandleRemoteFailureAsync(string jobId, string? errorMessage)
         {
             if (!_remoteJobs.TryGetValue(jobId, out var workItem)) return;
@@ -1394,6 +1702,10 @@ namespace Snacks.Services
             await HandleNodeFailure(jobId);
         }
 
+        /// <summary>
+        /// Handles node failure: cancels active transfers, increments failure count,
+        /// and re-queues or marks as permanently failed.
+        /// </summary>
         private async Task HandleNodeFailure(string jobId)
         {
             if (!_remoteJobs.TryRemove(jobId, out var workItem)) return;
@@ -1404,6 +1716,10 @@ namespace Snacks.Services
                 jobCts.Cancel();
                 jobCts.Dispose();
             }
+
+            // Release transfer locks so the job can be re-dispatched
+            _activeUploads.TryRemove(jobId, out _);
+            _activeDownloads.TryRemove(jobId, out _);
 
             workItem.RemoteFailureCount++;
             workItem.ErrorMessage = $"Remote: failed (attempt {workItem.RemoteFailureCount})";
@@ -1431,7 +1747,7 @@ namespace Snacks.Services
         }
 
         /// <summary>
-        /// Cancel a remote job — called from master when user cancels/stops a work item.
+        /// Cancels a remote job — called from master when user cancels/stops a work item.
         /// Sends DELETE to the node to kill its FFmpeg process and clean up.
         /// </summary>
         public async Task CancelRemoteJobOnNodeAsync(string jobId, string nodeId)
@@ -1464,7 +1780,7 @@ namespace Snacks.Services
         }
 
         /// <summary>
-        /// Cancel a job running locally on this node — called via DELETE /api/cluster/jobs/{id}
+        /// Cancels a job running locally on this node — called via DELETE /api/cluster/jobs/{id}
         /// </summary>
         public void CancelRemoteJob(string jobId)
         {
@@ -1476,14 +1792,25 @@ namespace Snacks.Services
             }
         }
 
-        // --- Node-side job handling ---
+    /******************************************************************
+     *  Node-Side Job Handling
+     ******************************************************************/
 
-        private WorkItem? _currentRemoteJob;
-        private CancellationTokenSource? _remoteJobCts;
-        private string? _receivingJobId; // Set while receiving file chunks from master
+        private WorkItem?                   _currentRemoteJob;
+        private CancellationTokenSource?    _remoteJobCts;
+        private string?                     _completedJobId;
 
+        private string? _receivingJobId;
+        private readonly string _pendingCompletionsPath;
+
+        /// <summary>
+        /// Whether this node is currently processing a remote job.
+        /// </summary>
         public bool IsProcessingRemoteJob() => _currentRemoteJob != null || _receivingJobId != null || _completedJobId != null;
 
+        /// <summary>
+        /// Sets the job ID being received. Used to track node status during file transfer.
+        /// </summary>
         public void SetReceivingJob(string? jobId)
         {
             var oldJobId = _receivingJobId;
@@ -1505,6 +1832,10 @@ namespace Snacks.Services
             }
         }
 
+        /// <summary>
+        /// Accepts or rejects a job offer from the master.
+        /// Validates file existence, size, and hash before accepting.
+        /// </summary>
         public async Task<bool> AcceptJobOfferAsync(JobAssignment assignment)
         {
             if (_nodePaused)
@@ -1538,6 +1869,19 @@ namespace Snacks.Services
                 return false;
             }
 
+            // Verify source file hash for end-to-end integrity
+            if (!string.IsNullOrEmpty(assignment.SourceFileHash))
+            {
+                var actualHash = await ComputeFileHashAsync(inputPath);
+                if (!string.Equals(actualHash, assignment.SourceFileHash, StringComparison.OrdinalIgnoreCase))
+                {
+                    Console.WriteLine($"Cluster: Source file hash mismatch for {assignment.FileName} — expected {assignment.SourceFileHash}, got {actualHash}. Rejecting job.");
+                    try { File.Delete(inputPath); } catch { }
+                    return false;
+                }
+                Console.WriteLine($"Cluster: Source file hash verified for {assignment.FileName}");
+            }
+
             var workItem = new WorkItem
             {
                 Id = assignment.JobId,
@@ -1562,6 +1906,9 @@ namespace Snacks.Services
             return true;
         }
 
+        /// <summary>
+        /// Executes a remote job: encodes the file and reports progress/completion to the master.
+        /// </summary>
         private async Task ExecuteRemoteJobAsync(WorkItem workItem, EncoderOptions options)
         {
             var masterUrl = _config.MasterUrl?.TrimEnd('/');
@@ -1641,7 +1988,7 @@ namespace Snacks.Services
                 });
 
                 // Use the transcoding service to encode
-                await _transcodingService.ConvertVideoForRemoteAsync(workItem, options);
+                await _transcodingService.ConvertVideoForRemoteAsync(workItem, options, _remoteJobCts?.Token ?? CancellationToken.None);
                 encodingSucceeded = true;
             }
             catch (Exception ex)
@@ -1675,6 +2022,10 @@ namespace Snacks.Services
             // and the master can discover it via heartbeat or recovery
             if (encodingSucceeded && masterUrl != null)
             {
+                // Persist the completed job ID so we can retry on every heartbeat
+                // until the master acknowledges receipt
+                await PersistCompletedJobAsync(workItem.Id, masterUrl, selfUrl: null);
+
                 for (int attempt = 0; attempt < 10; attempt++)
                 {
                     try
@@ -1692,6 +2043,9 @@ namespace Snacks.Services
                             Encoding.UTF8, "application/json");
                         await client.PostAsync($"{masterUrl}/api/cluster/jobs/{workItem.Id}/complete", content);
                         Console.WriteLine($"Cluster: Reported completion for {workItem.FileName} to master");
+
+                        // Remove from pending completions — master acknowledged
+                        await RemoveCompletedJobAsync(workItem.Id);
                         break; // Success
                     }
                     catch (Exception ex)
@@ -1700,11 +2054,124 @@ namespace Snacks.Services
                         if (attempt < 9)
                             await Task.Delay(TimeSpan.FromSeconds(10));
                         // Don't report failure — the output file exists, master can recover it
+                        // The persisted job ID will be retried on next heartbeat
                     }
                 }
             }
         }
 
+        /// <summary>
+        ///     Appends a completed job record to the pending-completions file so the completion
+        ///     can be re-reported on every heartbeat until the master acknowledges it.
+        /// </summary>
+        /// <param name="jobId">The completed job ID to persist.</param>
+        /// <param name="masterUrl">The master's base URL, stored for retry requests.</param>
+        /// <param name="selfUrl">This node's base URL, included in completion callbacks.</param>
+        private async Task PersistCompletedJobAsync(string jobId, string masterUrl, string? selfUrl)
+        {
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(_pendingCompletionsPath)!);
+                var completions = await LoadPendingCompletionsAsync();
+                if (!completions.ContainsKey(jobId))
+                {
+                    completions[jobId] = new PendingCompletion
+                    {
+                        JobId = jobId,
+                        MasterUrl = masterUrl,
+                        OutputFileName = _currentRemoteJob?.FileName ?? "",
+                        Timestamp = DateTime.UtcNow
+                    };
+                    var json = JsonSerializer.Serialize(completions.Values, _jsonOptions);
+                    await File.WriteAllTextAsync(_pendingCompletionsPath, json);
+                    Console.WriteLine($"Cluster: Persisted completed job {jobId} for retry");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Cluster: Failed to persist completed job {jobId}: {ex.Message}");
+            }
+        }
+
+        /// <summary> Removes a job from the pending-completions file once the master has acknowledged it. </summary>
+        /// <param name="jobId">The acknowledged job ID to remove.</param>
+        private async Task RemoveCompletedJobAsync(string jobId)
+        {
+            try
+            {
+                var completions = await LoadPendingCompletionsAsync();
+                if (completions.Remove(jobId))
+                {
+                    var json = JsonSerializer.Serialize(completions.Values, _jsonOptions);
+                    await File.WriteAllTextAsync(_pendingCompletionsPath, json);
+                    Console.WriteLine($"Cluster: Removed acknowledged job {jobId} from pending completions");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Cluster: Failed to remove completed job {jobId}: {ex.Message}");
+            }
+        }
+
+        /// <summary> Loads the pending-completions file, returning an empty dictionary if the file does not exist or is corrupt. </summary>
+        private async Task<Dictionary<string, PendingCompletion>> LoadPendingCompletionsAsync()
+        {
+            if (File.Exists(_pendingCompletionsPath))
+            {
+                try
+                {
+                    var json = await File.ReadAllTextAsync(_pendingCompletionsPath);
+                    var list = JsonSerializer.Deserialize<List<PendingCompletion>>(json, _jsonOptions);
+                    return list?.ToDictionary(c => c.JobId, c => c) ?? new();
+                }
+                catch { }
+            }
+            return new();
+        }
+
+        /// <summary>
+        ///     Re-posts all persisted pending completions to the master. Called on each heartbeat
+        ///     cycle to recover from lost completion notifications.
+        /// </summary>
+        public async Task RetryPendingCompletionsAsync()
+        {
+            var completions = await LoadPendingCompletionsAsync();
+            foreach (var kvp in completions.ToList())
+            {
+                var completion = kvp.Value;
+                try
+                {
+                    var client = CreateAuthenticatedClient();
+                    var selfUrl = $"http://{GetLocalIpAddress()}:{GetListeningPort()}";
+                    var jobCompletion = new JobCompletion
+                    {
+                        JobId = completion.JobId,
+                        Success = true,
+                        OutputFileName = completion.OutputFileName
+                    };
+                    var content = new StringContent(
+                        JsonSerializer.Serialize(new { jobCompletion, nodeBaseUrl = selfUrl }, _jsonOptions),
+                        Encoding.UTF8, "application/json");
+                    var response = await client.PostAsync($"{completion.MasterUrl}/api/cluster/jobs/{completion.JobId}/complete", content);
+                    if (response.IsSuccessStatusCode)
+                    {
+                        Console.WriteLine($"Cluster: Retried completion for {completion.JobId} — acknowledged by master");
+                        await RemoveCompletedJobAsync(completion.JobId);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Cluster: Pending completion retry failed for {completion.JobId}: {ex.Message}");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Returns the temp directory path for a remote job, creating it if needed.
+        /// Sanitizes the job ID to prevent path traversal attacks.
+        /// </summary>
+        /// <param name="jobId">The job ID to build the temp directory for.</param>
+        /// <returns>The absolute path to the temp directory for this job.</returns>
         public string GetNodeTempDirectory(string jobId)
         {
             // Sanitize jobId to prevent path traversal — only allow GUID characters
@@ -1722,6 +2189,8 @@ namespace Snacks.Services
             return dir;
         }
 
+        /// <summary> Returns the path to the encoded output file for a job, or <see langword="null"/> if no output exists yet. </summary>
+        /// <param name="jobId">The job ID to look up the output for.</param>
         public string? GetOutputFileForJob(string jobId)
         {
             var tempDir = GetNodeTempDirectory(jobId);
@@ -1729,6 +2198,10 @@ namespace Snacks.Services
             return files.FirstOrDefault();
         }
 
+        /// <summary>
+        /// Deletes all temp files for a completed or cancelled job and clears the receiving/completed job ID references.
+        /// </summary>
+        /// <param name="jobId">The job ID to clean up.</param>
         public void CleanupJobFiles(string jobId)
         {
             if (_receivingJobId == jobId) _receivingJobId = null;
@@ -1747,6 +2220,10 @@ namespace Snacks.Services
             }
         }
 
+        /// <summary>
+        /// Deletes all remote job temp directories unconditionally.
+        /// Called on node startup to reclaim disk space from a previous crashed session.
+        /// </summary>
         public void CleanupAllRemoteJobs()
         {
             var workDir = Environment.GetEnvironmentVariable("SNACKS_WORK_DIR")
@@ -1786,8 +2263,12 @@ namespace Snacks.Services
             }
         }
 
-        // --- Capability matching ---
-
+        /// <summary>
+        /// Selects the best available worker node for a job using a scoring algorithm.
+        /// Scores nodes based on hardware match, GPU availability, and supported encoders.
+        /// Among equal-scored nodes, prefers the one that has been idle longest.
+        /// Returns <c>null</c> if no node scores above 0 (e.g., all have insufficient disk space).
+        /// </summary>
         public ClusterNode? FindBestWorker(WorkItem workItem, EncoderOptions options)
         {
             var available = _nodes.Values
@@ -1813,6 +2294,15 @@ namespace Snacks.Services
             return bestScore > 0 ? best : null;
         }
 
+        /// <summary>
+        /// Assigns a numeric score to a candidate worker node for the given job.
+        /// Returns a negative value if the node lacks sufficient disk space.
+        /// Higher scores indicate a better fit (hardware match, encoder support).
+        /// </summary>
+        /// <param name="node">The candidate worker node to score.</param>
+        /// <param name="workItem">The work item to be dispatched.</param>
+        /// <param name="options">Encoder options describing the desired hardware and encoder.</param>
+        /// <returns>A score ≥ 1 for viable nodes, or a large negative value if the node should be skipped.</returns>
         private int ScoreNode(ClusterNode node, WorkItem workItem, EncoderOptions options)
         {
             int score = 1; // Base score for being available
@@ -1842,8 +2332,7 @@ namespace Snacks.Services
             return score;
         }
 
-        // --- Utility ---
-
+        /// <summary> Loads cluster configuration from disk into <see cref="_config"/>. No-ops if the file does not exist. </summary>
         private void LoadConfig()
         {
             if (File.Exists(_configPath))
@@ -1861,6 +2350,7 @@ namespace Snacks.Services
             }
         }
 
+        /// <summary> Persists the current <see cref="_config"/> to disk as JSON. </summary>
         private void SaveConfig()
         {
             try
@@ -1874,12 +2364,26 @@ namespace Snacks.Services
             }
         }
 
+        /// <summary>
+        /// Creates an <see cref="HttpClient"/> pre-configured with the cluster shared secret header
+        /// and a generous timeout suitable for large file transfers over slow networks.
+        /// </summary>
         private HttpClient CreateAuthenticatedClient()
         {
             var client = _httpClientFactory.CreateClient();
             client.Timeout = TimeSpan.FromMinutes(30); // Large chunks + slow networks need generous timeout
             client.DefaultRequestHeaders.Add("X-Snacks-Secret", _config.SharedSecret);
             return client;
+        }
+
+        /// <summary>
+        /// Computes the SHA256 hash of a file. Used for end-to-end source file integrity verification.
+        /// </summary>
+        private static async Task<string> ComputeFileHashAsync(string filePath)
+        {
+            using var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, FileOptions.Asynchronous);
+            var hash = await SHA256.HashDataAsync(stream);
+            return Convert.ToHexString(hash).ToLower();
         }
 
         // Remote job state is now persisted in the SQLite MediaFiles table.
@@ -1985,7 +2489,7 @@ namespace Snacks.Services
                             // Node is busy with a DIFFERENT job — fall through to check output/partial
                         }
                     }
-                    catch { }
+                    catch (Exception ex) { Console.WriteLine($"Cluster: Recovery heartbeat check failed for {mediaFile.FileName}: {ex.Message}"); }
 
                     // Check if the node has a completed output
                     try
@@ -1998,14 +2502,18 @@ namespace Snacks.Services
                             workItem.AssignedNodeId = mediaFile.AssignedNodeId;
                             workItem.AssignedNodeName = mediaFile.AssignedNodeName ?? "recovered";
                             workItem.RemoteJobPhase = "Downloading";
+                            workItem.RemoteFailureCount = mediaFile.RemoteFailureCount;
                             workItem.ErrorMessage = null;
                             _remoteJobs[workItem.Id] = workItem;
+                            // Seed download retry counter from prior failures so restart doesn't allow infinite retries
+                            if (mediaFile.RemoteFailureCount > 0)
+                                _downloadRetryCounts[workItem.Id] = mediaFile.RemoteFailureCount * 3;
                             await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
                             await HandleRemoteCompletionAsync(workItem.Id, baseUrl);
                             continue;
                         }
                     }
-                    catch { }
+                    catch (Exception ex) { Console.WriteLine($"Cluster: Recovery output check failed for {mediaFile.FileName}: {ex.Message}"); }
 
                     // Check if the node has a partial source file (upload was in progress)
                     try
@@ -2121,7 +2629,7 @@ namespace Snacks.Services
                                 {
                                     Console.WriteLine($"Cluster: Recovery upload failed for {workItem.FileName}: {ex.Message}");
                                     _remoteJobs.TryRemove(workItem.Id, out _);
-                                    try { await _mediaFileRepo.ClearRemoteAssignmentAsync(mediaFile.FilePath, MediaFileStatus.Queued); } catch { }
+                                    try { await _mediaFileRepo.ClearRemoteAssignmentAsync(mediaFile.FilePath, MediaFileStatus.Queued); } catch (Exception dbEx) { Console.WriteLine($"Cluster: Failed to clear assignment for {mediaFile.FileName}: {dbEx.Message}"); }
                                     _transcodingService.RequeueWorkItem(workItem);
                                 }
                                 finally
@@ -2134,7 +2642,7 @@ namespace Snacks.Services
                             continue;
                         }
                     }
-                    catch { }
+                    catch (Exception ex) { Console.WriteLine($"Cluster: Recovery partial upload check failed for {mediaFile.FileName}: {ex.Message}"); }
 
                     // Nothing recoverable on the node — re-queue for fresh dispatch
                     Console.WriteLine($"Cluster: Could not recover {mediaFile.FileName} — re-queuing");
@@ -2153,6 +2661,7 @@ namespace Snacks.Services
             }
         }
 
+        /// <summary> Returns the lowercase hex SHA-256 hash of the shared secret for safe logging and comparison. </summary>
         private static string HashSecret(string secret)
         {
             if (string.IsNullOrEmpty(secret)) return "";
@@ -2160,6 +2669,10 @@ namespace Snacks.Services
             return Convert.ToHexString(hash).ToLower();
         }
 
+        /// <summary>
+        ///     Resolves the machine's primary outbound IPv4 address by opening a UDP socket toward a
+        ///     public DNS server. Falls back to <c>127.0.0.1</c> if the network is unavailable.
+        /// </summary>
         private static string GetLocalIpAddress()
         {
             try
@@ -2175,8 +2688,14 @@ namespace Snacks.Services
             }
         }
 
+        /// <summary> Cached result of <see cref="GetListeningPort"/> so the environment variables are only read once. </summary>
         private int _resolvedPort = 0;
 
+        /// <summary>
+        /// Returns the HTTP port this instance is listening on.
+        /// Checks <c>ASPNETCORE_URLS</c> first, then falls back to <c>appsettings.json</c> Kestrel config,
+        /// then defaults to 6767.
+        /// </summary>
         private int GetListeningPort()
         {
             if (_resolvedPort > 0) return _resolvedPort;
@@ -2219,6 +2738,7 @@ namespace Snacks.Services
             return _resolvedPort;
         }
 
+        /// <summary> Returns free disk space in bytes on the drive containing the node temp directory, or 0 on error. </summary>
         private long GetAvailableDiskSpace()
         {
             try
@@ -2233,6 +2753,7 @@ namespace Snacks.Services
             }
         }
 
+        /// <summary> Creates a shallow copy of an <see cref="EncoderOptions"/> instance for safe per-job mutation. </summary>
         private static EncoderOptions CloneOptions(EncoderOptions options)
         {
             return new EncoderOptions
@@ -2255,20 +2776,27 @@ namespace Snacks.Services
                 Skip4K = options.Skip4K
             };
         }
+
     }
 
-    /// <summary>
-    /// A read-only stream wrapper that reports progress as data is read.
-    /// </summary>
+    /// <summary> A read-only stream wrapper that reports upload progress as data is read. </summary>
     internal class ProgressStream : System.IO.Stream
     {
         private readonly System.IO.Stream _inner;
         private readonly long _totalLength;
+        /// <summary> Callback invoked with the current upload percentage (0–100) at most once per second. </summary>
         private readonly Func<int, Task> _onProgress;
         private long _bytesRead;
         private int _lastPercent;
         private DateTime _lastReport = DateTime.MinValue;
 
+        /// <summary>
+        /// Wraps <paramref name="inner"/> and reports read progress through <paramref name="onProgress"/>.
+        /// </summary>
+        /// <param name="inner">The underlying stream to read from.</param>
+        /// <param name="totalLength">Total byte length used to compute percentage.</param>
+        /// <param name="onProgress">Async callback receiving the current completion percentage (0–100).</param>
+        /// <param name="initialOffset">Bytes already transferred before this stream started (for resume support).</param>
         public ProgressStream(System.IO.Stream inner, long totalLength, Func<int, Task> onProgress, long initialOffset = 0)
         {
             _inner = inner;
@@ -2277,6 +2805,7 @@ namespace Snacks.Services
             _bytesRead = initialOffset;
         }
 
+        /// <inheritdoc/>
         public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
         {
             int read = await _inner.ReadAsync(buffer, offset, count, cancellationToken);
@@ -2285,6 +2814,7 @@ namespace Snacks.Services
             return read;
         }
 
+        /// <inheritdoc/>
         public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
         {
             int read = await _inner.ReadAsync(buffer, cancellationToken);
@@ -2293,6 +2823,7 @@ namespace Snacks.Services
             return read;
         }
 
+        /// <summary> Fires <see cref="_onProgress"/> when the completion percentage changes, rate-limited to once per second. </summary>
         private async Task ReportProgress()
         {
             if (_totalLength <= 0) return;
@@ -2317,4 +2848,3 @@ namespace Snacks.Services
         public override void SetLength(long value) => throw new NotSupportedException();
         public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
     }
-}

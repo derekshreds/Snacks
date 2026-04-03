@@ -1,12 +1,29 @@
-namespace Snacks.Models
+namespace Snacks.Models;
+
+/// <summary>
+///     Persistent configuration for the auto-scan background service.
+///     Serialized to autoscan.json in the config directory.
+/// </summary>
+public sealed class AutoScanConfig
 {
-    public class AutoScanConfig
-    {
-        public bool Enabled { get; set; } = false;
-        public int IntervalMinutes { get; set; } = 60;
-        public List<string> Directories { get; set; } = new();
-        public DateTime? LastScanTime { get; set; }
-        public int LastScanNewFiles { get; set; } = 0;
-        public bool QueuePaused { get; set; } = false;
-    }
+    /// <summary> Whether automatic directory scanning is enabled. </summary>
+    public bool Enabled { get; set; } = false;
+
+    /// <summary> How often to run a scan, in minutes. Default: 60. </summary>
+    public int IntervalMinutes { get; set; } = 60;
+
+    /// <summary> Absolute paths of directories to include in each scan. </summary>
+    public List<string> Directories { get; set; } = new();
+
+    /// <summary> UTC timestamp of the most recent completed scan. Null if never scanned. </summary>
+    public DateTime? LastScanTime { get; set; }
+
+    /// <summary> Number of new files found during the last scan. </summary>
+    public int LastScanNewFiles { get; set; } = 0;
+
+    /// <summary>
+    ///     Whether the encoding queue is paused. Persisted so the paused state
+    ///     survives application restarts.
+    /// </summary>
+    public bool QueuePaused { get; set; } = false;
 }

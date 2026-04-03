@@ -7,6 +7,13 @@ using System.Text.Json;
 
 namespace Snacks.Controllers
 {
+    /// <summary>
+    ///     REST API controller for inter-node communication in the distributed encoding cluster.
+    ///     All endpoints are protected by <see cref="ClusterAuthFilter"/>, which validates the
+    ///     <c>X-Snacks-Secret</c> header against the configured shared secret. Covers node
+    ///     discovery, heartbeat monitoring, job lifecycle, chunked file transfer with resume,
+    ///     and graceful shutdown.
+    /// </summary>
     [Route("api/cluster")]
     [ApiController]
     [ServiceFilter(typeof(ClusterAuthFilter))]
@@ -20,14 +27,27 @@ namespace Snacks.Controllers
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase
         };
 
+        /// <summary>
+        ///     Initializes the controller with the cluster coordination service and the SignalR hub
+        ///     context used to push real-time transfer progress to the local UI.
+        /// </summary>
         public ClusterController(ClusterService clusterService, IHubContext<TranscodingHub> hubContext)
         {
             _clusterService = clusterService;
             _hubContext = hubContext;
         }
 
-        // --- Discovery ---
+        /******************************************************************
+         *  Discovery and Handshake
+         ******************************************************************/
 
+        /// <summary>
+        ///     Performs a bidirectional handshake between two nodes. The sender supplies its own
+        ///     node info, and the receiver registers it and returns its own, establishing mutual
+        ///     awareness for cluster coordination.
+        /// </summary>
+        /// <param name="senderNode"> The node initiating the handshake. </param>
+        /// <returns> The receiving node's info. </returns>
         [HttpPost("handshake")]
         public IActionResult Handshake([FromBody] ClusterNode senderNode)
         {
@@ -36,6 +56,11 @@ namespace Snacks.Controllers
             return Ok(selfNode);
         }
 
+        /// <summary>
+        ///     Returns the current status of this node, including its ID, online/busy/paused
+        ///     state, active job progress, available disk space, and hardware capabilities.
+        ///     Called periodically by the master to monitor node health.
+        /// </summary>
         [HttpGet("heartbeat")]
         public IActionResult Heartbeat()
         {
@@ -54,20 +79,33 @@ namespace Snacks.Controllers
             });
         }
 
+        /// <summary>
+        ///     Returns the hardware and software capabilities of this node. Used by the master
+        ///     for intelligent job dispatch.
+        /// </summary>
         [HttpGet("capabilities")]
         public IActionResult GetCapabilities()
         {
             return Ok(_clusterService.GetCapabilities());
         }
 
+        /// <summary> Returns the list of all known nodes in the cluster. Only available on master nodes. </summary>
         [HttpGet("nodes")]
         public IActionResult GetNodes()
         {
             return Ok(_clusterService.GetNodes());
         }
 
-        // --- Job lifecycle ---
+        /******************************************************************
+         *  Job Lifecycle
+         ******************************************************************/
 
+        /// <summary>
+        ///     Offers a transcoding job to this node. The node accepts when it is not paused,
+        ///     not already processing a job, and the source file is present in the temp directory.
+        ///     Returns 409 Conflict if the offer is rejected.
+        /// </summary>
+        /// <param name="assignment"> Job details including file info and encoding options. </param>
         [HttpPost("jobs/offer")]
         public async Task<IActionResult> OfferJob([FromBody] JobAssignment assignment)
         {
@@ -78,6 +116,8 @@ namespace Snacks.Controllers
             return Ok(new { accepted = true, jobId = assignment.JobId });
         }
 
+        /// <summary> Pauses or resumes this node. When paused, the node will not accept new job offers. </summary>
+        /// <param name="body"> JSON object with a <c>paused</c> boolean property. </param>
         [HttpPost("pause")]
         public IActionResult SetPaused([FromBody] JsonElement body)
         {
@@ -86,6 +126,8 @@ namespace Snacks.Controllers
             return Ok(new { paused = _clusterService.IsNodePaused });
         }
 
+        /// <summary> Cancels a running job on this node, killing the FFmpeg process and cleaning up temp files. </summary>
+        /// <param name="jobId"> The job ID to cancel. </param>
         [HttpDelete("jobs/{jobId}")]
         public IActionResult CancelJob(string jobId)
         {
@@ -93,6 +135,9 @@ namespace Snacks.Controllers
             return Ok(new { cancelled = true });
         }
 
+        /// <summary> Reports encoding progress from a worker node to the master. </summary>
+        /// <param name="jobId"> The job being reported on. </param>
+        /// <param name="progress"> Progress data including percentage and optional log lines. </param>
         [HttpPost("jobs/{jobId}/progress")]
         public async Task<IActionResult> ReportProgress(string jobId, [FromBody] JobProgress progress)
         {
@@ -101,10 +146,16 @@ namespace Snacks.Controllers
             return Ok();
         }
 
+        /// <summary>
+        ///     Reports that encoding completed on a worker node. The master initiates the output
+        ///     download in the background and returns immediately so the worker's POST does not time
+        ///     out. The node URL is derived from the registered node's IP rather than the request
+        ///     body to prevent SSRF attacks.
+        /// </summary>
+        /// <param name="jobId"> The completed job ID. </param>
         [HttpPost("jobs/{jobId}/complete")]
         public IActionResult ReportCompletion(string jobId)
         {
-            // Construct the node URL from the registered node, not from untrusted input (prevents SSRF)
             var nodes = _clusterService.GetNodes();
             var remoteIp = HttpContext.Connection.RemoteIpAddress?.ToString();
             var node = nodes.FirstOrDefault(n =>
@@ -113,12 +164,17 @@ namespace Snacks.Controllers
             if (node == null)
                 return Unauthorized(new { error = "Unknown node" });
 
-            // Return immediately — download the result in the background so the node's POST doesn't time out
             var nodeBaseUrl = $"http://{node.IpAddress}:{node.Port}";
             _ = Task.Run(() => _clusterService.HandleRemoteCompletionAsync(jobId, nodeBaseUrl));
             return Ok();
         }
 
+        /// <summary>
+        ///     Reports that encoding failed on a worker node. The master will re-queue the job or
+        ///     mark it as permanently failed depending on the retry count.
+        /// </summary>
+        /// <param name="jobId"> The failed job ID. </param>
+        /// <param name="body"> JSON object with an optional <c>errorMessage</c> property. </param>
         [HttpPost("jobs/{jobId}/failed")]
         public async Task<IActionResult> ReportFailure(string jobId, [FromBody] JsonElement body)
         {
@@ -130,15 +186,25 @@ namespace Snacks.Controllers
             return Ok();
         }
 
-        // --- File transfer ---
+        /******************************************************************
+         *  File Transfer
+         ******************************************************************/
 
+        /// <summary>
+        ///     Receives a chunk of a source file from the master for encoding. Supports chunked
+        ///     upload with resume via <c>Range</c> headers, per-chunk SHA256 hash verification,
+        ///     truncation of partial chunks on resume, and incremental hash computation to avoid
+        ///     buffering the entire chunk in memory.
+        /// </summary>
+        /// <param name="jobId"> The job ID this file belongs to. </param>
+        /// <returns> JSON with the total received byte count and whether the chunk hash matched. </returns>
         [HttpPut("files/{jobId}")]
         [RequestSizeLimit(75_000_000)] // 75MB — chunks are 50MB with headroom
         public async Task<IActionResult> ReceiveFile(string jobId)
         {
             try
             {
-                // Mark this node as busy receiving so heartbeat reports it correctly
+                // Mark this node as busy receiving so that heartbeat reports the correct state.
                 _clusterService.SetReceivingJob(jobId);
 
                 var rawFileName = Request.Headers["X-Original-FileName"].FirstOrDefault() ?? "input.mkv";
@@ -147,7 +213,6 @@ namespace Snacks.Controllers
                 var tempDir = _clusterService.GetNodeTempDirectory(jobId);
                 var filePath = Path.Combine(tempDir, fileName);
 
-                // Support resume: if Range header present, append to existing partial file
                 long offset = 0;
                 var rangeHeader = Request.Headers["Range"].FirstOrDefault();
                 if (rangeHeader != null && rangeHeader.StartsWith("bytes="))
@@ -193,7 +258,6 @@ namespace Snacks.Controllers
                     }
                 }
 
-                // Stream directly to disk while computing hash incrementally — avoids buffering the entire chunk in memory
                 var expectedHash = Request.Headers["X-Chunk-Hash"].FirstOrDefault();
                 using var incrementalHash = string.IsNullOrEmpty(expectedHash)
                     ? null
@@ -230,7 +294,6 @@ namespace Snacks.Controllers
                 var fileSize = new FileInfo(filePath).Length;
                 Response.Headers["X-Hash-Match"] = hashValid.ToString().ToLower();
 
-                // Broadcast download progress on this node's UI
                 var totalSizeHeader = Request.Headers["X-Total-Size"].FirstOrDefault();
                 long.TryParse(Request.Headers["X-Bitrate"].FirstOrDefault(), out var bitrate);
                 double.TryParse(Request.Headers["X-Duration"].FirstOrDefault(), out var duration);
@@ -265,8 +328,11 @@ namespace Snacks.Controllers
         }
 
         /// <summary>
-        /// Check how much of a file has been received (for resume support).
+        ///     Reports how many bytes of the source file have already been received, allowing the
+        ///     master to resume an interrupted upload. The count is returned in the
+        ///     <c>X-Received-Bytes</c> response header.
         /// </summary>
+        /// <param name="jobId"> The job ID to check. </param>
         [HttpHead("files/{jobId}")]
         public IActionResult CheckFileStatus(string jobId)
         {
@@ -298,8 +364,12 @@ namespace Snacks.Controllers
         }
 
         /// <summary>
-        /// Serves a chunk of the output file. Master calls this repeatedly with Range headers.
+        ///     Serves a 50 MB chunk of the encoded output file for download by the master.
+        ///     Supports <c>Range</c> headers for resume. Returns chunk and full-file SHA256 hashes
+        ///     in response headers for end-to-end integrity verification.
         /// </summary>
+        /// <param name="jobId"> The job ID whose output to download. </param>
+        /// <returns> A binary chunk with <c>X-Chunk-Hash</c>, <c>X-Total-Size</c>, and <c>Content-Range</c> headers. </returns>
         [HttpGet("files/{jobId}/output")]
         public async Task<IActionResult> DownloadOutput(string jobId)
         {
@@ -309,7 +379,6 @@ namespace Snacks.Controllers
 
             var totalSize = new FileInfo(outputPath).Length;
 
-            // Parse range for chunked download
             long offset = 0;
             var rangeHeader = Request.Headers["Range"].FirstOrDefault();
             if (rangeHeader != null && rangeHeader.StartsWith("bytes="))
@@ -339,7 +408,15 @@ namespace Snacks.Controllers
             var chunkHash = Convert.ToHexString(
                 System.Security.Cryptography.SHA256.HashData(buffer.AsSpan(0, length))).ToLower();
 
-            // Update node UI with upload progress
+            // Compute full file hash for end-to-end integrity verification (first request only)
+            string? fullFileHash = null;
+            if (offset == 0)
+            {
+                using var fullFs = new FileStream(outputPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+                var fullHash = await System.Security.Cryptography.SHA256.HashDataAsync(fullFs);
+                fullFileHash = Convert.ToHexString(fullHash).ToLower();
+            }
+
             var percent = totalSize > 0 ? (int)((offset + length) * 100 / totalSize) : 0;
             await _hubContext.Clients.All.SendAsync("WorkItemUpdated", new
             {
@@ -359,25 +436,22 @@ namespace Snacks.Controllers
             Response.Headers["X-Total-Size"] = totalSize.ToString();
             Response.Headers["X-Chunk-Hash"] = chunkHash;
             Response.Headers["Content-Range"] = $"bytes {offset}-{offset + length - 1}/{totalSize}";
+            if (fullFileHash != null)
+                Response.Headers["X-File-Hash"] = fullFileHash;
 
             return File(buffer.AsMemory(0, length).ToArray(), "application/octet-stream");
         }
 
-        [HttpGet("files/{jobId}")]
-        public IActionResult DownloadSource(string jobId)
-        {
-            // Master serves the source file for the given job
-            // The TranscodingService has the work item with the file path
-            var workItem = _clusterService.GetNodes(); // placeholder
-            return NotFound(new { error = "Source file serving not implemented via this endpoint" });
-        }
-
+        /// <summary>
+        ///     Cleans up temp files for a completed or cancelled job. Called by the master after
+        ///     it has successfully downloaded the encoded output.
+        /// </summary>
+        /// <param name="jobId"> The job ID to clean up. </param>
         [HttpDelete("files/{jobId}")]
         public async Task<IActionResult> CleanupFiles(string jobId)
         {
             _clusterService.CleanupJobFiles(jobId);
 
-            // Tell the node's UI this job is done
             await _hubContext.Clients.All.SendAsync("WorkItemUpdated", new
             {
                 id = jobId,
@@ -395,8 +469,50 @@ namespace Snacks.Controllers
             return Ok(new { cleaned = true });
         }
 
-        // --- Utility ---
+        /******************************************************************
+         *  Graceful Shutdown and Cleanup
+         ******************************************************************/
 
+        /// <summary>
+        ///     Initiates a cluster shutdown. When <c>graceful</c> is <see langword="true"/>,
+        ///     all nodes are paused and the operation waits up to <c>timeoutSeconds</c> for
+        ///     active transfers to finish before stopping.
+        /// </summary>
+        /// <param name="body">
+        ///     JSON with optional <c>graceful</c> (default: <see langword="true"/>) and
+        ///     <c>timeoutSeconds</c> (default: 300) properties.
+        /// </param>
+        [HttpPost("shutdown")]
+        public async Task<IActionResult> Shutdown([FromBody] JsonElement body)
+        {
+            bool graceful = true;
+            int timeoutSeconds = 300;
+            if (body.TryGetProperty("graceful", out var gracefulProp))
+                graceful = gracefulProp.GetBoolean();
+            if (body.TryGetProperty("timeoutSeconds", out var timeoutProp))
+                timeoutSeconds = timeoutProp.GetInt32();
+
+            await _clusterService.InitiateShutdownAsync(graceful, timeoutSeconds);
+            return Ok(new { acknowledged = true, graceful });
+        }
+
+        /// <summary>
+        ///     Manually triggers cleanup of remote job temp directories older than 24 hours,
+        ///     reclaiming disk space on worker nodes.
+        /// </summary>
+        [HttpPost("cleanup-old-jobs")]
+        public IActionResult CleanupOldJobs()
+        {
+            int ttlHours = 24;
+            _clusterService.CleanupOldRemoteJobs(ttlHours);
+            return Ok(new { cleaned = true });
+        }
+
+        /******************************************************************
+         *  Utility
+         ******************************************************************/
+
+        /// <summary> Returns the available disk space in bytes on the drive hosting the node's temp directory. </summary>
         private long GetAvailableDiskSpace()
         {
             try
@@ -410,5 +526,6 @@ namespace Snacks.Controllers
             }
             catch { return 0; }
         }
+
     }
 }

@@ -5,6 +5,11 @@ using Snacks.Services;
 
 namespace Snacks.Controllers
 {
+    /// <summary>
+    /// Primary MVC controller serving the main UI and all JSON API endpoints consumed
+    /// by the front-end JavaScript. Handles job management, settings, directory browsing,
+    /// auto-scan configuration, pause/resume, and cluster management.
+    /// </summary>
     public class HomeController : Controller
     {
         private readonly TranscodingService _transcodingService;
@@ -13,6 +18,7 @@ namespace Snacks.Controllers
         private readonly MediaFileRepository _mediaFileRepo;
         private readonly ClusterService _clusterService;
 
+        /// <summary> Initializes the controller with all required services. </summary>
         public HomeController(TranscodingService transcodingService, FileService fileService,
             AutoScanService autoScanService, MediaFileRepository mediaFileRepo,
             ClusterService clusterService)
@@ -24,12 +30,14 @@ namespace Snacks.Controllers
             _clusterService = clusterService;
         }
 
+        /// <summary> Renders the main queue view, passing all current work items to the template. </summary>
         public IActionResult Index()
         {
             var workItems = _transcodingService.GetAllWorkItems();
             return View(workItems);
         }
 
+        /// <summary> Returns a simple health check payload including the current version. </summary>
         [HttpGet]
         public IActionResult Health()
         {
@@ -40,6 +48,11 @@ namespace Snacks.Controllers
             });
         }
 
+        /// <summary>
+        ///     Returns browsable top-level directories. In desktop mode, returns all ready drive
+        ///     roots. In container mode, returns only subdirectories of the uploads folder that
+        ///     contain at least one video file.
+        /// </summary>
         [HttpGet]
         public IActionResult GetAvailableDirectories()
         {
@@ -47,7 +60,6 @@ namespace Snacks.Controllers
             {
                 if (_fileService.AllowAllPaths())
                 {
-                    // Desktop mode: list available drive roots
                     var directories = DriveInfo.GetDrives()
                         .Where(d => d.IsReady && d.DriveType is DriveType.Fixed or DriveType.Removable or DriveType.Network)
                         .Select(d => new
@@ -62,12 +74,11 @@ namespace Snacks.Controllers
                     return Json(new { directories, rootPath = "" });
                 }
 
-                var inputDir = _fileService.GetUploadsDirectory(); // This will be our input/library directory
+                var inputDir = _fileService.GetUploadsDirectory();
                 var directories2 = new List<object>();
 
                 if (Directory.Exists(inputDir))
                 {
-                    // Show only top-level directories with recursive video counts
                     var topLevelDirs = Directory.GetDirectories(inputDir)
                         .Select(dir => new
                         {
@@ -91,12 +102,16 @@ namespace Snacks.Controllers
             }
         }
 
+        /// <summary>
+        ///     Queues all video files in a directory for encoding. Validates that the directory
+        ///     is within the allowed path when running in container mode.
+        /// </summary>
+        /// <param name="request"> The directory path, encoder options, and recursion flag. </param>
         [HttpPost]
         public async Task<IActionResult> ProcessDirectory([FromBody] ProcessDirectoryRequest request)
         {
             try
             {
-                // Add null checks
                 if (request == null)
                 {
                     return BadRequest("Request is null");
@@ -117,7 +132,6 @@ namespace Snacks.Controllers
                     return BadRequest($"Directory does not exist: {request.DirectoryPath}");
                 }
 
-                // Security check - ensure directory is within allowed paths
                 if (!_fileService.AllowAllPaths())
                 {
                     var inputDir = _fileService.GetUploadsDirectory();
@@ -140,6 +154,12 @@ namespace Snacks.Controllers
             }
         }
 
+        /// <summary>
+        ///     Queues a single file for encoding. The <c>force</c> flag bypasses the database
+        ///     status check because the user explicitly selected the file, overriding any
+        ///     prior failed, cancelled, or completed state.
+        /// </summary>
+        /// <param name="request"> The file path and encoder options. </param>
         [HttpPost]
         public async Task<IActionResult> ProcessSingleFile([FromBody] ProcessFileRequest request)
         {
@@ -165,7 +185,6 @@ namespace Snacks.Controllers
                     return BadRequest($"File does not exist: {request.FilePath}");
                 }
 
-                // Security check - ensure file is within allowed paths
                 if (!_fileService.AllowAllPaths())
                 {
                     var inputDir = _fileService.GetUploadsDirectory();
@@ -178,7 +197,7 @@ namespace Snacks.Controllers
                     }
                 }
 
-                // User explicitly selected this file — force overrides DB status (failed/cancelled/completed)
+                // force: true overrides any prior failed/cancelled/completed status in the database.
                 var workItemId = await _transcodingService.AddFileAsync(request.FilePath, request.Options, force: true);
                 return Json(new { success = true, workItemId });
             }
@@ -189,6 +208,8 @@ namespace Snacks.Controllers
             }
         }
 
+        /// <summary> Permanently cancels a work item. It will not be reprocessed unless manually reset. </summary>
+        /// <param name="id"> The work item ID to cancel. </param>
         [HttpPost]
         public async Task<IActionResult> CancelWorkItem(string id)
         {
@@ -203,6 +224,8 @@ namespace Snacks.Controllers
             }
         }
 
+        /// <summary> Stops a work item and returns it to the Unseen state so it can be re-queued later. </summary>
+        /// <param name="id"> The work item ID to stop. </param>
         [HttpPost]
         public async Task<IActionResult> StopWorkItem(string id)
         {
@@ -217,6 +240,8 @@ namespace Snacks.Controllers
             }
         }
 
+        /// <summary> Resets a failed file's status so it can be re-added to the queue. </summary>
+        /// <param name="request"> Contains the file path to retry. </param>
         [HttpPost]
         public async Task<IActionResult> RetryFailedFile([FromBody] RetryRequest request)
         {
@@ -231,6 +256,7 @@ namespace Snacks.Controllers
             }
         }
 
+        /// <summary> Returns all failed files from the database, ordered by failure count descending. </summary>
         [HttpGet]
         public async Task<IActionResult> GetFailedFiles()
         {
@@ -245,6 +271,8 @@ namespace Snacks.Controllers
             }
         }
 
+        /// <summary> Returns the persisted FFmpeg log lines for a specific work item. </summary>
+        /// <param name="id"> The work item ID. </param>
         [HttpGet]
         public IActionResult GetWorkItemLogs(string id)
         {
@@ -252,15 +280,22 @@ namespace Snacks.Controllers
             return Json(logs);
         }
 
+        /// <summary>
+        ///     Returns paginated work items, always including all currently processing items
+        ///     regardless of page boundaries. Non-processing items are sorted by status priority
+        ///     (Pending, Completed, Failed, Cancelled) then by bitrate descending within each group.
+        /// </summary>
+        /// <param name="limit"> Maximum number of non-processing items to return. </param>
+        /// <param name="skip"> Number of non-processing items to skip for pagination. </param>
+        /// <param name="status"> Optional status filter applied before pagination. </param>
         [HttpGet]
         public IActionResult GetWorkItems(int? limit = null, int skip = 0, string? status = null)
         {
             var allItems = _transcodingService.GetAllWorkItems();
 
-            // Processing items are always returned separately so they don't affect pagination
+            // Processing items are always returned in full so they don't count against the page limit.
             var processingItems = allItems.Where(w => w.Status == WorkItemStatus.Processing).ToList();
 
-            // Queue items exclude processing — filter by status if requested
             var queueItems = allItems.Where(w => w.Status != WorkItemStatus.Processing).ToList();
 
             if (!string.IsNullOrEmpty(status))
@@ -283,7 +318,7 @@ namespace Snacks.Controllers
                 int cmp = StatusPriority(a.Status).CompareTo(StatusPriority(b.Status));
                 if (cmp != 0) return cmp;
 
-                // Within same status, sort by bitrate descending
+                // Higher bitrate files are more valuable to finish first within a status group.
                 return b.Bitrate.CompareTo(a.Bitrate);
             });
 
@@ -294,6 +329,7 @@ namespace Snacks.Controllers
             return Json(new { items = queueItems, total, processing = processingItems });
         }
 
+        /// <summary> Returns aggregate counts of work items grouped by status: pending, processing, completed, failed, and total. </summary>
         [HttpGet]
         public IActionResult GetWorkStats()
         {
@@ -308,6 +344,8 @@ namespace Snacks.Controllers
             });
         }
 
+        /// <summary> Returns a single work item by ID, or 404 if not found. </summary>
+        /// <param name="id"> The work item ID. </param>
         [HttpGet]
         public IActionResult GetWorkItem(string id)
         {
@@ -319,6 +357,8 @@ namespace Snacks.Controllers
             return Json(workItem);
         }
 
+        /// <summary> Returns the immediate child directories of a given path for the browser UI. </summary>
+        /// <param name="directoryPath"> The parent directory to list. </param>
         [HttpGet]
         public IActionResult GetSubdirectories(string directoryPath)
         {
@@ -327,7 +367,6 @@ namespace Snacks.Controllers
                 if (!Directory.Exists(directoryPath))
                     return BadRequest("Directory does not exist");
 
-                // Security check — in container mode, only allow browsing within uploads
                 if (!_fileService.AllowAllPaths())
                 {
                     var inputDir = _fileService.GetUploadsDirectory();
@@ -358,6 +397,12 @@ namespace Snacks.Controllers
             }
         }
 
+        /// <summary>
+        ///     Returns all video files in a directory, optionally including subdirectories.
+        ///     Paths are returned relative to the library root for display in the UI.
+        /// </summary>
+        /// <param name="directoryPath"> The directory to list video files from. </param>
+        /// <param name="recursive"> When <see langword="true"/>, includes files in all subdirectories. </param>
         [HttpGet]
         public IActionResult GetDirectoryFiles(string directoryPath, bool recursive = true)
         {
@@ -368,7 +413,6 @@ namespace Snacks.Controllers
                     return BadRequest("Directory does not exist");
                 }
 
-                // Security check
                 if (!_fileService.AllowAllPaths())
                 {
                     var inputDir = _fileService.GetUploadsDirectory();
@@ -381,7 +425,7 @@ namespace Snacks.Controllers
                     }
                 }
 
-                // Get video files — recursive for NAS mode, shallow for desktop browsing
+                // In NAS mode the scan is always recursive; desktop mode uses shallow browsing.
                 var allDirs = new List<string> { directoryPath };
                 if (recursive)
                     allDirs.AddRange(Directory.GetDirectories(directoryPath, "*", SearchOption.AllDirectories));
@@ -408,6 +452,9 @@ namespace Snacks.Controllers
             }
         }
 
+        /// <summary> Returns the total count of video files in a directory and all its subdirectories. </summary>
+        /// <param name="directory"> The root directory to count from. </param>
+        /// <returns> Video file count, or 0 if the directory is inaccessible. </returns>
         private int CountVideoFilesRecursive(string directory)
         {
             try
@@ -422,6 +469,7 @@ namespace Snacks.Controllers
             }
         }
 
+        /// <summary> Returns the absolute path to <c>settings.json</c>, creating the config directory if it does not yet exist. </summary>
         private string GetSettingsPath()
         {
             var configDir = Path.Combine(_fileService.GetWorkingDirectory(), "config");
@@ -430,20 +478,23 @@ namespace Snacks.Controllers
             return Path.Combine(configDir, "settings.json");
         }
 
+        /// <summary>
+        ///     Returns the current encoder settings as raw JSON. Falls back to the <c>.bak</c>
+        ///     file if the primary settings file is corrupt, and returns an empty object if
+        ///     neither file exists.
+        /// </summary>
         [HttpGet]
         public IActionResult GetSettings()
         {
             var settingsPath = GetSettingsPath();
             var backupPath = settingsPath + ".bak";
 
-            // Try primary settings file, fall back to backup if corrupted
             foreach (var path in new[] { settingsPath, backupPath })
             {
                 if (!System.IO.File.Exists(path)) continue;
                 try
                 {
                     var json = System.IO.File.ReadAllText(path);
-                    // Verify it's valid JSON
                     System.Text.Json.JsonDocument.Parse(json);
                     return Content(json, "application/json");
                 }
@@ -455,6 +506,12 @@ namespace Snacks.Controllers
             return Json(new { });
         }
 
+        /// <summary>
+        ///     Atomically saves encoder settings using a write-then-rename pattern. Keeps a
+        ///     <c>.bak</c> copy of the previous settings in case the new file is ever found
+        ///     to be corrupt on the next read.
+        /// </summary>
+        /// <param name="settings"> The settings object to serialize and persist. </param>
         [HttpPost]
         public IActionResult SaveSettings([FromBody] object settings)
         {
@@ -479,12 +536,15 @@ namespace Snacks.Controllers
             }
         }
 
+        /// <summary> Returns the current auto-scan configuration. </summary>
         [HttpGet]
         public IActionResult GetAutoScanConfig()
         {
             return Json(_autoScanService.GetConfig());
         }
 
+        /// <summary> Enables or disables the auto-scan background service. </summary>
+        /// <param name="request"> Contains the desired enabled state. </param>
         [HttpPost]
         public IActionResult SetAutoScanEnabled([FromBody] AutoScanEnabledRequest request)
         {
@@ -499,6 +559,8 @@ namespace Snacks.Controllers
             }
         }
 
+        /// <summary> Adds a directory to the auto-scan watch list. </summary>
+        /// <param name="request"> Contains the directory path to add. </param>
         [HttpPost]
         public IActionResult AddAutoScanDirectory([FromBody] AutoScanDirectoryRequest request)
         {
@@ -510,7 +572,6 @@ namespace Snacks.Controllers
                 if (!Directory.Exists(request.Path))
                     return BadRequest($"Directory does not exist: {request.Path}");
 
-                // Security check - ensure directory is within allowed paths
                 if (!_fileService.AllowAllPaths())
                 {
                     var inputDir = _fileService.GetUploadsDirectory();
@@ -530,6 +591,8 @@ namespace Snacks.Controllers
             }
         }
 
+        /// <summary> Removes a directory from the auto-scan watch list. </summary>
+        /// <param name="request"> Contains the directory path to remove. </param>
         [HttpPost]
         public IActionResult RemoveAutoScanDirectory([FromBody] AutoScanDirectoryRequest request)
         {
@@ -544,6 +607,8 @@ namespace Snacks.Controllers
             }
         }
 
+        /// <summary> Updates the auto-scan interval. Must be between 1 and 1440 minutes. </summary>
+        /// <param name="request"> Contains the new interval in minutes. </param>
         [HttpPost]
         public IActionResult SetAutoScanInterval([FromBody] AutoScanIntervalRequest request)
         {
@@ -561,6 +626,7 @@ namespace Snacks.Controllers
             }
         }
 
+        /// <summary> Runs an immediate scan outside the scheduled interval. </summary>
         [HttpPost]
         public async Task<IActionResult> TriggerAutoScan()
         {
@@ -575,6 +641,7 @@ namespace Snacks.Controllers
             }
         }
 
+        /// <summary> Resets all file statuses to Unseen so every file will be re-evaluated on the next scan. </summary>
         [HttpPost]
         public async Task<IActionResult> ClearAutoScanHistory()
         {
@@ -589,6 +656,11 @@ namespace Snacks.Controllers
             }
         }
 
+        /// <summary>
+        ///     Pauses or resumes the encoding queue. In node mode, also pauses or resumes
+        ///     accepting remote jobs from the master.
+        /// </summary>
+        /// <param name="request"> Contains the desired paused state. </param>
         [HttpPost]
         public IActionResult SetPaused([FromBody] PauseRequest request)
         {
@@ -597,7 +669,6 @@ namespace Snacks.Controllers
                 _transcodingService.SetPaused(request.Paused);
                 _autoScanService.SetQueuePaused(request.Paused);
 
-                // In node mode, also pause/resume accepting remote jobs
                 if (_clusterService.IsNodeMode)
                     _clusterService.SetNodePaused(request.Paused);
 
@@ -609,6 +680,7 @@ namespace Snacks.Controllers
             }
         }
 
+        /// <summary> Returns whether the queue is currently paused, either locally or by the master in node mode. </summary>
         [HttpGet]
         public IActionResult GetPausedState()
         {
@@ -617,8 +689,10 @@ namespace Snacks.Controllers
             return Json(new { paused });
         }
 
-        // --- Cluster endpoints ---
-
+        /// <summary>
+        ///     Returns the cluster configuration. The shared secret is never exposed; only a
+        ///     <c>hasSecret</c> boolean is returned to indicate whether one is configured.
+        /// </summary>
         [HttpGet]
         public IActionResult GetClusterConfig()
         {
@@ -641,6 +715,12 @@ namespace Snacks.Controllers
             });
         }
 
+        /// <summary>
+        ///     Saves and immediately applies a new cluster configuration. Preserves the existing
+        ///     shared secret when none is provided, since the UI never echoes it back. A shared
+        ///     secret is required to enable cluster mode.
+        /// </summary>
+        /// <param name="config"> The new cluster configuration to apply. </param>
         [HttpPost]
         public async Task<IActionResult> SaveClusterConfig([FromBody] ClusterConfig config)
         {
@@ -663,12 +743,15 @@ namespace Snacks.Controllers
             }
         }
 
+        /// <summary> Returns the list of known cluster nodes and their current status. </summary>
         [HttpGet]
         public IActionResult GetWorkers()
         {
             return Json(_clusterService.GetNodes());
         }
 
+        /// <summary> Pauses or resumes a specific cluster node from the master UI. </summary>
+        /// <param name="request"> Contains the node ID and desired paused state. </param>
         [HttpPost]
         public async Task<IActionResult> SetNodePaused([FromBody] NodePauseRequest request)
         {
@@ -683,6 +766,7 @@ namespace Snacks.Controllers
             }
         }
 
+        /// <summary> Returns a summary of cluster status: role, node count, and the full node list. </summary>
         [HttpGet]
         public IActionResult GetClusterStatus()
         {
@@ -697,68 +781,99 @@ namespace Snacks.Controllers
             });
         }
 
+        /// <summary>
+        ///     Stops the active encode, cleans up partial output, then exits the process.
+        ///     In Electron mode, the host detects the clean exit and relaunches the application.
+        /// </summary>
         [HttpPost]
         public IActionResult Restart()
         {
             _ = Task.Run(async () =>
             {
-                await Task.Delay(500); // Give the response time to send
+                await Task.Delay(500); // Allow the HTTP response to complete before the process exits.
 
-                // Stop active encode and clean up partial output before exiting
                 await _transcodingService.StopAndClearQueue();
 
-                Environment.Exit(0); // Electron will detect clean exit and relaunch
+                Environment.Exit(0); // Electron detects clean exit and relaunches the application.
             });
             return Json(new { success = true, message = "Restarting..." });
         }
 
+        /// <summary> Renders the error page view. </summary>
         public IActionResult Error()
         {
             return View();
         }
     }
 
+    /// <summary> Request body for <see cref="HomeController.ProcessDirectory"/>. </summary>
     public class ProcessDirectoryRequest
     {
+        /// <summary> Absolute path to the directory containing video files. </summary>
         public string DirectoryPath { get; set; } = "";
+
+        /// <summary> When <c>true</c>, subdirectories are also scanned. </summary>
         public bool Recursive { get; set; } = true;
+
+        /// <summary> Encoding options to apply to all files in the directory. </summary>
         public EncoderOptions Options { get; set; } = new();
     }
 
+    /// <summary> Request body for <see cref="HomeController.ProcessSingleFile"/>. </summary>
     public class ProcessFileRequest
     {
+        /// <summary> Absolute path to the video file to encode. </summary>
         public string FilePath { get; set; } = "";
+
+        /// <summary> Encoding options to apply to this file. </summary>
         public EncoderOptions Options { get; set; } = new();
     }
 
+    /// <summary> Request body for <see cref="HomeController.SetAutoScanEnabled"/>. </summary>
     public class AutoScanEnabledRequest
     {
+        /// <summary> Whether auto-scanning should be enabled. </summary>
         public bool Enabled { get; set; }
     }
 
+    /// <summary>
+    ///     Request body for <see cref="HomeController.AddAutoScanDirectory"/>
+    ///     and <see cref="HomeController.RemoveAutoScanDirectory"/>.
+    /// </summary>
     public class AutoScanDirectoryRequest
     {
+        /// <summary> The directory path to add or remove from the auto-scan list. </summary>
         public string Path { get; set; } = "";
     }
 
+    /// <summary> Request body for <see cref="HomeController.SetAutoScanInterval"/>. </summary>
     public class AutoScanIntervalRequest
     {
+        /// <summary> The new scan interval in minutes (1–1440). </summary>
         public int IntervalMinutes { get; set; }
     }
 
+    /// <summary> Request body for <see cref="HomeController.SetPaused"/>. </summary>
     public class PauseRequest
     {
+        /// <summary> Whether the encoding queue should be paused. </summary>
         public bool Paused { get; set; }
     }
 
+    /// <summary> Request body for <see cref="HomeController.SetNodePaused"/>. </summary>
     public class NodePauseRequest
     {
+        /// <summary> The ID of the cluster node to pause or resume. </summary>
         public string NodeId { get; set; } = "";
+
+        /// <summary> Whether the node should be paused. </summary>
         public bool Paused { get; set; }
     }
 
+    /// <summary> Request body for <see cref="HomeController.RetryFailedFile"/>. </summary>
     public class RetryRequest
     {
+        /// <summary> Absolute path to the file that should be retried. </summary>
         public string FilePath { get; set; } = "";
     }
 }

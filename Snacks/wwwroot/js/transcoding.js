@@ -1,5 +1,13 @@
-// Transcoding functionality with SignalR
+/**
+ * Main controller for the Snacks transcoding UI.
+ * Manages the SignalR connection, work item queue rendering, encoder settings,
+ * auto-scan configuration, and cluster panel for a single-page dashboard.
+ */
 class TranscodingManager {
+    /**
+     * Initializes state, starts SignalR, registers event handlers, and loads initial data.
+     * Re-syncs queue state whenever the page becomes visible (handles iOS Safari background suspension).
+     */
     constructor() {
         this.connection = null;
         this.workItems = new Map();
@@ -37,6 +45,11 @@ class TranscodingManager {
         });
     }
 
+    /**
+     * Connects (or reconnects) to the SignalR hub at `/transcodingHub`.
+     * Registers all hub event handlers and sets up a periodic connection status check.
+     * Guards against concurrent initialization with a flag to prevent duplicate connections.
+     */
     async initializeSignalR() {
         // Prevent concurrent initialization
         if (this._signalingInit) return;
@@ -148,6 +161,10 @@ class TranscodingManager {
         }
     }
 
+    /**
+     * Binds all static DOM event listeners for modals, settings form, pagination,
+     * filter tabs, and work item action buttons using event delegation where possible.
+     */
     initializeEventHandlers() {
         // Library modal event handlers
         document.getElementById('libraryModal').addEventListener('show.bs.modal', () => {
@@ -250,6 +267,10 @@ class TranscodingManager {
         });
     }
 
+    /**
+     * Updates the connection status dot and label in the navbar.
+     * @param {boolean} connected - True when the SignalR hub is connected.
+     */
     updateConnectionStatus(connected) {
         const dot = document.getElementById('connectionDot');
         const text = document.getElementById('connectionText');
@@ -266,6 +287,10 @@ class TranscodingManager {
         }
     }
 
+    /**
+     * Fetches the top-level video directories from the server and renders them in the library modal.
+     * Each directory entry includes a "Watch" button to add it to auto-scan.
+     */
     async loadDirectories() {
         const container = document.getElementById('directoryList');
         const fileList = document.getElementById('fileList');
@@ -325,6 +350,11 @@ class TranscodingManager {
         }
     }
 
+    /**
+     * Navigates into a directory, showing its subdirectories and process/watch action items.
+     * Also triggers a shallow file list load for the selected directory.
+     * @param {string} directoryPath - Absolute path of the directory to navigate into.
+     */
     async loadSubdirectories(directoryPath) {
         this.currentDirectory = directoryPath;
         const container = document.getElementById('directoryList');
@@ -418,6 +448,11 @@ class TranscodingManager {
         }
     }
 
+    /**
+     * Loads video files directly inside a directory (non-recursive) into the file list panel.
+     * Clears the current selection and renders checkboxes for individual file selection.
+     * @param {string} directoryPath - Absolute path of the directory to list.
+     */
     async loadDirectoryFilesShallow(directoryPath) {
         this.currentDirectory = directoryPath;
         this.selectedFiles.clear();
@@ -468,6 +503,11 @@ class TranscodingManager {
         }
     }
 
+    /**
+     * Renders a summary view for a directory in the file list panel with "Process All" and "Browse" buttons.
+     * @param {string} directoryPath - Absolute path of the selected directory.
+     * @param {number} videoCount - Number of video files found in the directory.
+     */
     showDirectorySummary(directoryPath, videoCount) {
         this.currentDirectory = directoryPath;
         this.selectedFiles.clear();
@@ -492,6 +532,10 @@ class TranscodingManager {
         this.updateProcessButton();
     }
 
+    /**
+     * Loads all video files in a directory (recursively by default) into the file list panel.
+     * @param {string} directoryPath - Absolute path of the directory to list.
+     */
     async loadDirectoryFiles(directoryPath) {
         this.currentDirectory = directoryPath;
         this.selectedFiles.clear();
@@ -556,6 +600,10 @@ class TranscodingManager {
         }
     }
 
+    /**
+     * Toggles all file checkboxes in the file list between selected and deselected,
+     * and updates the "Select All / Deselect All" button label accordingly.
+     */
     selectAllFiles() {
         const checkboxes = document.querySelectorAll('#fileList input[type="checkbox"]');
         const allSelected = Array.from(checkboxes).every(cb => cb.checked);
@@ -578,18 +626,24 @@ class TranscodingManager {
             '<i class="fas fa-square me-1"></i> Deselect All';
     }
 
+    /** Updates the "Process Selected" button's disabled state and file count label. */
     updateProcessButton() {
         const button = document.getElementById('processSelectedFiles');
         button.disabled = this.selectedFiles.size === 0;
         button.innerHTML = `<i class="fas fa-play me-1"></i> Process Selected (${this.selectedFiles.size})`;
     }
 
+    /** Closes the library modal using Bootstrap's JS API. */
     closeLibraryModal() {
         const modalEl = document.getElementById('libraryModal');
         const modal = bootstrap.Modal.getInstance(modalEl) || bootstrap.Modal.getOrCreateInstance(modalEl);
         modal.hide();
     }
 
+    /**
+     * Submits each individually selected file to the transcoding queue.
+     * Closes the modal immediately for perceived performance and reports final count.
+     */
     async processSelectedFiles() {
         if (this.selectedFiles.size === 0) {
             showToast('No files selected', 'warning');
@@ -624,6 +678,10 @@ class TranscodingManager {
         showToast(`Added ${successCount} file(s) to transcoding queue`, 'success');
     }
 
+    /**
+     * Submits the current directory for batch transcoding.
+     * @param {boolean} [recursive=true] - When true, processes subdirectories as well.
+     */
     async processCurrentDirectory(recursive = true) {
         // If no directory selected, process the entire root (all listed directories)
         const dirPath = this.currentDirectory || this.rootDirectory;
@@ -669,6 +727,11 @@ class TranscodingManager {
         }
     }
 
+    /**
+     * Reads encoder settings from the form inputs, persists them to the server, and returns the options object.
+     * @param {string} [prefix=''] - ID prefix used to distinguish settings form inputs from other modal inputs.
+     * @returns {object} The current encoder options as a plain object.
+     */
     getEncoderOptions(prefix = '') {
         const codec = document.getElementById(`${prefix}Codec`).value;
         const hwAccel = document.getElementById(`${prefix}HardwareAcceleration`).value;
@@ -694,6 +757,10 @@ class TranscodingManager {
         return options;
     }
 
+    /**
+     * Persists encoder options to the server so they survive page reloads.
+     * @param {object} options - Encoder options object to save.
+     */
     async saveSettingsToServer(options) {
         try {
             await fetch('/Home/SaveSettings', {
@@ -704,6 +771,10 @@ class TranscodingManager {
         } catch { }
     }
 
+    /**
+     * Fetches persisted encoder settings from the server and populates the form inputs.
+     * @param {string} [prefix='settings'] - ID prefix matching {@link getEncoderOptions}.
+     */
     async restoreSettings(prefix = 'settings') {
         try {
             const response = await fetch('/Home/GetSettings');
@@ -735,6 +806,11 @@ class TranscodingManager {
         } catch { }
     }
 
+    /**
+     * Fetches the current page of queue items and active processing items from the server,
+     * reconciles the DOM without a full rebuild to preserve CSS transitions, and updates
+     * stat counters, pagination, and filter tabs.
+     */
     async loadWorkItems() {
         try {
             const skip = this.queuePage * this.queuePageSize;
@@ -835,12 +911,20 @@ class TranscodingManager {
         }
     }
 
+    /**
+     * Sets the queue status filter and reloads the first page.
+     * @param {string|null} filter - Status string to filter by ('Pending', 'Completed', 'Failed'), or null for all.
+     */
     setFilter(filter) {
         this.queueFilter = filter;
         this.queuePage = 0;
         this.loadWorkItems();
     }
 
+    /**
+     * Renders the queue filter tab buttons with live counts from the stats object.
+     * @param {object} stats - Work item stats with `pending`, `completed`, and `failed` counts.
+     */
     renderFilterTabs(stats) {
         const container = document.getElementById('queueFilterTabs');
         if (!container) return;
@@ -859,6 +943,7 @@ class TranscodingManager {
         // Event handlers are delegated on #queueFilterTabs — no per-button binding needed
     }
 
+    /** Renders first/prev/next/last pagination buttons, hiding the container when only one page exists. */
     renderPagination() {
         let paginationEl = document.getElementById('queuePagination');
         if (!paginationEl) return;
@@ -893,11 +978,22 @@ class TranscodingManager {
         // Event handlers are delegated on #queuePagination — no per-button binding needed
     }
 
+    /**
+     * Handles a `WorkItemAdded` SignalR event by storing the item and scheduling a queue refresh.
+     * @param {object} workItem - The new work item received from the hub.
+     */
     addWorkItem(workItem) {
         this.workItems.set(workItem.id, workItem);
         this.scheduleQueueRefresh();
     }
 
+    /**
+     * Handles a `WorkItemUpdated` SignalR event.
+     * Renders processing items immediately; for upload/download transfer phases only a
+     * short-lived fallback refresh is scheduled to avoid wiping ephemeral progress from
+     * a full server reload.
+     * @param {object} workItem - The updated work item received from the hub.
+     */
     updateWorkItem(workItem) {
         this.workItems.set(workItem.id, workItem);
         const statusString = this.getStatusString(workItem.status);
@@ -934,7 +1030,10 @@ class TranscodingManager {
         this.scheduleQueueRefresh();
     }
 
-    // Throttle full queue + stats refresh to avoid flooding the server during rapid SignalR events
+    /**
+     * Throttles full queue and stats refreshes to at most once per 2 seconds,
+     * preventing server flooding during rapid SignalR event bursts.
+     */
     scheduleQueueRefresh() {
         if (this._refreshTimer) return;
         this._refreshTimer = setTimeout(() => {
@@ -943,6 +1042,7 @@ class TranscodingManager {
         }, 2000);
     }
 
+    /** Fetches the current queue pause state from the server and updates the pause button. */
     async loadPauseState() {
         try {
             const response = await fetch('/Home/GetPausedState');
@@ -955,6 +1055,7 @@ class TranscodingManager {
         }
     }
 
+    /** Toggles the queue between paused and running and updates the pause button state. */
     async togglePause() {
         try {
             const newState = !this.isPaused;
@@ -974,6 +1075,7 @@ class TranscodingManager {
         }
     }
 
+    /** Syncs the pause/resume button icon and style with the current `isPaused` state. */
     updatePauseButton() {
         const btn = document.getElementById('pauseResumeBtn');
         const icon = document.getElementById('pauseResumeIcon');
@@ -990,7 +1092,11 @@ class TranscodingManager {
         }
     }
 
-    // Helper method to convert numeric status to string
+    /**
+     * Converts a numeric or string work item status to its canonical string name.
+     * @param {number|string} status - Numeric status code (0–5) or existing string.
+     * @returns {string} Human-readable status string (e.g. 'Pending', 'Processing', 'Completed').
+     */
     getStatusString(status) {
         const statusMap = {
             0: 'Pending',
@@ -1004,6 +1110,10 @@ class TranscodingManager {
         return typeof status === 'string' ? status : statusMap[status] || 'Unknown';
     }
 
+    /**
+     * Updates the stat counter badges in both the desktop navbar and the mobile summary bar.
+     * @param {object} stats - Object with `pending`, `processing`, `completed`, `failed` counts.
+     */
     updateStatCounters(stats) {
         const set = (id, val) => {
             const el = document.getElementById(id);
@@ -1019,6 +1129,12 @@ class TranscodingManager {
         set('failedCountMobile', stats.failed);
     }
 
+    /**
+     * Renders or updates a work item element in the correct container (processing or queue).
+     * Creates a new DOM element on first render; uses differential DOM updates on subsequent calls
+     * to preserve CSS transitions.
+     * @param {object} workItem - The work item to render.
+     */
     renderWorkItem(workItem) {
         const queueContainer = document.getElementById('workItemsContainer');
         const processingContainer = document.getElementById('processingContainer');
@@ -1070,6 +1186,13 @@ class TranscodingManager {
         // Event listeners are handled by delegation on the container — no per-element binding needed
     }
 
+    /**
+     * Performs a surgical DOM update on an existing work item element, targeting only the
+     * changed fields (status badge, progress bar, action buttons) instead of rebuilding innerHTML.
+     * @param {HTMLElement} element - The existing work item DOM node.
+     * @param {object} workItem - Updated work item data.
+     * @param {string} statusString - Pre-resolved status string for the work item.
+     */
     updateWorkItemDOM(element, workItem, statusString) {
         const prevStatus = element.dataset.status;
 
@@ -1152,6 +1275,11 @@ class TranscodingManager {
         }
     }
 
+    /**
+     * Returns the full HTML string for a work item card (used on first render only).
+     * @param {object} workItem - Work item data with status already converted to a string.
+     * @returns {string} HTML markup for the work item card.
+     */
     getWorkItemHtml(workItem) {
         const statusClass = `status-${workItem.status.toLowerCase()}`;
         const progressPercent = workItem.progress || 0;
@@ -1207,6 +1335,11 @@ class TranscodingManager {
         `;
     }
 
+    /**
+     * Returns the HTML for the action button(s) appropriate to the work item's current status.
+     * @param {object} workItem - Work item with a string `status` property.
+     * @returns {string} HTML for one or more action buttons.
+     */
     getActionButtons(workItem) {
         switch (workItem.status) {
             case 'Pending':
@@ -1229,6 +1362,11 @@ class TranscodingManager {
         }
     }
 
+    /**
+     * Opens the stop/cancel confirmation modal for the specified work item.
+     * Replaces button nodes to remove stale event listeners before attaching new ones.
+     * @param {string} workItemId - ID of the work item to stop or cancel.
+     */
     showStopCancelDialog(workItemId) {
         const modalEl = document.getElementById('stopCancelModal');
         const modal = bootstrap.Modal.getOrCreateInstance(modalEl);
@@ -1254,6 +1392,10 @@ class TranscodingManager {
         modal.show();
     }
 
+    /**
+     * Stops the specified work item and re-queues it for retry on the next scan.
+     * @param {string} id - Work item ID to stop.
+     */
     async stopWorkItem(id) {
         try {
             const response = await fetch(`/Home/StopWorkItem?id=${id}`, { method: 'POST' });
@@ -1264,6 +1406,10 @@ class TranscodingManager {
         }
     }
 
+    /**
+     * Permanently cancels the specified work item so it will not be reprocessed.
+     * @param {string} id - Work item ID to cancel.
+     */
     async cancelWorkItem(id) {
         try {
             const response = await fetch(`/Home/CancelWorkItem?id=${id}`, { method: 'POST' });
@@ -1274,6 +1420,13 @@ class TranscodingManager {
         }
     }
 
+    /**
+     * Appends a log message received via SignalR to the in-memory log buffer.
+     * If the log modal is currently open for this work item, appends the entry live
+     * and auto-scrolls if the user was already at the bottom.
+     * @param {string} workItemId - ID of the work item the message belongs to.
+     * @param {string} message - Log line text from the transcoding service.
+     */
     addLogMessage(workItemId, message) {
         if (!this.logs.has(workItemId)) {
             this.logs.set(workItemId, []);
@@ -1301,6 +1454,11 @@ class TranscodingManager {
         }
     }
 
+    /**
+     * Opens the log modal for a work item, loading persisted server logs first and overlaying
+     * any additional in-memory SignalR entries.
+     * @param {string} workItemId - ID of the work item whose log to display.
+     */
     async showLog(workItemId) {
         const workItem = this.workItems.get(workItemId);
         const logModal = document.getElementById('logModal');
@@ -1320,6 +1478,10 @@ class TranscodingManager {
         bootstrap.Modal.getOrCreateInstance(logModal).show();
     }
 
+    /**
+     * Fetches persisted log lines from the server and replaces the in-memory log buffer for the item.
+     * @param {string} workItemId - ID of the work item to load logs for.
+     */
     async loadLogsFromServer(workItemId) {
         try {
             const response = await fetch(`/Home/GetWorkItemLogs?id=${workItemId}`);
@@ -1336,6 +1498,10 @@ class TranscodingManager {
         } catch { }
     }
 
+    /**
+     * Rebuilds the log modal content from the in-memory log buffer and scrolls to the bottom.
+     * @param {string} workItemId - ID of the work item whose logs to render.
+     */
     updateLogModal(workItemId) {
         const logContent = document.getElementById('logContent');
         const logs = this.logs.get(workItemId) || [];
@@ -1350,6 +1516,7 @@ class TranscodingManager {
         logContent.scrollTop = logContent.scrollHeight;
     }
 
+    /** @deprecated Delegates to `refreshStats`. Use `loadWorkItems` for a full refresh. */
     updateStatistics() {
         // Delegate to refreshStats which fetches real counts from the server
         this.refreshStats();
@@ -1357,6 +1524,11 @@ class TranscodingManager {
 
     // --- Auto-Scan methods ---
 
+    /**
+     * Loads auto-scan configuration from the server.
+     * @param {boolean} [fullLoad=true] - When true, also populates the enabled/interval form inputs.
+     *   Pass false for lightweight refreshes after adding/removing directories.
+     */
     async loadAutoScanConfig(fullLoad = true) {
         try {
             const response = await fetch('/Home/GetAutoScanConfig');
@@ -1390,6 +1562,10 @@ class TranscodingManager {
         }
     }
 
+    /**
+     * Renders the list of auto-scan watched directories with per-item remove buttons.
+     * @param {string[]} directories - Array of absolute directory paths to display.
+     */
     renderAutoScanDirectories(directories) {
         const container = document.getElementById('autoScanDirectories');
         if (!container) return;
@@ -1415,6 +1591,10 @@ class TranscodingManager {
         });
     }
 
+    /**
+     * Adds a directory to the auto-scan watch list via a quick-action button in the library modal.
+     * @param {string} path - Absolute path of the directory to watch.
+     */
     async watchDirectory(path) {
         try {
             const response = await fetch('/Home/AddAutoScanDirectory', {
@@ -1431,6 +1611,7 @@ class TranscodingManager {
         }
     }
 
+    /** Reads the directory path from the auto-scan input field and adds it to the watch list. */
     async addAutoScanDirectory() {
         const input = document.getElementById('autoScanDirInput');
         const path = input?.value?.trim();
@@ -1456,6 +1637,10 @@ class TranscodingManager {
         }
     }
 
+    /**
+     * Removes a directory from the auto-scan watch list and refreshes the directory display.
+     * @param {string} path - Absolute path of the directory to remove.
+     */
     async removeAutoScanDirectory(path) {
         try {
             const response = await fetch('/Home/RemoveAutoScanDirectory', {
@@ -1473,6 +1658,10 @@ class TranscodingManager {
         }
     }
 
+    /**
+     * Enables or disables the auto-scan background service.
+     * @param {boolean} enabled - True to enable automatic scanning.
+     */
     async setAutoScanEnabled(enabled) {
         try {
             const response = await fetch('/Home/SetAutoScanEnabled', {
@@ -1489,6 +1678,10 @@ class TranscodingManager {
         }
     }
 
+    /**
+     * Updates the auto-scan polling interval on the server.
+     * @param {number} minutes - Scan interval in minutes (must be ≥ 1).
+     */
     async setAutoScanInterval(minutes) {
         if (isNaN(minutes) || minutes < 1) return;
         try {
@@ -1506,6 +1699,7 @@ class TranscodingManager {
         }
     }
 
+    /** Requests an immediate auto-scan run outside of the normal schedule. */
     async triggerAutoScan() {
         try {
             showToast('Starting auto-scan...', 'info');
@@ -1522,6 +1716,7 @@ class TranscodingManager {
         }
     }
 
+    /** Prompts for confirmation then clears all auto-scan history from the server. */
     async clearAutoScanHistory() {
         if (!await showConfirmModal('Clear History', '<p>Clear all auto-scan history? This cannot be undone.</p>', 'Clear History')) return;
         try {
@@ -1539,6 +1734,12 @@ class TranscodingManager {
         }
     }
 
+    /**
+     * Returns a human-readable relative time string (e.g. "3 hours ago").
+     * Falls back to locale date string for dates older than a week.
+     * @param {Date} date - The date to compare against now.
+     * @returns {string} Relative time description.
+     */
     formatTimeAgo(date) {
         const now = new Date();
         const diffMs = now - date;
@@ -1554,7 +1755,11 @@ class TranscodingManager {
         return date.toLocaleString();
     }
 
-    // Helper method to format file size
+    /**
+     * Formats a byte count into a human-readable size string (e.g. "1.23 GB").
+     * @param {number} bytes - File size in bytes.
+     * @returns {string} Formatted size string.
+     */
     formatFileSize(bytes) {
         if (bytes === 0) return '0 Bytes';
         const k = 1024;
@@ -1565,6 +1770,10 @@ class TranscodingManager {
 
     // --- Cluster functionality ---
 
+    /**
+     * Loads cluster configuration from the server and optionally populates the cluster settings form.
+     * @param {boolean} [updateUI=true] - When true, fills in all cluster settings form inputs.
+     */
     async loadClusterConfig(updateUI = true) {
         try {
             const response = await fetch('/Home/GetClusterConfig');
@@ -1604,6 +1813,7 @@ class TranscodingManager {
         }
     }
 
+    /** Fetches the current list of connected worker nodes and refreshes the local `workers` map. */
     async loadWorkers() {
         try {
             const response = await fetch('/Home/GetWorkers');
@@ -1617,6 +1827,11 @@ class TranscodingManager {
         }
     }
 
+    /**
+     * Reads cluster settings from the form, merges them with the existing server config (to preserve
+     * fields not shown in the UI), and saves to the server. Prompts for restart when cluster mode
+     * is toggled on or off, and confirms before switching to node mode.
+     */
     async saveClusterConfig() {
         // Load existing config first to preserve nodeId, timeouts, etc.
         // Also use it to detect if cluster mode is being toggled (for restart prompt)
@@ -1700,6 +1915,10 @@ class TranscodingManager {
         }
     }
 
+    /**
+     * Shows or hides role-specific settings sections (master vs. node) and updates the description text.
+     * @param {string} role - Cluster role: 'standalone', 'master', or 'node'.
+     */
     updateClusterRoleUI(role) {
         const masterSettings = document.getElementById('masterSettings');
         const nodeSettings = document.getElementById('nodeSettings');
@@ -1717,6 +1936,10 @@ class TranscodingManager {
         }
     }
 
+    /**
+     * Renders the list of manually configured cluster nodes with per-item remove buttons.
+     * @param {Array<{name: string, url: string}>} nodes - Array of manual node entries.
+     */
     renderManualNodes(nodes) {
         this._manualNodes = nodes || [];
         const container = document.getElementById('manualNodesList');
@@ -1747,6 +1970,10 @@ class TranscodingManager {
         });
     }
 
+    /**
+     * Renders the cluster worker node panel, showing a card per connected node with status,
+     * GPU info, job counts, and pause/resume buttons (master-only).
+     */
     renderClusterPanel() {
         const panel = document.getElementById('clusterPanel');
         const container = document.getElementById('clusterNodesContainer');
@@ -1828,6 +2055,7 @@ class TranscodingManager {
         });
     }
 
+    /** Shows or hides the "node mode" banner and updates the master hostname display. */
     updateNodeBanner() {
         const banner = document.getElementById('nodeBanner');
         if (!banner) return;
@@ -1845,6 +2073,10 @@ class TranscodingManager {
         }
     }
 
+    /**
+     * Binds all cluster settings panel event handlers: role selector, save, secret generation,
+     * secret visibility toggle, manual node addition, and standalone switch.
+     */
     initializeClusterEventHandlers() {
         // Role selector changes
         const roleSelect = document.getElementById('clusterRole');
@@ -1931,13 +2163,25 @@ document.addEventListener('DOMContentLoaded', function() {
     window.transcodingManager = new TranscodingManager();
 });
 
-// Escape HTML to prevent XSS from FFmpeg output or error messages
+/**
+ * Escapes HTML special characters to prevent XSS injection from FFmpeg output or server error messages.
+ * @param {string} text - Raw text to escape.
+ * @returns {string} HTML-safe string.
+ */
 function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
 }
 
+/**
+ * Shows a Bootstrap confirmation modal and returns a Promise that resolves to true
+ * if the user confirms, or false if they dismiss it.
+ * @param {string} title - Modal header title.
+ * @param {string} message - HTML body content.
+ * @param {string} [confirmText='Confirm'] - Label for the confirm button.
+ * @returns {Promise<boolean>} Resolves to true on confirm, false on dismiss.
+ */
 function showConfirmModal(title, message, confirmText = 'Confirm') {
     return new Promise((resolve) => {
         const modalEl = document.getElementById('confirmModal');
@@ -1961,6 +2205,12 @@ function showConfirmModal(title, message, confirmText = 'Confirm') {
 }
 
 // Global utility functions
+
+/**
+ * Formats a byte count as a human-readable size string.
+ * @param {number} bytes - File size in bytes.
+ * @returns {string} Formatted string (e.g. "1.23 GB").
+ */
 function formatFileSize(bytes) {
     if (bytes === 0) return '0 Bytes';
     const k = 1024;
@@ -1969,12 +2219,22 @@ function formatFileSize(bytes) {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }
 
+/**
+ * Formats a bitrate in kbps as a human-readable string, converting to Mbps above 1000 kbps.
+ * @param {number} bitrate - Bitrate in kbps.
+ * @returns {string} Formatted string (e.g. "4.5 Mbps" or "800 kbps").
+ */
 function formatBitrate(bitrate) {
     if (bitrate === 0) return '0 kbps';
     if (bitrate < 1000) return bitrate + ' kbps';
     return (bitrate / 1000).toFixed(1) + ' Mbps';
 }
 
+/**
+ * Formats a duration in seconds as a compact time string.
+ * @param {number} seconds - Duration in seconds.
+ * @returns {string} Time string in `H:MM:SS` or `M:SS` format.
+ */
 function formatDuration(seconds) {
     if (seconds === 0) return '0:00';
     const hours = Math.floor(seconds / 3600);
@@ -1988,6 +2248,12 @@ function formatDuration(seconds) {
     }
 }
 
+/**
+ * Displays a dismissible Bootstrap toast notification at the top-right of the screen.
+ * Creates the toast container on first call if it does not yet exist.
+ * @param {string} message - Text or HTML content to display in the toast body.
+ * @param {'info'|'success'|'warning'|'danger'} [type='info'] - Bootstrap color variant for the toast background.
+ */
 function showToast(message, type = 'info') {
     // Create toast container if it doesn't exist
     let container = document.getElementById('toast-container');
