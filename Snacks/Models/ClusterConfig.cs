@@ -79,6 +79,13 @@ public sealed class ClusterConfig
     ///     Used to distinguish nodes during discovery and heartbeat.
     /// </summary>
     public string NodeId { get; set; } = Guid.NewGuid().ToString();
+
+    /// <summary>
+    ///     Whether inter-node communication should use HTTPS.
+    ///     When <see langword="false" />, the shared secret is transmitted in plaintext
+    ///     over HTTP and a security warning is logged on startup.
+    /// </summary>
+    public bool UseHttps { get; set; } = false;
 }
 
 /// <summary>

@@ -13,6 +13,7 @@ namespace Snacks.Data;
 /// </summary>
 public class MediaFileRepository
 {
+        #region Construction & Helpers
 
         private readonly IDbContextFactory<SnacksDbContext> _contextFactory;
 
@@ -572,4 +573,6 @@ public class MediaFileRepository
                 await SaveChangesWithRetryAsync(context);
             }
         }
+
+        #endregion
     }

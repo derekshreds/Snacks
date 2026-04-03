@@ -5,37 +5,39 @@ using Snacks.Models;
 using Snacks.Services;
 using System.Text.Json;
 
-namespace Snacks.Controllers
-{
-    /// <summary>
-    ///     REST API controller for inter-node communication in the distributed encoding cluster.
-    ///     All endpoints are protected by <see cref="ClusterAuthFilter"/>, which validates the
-    ///     <c>X-Snacks-Secret</c> header against the configured shared secret. Covers node
-    ///     discovery, heartbeat monitoring, job lifecycle, chunked file transfer with resume,
-    ///     and graceful shutdown.
-    /// </summary>
-    [Route("api/cluster")]
-    [ApiController]
-    [ServiceFilter(typeof(ClusterAuthFilter))]
-    public class ClusterController : ControllerBase
-    {
-        private readonly ClusterService _clusterService;
-        private readonly IHubContext<TranscodingHub> _hubContext;
-        private readonly JsonSerializerOptions _jsonOptions = new()
-        {
-            PropertyNameCaseInsensitive = true,
-            PropertyNamingPolicy = JsonNamingPolicy.CamelCase
-        };
+namespace Snacks.Controllers;
 
-        /// <summary>
-        ///     Initializes the controller with the cluster coordination service and the SignalR hub
-        ///     context used to push real-time transfer progress to the local UI.
-        /// </summary>
-        public ClusterController(ClusterService clusterService, IHubContext<TranscodingHub> hubContext)
-        {
-            _clusterService = clusterService;
-            _hubContext = hubContext;
-        }
+/// <summary>
+///     REST API controller for inter-node communication in the distributed encoding cluster.
+///     All endpoints are protected by <see cref="ClusterAuthFilter"/>, which validates the
+///     <c>X-Snacks-Secret</c> header against the configured shared secret. Covers node
+///     discovery, heartbeat monitoring, job lifecycle, chunked file transfer with resume,
+///     and graceful shutdown.
+/// </summary>
+[Route("api/cluster")]
+[ApiController]
+[ServiceFilter(typeof(ClusterAuthFilter))]
+public sealed class ClusterController : ControllerBase
+{
+    private readonly ClusterService              _clusterService;
+    private readonly IHubContext<TranscodingHub> _hubContext;
+    private readonly JsonSerializerOptions       _jsonOptions = new()
+    {
+        PropertyNameCaseInsensitive = true,
+        PropertyNamingPolicy        = JsonNamingPolicy.CamelCase
+    };
+
+    /// <summary>
+    ///     Initializes the controller with the cluster coordination service and the SignalR hub
+    ///     context used to push real-time transfer progress to the local UI.
+    /// </summary>
+    /// <param name="clusterService"> The cluster coordination service. </param>
+    /// <param name="hubContext"> SignalR hub context for pushing transfer progress to the UI. </param>
+    public ClusterController(ClusterService clusterService, IHubContext<TranscodingHub> hubContext)
+    {
+        _clusterService = clusterService;
+        _hubContext     = hubContext;
+    }
 
         /******************************************************************
          *  Discovery and Handshake
@@ -528,4 +530,4 @@ namespace Snacks.Controllers
         }
 
     }
-}
+

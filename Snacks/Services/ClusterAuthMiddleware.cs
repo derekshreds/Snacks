@@ -1,7 +1,7 @@
-namespace Snacks.Services;
-
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.Filters;
+
+namespace Snacks.Services;
 
 /// <summary>
 ///     ASP.NET MVC action filter that authenticates inter-node cluster requests.

@@ -60,8 +60,8 @@ public class TranscodingService
         /// <summary>Optional callback to cancel a remote job on a cluster node.</summary>
         private Func<string, string, Task>? _remoteJobCanceller;
 
-        /// <summary>Optional callback for the cluster to check whether a file is already assigned remotely.</summary>
-        private Func<string, bool>? _isRemoteJobChecker;
+        /// <summary>Optional async callback for the cluster to check whether a file is already assigned remotely.</summary>
+        private Func<string, Task<bool>>? _isRemoteJobChecker;
 
         /// <summary>Whether the encoding queue is paused by user request.</summary>
         public bool IsPaused => _isPaused;
@@ -273,7 +273,7 @@ public class TranscodingService
                     return workItem.Id;
                 }
 
-                if (_isRemoteJobChecker?.Invoke(normalizedPath) == true)
+                if (_isRemoteJobChecker != null && await _isRemoteJobChecker(normalizedPath))
                 {
                     Console.WriteLine($"Skipping {workItem.FileName}: already active as a remote job");
                     return workItem.Id;
@@ -1710,9 +1710,9 @@ public class TranscodingService
             _remoteJobCanceller = canceller;
         }
 
-        /// <summary>Sets the callback the cluster service uses to check whether a file is already assigned to a remote node.</summary>
-        /// <param name="checker">Delegate receiving (filePath), returning <c>true</c> if currently remote.</param>
-        public void SetRemoteJobChecker(Func<string, bool>? checker)
+        /// <summary>Sets the async callback the cluster service uses to check whether a file is already assigned to a remote node.</summary>
+        /// <param name="checker">Async delegate receiving (filePath), returning <c>true</c> if currently remote.</param>
+        public void SetRemoteJobChecker(Func<string, Task<bool>>? checker)
         {
             _isRemoteJobChecker = checker;
         }
