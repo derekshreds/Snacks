@@ -11,14 +11,17 @@ namespace Snacks.Controllers
         private readonly FileService _fileService;
         private readonly AutoScanService _autoScanService;
         private readonly MediaFileRepository _mediaFileRepo;
+        private readonly ClusterService _clusterService;
 
         public HomeController(TranscodingService transcodingService, FileService fileService,
-            AutoScanService autoScanService, MediaFileRepository mediaFileRepo)
+            AutoScanService autoScanService, MediaFileRepository mediaFileRepo,
+            ClusterService clusterService)
         {
             _transcodingService = transcodingService;
             _fileService = fileService;
             _autoScanService = autoScanService;
             _mediaFileRepo = mediaFileRepo;
+            _clusterService = clusterService;
         }
 
         public IActionResult Index()
@@ -30,10 +33,10 @@ namespace Snacks.Controllers
         [HttpGet]
         public IActionResult Health()
         {
-            return Json(new { 
-                status = "healthy", 
+            return Json(new {
+                status = "healthy",
                 timestamp = DateTime.UtcNow,
-                version = "1.0.0"
+                version = "2.1.0"
             });
         }
 
@@ -593,6 +596,11 @@ namespace Snacks.Controllers
             {
                 _transcodingService.SetPaused(request.Paused);
                 _autoScanService.SetQueuePaused(request.Paused);
+
+                // In node mode, also pause/resume accepting remote jobs
+                if (_clusterService.IsNodeMode)
+                    _clusterService.SetNodePaused(request.Paused);
+
                 return Json(new { success = true, paused = _transcodingService.IsPaused });
             }
             catch (Exception ex)
@@ -604,7 +612,104 @@ namespace Snacks.Controllers
         [HttpGet]
         public IActionResult GetPausedState()
         {
-            return Json(new { paused = _transcodingService.IsPaused });
+            // In node mode, reflect node pause state (may be set by master)
+            var paused = _transcodingService.IsPaused || _clusterService.IsNodePaused;
+            return Json(new { paused });
+        }
+
+        // --- Cluster endpoints ---
+
+        [HttpGet]
+        public IActionResult GetClusterConfig()
+        {
+            var config = _clusterService.GetConfig();
+            // Never expose the raw secret over the unauthenticated UI API
+            return Json(new
+            {
+                config.Enabled,
+                config.Role,
+                config.NodeName,
+                hasSecret = !string.IsNullOrEmpty(config.SharedSecret),
+                config.AutoDiscovery,
+                config.LocalEncodingEnabled,
+                config.MasterUrl,
+                config.NodeTempDirectory,
+                config.ManualNodes,
+                config.HeartbeatIntervalSeconds,
+                config.NodeTimeoutSeconds,
+                config.NodeId
+            });
+        }
+
+        [HttpPost]
+        public async Task<IActionResult> SaveClusterConfig([FromBody] ClusterConfig config)
+        {
+            try
+            {
+                // Preserve existing secret if none was sent (UI doesn't echo it back)
+                if (string.IsNullOrEmpty(config.SharedSecret))
+                    config.SharedSecret = _clusterService.GetConfig().SharedSecret;
+
+                // Require a secret to enable cluster mode
+                if (config.Enabled && config.Role != "standalone" && string.IsNullOrEmpty(config.SharedSecret))
+                    return Json(new { success = false, error = "A shared secret is required to enable cluster mode." });
+
+                await _clusterService.SaveConfigAndApplyAsync(config);
+                return Json(new { success = true });
+            }
+            catch (Exception ex)
+            {
+                return Json(new { success = false, error = ex.Message });
+            }
+        }
+
+        [HttpGet]
+        public IActionResult GetWorkers()
+        {
+            return Json(_clusterService.GetNodes());
+        }
+
+        [HttpPost]
+        public async Task<IActionResult> SetNodePaused([FromBody] NodePauseRequest request)
+        {
+            try
+            {
+                await _clusterService.SetRemoteNodePausedAsync(request.NodeId, request.Paused);
+                return Json(new { success = true });
+            }
+            catch (Exception ex)
+            {
+                return Json(new { success = false, error = ex.Message });
+            }
+        }
+
+        [HttpGet]
+        public IActionResult GetClusterStatus()
+        {
+            var config = _clusterService.GetConfig();
+            return Json(new
+            {
+                enabled = config.Enabled,
+                role = config.Role,
+                nodeName = config.NodeName,
+                nodeCount = _clusterService.GetNodes().Count,
+                nodes = _clusterService.GetNodes()
+            });
+        }
+
+        [HttpPost]
+        public IActionResult Restart()
+        {
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(500); // Give the response time to send
+
+                // Stop active encode and clean up partial output before exiting
+                await _transcodingService.StopAndClearQueue();
+
+                Environment.Exit(0); // Electron will detect clean exit and relaunch
+            });
+            return Json(new { success = true, message = "Restarting..." });
         }
 
         public IActionResult Error()
@@ -643,6 +748,12 @@ namespace Snacks.Controllers
 
     public class PauseRequest
     {
+        public bool Paused { get; set; }
+    }
+
+    public class NodePauseRequest
+    {
+        public string NodeId { get; set; } = "";
         public bool Paused { get; set; }
     }
 

@@ -23,6 +23,15 @@ namespace Snacks.Models
         public DateTime? CompletedAt { get; set; }
         public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
         public long FileMtime { get; set; }
+
+        // Cluster remote job tracking
+        public string? RemoteWorkItemId { get; set; } // The WorkItem.Id GUID used for this remote job
+        public string? AssignedNodeId { get; set; }
+        public string? AssignedNodeName { get; set; }
+        public string? RemoteJobPhase { get; set; }
+        public int RemoteFailureCount { get; set; }
+        public string? AssignedNodeIp { get; set; }
+        public int? AssignedNodePort { get; set; }
     }
 
     public enum MediaFileStatus

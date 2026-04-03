@@ -15,14 +15,22 @@ let isQuitting = false;
 // Helpers
 // ---------------------------------------------------------------------------
 
-function findFreePort() {
+function findFreePort(preferred = 6767) {
   return new Promise((resolve, reject) => {
+    // Try the preferred port first so firewall rules stay predictable
     const srv = net.createServer();
-    srv.listen(0, "127.0.0.1", () => {
-      const port = srv.address().port;
-      srv.close(() => resolve(port));
+    srv.listen(preferred, "0.0.0.0", () => {
+      srv.close(() => resolve(preferred));
     });
-    srv.on("error", reject);
+    srv.on("error", () => {
+      // Preferred port is taken — fall back to a random one
+      const srv2 = net.createServer();
+      srv2.listen(0, "0.0.0.0", () => {
+        const port = srv2.address().port;
+        srv2.close(() => resolve(port));
+      });
+      srv2.on("error", reject);
+    });
   });
 }
 
@@ -66,16 +74,8 @@ function startBackend(port) {
   const workDir = getWorkDir();
   fs.mkdirSync(workDir, { recursive: true });
 
-  // Override appsettings.json to remove hardcoded Kestrel port (Docker uses it, desktop doesn't)
-  const appSettingsPath = path.join(path.dirname(exe), "appsettings.json");
-  try {
-    const settings = JSON.parse(fs.readFileSync(appSettingsPath, "utf8"));
-    delete settings.Kestrel;
-    fs.writeFileSync(appSettingsPath, JSON.stringify(settings, null, 2));
-  } catch { /* ignore if not found */ }
-
   const env = Object.assign({}, process.env, {
-    ASPNETCORE_URLS: `http://localhost:${port}`,
+    ASPNETCORE_URLS: `http://0.0.0.0:${port}`,
     ASPNETCORE_ENVIRONMENT: "Production",
     FFMPEG_PATH: resolveFfmpegPath(),
     FFPROBE_PATH: resolveFfprobePath(),
@@ -83,7 +83,7 @@ function startBackend(port) {
     SNACKS_ALLOW_ALL_PATHS: "true",
   });
 
-  backendProcess = spawn(exe, ["--urls", `http://localhost:${port}`], {
+  backendProcess = spawn(exe, ["--urls", `http://0.0.0.0:${port}`], {
     env,
     cwd: path.dirname(exe),
     stdio: ["ignore", "pipe", "pipe"],
@@ -94,12 +94,25 @@ function startBackend(port) {
   backendProcess.stderr.on("data", (d) => process.stderr.write(`[backend:err] ${d}`));
   backendProcess.on("exit", (code) => {
     console.log(`Backend exited with code ${code}`);
-    if (!isQuitting && mainWindow === null) {
+    backendProcess = null;
+
+    if (isQuitting) return;
+
+    if (mainWindow === null) {
       dialog.showErrorBox("Snacks - Backend crashed",
         `Backend exited with code ${code} before the window could open.\n\nCheck that the backend published correctly.`);
       app.quit();
+    } else if (code === 0) {
+      // Clean exit (triggered by restart request) — relaunch
+      console.log("Backend exited cleanly — restarting...");
+      startBackend(backendPort);
+      pollHealth(backendPort).then(() => {
+        if (mainWindow) mainWindow.reload();
+      }).catch(() => {
+        dialog.showErrorBox("Snacks", "Backend failed to restart.");
+        app.quit();
+      });
     }
-    backendProcess = null;
   });
 }
 

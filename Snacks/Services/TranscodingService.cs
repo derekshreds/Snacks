@@ -23,7 +23,12 @@ namespace Snacks.Services
         private Process? _activeProcess;
         private WorkItem? _activeWorkItem;
         private bool _isPaused = false;
+        private bool _localEncodingPaused = false;
         private EncoderOptions? _lastOptions;
+        private Func<string, int, Task>? _progressCallback;
+        private Func<string, string, Task>? _logCallback;
+        private Func<string, string, Task>? _remoteJobCanceller;
+        private Func<string, bool>? _isRemoteJobChecker;
 
         public bool IsPaused => _isPaused;
 
@@ -59,6 +64,10 @@ namespace Snacks.Services
         private async Task LogAsync(string workItemId, string message)
         {
             await _hubContext.Clients.All.SendAsync("TranscodingLog", workItemId, message);
+
+            // Forward log to master if this is a remote job
+            if (_logCallback != null)
+                _ = _logCallback(workItemId, message);
 
             // Persist to per-item log file (named after the video file for easy disk browsing)
             try
@@ -211,6 +220,13 @@ namespace Snacks.Services
                     return workItem.Id;
                 }
 
+                // Skip if this file is currently being processed as a remote job on a cluster node
+                if (_isRemoteJobChecker?.Invoke(normalizedPath) == true)
+                {
+                    Console.WriteLine($"Skipping {workItem.FileName}: already active as a remote job");
+                    return workItem.Id;
+                }
+
                 // Check the database for existing records
                 var dbFile = await _mediaFileRepo.GetByPathAsync(normalizedPath);
                 if (dbFile != null)
@@ -325,6 +341,14 @@ namespace Snacks.Services
             return workItem;
         }
 
+        /// <summary>Replace a work item's ID in the tracking dictionary (used to reuse IDs across restarts).</summary>
+        public void ReplaceWorkItemId(string oldId, string newId, WorkItem workItem)
+        {
+            _workItems.TryRemove(oldId, out _);
+            workItem.Id = newId;
+            _workItems[newId] = workItem;
+        }
+
         public bool IsFileQueued(string filePath)
         {
             var normalizedPath = Path.GetFullPath(filePath);
@@ -352,6 +376,19 @@ namespace Snacks.Services
                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
                 await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Cancelled);
             }
+            else if (workItem.Status == WorkItemStatus.Processing && workItem.IsRemote)
+            {
+                // Cancel remote job on the node
+                if (_remoteJobCanceller != null && workItem.AssignedNodeId != null)
+                    await _remoteJobCanceller.Invoke(id, workItem.AssignedNodeId);
+                workItem.Status = WorkItemStatus.Cancelled;
+                workItem.CompletedAt = DateTime.UtcNow;
+                workItem.AssignedNodeId = null;
+                workItem.AssignedNodeName = null;
+                workItem.RemoteJobPhase = null;
+                await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
+                await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Cancelled);
+            }
             else if (workItem.Status == WorkItemStatus.Processing && _activeWorkItem?.Id == id)
             {
                 await KillActiveProcess(workItem, "Encoding cancelled by user.");
@@ -374,7 +411,19 @@ namespace Snacks.Services
             {
                 workItem.Status = WorkItemStatus.Stopped;
                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
-                // Mark as Unseen so it gets picked up again on next scan
+                await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Unseen);
+            }
+            else if (workItem.Status == WorkItemStatus.Processing && workItem.IsRemote)
+            {
+                // Stop remote job on the node
+                if (_remoteJobCanceller != null && workItem.AssignedNodeId != null)
+                    await _remoteJobCanceller.Invoke(id, workItem.AssignedNodeId);
+                workItem.Status = WorkItemStatus.Stopped;
+                workItem.CompletedAt = DateTime.UtcNow;
+                workItem.AssignedNodeId = null;
+                workItem.AssignedNodeName = null;
+                workItem.RemoteJobPhase = null;
+                await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
                 await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Unseen);
             }
             else if (workItem.Status == WorkItemStatus.Processing && _activeWorkItem?.Id == id)
@@ -435,6 +484,11 @@ namespace Snacks.Services
                         Console.WriteLine("Queue is paused — stopping processing loop");
                         break;
                     }
+
+                    // When local encoding is paused (master delegating to nodes),
+                    // leave items in the queue for the cluster dispatch loop
+                    if (_localEncodingPaused)
+                        break;
 
                     WorkItem? workItem = null;
                     lock (_queueLock)
@@ -1364,6 +1418,10 @@ namespace Snacks.Services
                                                     lastProgressUpdate = now;
                                                     await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
                                                     await LogAsync(workItem.Id, $"FFmpeg: {line}");
+
+                                                    // Report progress to master if this is a remote job
+                                                    if (_progressCallback != null)
+                                                        _ = _progressCallback(workItem.Id, progress);
                                                 }
                                             }
                                         }
@@ -1493,6 +1551,260 @@ namespace Snacks.Services
             // All retries exhausted — original file is untouched
             await LogAsync(workItem.Id, "All retries exhausted. Original file is unchanged.");
             throw new Exception($"Conversion failed after retries: {reason}");
+        }
+
+        // --- Cluster support methods ---
+
+        public WorkItem? GetActiveWorkItem() => _activeWorkItem;
+        public EncoderOptions? GetLastOptions() => _lastOptions;
+
+        /// <summary>
+        /// When true, the local processing loop will not dequeue items.
+        /// Items stay in the queue for the cluster dispatch loop to pick up.
+        /// </summary>
+        public void SetLocalEncodingPaused(bool paused)
+        {
+            _localEncodingPaused = paused;
+            Console.WriteLine($"Cluster: Local encoding {(paused ? "paused" : "resumed")}");
+        }
+
+        public string? GetDetectedHardware() => _detectedHardware;
+
+        public void SetProgressCallback(Func<string, int, Task>? callback)
+        {
+            _progressCallback = callback;
+        }
+
+        public void SetLogCallback(Func<string, string, Task>? callback)
+        {
+            _logCallback = callback;
+        }
+
+        public void SetRemoteJobCanceller(Func<string, string, Task>? canceller)
+        {
+            _remoteJobCanceller = canceller;
+        }
+
+        public void SetRemoteJobChecker(Func<string, bool>? checker)
+        {
+            _isRemoteJobChecker = checker;
+        }
+
+        /// <summary>
+        /// Stops all processing and clears the queue. Used when switching to node mode.
+        /// </summary>
+        public async Task StopAndClearQueue()
+        {
+            Console.WriteLine("Cluster: Stopping all processing and clearing queue...");
+
+            // Kill active FFmpeg process
+            if (_activeWorkItem != null && _activeProcess != null)
+            {
+                try
+                {
+                    if (!_activeProcess.HasExited)
+                        _activeProcess.Kill(entireProcessTree: true);
+                }
+                catch { }
+
+                // Clean up partial output
+                if (_lastOptions != null)
+                {
+                    var outputPath = GetOutputPath(_activeWorkItem, _lastOptions);
+                    try
+                    {
+                        if (File.Exists(outputPath))
+                            await _fileService.FileDeleteAsync(outputPath);
+                    }
+                    catch { }
+                }
+
+                _activeWorkItem.Status = WorkItemStatus.Stopped;
+                _activeWorkItem.CompletedAt = DateTime.UtcNow;
+                await _hubContext.Clients.All.SendAsync("WorkItemUpdated", _activeWorkItem);
+                await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(_activeWorkItem.Path), MediaFileStatus.Unseen);
+                _activeWorkItem = null;
+                _activeProcess = null;
+            }
+
+            // Clear the queue
+            List<WorkItem> pendingItems;
+            lock (_queueLock)
+            {
+                pendingItems = _workQueue.ToList();
+                _workQueue.Clear();
+            }
+
+            // Mark all pending items as unseen in DB (so they won't be resumed in node mode)
+            foreach (var item in pendingItems)
+            {
+                item.Status = WorkItemStatus.Stopped;
+                await _hubContext.Clients.All.SendAsync("WorkItemUpdated", item);
+                try
+                {
+                    await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(item.Path), MediaFileStatus.Unseen);
+                }
+                catch { }
+            }
+
+            // Clear in-memory work items
+            _workItems.Clear();
+
+            Console.WriteLine($"Cluster: Queue cleared ({pendingItems.Count} items stopped)");
+        }
+
+        /// <summary>
+        /// Dequeue a pending item for remote processing on a cluster node.
+        /// </summary>
+        public WorkItem? DequeueForRemoteProcessing()
+        {
+            lock (_queueLock)
+            {
+                var item = _workQueue.FirstOrDefault(w => w.Status == WorkItemStatus.Pending);
+                if (item != null)
+                {
+                    item.Status = WorkItemStatus.Processing;
+                    _workQueue.Remove(item);
+                }
+                return item;
+            }
+        }
+
+        /// <summary>
+        /// Re-queue a work item that failed on a remote node.
+        /// </summary>
+        public void RequeueWorkItem(WorkItem item)
+        {
+            item.Status = WorkItemStatus.Pending;
+            item.AssignedNodeId = null;
+            item.AssignedNodeName = null;
+            item.RemoteJobPhase = null;
+            item.TransferProgress = 0;
+
+            lock (_queueLock)
+            {
+                _workQueue.Add(item);
+                _workQueue.Sort((a, b) => b.Bitrate.CompareTo(a.Bitrate));
+            }
+
+            _ = _hubContext.Clients.All.SendAsync("WorkItemUpdated", item);
+            Console.WriteLine($"Cluster: Re-queued {item.FileName} for processing");
+        }
+
+        /// <summary>
+        /// Handle completion of a remote job — validate output and perform file placement.
+        /// </summary>
+        public async Task HandleRemoteCompletion(WorkItem workItem, string outputPath, EncoderOptions options)
+        {
+            // Calculate savings
+            var outputSize = new FileInfo(outputPath).Length;
+            float savings = (workItem.Size - outputSize) / 1048576f;
+            float percent = 1 - ((float)outputSize / workItem.Size);
+
+            Console.WriteLine($"Cluster: Remote encode of {workItem.FileName}: {savings:0,0}MB / {percent:P} saved");
+
+            if (savings > 0)
+            {
+                await HandleOutputPlacement(outputPath, workItem, options);
+            }
+            else
+            {
+                Console.WriteLine($"Cluster: No savings for {workItem.FileName}, deleting output");
+                try { await _fileService.FileDeleteAsync(outputPath); } catch { }
+            }
+
+            workItem.Status = WorkItemStatus.Completed;
+            workItem.CompletedAt = DateTime.UtcNow;
+            workItem.Progress = 100;
+            workItem.ErrorMessage = null;
+            workItem.RemoteJobPhase = null;
+            await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Completed);
+            await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
+        }
+
+        /// <summary>
+        /// Mark a work item as failed (used by cluster for remote failures).
+        /// </summary>
+        public async Task MarkWorkItemFailed(string workItemId, string errorMessage)
+        {
+            if (_workItems.TryGetValue(workItemId, out var workItem))
+            {
+                workItem.Status = WorkItemStatus.Failed;
+                workItem.ErrorMessage = errorMessage;
+                workItem.CompletedAt = DateTime.UtcNow;
+                await _mediaFileRepo.IncrementFailureCountAsync(Path.GetFullPath(workItem.Path), errorMessage);
+                await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
+            }
+        }
+
+        /// <summary>
+        /// Reconstruct a WorkItem with a specific ID from a file on disk.
+        /// Used during crash recovery to preserve the job ID so nodes can resume.
+        /// </summary>
+        public async Task<WorkItem?> CreateWorkItemWithIdAsync(string id, string filePath)
+        {
+            try
+            {
+                if (!File.Exists(filePath)) return null;
+
+                var fileInfo = new FileInfo(filePath);
+                var probe = await _ffprobeService.ProbeAsync(filePath);
+                var length = _ffprobeService.GetVideoDuration(probe);
+
+                var isHevc = false;
+                long bitrate = 0;
+                foreach (var stream in probe.streams)
+                {
+                    if (stream.codec_type == "video")
+                    {
+                        isHevc = stream.codec_name == "hevc";
+                        break;
+                    }
+                }
+
+                if (length > 0)
+                    bitrate = (long)(fileInfo.Length * 8 / length / 1000);
+
+                var workItem = new WorkItem
+                {
+                    Id = id,
+                    FileName = Path.GetFileName(filePath),
+                    Path = filePath,
+                    Size = fileInfo.Length,
+                    Bitrate = bitrate,
+                    Length = length,
+                    IsHevc = isHevc,
+                    Probe = probe,
+                    Status = WorkItemStatus.Processing,
+                    StartedAt = DateTime.UtcNow
+                };
+
+                _workItems[id] = workItem;
+                return workItem;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Cluster: Failed to reconstruct work item {id}: {ex.Message}");
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Run ConvertVideoAsync for a remote job (node-side encoding).
+        /// </summary>
+        public async Task ConvertVideoForRemoteAsync(WorkItem workItem, EncoderOptions options)
+        {
+            // Register the work item so logging works
+            _workItems[workItem.Id] = workItem;
+
+            try
+            {
+                await ConvertVideoAsync(workItem, options);
+            }
+            finally
+            {
+                // Don't remove from _workItems — the output file needs to remain accessible
+            }
         }
 
         private async Task HandleOutputPlacement(string outputPath, WorkItem workItem, EncoderOptions options)

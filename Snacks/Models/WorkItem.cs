@@ -16,6 +16,14 @@ namespace Snacks.Models
         public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
         public DateTime? StartedAt { get; set; }
         public DateTime? CompletedAt { get; set; }
+
+        // Cluster / remote job fields
+        public string? AssignedNodeId { get; set; }
+        public string? AssignedNodeName { get; set; }
+        public string? RemoteJobPhase { get; set; } // "Uploading", "Encoding", "Downloading"
+        public int TransferProgress { get; set; }
+        public int RemoteFailureCount { get; set; }
+        public bool IsRemote => AssignedNodeId != null;
     }
 
     public enum WorkItemStatus

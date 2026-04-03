@@ -26,6 +26,13 @@ namespace Snacks.Data
                 entity.Property(e => e.Codec).HasMaxLength(32);
                 entity.Property(e => e.PixelFormat).HasMaxLength(32);
                 entity.Property(e => e.FailureReason).HasMaxLength(2048);
+
+                // Cluster remote job tracking
+                entity.Property(e => e.RemoteWorkItemId).HasMaxLength(64);
+                entity.Property(e => e.AssignedNodeId).HasMaxLength(64);
+                entity.Property(e => e.AssignedNodeName).HasMaxLength(128);
+                entity.Property(e => e.RemoteJobPhase).HasMaxLength(32);
+                entity.Property(e => e.AssignedNodeIp).HasMaxLength(64);
             });
         }
     }

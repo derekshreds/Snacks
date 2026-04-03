@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Snacks.Data;
 
@@ -10,9 +11,11 @@ using Snacks.Data;
 namespace Snacks.Data.Migrations
 {
     [DbContext(typeof(SnacksDbContext))]
-    partial class SnacksDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260403124639_AddRemoteWorkItemId")]
+    partial class AddRemoteWorkItemId
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder.HasAnnotation("ProductVersion", "10.0.0");

@@ -270,7 +270,7 @@ footer a.text-muted:hover {
    Progress Bars
    =========================== */
 .progress {
-    height: 10px;
+    height: 18px;
     border-radius: 10px;
     background-color: var(--gray-200);
     overflow: hidden;
@@ -745,6 +745,26 @@ footer a.text-muted:hover {
     border-color: var(--primary) !important;
 }
 
+.nav-tabs .nav-link {
+    color: var(--text-secondary);
+}
+
+.nav-tabs .nav-link:hover,
+.nav-tabs .nav-link:focus {
+    color: var(--primary);
+    border-color: transparent;
+}
+
+.nav-tabs .nav-link.active {
+    color: var(--primary) !important;
+    background-color: var(--bg-card);
+    border-color: var(--border-color) var(--border-color) var(--bg-card);
+}
+
+.nav-tabs {
+    border-bottom-color: var(--border-color);
+}
+
 /* ===========================
    Queue Section
    =========================== */
@@ -976,7 +996,7 @@ footer a.text-muted:hover {
 
     /* Progress bar */
     .progress {
-        height: 16px;
+        height: 18px;
         font-size: 0.65rem;
     }
 

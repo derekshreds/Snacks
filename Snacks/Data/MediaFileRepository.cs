@@ -242,5 +242,81 @@ namespace Snacks.Data
             using var context = await _contextFactory.CreateDbContextAsync();
             return await context.MediaFiles.CountAsync(f => f.Status == status);
         }
+
+        // --- Cluster remote job tracking ---
+
+        public async Task AssignToRemoteNodeAsync(string normalizedPath, string workItemId,
+            string nodeId, string nodeName, string nodeIp, int nodePort, string phase)
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            var file = await context.MediaFiles.FirstOrDefaultAsync(f => f.FilePath == normalizedPath);
+            if (file == null) return;
+
+            file.Status = MediaFileStatus.Processing;
+            file.RemoteWorkItemId = workItemId;
+            file.AssignedNodeId = nodeId;
+            file.AssignedNodeName = nodeName;
+            file.AssignedNodeIp = nodeIp;
+            file.AssignedNodePort = nodePort;
+            file.RemoteJobPhase = phase;
+            await context.SaveChangesAsync();
+        }
+
+        public async Task UpdateRemoteJobPhaseAsync(string normalizedPath, string phase)
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            var file = await context.MediaFiles.FirstOrDefaultAsync(f => f.FilePath == normalizedPath);
+            if (file != null)
+            {
+                file.RemoteJobPhase = phase;
+                await context.SaveChangesAsync();
+            }
+        }
+
+        public async Task ClearRemoteAssignmentAsync(string normalizedPath, MediaFileStatus newStatus)
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            var file = await context.MediaFiles.FirstOrDefaultAsync(f => f.FilePath == normalizedPath);
+            if (file == null) return;
+
+            // Keep RemoteWorkItemId so the node's partial temp files can be found on retry.
+            // Only clear it on successful completion (Completed status).
+            if (newStatus == MediaFileStatus.Completed)
+                file.RemoteWorkItemId = null;
+            file.AssignedNodeId = null;
+            file.AssignedNodeName = null;
+            file.AssignedNodeIp = null;
+            file.AssignedNodePort = null;
+            file.RemoteJobPhase = null;
+            file.Status = newStatus;
+            await context.SaveChangesAsync();
+        }
+
+        public async Task IncrementRemoteFailureCountAsync(string normalizedPath)
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            var file = await context.MediaFiles.FirstOrDefaultAsync(f => f.FilePath == normalizedPath);
+            if (file != null)
+            {
+                file.RemoteFailureCount++;
+                await context.SaveChangesAsync();
+            }
+        }
+
+        public async Task<List<MediaFile>> GetActiveRemoteJobsAsync()
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            return await context.MediaFiles
+                .Where(f => f.AssignedNodeId != null)
+                .ToListAsync();
+        }
+
+        public async Task<bool> IsRemoteJobAsync(string normalizedPath)
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            return await context.MediaFiles.AnyAsync(f =>
+                f.FilePath == normalizedPath &&
+                f.AssignedNodeId != null);
+        }
     }
 }

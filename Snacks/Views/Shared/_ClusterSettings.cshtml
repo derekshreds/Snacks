@@ -1,0 +1,153 @@
+<div class="row g-4">
+    <div class="col-md-6">
+        <div class="encoder-panel rounded">
+            <h6 class="fw-bold mb-3 d-flex align-items-center">
+                <i class="fas fa-network-wired me-2 text-primary"></i>
+                Distributed Encoding
+            </h6>
+
+            <div class="form-check form-switch mb-3">
+                <input class="form-check-input" type="checkbox" id="clusterEnabled">
+                <label class="form-check-label" for="clusterEnabled">
+                    Enable Cluster Mode
+                </label>
+                <div class="form-text ms-4">Connect to other Snacks instances for distributed encoding</div>
+            </div>
+
+            <div class="mb-3">
+                <label for="clusterRole" class="form-label">
+                    <i class="fas fa-crown me-1"></i> Role
+                </label>
+                <select class="form-select" id="clusterRole">
+                    <option value="standalone">Standalone (Default)</option>
+                    <option value="master">Master (Has library, delegates to nodes)</option>
+                    <option value="node">Node (Accepts work from a master)</option>
+                </select>
+                <div class="form-text">
+                    <i class="fas fa-info-circle me-1"></i>
+                    <span id="roleDescription">Standard single-instance mode</span>
+                </div>
+            </div>
+
+            <div class="mb-3">
+                <label for="clusterNodeName" class="form-label">
+                    <i class="fas fa-tag me-1"></i> Node Name
+                </label>
+                <input type="text" class="form-control" id="clusterNodeName" placeholder="My Computer">
+                <div class="form-text">Friendly name shown in the cluster dashboard</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-md-6">
+        <div class="encoder-panel rounded">
+            <h6 class="fw-bold mb-3 d-flex align-items-center">
+                <i class="fas fa-shield-alt me-2 text-warning"></i>
+                Security
+            </h6>
+
+            <div class="mb-3">
+                <label for="clusterSecret" class="form-label">
+                    <i class="fas fa-key me-1"></i> Shared Secret
+                </label>
+                <div class="input-group">
+                    <input type="password" class="form-control" id="clusterSecret" placeholder="Enter a shared secret">
+                    <button class="btn btn-outline-secondary" type="button" id="toggleSecretVisibility">
+                        <i class="fas fa-eye"></i>
+                    </button>
+                    <button class="btn btn-outline-primary" type="button" id="generateSecret">
+                        <i class="fas fa-random me-1"></i>Generate
+                    </button>
+                </div>
+                <div class="form-text">All nodes in the cluster must use the same secret</div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Master-specific settings -->
+<div class="row g-4 mt-1" id="masterSettings" style="display: none;">
+    <div class="col-md-6">
+        <div class="encoder-panel rounded">
+            <h6 class="fw-bold mb-3 d-flex align-items-center">
+                <i class="fas fa-broadcast-tower me-2 text-info"></i>
+                Discovery
+            </h6>
+
+            <div class="form-check form-switch mb-3">
+                <input class="form-check-input" type="checkbox" id="clusterAutoDiscovery" checked>
+                <label class="form-check-label" for="clusterAutoDiscovery">
+                    Auto-discover nodes on local network
+                </label>
+                <div class="form-text ms-4">Uses UDP broadcast to find other Snacks instances</div>
+            </div>
+
+            <div class="form-check form-switch mb-3">
+                <input class="form-check-input" type="checkbox" id="clusterLocalEncoding" checked>
+                <label class="form-check-label" for="clusterLocalEncoding">
+                    Local encoding enabled
+                </label>
+                <div class="form-text ms-4">Master encodes files locally in addition to delegating to nodes</div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-6">
+        <div class="encoder-panel rounded">
+            <h6 class="fw-bold mb-3 d-flex align-items-center">
+                <i class="fas fa-server me-2 text-success"></i>
+                Manual Nodes
+            </h6>
+
+            <div id="manualNodesList" class="mb-3" style="max-height: 200px; overflow-y: auto;">
+                <div class="text-muted text-center py-2"><small>No manual nodes configured</small></div>
+            </div>
+
+            <div class="d-flex gap-2">
+                <input type="text" class="form-control form-control-sm" id="manualNodeName" placeholder="Name">
+                <input type="text" class="form-control form-control-sm" id="manualNodeUrl" placeholder="http://192.168.1.50:6767">
+                <button class="btn btn-sm btn-outline-primary" id="addManualNode">
+                    <i class="fas fa-plus"></i>
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Node-specific settings -->
+<div class="row g-4 mt-1" id="nodeSettings" style="display: none;">
+    <div class="col-md-6">
+        <div class="encoder-panel rounded">
+            <h6 class="fw-bold mb-3 d-flex align-items-center">
+                <i class="fas fa-link me-2 text-info"></i>
+                Connection
+            </h6>
+
+            <div class="mb-3">
+                <label for="clusterMasterUrl" class="form-label">
+                    <i class="fas fa-crown me-1"></i> Master URL
+                </label>
+                <input type="text" class="form-control" id="clusterMasterUrl" placeholder="http://192.168.1.10:6767">
+                <div class="form-text">Leave blank to automatically discover the master on the local network. Only set this if auto-discovery doesn't work (e.g. different subnets).</div>
+            </div>
+
+            <div class="mb-3">
+                <label for="clusterNodeTempDir" class="form-label">
+                    <i class="fas fa-folder me-1"></i> Temporary Encode Directory
+                </label>
+                <input type="text" class="form-control" id="clusterNodeTempDir" placeholder="Leave blank for default">
+                <div class="form-text">Where files are stored during encoding. Use a fast drive for best performance.</div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row g-4 mt-3">
+    <div class="col-12 d-flex align-items-center gap-2 flex-wrap">
+        <button class="btn btn-primary" id="saveClusterConfig">
+            <i class="fas fa-save me-1"></i> Save Cluster Settings
+        </button>
+        <span class="text-success ms-2" id="clusterSaveStatus" style="display: none;">
+            <i class="fas fa-check me-1"></i>Saved
+        </span>
+    </div>
+</div>

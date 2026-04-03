@@ -14,6 +14,7 @@ namespace Snacks.Services
         private readonly TranscodingService _transcodingService;
         private readonly MediaFileRepository _mediaFileRepo;
         private readonly IHubContext<TranscodingHub> _hubContext;
+        private readonly ClusterService _clusterService;
         private readonly SemaphoreSlim _scanLock = new(1, 1);
         private readonly string _configPath;
         private readonly string _settingsPath;
@@ -28,13 +29,14 @@ namespace Snacks.Services
 
         public AutoScanService(FileService fileService, FfprobeService ffprobeService,
             TranscodingService transcodingService, MediaFileRepository mediaFileRepo,
-            IHubContext<TranscodingHub> hubContext)
+            IHubContext<TranscodingHub> hubContext, ClusterService clusterService)
         {
             _fileService = fileService;
             _ffprobeService = ffprobeService;
             _transcodingService = transcodingService;
             _mediaFileRepo = mediaFileRepo;
             _hubContext = hubContext;
+            _clusterService = clusterService;
 
             var workDir = _fileService.GetWorkingDirectory();
             var configDir = Path.Combine(workDir, "config");
@@ -59,14 +61,20 @@ namespace Snacks.Services
             }
 
             // Resume any items that were queued or mid-encode when the app last shut down
+            // (skipped in node mode by ResumeQueueFromDatabaseAsync guard)
             _ = Task.Run(ResumeQueueFromDatabaseAsync);
 
             // Run an immediate scan on startup if enabled, so files pending
             // from before a restart get re-queued without waiting for the interval
+            // (skipped in node mode by RunScan guard)
             if (_config.Enabled && _config.Directories.Count > 0)
             {
                 _ = Task.Run(() => TriggerScanNow());
             }
+
+            // In node mode, also clean up orphaned remote job files
+            if (_clusterService.IsNodeMode)
+                _clusterService.CleanupAllRemoteJobs();
 
             return Task.CompletedTask;
         }
@@ -138,8 +146,22 @@ namespace Snacks.Services
         /// </summary>
         private async Task ResumeQueueFromDatabaseAsync()
         {
+            // In node mode, don't resume local queue
+            if (_clusterService.IsNodeMode)
+            {
+                Console.WriteLine("Node mode: Skipping queue resume from database");
+                return;
+            }
+
             try
             {
+                // Wait for cluster recovery to finish so we don't re-queue files it's handling
+                if (_clusterService.IsMasterMode)
+                {
+                    try { await _clusterService.RecoveryCompleteTask.WaitAsync(TimeSpan.FromMinutes(3)); }
+                    catch (TimeoutException) { Console.WriteLine("Resume: Cluster recovery timed out after 3 minutes — proceeding"); }
+                }
+
                 var options = LoadEncoderOptions();
                 var queued = await _mediaFileRepo.GetFilesWithStatusAsync(MediaFileStatus.Queued);
                 var processing = await _mediaFileRepo.GetFilesWithStatusAsync(MediaFileStatus.Processing);
@@ -152,6 +174,13 @@ namespace Snacks.Services
 
                 foreach (var file in toResume)
                 {
+                    // Skip files assigned to a remote node — cluster recovery handles those
+                    if (!string.IsNullOrEmpty(file.AssignedNodeId))
+                    {
+                        Console.WriteLine($"Resume: Skipping {file.FileName} — assigned to remote node {file.AssignedNodeName}");
+                        continue;
+                    }
+
                     if (!File.Exists(file.FilePath))
                     {
                         // File no longer exists — mark as unseen so it gets pruned
@@ -200,6 +229,10 @@ namespace Snacks.Services
 
         private async Task RunScan()
         {
+            // In node mode, don't scan for local files
+            if (_clusterService.IsNodeMode)
+                return;
+
             if (!_scanLock.Wait(0))
                 return; // Already scanning
 

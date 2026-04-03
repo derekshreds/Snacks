@@ -12,12 +12,16 @@ class TranscodingManager {
         this.queueTotal = 0;
         this.queueFilter = null; // null = all, 'Pending', 'Completed', 'Failed'
         this.isPaused = false;
+        this.clusterEnabled = false;
+        this.clusterRole = 'standalone';
+        this.workers = new Map();
         this.initializeSignalR();
         this.initializeEventHandlers();
         this.restoreSettings();
         this.loadAutoScanConfig();
         this.loadWorkItems();
         this.loadPauseState();
+        this.loadClusterConfig();
 
         // iOS Safari suspends WebSockets when the tab is backgrounded.
         // Re-check connection when the page becomes visible again.
@@ -68,6 +72,40 @@ class TranscodingManager {
             this.connection.on("AutoScanCompleted", (newFiles, total) => {
                 showToast(`Auto-scan complete: ${newFiles} new file(s) found`, newFiles > 0 ? 'success' : 'info');
                 this.loadAutoScanConfig(false);
+            });
+
+            // Cluster events
+            this.connection.on("WorkerConnected", (node) => {
+                if (!this.workers.has(node.nodeId)) {
+                    showToast(`Node "${node.hostname}" connected`, 'success');
+                }
+                this.workers.set(node.nodeId, node);
+                this.renderClusterPanel();
+            });
+
+            this.connection.on("WorkerDisconnected", (nodeId) => {
+                const node = this.workers.get(nodeId);
+                this.workers.delete(nodeId);
+                this.renderClusterPanel();
+                if (node) showToast(`Node "${node.hostname}" disconnected`, 'warning');
+            });
+
+            this.connection.on("WorkerUpdated", (node) => {
+                this.workers.set(node.nodeId, node);
+                this.renderClusterPanel();
+            });
+
+            this.connection.on("ClusterConfigChanged", (config) => {
+                this.clusterEnabled = config.enabled;
+                this.clusterRole = config.role;
+                this.renderClusterPanel();
+                this.updateNodeBanner();
+            });
+
+            // Node: master paused/resumed us
+            this.connection.on("ClusterNodePaused", (paused) => {
+                this.isPaused = paused;
+                this.updatePauseButton();
             });
 
             // Register lifecycle handlers BEFORE start so they catch all events
@@ -124,10 +162,14 @@ class TranscodingManager {
             this.processSelectedFiles();
         });
 
-        // Reload auto-scan config when settings modal opens
+        // Reload auto-scan and cluster config when settings modal opens
         document.getElementById('settingsModal')?.addEventListener('show.bs.modal', () => {
             this.loadAutoScanConfig();
+            this.loadClusterConfig();
         });
+
+        // Cluster event handlers
+        this.initializeClusterEventHandlers();
 
         document.getElementById('processDirectory').addEventListener('click', () => {
             this.processCurrentDirectory();
@@ -168,6 +210,44 @@ class TranscodingManager {
                 }, 1000);
             });
         }
+
+        // --- Delegated event handlers (bound once, survive DOM rebuilds) ---
+
+        // Work item action buttons (cancel/log) in both containers
+        for (const containerId of ['processingContainer', 'workItemsContainer']) {
+            document.getElementById(containerId)?.addEventListener('click', (e) => {
+                const btn = e.target.closest('[data-action]');
+                if (!btn) return;
+                const itemEl = btn.closest('.work-item');
+                const itemId = itemEl?.id?.replace('work-item-', '');
+                if (!itemId) return;
+                if (btn.dataset.action === 'remove') this.showStopCancelDialog(itemId);
+                if (btn.dataset.action === 'log') this.showLog(itemId);
+            });
+        }
+
+        // Pagination buttons
+        document.getElementById('queuePagination')?.addEventListener('click', (e) => {
+            const btn = e.target.closest('[data-page-action]');
+            if (!btn || btn.disabled) return;
+            const totalPages = Math.ceil(this.queueTotal / this.queuePageSize);
+            switch (btn.dataset.pageAction) {
+                case 'first': if (this.queuePage > 0) { this.queuePage = 0; this.loadWorkItems(); } break;
+                case 'prev': if (this.queuePage > 0) { this.queuePage--; this.loadWorkItems(); } break;
+                case 'next': if (this.queuePage < totalPages - 1) { this.queuePage++; this.loadWorkItems(); } break;
+                case 'last': if (this.queuePage < totalPages - 1) { this.queuePage = totalPages - 1; this.loadWorkItems(); } break;
+            }
+        });
+
+        // Filter tab buttons
+        document.getElementById('queueFilterTabs')?.addEventListener('click', (e) => {
+            const btn = e.target.closest('[data-filter]');
+            if (!btn) return;
+            const val = btn.dataset.filter;
+            this.queueFilter = val === '' ? null : val;
+            this.queuePage = 0;
+            this.loadWorkItems();
+        });
     }
 
     updateConnectionStatus(connected) {
@@ -670,15 +750,36 @@ class TranscodingManager {
             const processingItems = data.processing || [];
             this.queueTotal = data.total;
 
-            // Clear queue container only — processing is handled separately
-            this.workItems.clear();
-            document.getElementById('workItemsContainer').innerHTML = '';
+            // Save ephemeral transfer items before clearing (they come from SignalR, not server)
+            const ephemeralItems = new Map();
+            for (const [id, item] of this.workItems) {
+                if (item.remoteJobPhase === 'Downloading' || item.remoteJobPhase === 'Uploading') {
+                    ephemeralItems.set(id, item);
+                }
+            }
 
-            // Render processing items (always shown regardless of page/filter)
+            this.workItems.clear();
+
+            // Restore ephemeral items to the Map
+            for (const [id, item] of ephemeralItems) {
+                this.workItems.set(id, item);
+            }
+
+            // --- Reconcile processing container (no nuclear clear) ---
             const processingContainer = document.getElementById('processingContainer');
             const processingSection = document.getElementById('processingSection');
-            processingContainer.innerHTML = '';
-            if (processingItems.length > 0) {
+            const ephemeralIds = new Set(ephemeralItems.keys());
+            const expectedProcessingIds = new Set(processingItems.map(i => `work-item-${i.id}`));
+
+            // Remove processing DOM children no longer expected (and not ephemeral)
+            for (const child of [...processingContainer.children]) {
+                if (child.id && !expectedProcessingIds.has(child.id) && !ephemeralIds.has(child.id?.replace('work-item-', ''))) {
+                    child.remove();
+                }
+            }
+
+            // Render/update server-side processing items
+            if (processingItems.length > 0 || ephemeralIds.size > 0) {
                 processingSection.style.display = '';
                 for (const item of processingItems) {
                     this.workItems.set(item.id, item);
@@ -688,10 +789,31 @@ class TranscodingManager {
                 processingSection.style.display = 'none';
             }
 
-            // Render queue items
+            // --- Reconcile queue container (no nuclear clear) ---
+            const queueContainer = document.getElementById('workItemsContainer');
+            const expectedQueueIds = new Set(queueItems.map(i => `work-item-${i.id}`));
+
+            // Remove queue DOM children no longer in server response
+            for (const child of [...queueContainer.children]) {
+                if (child.id && !expectedQueueIds.has(child.id)) {
+                    child.remove();
+                } else if (!child.id) {
+                    child.remove(); // Remove empty-state messages etc.
+                }
+            }
+
+            // Render/update queue items
             for (const workItem of queueItems) {
                 this.workItems.set(workItem.id, workItem);
                 this.renderWorkItem(workItem);
+            }
+
+            // Reorder queue children to match server order
+            for (let i = 0; i < queueItems.length; i++) {
+                const el = document.getElementById(`work-item-${queueItems[i].id}`);
+                if (el && el !== queueContainer.children[i]) {
+                    queueContainer.insertBefore(el, queueContainer.children[i]);
+                }
             }
 
             // Update stats (desktop + mobile)
@@ -701,7 +823,7 @@ class TranscodingManager {
                 const msg = this.queueFilter
                     ? `No ${this.queueFilter.toLowerCase()} items`
                     : 'No files in queue';
-                document.getElementById('workItemsContainer').innerHTML = `<div class="text-muted text-center py-4"><i class="fas fa-inbox fa-2x mb-2"></i><br>${msg}</div>`;
+                queueContainer.innerHTML = `<div class="text-muted text-center py-4"><i class="fas fa-inbox fa-2x mb-2"></i><br>${msg}</div>`;
             }
 
             this.renderPagination();
@@ -734,13 +856,7 @@ class TranscodingManager {
             const active = this.queueFilter === f.value ? 'active' : '';
             return `<button class="btn btn-sm btn-outline-secondary ${active} queue-filter-btn" data-filter="${f.value ?? ''}">${f.label} <span class="badge bg-secondary ms-1">${f.count}</span></button>`;
         }).join('');
-
-        container.querySelectorAll('.queue-filter-btn').forEach(btn => {
-            btn.addEventListener('click', () => {
-                const val = btn.dataset.filter;
-                this.setFilter(val === '' ? null : val);
-            });
-        });
+        // Event handlers are delegated on #queueFilterTabs — no per-button binding needed
     }
 
     renderPagination() {
@@ -758,35 +874,23 @@ class TranscodingManager {
             <nav class="d-flex justify-content-between align-items-center mt-3">
                 <small class="text-muted">${this.queueTotal} items</small>
                 <div class="btn-group btn-group-sm">
-                    <button class="btn btn-outline-secondary" ${page === 0 ? 'disabled' : ''} id="pageFirst" title="First page">
+                    <button class="btn btn-outline-secondary" ${page === 0 ? 'disabled' : ''} data-page-action="first" title="First page">
                         <i class="fas fa-angle-double-left"></i>
                     </button>
-                    <button class="btn btn-outline-secondary" ${page === 0 ? 'disabled' : ''} id="pagePrev">
+                    <button class="btn btn-outline-secondary" ${page === 0 ? 'disabled' : ''} data-page-action="prev">
                         <i class="fas fa-chevron-left"></i>
                     </button>
                     <button class="btn btn-outline-secondary disabled">${page + 1} / ${totalPages}</button>
-                    <button class="btn btn-outline-secondary" ${page >= totalPages - 1 ? 'disabled' : ''} id="pageNext">
+                    <button class="btn btn-outline-secondary" ${page >= totalPages - 1 ? 'disabled' : ''} data-page-action="next">
                         <i class="fas fa-chevron-right"></i>
                     </button>
-                    <button class="btn btn-outline-secondary" ${page >= totalPages - 1 ? 'disabled' : ''} id="pageLast" title="Last page">
+                    <button class="btn btn-outline-secondary" ${page >= totalPages - 1 ? 'disabled' : ''} data-page-action="last" title="Last page">
                         <i class="fas fa-angle-double-right"></i>
                     </button>
                 </div>
             </nav>
         `;
-
-        document.getElementById('pageFirst')?.addEventListener('click', () => {
-            if (this.queuePage > 0) { this.queuePage = 0; this.loadWorkItems(); }
-        });
-        document.getElementById('pagePrev')?.addEventListener('click', () => {
-            if (this.queuePage > 0) { this.queuePage--; this.loadWorkItems(); }
-        });
-        document.getElementById('pageNext')?.addEventListener('click', () => {
-            if (this.queuePage < totalPages - 1) { this.queuePage++; this.loadWorkItems(); }
-        });
-        document.getElementById('pageLast')?.addEventListener('click', () => {
-            if (this.queuePage < totalPages - 1) { this.queuePage = totalPages - 1; this.loadWorkItems(); }
-        });
+        // Event handlers are delegated on #queuePagination — no per-button binding needed
     }
 
     addWorkItem(workItem) {
@@ -800,7 +904,31 @@ class TranscodingManager {
 
         // Processing items get rendered immediately to the dedicated section
         if (statusString === 'Processing') {
+            // Remove orphaned items for the same file (e.g., master restarted with a new job ID)
+            if (workItem.fileName && (workItem.remoteJobPhase === 'Downloading' || workItem.remoteJobPhase === 'Uploading')) {
+                for (const [existingId, existing] of this.workItems) {
+                    if (existingId !== workItem.id &&
+                        existing.fileName === workItem.fileName &&
+                        this.getStatusString(existing.status) === 'Processing') {
+                        this.workItems.delete(existingId);
+                        document.getElementById(`work-item-${existingId}`)?.remove();
+                    }
+                }
+            }
+
             this.renderWorkItem(workItem);
+            // Don't trigger a full server refresh for transfer progress updates —
+            // they're ephemeral and would be wiped by the server response.
+            // But schedule a fallback refresh in case the final state message is missed.
+            if (workItem.remoteJobPhase === 'Downloading' || workItem.remoteJobPhase === 'Uploading') {
+                if (!this._transferFallbackTimer) {
+                    this._transferFallbackTimer = setTimeout(() => {
+                        this._transferFallbackTimer = null;
+                        this.scheduleQueueRefresh();
+                    }, 30000);
+                }
+                return;
+            }
         }
 
         this.scheduleQueueRefresh();
@@ -908,9 +1036,6 @@ class TranscodingManager {
         // Move element to the correct container based on status
         if (statusString === 'Processing') {
             if (element.parentNode !== processingContainer) {
-                while (processingContainer.firstChild) {
-                    processingContainer.removeChild(processingContainer.firstChild);
-                }
                 processingContainer.appendChild(element);
             }
             processingSection.style.display = '';
@@ -933,17 +1058,97 @@ class TranscodingManager {
         }
 
         element.className = `work-item ${statusString.toLowerCase()}`;
-        element.innerHTML = this.getWorkItemHtml({...workItem, status: statusString});
 
-        // Add event listeners
-        const removeBtn = element.querySelector('.remove-btn');
-        if (removeBtn) {
-            removeBtn.addEventListener('click', () => this.showStopCancelDialog(workItem.id));
+        if (element.dataset.status) {
+            // Element already exists — do a differential update instead of full innerHTML rebuild
+            this.updateWorkItemDOM(element, workItem, statusString);
+        } else {
+            // First render — full HTML
+            element.innerHTML = this.getWorkItemHtml({...workItem, status: statusString});
+        }
+        element.dataset.status = statusString;
+        // Event listeners are handled by delegation on the container — no per-element binding needed
+    }
+
+    updateWorkItemDOM(element, workItem, statusString) {
+        const prevStatus = element.dataset.status;
+
+        // Update status badge
+        const badge = element.querySelector('.status-badge');
+        if (badge) {
+            const newClass = `status-badge status-${statusString.toLowerCase()} flex-shrink-0`;
+            if (badge.className !== newClass) badge.className = newClass;
+            if (badge.textContent !== statusString) badge.textContent = statusString;
         }
 
-        const logBtn = element.querySelector('.log-btn');
-        if (logBtn) {
-            logBtn.addEventListener('click', () => this.showLog(workItem.id));
+        // Update progress bar (processing items only)
+        const isTransfer = workItem.remoteJobPhase === 'Uploading' || workItem.remoteJobPhase === 'Downloading';
+        const pct = isTransfer ? (workItem.transferProgress || 0) : (workItem.progress || 0);
+        const progressContainer = element.querySelector('.progress');
+
+        if (statusString === 'Processing') {
+            if (progressContainer) {
+                // Update existing progress bar width directly (preserves CSS transition)
+                const bar = progressContainer.querySelector('.progress-bar');
+                if (bar) bar.style.width = pct + '%';
+                const label = progressContainer.querySelector('.progress-label');
+                if (label) {
+                    const labelText = workItem.remoteJobPhase === 'Uploading' ? `Uploading ${workItem.transferProgress || 0}%`
+                        : workItem.remoteJobPhase === 'Downloading' ? `Downloading ${workItem.transferProgress || 0}%`
+                        : `${pct}%`;
+                    if (label.textContent !== labelText) label.textContent = labelText;
+                }
+            } else {
+                // Status just changed to Processing — need to add progress bar.
+                // Fall through to full rebuild for this transition.
+                element.innerHTML = this.getWorkItemHtml({...workItem, status: statusString});
+                return;
+            }
+        } else if (progressContainer) {
+            progressContainer.remove();
+        }
+
+        // Update action buttons only if status changed
+        if (prevStatus !== statusString) {
+            const actionsDiv = element.querySelector('.ms-2.flex-shrink-0');
+            if (actionsDiv) actionsDiv.innerHTML = this.getActionButtons({...workItem, status: statusString});
+        }
+
+        // Update error message
+        const existingError = element.querySelector('.alert-danger');
+        if (workItem.errorMessage) {
+            if (existingError) {
+                const newMsg = `<i class="fas fa-exclamation-triangle me-2"></i>${escapeHtml(workItem.errorMessage)}`;
+                if (existingError.innerHTML !== newMsg) existingError.innerHTML = newMsg;
+            } else {
+                const errorDiv = document.createElement('div');
+                errorDiv.className = 'alert alert-danger alert-sm mb-0 mt-2';
+                errorDiv.innerHTML = `<i class="fas fa-exclamation-triangle me-2"></i>${escapeHtml(workItem.errorMessage)}`;
+                const timeEl = element.querySelector('.text-muted.small.mt-1');
+                if (timeEl) timeEl.before(errorDiv);
+            }
+        } else if (existingError) {
+            existingError.remove();
+        }
+
+        // Update node badge
+        const nodeBadge = element.querySelector('.badge.bg-secondary');
+        if (this.clusterEnabled && workItem.assignedNodeName) {
+            if (nodeBadge) {
+                const expectedText = workItem.assignedNodeName;
+                if (!nodeBadge.textContent.includes(expectedText)) {
+                    nodeBadge.innerHTML = `<i class="fas fa-server me-1"></i>${escapeHtml(workItem.assignedNodeName)}`;
+                }
+            }
+        } else if (nodeBadge && !workItem.assignedNodeName) {
+            nodeBadge.remove();
+        }
+
+        // Update timestamp
+        const timeEl = element.querySelector('.text-muted.small.mt-1');
+        if (timeEl) {
+            const newTime = `${new Date(workItem.createdAt).toLocaleString()}${workItem.completedAt ? ` &rarr; ${new Date(workItem.completedAt).toLocaleString()}` : ''}`;
+            if (timeEl.innerHTML !== newTime) timeEl.innerHTML = newTime;
         }
     }
 
@@ -951,13 +1156,21 @@ class TranscodingManager {
         const statusClass = `status-${workItem.status.toLowerCase()}`;
         const progressPercent = workItem.progress || 0;
         
+        const badges = [
+            `<span class="status-badge ${statusClass} flex-shrink-0">${workItem.status}</span>`,
+            this.clusterEnabled && workItem.assignedNodeName ? `<span class="badge bg-secondary flex-shrink-0" title="Processing on remote node"><i class="fas fa-server me-1"></i>${escapeHtml(workItem.assignedNodeName)}</span>` : '',
+            ''
+        ].filter(Boolean).join(' ');
+
         return `
             <div class="d-flex justify-content-between align-items-start mb-2">
-                <div class="flex-grow-1 min-width-0">
-                    <div class="d-flex align-items-center flex-wrap mb-1">
-                        <i class="fas fa-file-video me-2 text-primary"></i>
-                        <strong class="me-2 text-truncate">${workItem.fileName}</strong>
-                        <span class="status-badge ${statusClass}">${workItem.status}</span>
+                <div class="flex-grow-1" style="min-width:0;">
+                    <div class="d-flex align-items-center flex-wrap gap-1 mb-1" style="min-width:0;">
+                        <div class="d-flex align-items-center" style="min-width:0; max-width:100%;">
+                            <i class="fas fa-file-video me-2 text-primary flex-shrink-0"></i>
+                            <strong style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(workItem.fileName)}</strong>
+                        </div>
+                        ${badges}
                     </div>
                     <small class="text-muted">
                         ${formatFileSize(workItem.size)} &bull; ${formatBitrate(workItem.bitrate)} &bull; ${formatDuration(workItem.length)}
@@ -972,12 +1185,12 @@ class TranscodingManager {
                 <div class="progress mb-2" style="position: relative;">
                     <div class="progress-bar progress-bar-striped progress-bar-animated"
                          role="progressbar"
-                         style="width: ${progressPercent}%"
+                         style="width: ${workItem.remoteJobPhase === 'Uploading' || workItem.remoteJobPhase === 'Downloading' ? (workItem.transferProgress || 0) : progressPercent}%"
                          aria-valuenow="${progressPercent}"
                          aria-valuemin="0"
                          aria-valuemax="100">
                     </div>
-                    <span class="progress-label">${progressPercent}%</span>
+                    <span class="progress-label">${workItem.remoteJobPhase === 'Uploading' ? `Uploading ${workItem.transferProgress || 0}%` : workItem.remoteJobPhase === 'Downloading' ? `Downloading ${workItem.transferProgress || 0}%` : `${progressPercent}%`}</span>
                 </div>
             ` : ''}
             
@@ -997,20 +1210,20 @@ class TranscodingManager {
     getActionButtons(workItem) {
         switch (workItem.status) {
             case 'Pending':
-                return '<button class="btn btn-sm btn-outline-danger remove-btn" title="Remove from queue"><i class="fas fa-times"></i></button>';
+                return '<button class="btn btn-sm btn-outline-danger remove-btn" data-action="remove" title="Remove from queue"><i class="fas fa-times"></i></button>';
             case 'Processing':
                 return `
                     <div class="btn-group" role="group">
-                        <button class="btn btn-sm btn-outline-danger remove-btn" title="Stop/Cancel"><i class="fas fa-times"></i></button>
-                        <button class="btn btn-sm btn-outline-info log-btn" title="View Log"><i class="fas fa-terminal"></i></button>
+                        <button class="btn btn-sm btn-outline-danger remove-btn" data-action="remove" title="Stop/Cancel"><i class="fas fa-times"></i></button>
+                        <button class="btn btn-sm btn-outline-info log-btn" data-action="log" title="View Log"><i class="fas fa-terminal"></i></button>
                     </div>
                 `;
             case 'Completed':
-                return '<button class="btn btn-sm btn-outline-info log-btn" title="View Log"><i class="fas fa-terminal"></i></button>';
+                return '<button class="btn btn-sm btn-outline-info log-btn" data-action="log" title="View Log"><i class="fas fa-terminal"></i></button>';
             case 'Failed':
             case 'Cancelled':
             case 'Stopped':
-                return '<button class="btn btn-sm btn-outline-info log-btn" title="View Log"><i class="fas fa-terminal"></i></button>';
+                return '<button class="btn btn-sm btn-outline-info log-btn" data-action="log" title="View Log"><i class="fas fa-terminal"></i></button>';
             default:
                 return '';
         }
@@ -1310,7 +1523,7 @@ class TranscodingManager {
     }
 
     async clearAutoScanHistory() {
-        if (!confirm('Clear all auto-scan history? This cannot be undone.')) return;
+        if (!await showConfirmModal('Clear History', '<p>Clear all auto-scan history? This cannot be undone.</p>', 'Clear History')) return;
         try {
             const response = await fetch('/Home/ClearAutoScanHistory', {
                 method: 'POST'
@@ -1349,6 +1562,368 @@ class TranscodingManager {
         const i = Math.floor(Math.log(bytes) / Math.log(k));
         return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
     }
+
+    // --- Cluster functionality ---
+
+    async loadClusterConfig(updateUI = true) {
+        try {
+            const response = await fetch('/Home/GetClusterConfig');
+            const config = await response.json();
+            this.clusterEnabled = config.enabled;
+            this.clusterRole = config.role;
+
+            if (updateUI) {
+                // Populate settings form
+                const el = (id) => document.getElementById(id);
+                if (el('clusterEnabled')) el('clusterEnabled').checked = config.enabled;
+                if (el('clusterRole')) el('clusterRole').value = config.role;
+                if (el('clusterNodeName')) el('clusterNodeName').value = config.nodeName || '';
+                this._hasExistingSecret = config.hasSecret;
+                if (el('clusterSecret')) {
+                    el('clusterSecret').value = '';
+                    el('clusterSecret').placeholder = config.hasSecret ? '(secret configured)' : 'Enter a shared secret';
+                }
+                if (el('clusterAutoDiscovery')) el('clusterAutoDiscovery').checked = config.autoDiscovery !== false;
+                if (el('clusterLocalEncoding')) el('clusterLocalEncoding').checked = config.localEncodingEnabled !== false;
+                if (el('clusterMasterUrl')) el('clusterMasterUrl').value = config.masterUrl || '';
+                if (el('clusterNodeTempDir')) el('clusterNodeTempDir').value = config.nodeTempDirectory || '';
+
+                this.updateClusterRoleUI(config.role);
+                this.renderManualNodes(config.manualNodes || []);
+            }
+
+            // Load workers if cluster is active
+            if (config.enabled && config.role !== 'standalone') {
+                await this.loadWorkers();
+            }
+
+            this.renderClusterPanel();
+            this.updateNodeBanner();
+        } catch (error) {
+            console.error('Failed to load cluster config:', error);
+        }
+    }
+
+    async loadWorkers() {
+        try {
+            const response = await fetch('/Home/GetWorkers');
+            const nodes = await response.json();
+            this.workers.clear();
+            for (const node of nodes) {
+                this.workers.set(node.nodeId, node);
+            }
+        } catch (error) {
+            console.error('Failed to load workers:', error);
+        }
+    }
+
+    async saveClusterConfig() {
+        // Load existing config first to preserve nodeId, timeouts, etc.
+        // Also use it to detect if cluster mode is being toggled (for restart prompt)
+        let config;
+        let serverWasCluster = false;
+        try {
+            const existing = await fetch('/Home/GetClusterConfig');
+            config = await existing.json();
+            serverWasCluster = config.enabled && config.role !== 'standalone';
+        } catch {
+            config = {};
+        }
+
+        const el = (id) => document.getElementById(id);
+        config.enabled = el('clusterEnabled')?.checked || false;
+        config.role = el('clusterRole')?.value || 'standalone';
+        config.nodeName = el('clusterNodeName')?.value || '';
+        // Only send secret if user typed a new one (field is blank on load for security)
+        const newSecret = el('clusterSecret')?.value;
+        if (newSecret) config.sharedSecret = newSecret;
+        config.autoDiscovery = el('clusterAutoDiscovery')?.checked !== false;
+        config.localEncodingEnabled = el('clusterLocalEncoding')?.checked !== false;
+        config.masterUrl = el('clusterMasterUrl')?.value || '';
+        config.nodeTempDirectory = el('clusterNodeTempDir')?.value || '';
+        config.manualNodes = this._manualNodes || [];
+
+        // Require secret for cluster mode
+        if (config.enabled && config.role !== 'standalone' && !config.sharedSecret && !this._hasExistingSecret) {
+            showToast('A shared secret is required to enable cluster mode. Enter one or click Generate.', 'danger');
+            return;
+        }
+
+        // Warn when switching to node mode
+        if (config.role === 'node' && this.clusterRole !== 'node') {
+            const confirmed = await showConfirmModal(
+                'Switch to Node Mode',
+                '<p>Switching to Node mode will:</p><ul><li>Stop any active encoding</li><li>Clear the local queue</li><li>Disable auto-scanning</li></ul><p>This instance will only process jobs delegated by a master.</p>',
+                'Switch to Node Mode'
+            );
+            if (!confirmed) return;
+        }
+
+        try {
+            const response = await fetch('/Home/SaveClusterConfig', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(config)
+            });
+            const result = await response.json();
+            if (result.success) {
+                const isCluster = config.enabled && config.role !== 'standalone';
+
+                this.clusterEnabled = config.enabled;
+                this.clusterRole = config.role;
+                const status = document.getElementById('clusterSaveStatus');
+                if (status) {
+                    status.style.display = 'inline';
+                    setTimeout(() => status.style.display = 'none', 3000);
+                }
+                if (serverWasCluster !== isCluster) {
+                    const confirmed = await showConfirmModal(
+                        'Restart Required',
+                        '<p>Snacks needs to restart to apply network binding changes.</p><p>Any active encoding will be stopped and re-queued after restart.</p>',
+                        'Restart Now'
+                    );
+                    if (confirmed) {
+                        await fetch('/Home/Restart', { method: 'POST' });
+                        // App will restart — page will reconnect automatically
+                    }
+                } else {
+                    showToast('Cluster settings saved', 'success');
+                }
+                this.renderClusterPanel();
+                this.updateNodeBanner();
+                if (config.enabled) await this.loadWorkers();
+            } else {
+                showToast('Error saving cluster settings: ' + (result.error || 'Unknown error'), 'danger');
+            }
+        } catch (error) {
+            showToast('Error saving cluster settings: ' + error.message, 'danger');
+        }
+    }
+
+    updateClusterRoleUI(role) {
+        const masterSettings = document.getElementById('masterSettings');
+        const nodeSettings = document.getElementById('nodeSettings');
+        const roleDesc = document.getElementById('roleDescription');
+
+        if (masterSettings) masterSettings.style.display = role === 'master' ? '' : 'none';
+        if (nodeSettings) nodeSettings.style.display = role === 'node' ? '' : 'none';
+
+        if (roleDesc) {
+            switch (role) {
+                case 'master': roleDesc.textContent = 'Has the media library, delegates encoding to nodes, and encodes locally'; break;
+                case 'node': roleDesc.textContent = 'Accepts encoding jobs from a master instance'; break;
+                default: roleDesc.textContent = 'Standard single-instance mode'; break;
+            }
+        }
+    }
+
+    renderManualNodes(nodes) {
+        this._manualNodes = nodes || [];
+        const container = document.getElementById('manualNodesList');
+        if (!container) return;
+
+        if (this._manualNodes.length === 0) {
+            container.innerHTML = '<div class="text-muted text-center py-2"><small>No manual nodes configured</small></div>';
+            return;
+        }
+
+        container.innerHTML = this._manualNodes.map((node, idx) => `
+            <div class="d-flex justify-content-between align-items-center mb-1 p-1 border rounded">
+                <div>
+                    <strong class="me-2">${escapeHtml(node.name)}</strong>
+                    <small class="text-muted">${escapeHtml(node.url)}</small>
+                </div>
+                <button class="btn btn-sm btn-outline-danger remove-manual-node" data-idx="${idx}">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+        `).join('');
+
+        container.querySelectorAll('.remove-manual-node').forEach(btn => {
+            btn.addEventListener('click', () => {
+                this._manualNodes.splice(parseInt(btn.dataset.idx), 1);
+                this.renderManualNodes(this._manualNodes);
+            });
+        });
+    }
+
+    renderClusterPanel() {
+        const panel = document.getElementById('clusterPanel');
+        const container = document.getElementById('clusterNodesContainer');
+        const countBadge = document.getElementById('clusterNodeCount');
+        if (!panel || !container) return;
+
+        const showPanel = this.clusterEnabled && this.clusterRole !== 'standalone';
+        panel.style.display = showPanel ? '' : 'none';
+        if (!showPanel) return;
+
+        const nodes = Array.from(this.workers.values());
+        if (countBadge) countBadge.textContent = `${nodes.length} node${nodes.length !== 1 ? 's' : ''}`;
+
+        if (nodes.length === 0) {
+            container.innerHTML = '<div class="text-muted"><i class="fas fa-search me-1"></i>Discovering nodes...</div>';
+            return;
+        }
+
+        // NodeStatus enum: 0=Online, 1=Busy, 2=Offline, 3=Unreachable, 4=Paused
+        const statusNames = { 0: 'Online', 1: 'Busy', 2: 'Offline', 3: 'Unreachable', 4: 'Paused',
+            'Online': 'Online', 'Busy': 'Busy', 'Offline': 'Offline', 'Unreachable': 'Unreachable', 'Paused': 'Paused' };
+        const statusColors = {
+            'Online': 'var(--success-color, #28a745)',
+            'Busy': 'var(--info-color, #17a2b8)',
+            'Offline': 'var(--danger-color, #dc3545)',
+            'Unreachable': 'var(--warning-color, #ffc107)',
+            'Paused': 'var(--warning-color, #ffc107)'
+        };
+
+        container.innerHTML = nodes.map(node => {
+            const statusName = statusNames[node.status] || 'Unknown';
+            const statusColor = statusColors[statusName] || 'gray';
+
+            const statusText = statusName;
+
+            const gpuInfo = node.capabilities?.gpuVendor && node.capabilities.gpuVendor !== 'none'
+                ? node.capabilities.gpuVendor.charAt(0).toUpperCase() + node.capabilities.gpuVendor.slice(1)
+                : 'CPU only';
+
+            const osInfo = node.capabilities?.osPlatform || '';
+
+            return `
+                <div class="card hover-lift" style="min-width: 180px; max-width: 240px; flex: 1 1 200px;">
+                    <div class="card-body p-2" style="overflow:hidden;">
+                        <div class="d-flex align-items-center mb-1" style="min-width:0;">
+                            <span class="flex-shrink-0" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${statusColor};margin-right:6px;"></span>
+                            <strong style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(node.hostname)}</strong>
+                        </div>
+                        <div class="text-muted small">
+                            <div>${escapeHtml(node.role)} &bull; ${escapeHtml(osInfo)}${gpuInfo ? ' / ' + escapeHtml(gpuInfo) : ''}</div>
+                            <div style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(statusText)}</div>
+                            <div class="mt-1">Jobs: ${node.completedJobs || 0} done, ${node.failedJobs || 0} failed</div>
+                            ${this.clusterRole === 'master' && node.role === 'node' ? `
+                                <button class="btn btn-sm ${node.isPaused ? 'btn-outline-success' : 'btn-outline-warning'} mt-1 w-100 cluster-node-pause" data-node-id="${node.nodeId}" data-paused="${node.isPaused}">
+                                    <i class="fas fa-${node.isPaused ? 'play' : 'pause'} me-1"></i>${node.isPaused ? 'Resume' : 'Pause'}
+                                </button>
+                            ` : ''}
+                        </div>
+                    </div>
+                </div>
+            `;
+        }).join('');
+
+        // Bind pause/resume buttons
+        container.querySelectorAll('.cluster-node-pause').forEach(btn => {
+            btn.addEventListener('click', async () => {
+                const nodeId = btn.dataset.nodeId;
+                const isPaused = btn.dataset.paused === 'true';
+                try {
+                    await fetch('/Home/SetNodePaused', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ nodeId, paused: !isPaused })
+                    });
+                } catch (error) {
+                    showToast('Error: ' + error.message, 'danger');
+                }
+            });
+        });
+    }
+
+    updateNodeBanner() {
+        const banner = document.getElementById('nodeBanner');
+        if (!banner) return;
+
+        if (this.clusterEnabled && this.clusterRole === 'node') {
+            banner.style.display = '';
+            // Find master in workers
+            const master = Array.from(this.workers.values()).find(n => n.role === 'master');
+            const masterName = document.getElementById('nodeBannerMaster');
+            if (masterName) {
+                masterName.textContent = master ? `${master.hostname} (${master.ipAddress})` : 'a master';
+            }
+        } else {
+            banner.style.display = 'none';
+        }
+    }
+
+    initializeClusterEventHandlers() {
+        // Role selector changes
+        const roleSelect = document.getElementById('clusterRole');
+        if (roleSelect) {
+            roleSelect.addEventListener('change', () => {
+                this.updateClusterRoleUI(roleSelect.value);
+            });
+        }
+
+        // Save cluster config
+        const saveBtn = document.getElementById('saveClusterConfig');
+        if (saveBtn) {
+            saveBtn.addEventListener('click', () => this.saveClusterConfig());
+        }
+
+        // Generate secret
+        const genBtn = document.getElementById('generateSecret');
+        if (genBtn) {
+            genBtn.addEventListener('click', () => {
+                const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+                const array = new Uint8Array(32);
+                crypto.getRandomValues(array);
+                let secret = '';
+                for (let i = 0; i < 32; i++) secret += chars.charAt(array[i] % chars.length);
+                document.getElementById('clusterSecret').value = secret;
+            });
+        }
+
+        // Toggle secret visibility
+        const toggleBtn = document.getElementById('toggleSecretVisibility');
+        if (toggleBtn) {
+            toggleBtn.addEventListener('click', () => {
+                const input = document.getElementById('clusterSecret');
+                const isPassword = input.type === 'password';
+                input.type = isPassword ? 'text' : 'password';
+                toggleBtn.innerHTML = `<i class="fas fa-eye${isPassword ? '-slash' : ''}"></i>`;
+            });
+        }
+
+        // Add manual node
+        const addNodeBtn = document.getElementById('addManualNode');
+        if (addNodeBtn) {
+            addNodeBtn.addEventListener('click', () => {
+                const name = document.getElementById('manualNodeName')?.value?.trim();
+                const url = document.getElementById('manualNodeUrl')?.value?.trim();
+                if (name && url) {
+                    if (!this._manualNodes) this._manualNodes = [];
+                    this._manualNodes.push({ name, url });
+                    this.renderManualNodes(this._manualNodes);
+                    document.getElementById('manualNodeName').value = '';
+                    document.getElementById('manualNodeUrl').value = '';
+                }
+            });
+        }
+
+        // Switch to standalone button on node banner
+        const standaloneBtn = document.getElementById('switchToStandalone');
+        if (standaloneBtn) {
+            standaloneBtn.addEventListener('click', async () => {
+                const confirmed = await showConfirmModal('Switch to Standalone', '<p>Switch back to standalone mode? This will disconnect from the cluster.</p>', 'Switch to Standalone');
+                if (confirmed) {
+                    const response = await fetch('/Home/GetClusterConfig');
+                    const config = await response.json();
+                    config.role = 'standalone';
+                    config.enabled = false;
+                    await fetch('/Home/SaveClusterConfig', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(config)
+                    });
+                    this.clusterEnabled = false;
+                    this.clusterRole = 'standalone';
+                    this.renderClusterPanel();
+                    this.updateNodeBanner();
+                    showToast('Switched to standalone mode', 'success');
+                }
+            });
+        }
+    }
 }
 
 // Initialize transcoding manager when DOM is loaded
@@ -1361,6 +1936,28 @@ function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
+}
+
+function showConfirmModal(title, message, confirmText = 'Confirm') {
+    return new Promise((resolve) => {
+        const modalEl = document.getElementById('confirmModal');
+        document.getElementById('confirmModalTitle').innerHTML = `<i class="fas fa-exclamation-triangle me-2"></i>${escapeHtml(title)}`;
+        document.getElementById('confirmModalBody').innerHTML = message;
+        const confirmBtn = document.getElementById('confirmModalConfirm');
+        confirmBtn.textContent = confirmText;
+
+        const modal = bootstrap.Modal.getOrCreateInstance(modalEl);
+        const newBtn = confirmBtn.cloneNode(true);
+        confirmBtn.replaceWith(newBtn);
+
+        newBtn.addEventListener('click', () => {
+            modal.hide();
+            resolve(true);
+        });
+        modalEl.addEventListener('hidden.bs.modal', () => resolve(false), { once: true });
+
+        modal.show();
+    });
 }
 
 // Global utility functions

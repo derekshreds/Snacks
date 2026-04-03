@@ -13,7 +13,7 @@
   },
   "devDependencies": {
     "electron": "^41.1.0",
-    "electron-builder": "^25.1.8"
+    "electron-builder": "^26.8.1"
   },
   "author": "Derek Morris",
   "build": {
@@ -29,24 +29,30 @@
     },
     "nsis": {
       "oneClick": false,
+      "perMachine": true,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "shortcutName": "Snacks",
       "installerIcon": "icons/snacks.ico",
       "uninstallerIcon": "icons/snacks.ico",
-      "installerHeaderIcon": "icons/snacks.ico"
+      "installerHeaderIcon": "icons/snacks.ico",
+      "include": "installer.nsh"
     },
     "extraResources": [
       {
         "from": "backend",
         "to": "backend",
-        "filter": ["**/*"]
+        "filter": [
+          "**/*"
+        ]
       },
       {
         "from": "ffmpeg",
         "to": "ffmpeg",
-        "filter": ["**/*"]
+        "filter": [
+          "**/*"
+        ]
       }
     ],
     "files": [
