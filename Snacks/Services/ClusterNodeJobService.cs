@@ -344,6 +344,8 @@ public sealed class ClusterNodeJobService
         {
             _completedJobId = encodingSucceeded ? _currentRemoteJob?.Id : null;
             _currentRemoteJob = null;
+            _remoteJobCts?.Dispose();
+            _remoteJobCts = null;
             _transcodingService.SetProgressCallback(null);
             _transcodingService.SetLogCallback(null);
         }
@@ -353,14 +355,14 @@ public sealed class ClusterNodeJobService
         // and the master can discover it via heartbeat or recovery
         if (encodingSucceeded && masterUrl != null)
         {
-            await PersistCompletedJobAsync(workItem.Id, masterUrl, selfUrl: null);
+            await PersistCompletedJobAsync(workItem.Id, masterUrl, selfUrl: null, outputFileName: workItem.FileName);
 
             for (int attempt = 0; attempt < 10; attempt++)
             {
                 try
                 {
                     var client  = CreateAuthenticatedClient();
-                    var selfUrl = $"http://{ClusterDiscoveryService.GetLocalIpAddress()}:{_discoveryService.GetListeningPort()}";
+                    var selfUrl = $"{(Config.UseHttps ? "https" : "http")}://{ClusterDiscoveryService.GetLocalIpAddress()}:{_discoveryService.GetListeningPort()}";
                     var completion = new JobCompletion
                     {
                         JobId          = workItem.Id,
@@ -415,7 +417,7 @@ public sealed class ClusterNodeJobService
     /// <param name="jobId">The completed job ID to persist.</param>
     /// <param name="masterUrl">The master's base URL, stored for retry requests.</param>
     /// <param name="selfUrl">This node's base URL, included in completion callbacks.</param>
-    public async Task PersistCompletedJobAsync(string jobId, string masterUrl, string? selfUrl)
+    public async Task PersistCompletedJobAsync(string jobId, string masterUrl, string? selfUrl, string? outputFileName = null)
     {
         await _pendingCompletionsLock.WaitAsync();
         try
@@ -428,7 +430,7 @@ public sealed class ClusterNodeJobService
                 {
                     JobId          = jobId,
                     MasterUrl      = masterUrl,
-                    OutputFileName = _currentRemoteJob?.FileName ?? "",
+                    OutputFileName = outputFileName ?? _currentRemoteJob?.FileName ?? "",
                     Timestamp      = DateTime.UtcNow
                 };
                 var json = JsonSerializer.Serialize(completions.Values, _jsonOptions);
@@ -517,14 +519,14 @@ public sealed class ClusterNodeJobService
             {
                 var client  = CreateAuthenticatedClient();
                 var selfUrl = $"http://{ClusterDiscoveryService.GetLocalIpAddress()}:{_discoveryService.GetListeningPort()}";
-                var jobCompletion = new JobCompletion
+                var completionPayload = new JobCompletion
                 {
                     JobId          = completion.JobId,
                     Success        = true,
                     OutputFileName = completion.OutputFileName
                 };
                 var content = new StringContent(
-                    JsonSerializer.Serialize(new { jobCompletion, nodeBaseUrl = selfUrl }, _jsonOptions),
+                    JsonSerializer.Serialize(new { completion = completionPayload, nodeBaseUrl = selfUrl }, _jsonOptions),
                     Encoding.UTF8, "application/json");
                 var response = await client.PostAsync(
                     $"{completion.MasterUrl}/api/cluster/jobs/{completion.JobId}/complete", content);
@@ -700,7 +702,7 @@ public sealed class ClusterNodeJobService
 
         var masterNode = _nodes.Values.FirstOrDefault(n => n.Role == "master");
         return masterNode != null
-            ? $"http://{masterNode.IpAddress}:{masterNode.Port}"
+            ? $"{(Config.UseHttps ? "https" : "http")}://{masterNode.IpAddress}:{masterNode.Port}"
             : null;
     }
 

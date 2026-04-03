@@ -169,9 +169,11 @@ public sealed class ClusterFileTransferService
         }
 
         // Verify final size
+        var secret = client.DefaultRequestHeaders.TryGetValues("X-Snacks-Secret", out var secretValues)
+            ? secretValues.FirstOrDefault() ?? ""
+            : "";
         var finalSize = await GetNodeReceivedBytesAsync(
-            CreateAuthenticatedClient(client.DefaultRequestHeaders
-                .GetValues("X-Snacks-Secret").FirstOrDefault() ?? ""),
+            CreateAuthenticatedClient(secret),
             baseUrl, workItem.Id);
 
         if (finalSize != totalSize)
@@ -508,6 +510,20 @@ internal sealed class ProgressStream : System.IO.Stream
     {
         get => _inner.Position;
         set => _inner.Position = value;
+    }
+
+    /// <inheritdoc/>
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) _inner.Dispose();
+        base.Dispose(disposing);
+    }
+
+    /// <inheritdoc/>
+    public override async ValueTask DisposeAsync()
+    {
+        await _inner.DisposeAsync();
+        await base.DisposeAsync();
     }
 
     /// <inheritdoc/>

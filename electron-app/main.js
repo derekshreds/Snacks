@@ -112,6 +112,17 @@ function startBackend(port) {
         dialog.showErrorBox("Snacks", "Backend failed to restart.");
         app.quit();
       });
+    } else {
+      // Non-zero exit while window is open — show error and attempt restart
+      console.error(`Backend crashed with code ${code} — attempting restart...`);
+      startBackend(backendPort);
+      pollHealth(backendPort).then(() => {
+        if (mainWindow) mainWindow.reload();
+      }).catch(() => {
+        dialog.showErrorBox("Snacks - Backend crashed",
+          `Backend exited with code ${code}.\n\nThe application will now close.`);
+        app.quit();
+      });
     }
   });
 }
@@ -230,9 +241,11 @@ app.on("window-all-closed", () => {
   app.quit();
 });
 
+let quitHandled = false;
 app.on("before-quit", async (e) => {
   isQuitting = true;
-  if (backendProcess && backendProcess.exitCode === null) {
+  if (!quitHandled && backendProcess && backendProcess.exitCode === null) {
+    quitHandled = true;
     e.preventDefault();
     await killBackend();
     app.quit();

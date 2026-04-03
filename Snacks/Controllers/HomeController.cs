@@ -138,7 +138,8 @@ namespace Snacks.Controllers
                     var fullRequestPath = Path.GetFullPath(request.DirectoryPath);
                     var fullInputDir = Path.GetFullPath(inputDir);
 
-                    if (!fullRequestPath.StartsWith(fullInputDir))
+                    if (!fullRequestPath.StartsWith(fullInputDir + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+                        && !fullRequestPath.Equals(fullInputDir, StringComparison.OrdinalIgnoreCase))
                     {
                         return BadRequest("Directory is not within allowed library path");
                     }
@@ -191,7 +192,8 @@ namespace Snacks.Controllers
                     var fullRequestPath = Path.GetFullPath(request.FilePath);
                     var fullInputDir = Path.GetFullPath(inputDir);
 
-                    if (!fullRequestPath.StartsWith(fullInputDir))
+                    if (!fullRequestPath.StartsWith(fullInputDir + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+                        && !fullRequestPath.Equals(fullInputDir, StringComparison.OrdinalIgnoreCase))
                     {
                         return BadRequest("File is not within allowed library path");
                     }
@@ -247,6 +249,9 @@ namespace Snacks.Controllers
         {
             try
             {
+                if (request == null || string.IsNullOrEmpty(request.FilePath))
+                    return BadRequest("File path is required");
+
                 await _transcodingService.RetryFileAsync(request.FilePath);
                 return Json(new { success = true });
             }
@@ -372,7 +377,8 @@ namespace Snacks.Controllers
                     var inputDir = _fileService.GetUploadsDirectory();
                     var fullRequestPath = Path.GetFullPath(directoryPath);
                     var fullInputDir = Path.GetFullPath(inputDir);
-                    if (!fullRequestPath.StartsWith(fullInputDir))
+                    if (!fullRequestPath.StartsWith(fullInputDir + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+                        && !fullRequestPath.Equals(fullInputDir, StringComparison.OrdinalIgnoreCase))
                         return BadRequest("Directory is not within allowed library path");
                 }
 
@@ -419,7 +425,8 @@ namespace Snacks.Controllers
                     var fullRequestPath = Path.GetFullPath(directoryPath);
                     var fullInputDir = Path.GetFullPath(inputDir);
 
-                    if (!fullRequestPath.StartsWith(fullInputDir))
+                    if (!fullRequestPath.StartsWith(fullInputDir + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+                        && !fullRequestPath.Equals(fullInputDir, StringComparison.OrdinalIgnoreCase))
                     {
                         return BadRequest("Directory is not within allowed library path");
                     }
@@ -578,7 +585,8 @@ namespace Snacks.Controllers
                     var fullRequestPath = Path.GetFullPath(request.Path);
                     var fullInputDir = Path.GetFullPath(inputDir);
 
-                    if (!fullRequestPath.StartsWith(fullInputDir))
+                    if (!fullRequestPath.StartsWith(fullInputDir + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+                        && !fullRequestPath.Equals(fullInputDir, StringComparison.OrdinalIgnoreCase))
                         return BadRequest("Directory is not within allowed library path");
                 }
 
@@ -598,6 +606,9 @@ namespace Snacks.Controllers
         {
             try
             {
+                if (request == null || string.IsNullOrEmpty(request.Path))
+                    return BadRequest("Directory path is required");
+
                 _autoScanService.RemoveDirectory(request.Path);
                 return Json(new { success = true });
             }
@@ -632,7 +643,7 @@ namespace Snacks.Controllers
         {
             try
             {
-                await _autoScanService.TriggerScanNow();
+                await _autoScanService.TriggerScanNowAsync();
                 return Json(new { success = true });
             }
             catch (Exception ex)

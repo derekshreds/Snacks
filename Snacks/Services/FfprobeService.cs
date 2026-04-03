@@ -62,6 +62,7 @@ public class FfprobeService
         process.BeginErrorReadLine();
 
         await process.WaitForExitAsync();
+        process.WaitForExit(); // Ensures async OutputDataReceived/ErrorDataReceived events have finished firing
 
         // ffprobe writes JSON to stdout, but some builds redirect it to stderr.
         // Use whichever stream captured more content.
@@ -265,10 +266,13 @@ public class FfprobeService
 
         try
         {
-            string[] split = input.Split(new char[] { ':', '.' }, StringSplitOptions.RemoveEmptyEntries);
-            if (split.Length >= 3)
+            // Split only on ':' first to preserve fractional seconds in the last component
+            string[] colonParts = input.Split(':');
+            if (colonParts.Length >= 3)
             {
-                return double.Parse(split[0]) * 3600 + double.Parse(split[1]) * 60 + double.Parse(split[2]);
+                return double.Parse(colonParts[0]) * 3600
+                     + double.Parse(colonParts[1]) * 60
+                     + double.Parse(colonParts[2]); // "SS.ff" parsed as a decimal
             }
             else
             {

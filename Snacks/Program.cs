@@ -34,7 +34,7 @@ else
         try
         {
             var clusterJson = File.ReadAllText(clusterConfigPath);
-            var clusterDoc = System.Text.Json.JsonDocument.Parse(clusterJson);
+            using var clusterDoc = System.Text.Json.JsonDocument.Parse(clusterJson);
             if (clusterDoc.RootElement.TryGetProperty("enabled", out var enabled)
                 && enabled.GetBoolean()
                 && clusterDoc.RootElement.TryGetProperty("role", out var role)

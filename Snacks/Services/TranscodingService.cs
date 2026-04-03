@@ -36,6 +36,9 @@ public class TranscodingService
         /// <summary>Ensures only one local encoding job runs at a time.</summary>
         private readonly SemaphoreSlim _processingLock = new(1, 1);
 
+        /// <summary>Lock protecting access to <see cref="_activeProcess"/> and <see cref="_activeWorkItem"/>.</summary>
+        private readonly object _activeLock = new();
+
         /// <summary>The currently running FFmpeg process, or <c>null</c> when idle.</summary>
         private Process? _activeProcess;
 
@@ -43,10 +46,10 @@ public class TranscodingService
         private WorkItem? _activeWorkItem;
 
         /// <summary>Whether the local processing loop is paused by user request.</summary>
-        private bool _isPaused = false;
+        private volatile bool _isPaused = false;
 
         /// <summary>Whether local encoding is suspended so the cluster dispatch loop can handle items instead.</summary>
-        private bool _localEncodingPaused = false;
+        private volatile bool _localEncodingPaused = false;
 
         /// <summary>The encoder options from the most recently started queue run. Used when resuming after unpause.</summary>
         private EncoderOptions? _lastOptions;
@@ -78,7 +81,11 @@ public class TranscodingService
 
             if (!paused && _lastOptions != null)
             {
-                _ = Task.Run(() => ProcessQueueAsync(_lastOptions));
+                _ = Task.Run(async () =>
+                {
+                    try { await ProcessQueueAsync(_lastOptions); }
+                    catch (Exception ex) { Console.WriteLine($"Error in ProcessQueueAsync: {ex.Message}"); }
+                });
             }
         }
 
@@ -345,7 +352,11 @@ public class TranscodingService
                 await _hubContext.Clients.All.SendAsync("WorkItemAdded", workItem);
 
                 // Always try to start queue processing — the semaphore ensures only one runs at a time
-                _ = Task.Run(() => ProcessQueueAsync(options));
+                _ = Task.Run(async () =>
+                {
+                    try { await ProcessQueueAsync(options); }
+                    catch (Exception ex) { Console.WriteLine($"Error in ProcessQueueAsync: {ex.Message}"); }
+                });
 
                 return workItem.Id;
             }
@@ -529,9 +540,11 @@ public class TranscodingService
         {
             try
             {
-                if (_activeProcess != null && !_activeProcess.HasExited)
+                Process? proc;
+                lock (_activeLock) { proc = _activeProcess; }
+                if (proc != null && !proc.HasExited)
                 {
-                    _activeProcess.Kill(entireProcessTree: true);
+                    proc.Kill(entireProcessTree: true);
                     await LogAsync(workItem.Id, logMessage);
                 }
             }
@@ -614,7 +627,7 @@ public class TranscodingService
         /// </summary>
         private async Task ProcessWorkItemAsync(WorkItem workItem, EncoderOptions options)
         {
-            _activeWorkItem = workItem;
+            lock (_activeLock) { _activeWorkItem = workItem; }
             try
             {
                 workItem.Status = WorkItemStatus.Processing;
@@ -645,8 +658,11 @@ public class TranscodingService
             }
             finally
             {
-                _activeWorkItem = null;
-                _activeProcess = null;
+                lock (_activeLock)
+                {
+                    _activeWorkItem = null;
+                    _activeProcess = null;
+                }
             }
 
             await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
@@ -823,7 +839,7 @@ public class TranscodingService
             }
             catch (Exception ex)
             {
-                await HandleConversionFailure(workItem, options, outputPath, ex.Message, stripSubtitles, forceSwDecode);
+                await HandleConversionFailure(workItem, options, outputPath, ex.Message, stripSubtitles, forceSwDecode, cancellationToken: cancellationToken);
                 return;
             }
 
@@ -831,14 +847,14 @@ public class TranscodingService
 
             if (!File.Exists(outputPath))
             {
-                await HandleConversionFailure(workItem, options, outputPath, "Output file not found", stripSubtitles, forceSwDecode);
+                await HandleConversionFailure(workItem, options, outputPath, "Output file not found", stripSubtitles, forceSwDecode, cancellationToken: cancellationToken);
                 return;
             }
 
             var outputProbe = await _ffprobeService.ProbeAsync(outputPath);
             if (!_ffprobeService.ConvertedSuccessfully(workItem.Probe!, outputProbe))
             {
-                await HandleConversionFailure(workItem, options, outputPath, "Duration mismatch detected", stripSubtitles, forceSwDecode);
+                await HandleConversionFailure(workItem, options, outputPath, "Duration mismatch detected", stripSubtitles, forceSwDecode, cancellationToken: cancellationToken);
                 return;
             }
 
@@ -907,7 +923,7 @@ public class TranscodingService
                     ? (int)Math.Min(options.TargetBitrate, workItem.Bitrate)
                     : options.TargetBitrate;
                 targetBitrate = $"{effectiveTarget}k";
-                minBitrate = $"{effectiveTarget - 200}k";
+                minBitrate = $"{Math.Max(effectiveTarget - 200, 0)}k";
                 maxBitrate = $"{effectiveTarget + 500}k";
             }
 
@@ -1474,8 +1490,8 @@ public class TranscodingService
                 CreateNoWindow = true
             };
 
-            using var process = new Process { StartInfo = processStartInfo };
-            _activeProcess = process;
+            var process = new Process { StartInfo = processStartInfo };
+            lock (_activeLock) { _activeProcess = process; }
             var errorOutput = new ConcurrentQueue<string>();
             var lastProgressUpdate = DateTime.MinValue;
             var lastActivity = DateTime.UtcNow;
@@ -1572,7 +1588,16 @@ public class TranscodingService
                     throw new OperationCanceledException("Encoding was cancelled.");
                 }
 
-                var winner = await Task.WhenAny(exitTask, Task.Delay(30000, cancellationToken));
+                Task delayTask;
+                try { delayTask = Task.Delay(30000, cancellationToken); }
+                catch (OperationCanceledException)
+                {
+                    await LogAsync(workItem.Id, "Cancellation requested — killing FFmpeg process.");
+                    try { process.Kill(entireProcessTree: true); } catch { }
+                    await exitTask;
+                    throw new OperationCanceledException("Encoding was cancelled.");
+                }
+                var winner = await Task.WhenAny(exitTask, delayTask);
                 if (winner != exitTask && !process.HasExited)
                 {
                     if ((DateTime.UtcNow - lastActivity).TotalSeconds >= stallTimeoutSeconds)
@@ -1586,23 +1611,27 @@ public class TranscodingService
                 }
             }
 
-            _activeProcess = null;
+            lock (_activeLock) { _activeProcess = null; }
 
             if (workItem.Status is WorkItemStatus.Cancelled or WorkItemStatus.Stopped)
             {
+                process.Dispose();
                 throw new OperationCanceledException("Encoding was cancelled.");
             }
 
-            if (process.ExitCode != 0)
+            var exitCode = process.ExitCode;
+            process.Dispose();
+
+            if (exitCode != 0)
             {
                 var errorText = string.Join("\n", errorOutput.ToArray().TakeLast(10));
-                await LogAsync(workItem.Id, $"FFmpeg failed with exit code {process.ExitCode}");
+                await LogAsync(workItem.Id, $"FFmpeg failed with exit code {exitCode}");
                 await LogAsync(workItem.Id, $"Last error lines:\n{errorText}");
-                throw new Exception($"FFmpeg exited with code {process.ExitCode}. Error: {errorText}");
+                throw new Exception($"FFmpeg exited with code {exitCode}. Error: {errorText}");
             }
         }
 
-        private async Task HandleConversionFailure(WorkItem workItem, EncoderOptions options, string outputPath, string reason, bool subtitlesWereStripped, bool swDecodeWasForced = false)
+        private async Task HandleConversionFailure(WorkItem workItem, EncoderOptions options, string outputPath, string reason, bool subtitlesWereStripped, bool swDecodeWasForced = false, CancellationToken cancellationToken = default)
         {
             await LogAsync(workItem.Id, $"Conversion failed: {reason}");
 
@@ -1725,18 +1754,26 @@ public class TranscodingService
         {
             Console.WriteLine("Cluster: Stopping all processing and clearing queue...");
 
-            if (_activeWorkItem != null && _activeProcess != null)
+            WorkItem? activeItem;
+            Process? activeProc;
+            lock (_activeLock)
+            {
+                activeItem = _activeWorkItem;
+                activeProc = _activeProcess;
+            }
+
+            if (activeItem != null && activeProc != null)
             {
                 try
                 {
-                    if (!_activeProcess.HasExited)
-                        _activeProcess.Kill(entireProcessTree: true);
+                    if (!activeProc.HasExited)
+                        activeProc.Kill(entireProcessTree: true);
                 }
                 catch { }
 
                 if (_lastOptions != null)
                 {
-                    var outputPath = GetOutputPath(_activeWorkItem, _lastOptions);
+                    var outputPath = GetOutputPath(activeItem, _lastOptions);
                     try
                     {
                         if (File.Exists(outputPath))
@@ -1745,12 +1782,15 @@ public class TranscodingService
                     catch { }
                 }
 
-                _activeWorkItem.Status = WorkItemStatus.Stopped;
-                _activeWorkItem.CompletedAt = DateTime.UtcNow;
-                await _hubContext.Clients.All.SendAsync("WorkItemUpdated", _activeWorkItem);
-                await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(_activeWorkItem.Path), MediaFileStatus.Unseen);
-                _activeWorkItem = null;
-                _activeProcess = null;
+                activeItem.Status = WorkItemStatus.Stopped;
+                activeItem.CompletedAt = DateTime.UtcNow;
+                await _hubContext.Clients.All.SendAsync("WorkItemUpdated", activeItem);
+                await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(activeItem.Path), MediaFileStatus.Unseen);
+                lock (_activeLock)
+                {
+                    _activeWorkItem = null;
+                    _activeProcess = null;
+                }
             }
 
             List<WorkItem> pendingItems;
@@ -1837,19 +1877,25 @@ public class TranscodingService
             if (savings > 0)
             {
                 await HandleOutputPlacement(outputPath, workItem, options);
+                workItem.Status = WorkItemStatus.Completed;
+                workItem.CompletedAt = DateTime.UtcNow;
+                workItem.Progress = 100;
+                workItem.ErrorMessage = null;
+                workItem.RemoteJobPhase = null;
+                await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Completed);
             }
             else
             {
                 Console.WriteLine($"Cluster: No savings for {workItem.FileName}, deleting output");
                 try { await _fileService.FileDeleteAsync(outputPath); } catch { }
+                workItem.Status = WorkItemStatus.Completed;
+                workItem.CompletedAt = DateTime.UtcNow;
+                workItem.Progress = 100;
+                workItem.ErrorMessage = null;
+                workItem.RemoteJobPhase = null;
+                await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Skipped);
             }
 
-            workItem.Status = WorkItemStatus.Completed;
-            workItem.CompletedAt = DateTime.UtcNow;
-            workItem.Progress = 100;
-            workItem.ErrorMessage = null;
-            workItem.RemoteJobPhase = null;
-            await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Completed);
             await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
         }
 

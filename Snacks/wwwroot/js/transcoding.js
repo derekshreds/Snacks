@@ -317,12 +317,12 @@ class TranscodingManager {
             
             const directoriesHtml = data.directories.map(dir => `
                 <div class="directory-item p-2 border-bottom d-flex justify-content-between align-items-center">
-                    <div class="flex-grow-1" data-path="${dir.path}" data-count="${dir.videoCount}" style="cursor: pointer;">
+                    <div class="flex-grow-1" data-path="${escapeHtml(dir.path)}" data-count="${dir.videoCount}" style="cursor: pointer;">
                         <i class="fas ${dir.videoCount === 0 ? 'fa-hdd' : 'fa-folder'} text-warning me-2"></i>
-                        <span>${dir.name}</span>
+                        <span>${escapeHtml(dir.name)}</span>
                         ${dir.videoCount > 0 ? `<small class="text-muted ms-2">${dir.videoCount} videos</small>` : ''}
                     </div>
-                    <button class="btn btn-sm btn-link p-0 ms-2 watch-dir-btn" data-path="${dir.path}" title="Watch (Auto-Scan)">
+                    <button class="btn btn-sm btn-link p-0 ms-2 watch-dir-btn" data-path="${escapeHtml(dir.path)}" title="Watch (Auto-Scan)">
                         <i class="fas fa-eye" style="color: var(--primary); opacity: 0.6;"></i>
                     </button>
                 </div>
@@ -346,7 +346,7 @@ class TranscodingManager {
             });
             
         } catch (error) {
-            container.innerHTML = `<div class="alert alert-danger">Error loading directories: ${error.message}</div>`;
+            container.innerHTML = `<div class="alert alert-danger">Error loading directories: ${escapeHtml(error.message)}</div>`;
         }
     }
 
@@ -444,7 +444,7 @@ class TranscodingManager {
             this.loadDirectoryFilesShallow(directoryPath);
 
         } catch (error) {
-            container.innerHTML = `<div class="alert alert-danger">Error: ${error.message}</div>`;
+            container.innerHTML = `<div class="alert alert-danger">Error: ${escapeHtml(error.message)}</div>`;
         }
     }
 
@@ -472,14 +472,14 @@ class TranscodingManager {
             }
 
             const filesHtml = data.files.map(file => `
-                <div class="file-item p-2 border-bottom" data-path="${file.path}">
+                <div class="file-item p-2 border-bottom" data-path="${escapeHtml(file.path)}">
                     <div class="form-check d-flex align-items-center">
-                        <input class="form-check-input me-3" type="checkbox" value="${file.path}" id="file-${file.path.replace(/[^a-zA-Z0-9]/g, '_')}">
+                        <input class="form-check-input me-3" type="checkbox" value="${escapeHtml(file.path)}" id="file-${file.path.replace(/[^a-zA-Z0-9]/g, '_')}">
                         <label class="form-check-label w-100" for="file-${file.path.replace(/[^a-zA-Z0-9]/g, '_')}">
                             <div class="d-flex justify-content-between align-items-center">
                                 <div>
                                     <i class="fas fa-file-video text-primary me-2"></i>
-                                    <strong>${file.name}</strong>
+                                    <strong>${escapeHtml(file.name)}</strong>
                                 </div>
                                 <small class="text-muted">${this.formatFileSize(file.size)}</small>
                             </div>
@@ -499,7 +499,7 @@ class TranscodingManager {
             });
 
         } catch (error) {
-            container.innerHTML = `<div class="alert alert-danger">Error: ${error.message}</div>`;
+            container.innerHTML = `<div class="alert alert-danger">Error: ${escapeHtml(error.message)}</div>`;
         }
     }
 
@@ -512,18 +512,18 @@ class TranscodingManager {
         this.currentDirectory = directoryPath;
         this.selectedFiles.clear();
         const container = document.getElementById('fileList');
-        const dirName = directoryPath.split('/').pop() || 'Root';
+        const dirName = directoryPath.split(/[/\\]/).pop() || 'Root';
 
         container.innerHTML = `
             <div class="text-center py-5">
                 <i class="fas fa-folder-open fa-3x text-warning mb-3"></i>
-                <h5>${dirName}</h5>
+                <h5>${escapeHtml(dirName)}</h5>
                 <p class="text-muted mb-4">${videoCount} video files</p>
                 <button class="btn btn-primary btn-lg mb-3" onclick="transcodingManager.processCurrentDirectory()">
                     <i class="fas fa-play me-2"></i>Process All ${videoCount} Files
                 </button>
                 <br>
-                <button class="btn btn-sm btn-outline-secondary" onclick="transcodingManager.loadDirectoryFiles('${directoryPath.replace(/'/g, "\\'")}')">
+                <button class="btn btn-sm btn-outline-secondary" onclick="transcodingManager.loadDirectoryFiles('${escapeHtml(directoryPath).replace(/'/g, "\\'")}')">
                     <i class="fas fa-list me-1"></i>Browse Individual Files
                 </button>
             </div>
@@ -557,16 +557,16 @@ class TranscodingManager {
             }
 
             const filesHtml = data.files.map(file => `
-                <div class="file-item p-2 border-bottom" data-path="${file.path}">
+                <div class="file-item p-2 border-bottom" data-path="${escapeHtml(file.path)}">
                     <div class="form-check d-flex align-items-center">
-                        <input class="form-check-input me-3" type="checkbox" value="${file.path}" id="file-${file.path.replace(/[^a-zA-Z0-9]/g, '_')}">
+                        <input class="form-check-input me-3" type="checkbox" value="${escapeHtml(file.path)}" id="file-${file.path.replace(/[^a-zA-Z0-9]/g, '_')}">
                         <div class="flex-grow-1">
                             <label class="form-check-label w-100" for="file-${file.path.replace(/[^a-zA-Z0-9]/g, '_')}">
                                 <div class="d-flex justify-content-between align-items-center">
                                     <div>
                                         <i class="fas fa-file-video text-primary me-2"></i>
-                                        <strong>${file.name}</strong><br>
-                                        <small class="text-muted">${file.relativePath}</small>
+                                        <strong>${escapeHtml(file.name)}</strong><br>
+                                        <small class="text-muted">${escapeHtml(file.relativePath)}</small>
                                     </div>
                                     <div class="text-end">
                                         <small class="text-muted">
@@ -596,7 +596,7 @@ class TranscodingManager {
             });
 
         } catch (error) {
-            container.innerHTML = `<div class="alert alert-danger">Error loading files: ${error.message}</div>`;
+            container.innerHTML = `<div class="alert alert-danger">Error loading files: ${escapeHtml(error.message)}</div>`;
         }
     }
 
@@ -692,7 +692,7 @@ class TranscodingManager {
 
         const options = this.getEncoderOptions('settings');
         const dirName = this.currentDirectory
-            ? (this.currentDirectory.split('/').pop() || this.currentDirectory)
+            ? (this.currentDirectory.split(/[/\\]/).pop() || this.currentDirectory)
             : 'all directories';
 
         // Close modal FIRST, then yield to let the browser process the close
@@ -1761,11 +1761,7 @@ class TranscodingManager {
      * @returns {string} Formatted size string.
      */
     formatFileSize(bytes) {
-        if (bytes === 0) return '0 Bytes';
-        const k = 1024;
-        const sizes = ['Bytes', 'KB', 'MB', 'GB'];
-        const i = Math.floor(Math.log(bytes) / Math.log(k));
-        return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        return formatFileSize(bytes);
     }
 
     // --- Cluster functionality ---
@@ -1777,6 +1773,7 @@ class TranscodingManager {
     async loadClusterConfig(updateUI = true) {
         try {
             const response = await fetch('/Home/GetClusterConfig');
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
             const config = await response.json();
             this.clusterEnabled = config.enabled;
             this.clusterRole = config.role;
@@ -1817,6 +1814,7 @@ class TranscodingManager {
     async loadWorkers() {
         try {
             const response = await fetch('/Home/GetWorkers');
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
             const nodes = await response.json();
             this.workers.clear();
             for (const node of nodes) {
@@ -1880,6 +1878,7 @@ class TranscodingManager {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(config)
             });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
             const result = await response.json();
             if (result.success) {
                 const isCluster = config.enabled && config.role !== 'standalone';
@@ -2139,14 +2138,16 @@ class TranscodingManager {
                 const confirmed = await showConfirmModal('Switch to Standalone', '<p>Switch back to standalone mode? This will disconnect from the cluster.</p>', 'Switch to Standalone');
                 if (confirmed) {
                     const response = await fetch('/Home/GetClusterConfig');
+                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
                     const config = await response.json();
                     config.role = 'standalone';
                     config.enabled = false;
-                    await fetch('/Home/SaveClusterConfig', {
+                    const saveResp = await fetch('/Home/SaveClusterConfig', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify(config)
                     });
+                    if (!saveResp.ok) throw new Error(`HTTP ${saveResp.status}`);
                     this.clusterEnabled = false;
                     this.clusterRole = 'standalone';
                     this.renderClusterPanel();
@@ -2204,104 +2205,5 @@ function showConfirmModal(title, message, confirmText = 'Confirm') {
     });
 }
 
-// Global utility functions
-
-/**
- * Formats a byte count as a human-readable size string.
- * @param {number} bytes - File size in bytes.
- * @returns {string} Formatted string (e.g. "1.23 GB").
- */
-function formatFileSize(bytes) {
-    if (bytes === 0) return '0 Bytes';
-    const k = 1024;
-    const sizes = ['Bytes', 'KB', 'MB', 'GB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-}
-
-/**
- * Formats a bitrate in kbps as a human-readable string, converting to Mbps above 1000 kbps.
- * @param {number} bitrate - Bitrate in kbps.
- * @returns {string} Formatted string (e.g. "4.5 Mbps" or "800 kbps").
- */
-function formatBitrate(bitrate) {
-    if (bitrate === 0) return '0 kbps';
-    if (bitrate < 1000) return bitrate + ' kbps';
-    return (bitrate / 1000).toFixed(1) + ' Mbps';
-}
-
-/**
- * Formats a duration in seconds as a compact time string.
- * @param {number} seconds - Duration in seconds.
- * @returns {string} Time string in `H:MM:SS` or `M:SS` format.
- */
-function formatDuration(seconds) {
-    if (seconds === 0) return '0:00';
-    const hours = Math.floor(seconds / 3600);
-    const minutes = Math.floor((seconds % 3600) / 60);
-    const secs = Math.floor(seconds % 60);
-    
-    if (hours > 0) {
-        return `${hours}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
-    } else {
-        return `${minutes}:${secs.toString().padStart(2, '0')}`;
-    }
-}
-
-/**
- * Displays a dismissible Bootstrap toast notification at the top-right of the screen.
- * Creates the toast container on first call if it does not yet exist.
- * @param {string} message - Text or HTML content to display in the toast body.
- * @param {'info'|'success'|'warning'|'danger'} [type='info'] - Bootstrap color variant for the toast background.
- */
-function showToast(message, type = 'info') {
-    // Create toast container if it doesn't exist
-    let container = document.getElementById('toast-container');
-    if (!container) {
-        container = document.createElement('div');
-        container.id = 'toast-container';
-        container.className = 'toast-container position-fixed top-0 end-0 p-3';
-        container.style.zIndex = '9999';
-        document.body.appendChild(container);
-    }
-
-    // Create toast element
-    const toastId = 'toast-' + Date.now();
-    const toastHtml = `
-        <div id="${toastId}" class="toast align-items-center text-white bg-${type === 'danger' ? 'danger' : type === 'success' ? 'success' : type === 'warning' ? 'warning' : 'primary'} border-0" role="alert" aria-live="assertive" aria-atomic="true">
-            <div class="d-flex">
-                <div class="toast-body">
-                    ${message}
-                </div>
-                <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" aria-label="Close"></button>
-            </div>
-        </div>
-    `;
-    
-    container.insertAdjacentHTML('beforeend', toastHtml);
-    
-    // Show toast
-    const toastElement = document.getElementById(toastId);
-    const toast = new bootstrap.Toast(toastElement, {
-        autohide: true,
-        delay: 5000
-    });
-    
-    toast.show();
-    
-    // Remove from DOM after hiding
-    toastElement.addEventListener('hidden.bs.toast', () => {
-        toastElement.remove();
-    });
-}
-
-function showLoading(button, text = 'Processing...') {
-    const originalText = button.innerHTML;
-    button.innerHTML = `<span class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>${text}`;
-    button.disabled = true;
-    
-    return function hideLoading() {
-        button.innerHTML = originalText;
-        button.disabled = false;
-    };
-}
+// Global utility functions (formatFileSize, formatDuration, formatBitrate, showToast, showLoading)
+// are defined in site.js which is loaded before this file.

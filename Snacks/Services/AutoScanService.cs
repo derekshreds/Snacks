@@ -30,8 +30,9 @@ public sealed class AutoScanService : IHostedService, IDisposable
         WriteIndented = true
     };
 
-    private AutoScanConfig _config = new();
-    private Timer?         _timer;
+    private readonly object _configLock = new();
+    private AutoScanConfig  _config = new();
+    private Timer?          _timer;
 
     /******************************************************************
      *  Constructor
@@ -73,10 +74,10 @@ public sealed class AutoScanService : IHostedService, IDisposable
     ///     resumes interrupted queue items from the database, and triggers an immediate scan if enabled.
     /// </summary>
     /// <param name="cancellationToken">Triggered when the host is starting a shutdown.</param>
-    public Task StartAsync(CancellationToken cancellationToken)
+    public async Task StartAsync(CancellationToken cancellationToken)
     {
         LoadConfig();
-        MigrateSeenFilesIfNeeded();
+        await MigrateSeenFilesIfNeededAsync();
         ScheduleTimer();
 
         if (_config.QueuePaused)
@@ -92,8 +93,6 @@ public sealed class AutoScanService : IHostedService, IDisposable
 
         if (_clusterService.IsNodeMode)
             _clusterService.CleanupAllRemoteJobs();
-
-        return Task.CompletedTask;
     }
 
     /// <summary> Stops the scan timer. Active scans finish naturally. </summary>
@@ -125,10 +124,13 @@ public sealed class AutoScanService : IHostedService, IDisposable
     public void AddDirectory(string path)
     {
         var normalized = Path.GetFullPath(path);
-        if (!_config.Directories.Contains(normalized, StringComparer.OrdinalIgnoreCase))
+        lock (_configLock)
         {
-            _config.Directories.Add(normalized);
-            SaveConfig();
+            if (!_config.Directories.Contains(normalized, StringComparer.OrdinalIgnoreCase))
+            {
+                _config.Directories.Add(normalized);
+                SaveConfig();
+            }
         }
     }
 
@@ -139,16 +141,22 @@ public sealed class AutoScanService : IHostedService, IDisposable
     public void RemoveDirectory(string path)
     {
         var normalized = Path.GetFullPath(path);
-        _config.Directories.RemoveAll(d => string.Equals(d, normalized, StringComparison.OrdinalIgnoreCase));
-        SaveConfig();
+        lock (_configLock)
+        {
+            _config.Directories.RemoveAll(d => string.Equals(d, normalized, StringComparison.OrdinalIgnoreCase));
+            SaveConfig();
+        }
     }
 
     /// <summary> Enables or disables automatic scanning and reschedules the timer accordingly. </summary>
     /// <param name="enabled">Whether auto-scan should be active.</param>
     public void SetEnabled(bool enabled)
     {
-        _config.Enabled = enabled;
-        SaveConfig();
+        lock (_configLock)
+        {
+            _config.Enabled = enabled;
+            SaveConfig();
+        }
         ScheduleTimer();
     }
 
@@ -157,8 +165,11 @@ public sealed class AutoScanService : IHostedService, IDisposable
     public void SetInterval(int minutes)
     {
         if (minutes < 1) minutes = 1;
-        _config.IntervalMinutes = minutes;
-        SaveConfig();
+        lock (_configLock)
+        {
+            _config.IntervalMinutes = minutes;
+            SaveConfig();
+        }
         ScheduleTimer();
     }
 
@@ -166,8 +177,11 @@ public sealed class AutoScanService : IHostedService, IDisposable
     /// <param name="paused">Whether the encoding queue should be paused.</param>
     public void SetQueuePaused(bool paused)
     {
-        _config.QueuePaused = paused;
-        SaveConfig();
+        lock (_configLock)
+        {
+            _config.QueuePaused = paused;
+            SaveConfig();
+        }
     }
 
     /// <summary> Whether the encoding queue is currently marked as paused in the persisted config. </summary>
@@ -298,7 +312,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
 
         try
         {
-            if (!_config.Enabled && _config.Directories.Count == 0)
+            if (!_config.Enabled || _config.Directories.Count == 0)
                 return;
 
             var options = LoadEncoderOptions();
@@ -452,7 +466,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
     ///     One-time migration: moves <c>SeenFiles</c> from the old <c>autoscan.json</c> into the
     ///     database, then re-saves the config without the obsolete property.
     /// </summary>
-    private void MigrateSeenFilesIfNeeded()
+    private async Task MigrateSeenFilesIfNeededAsync()
     {
         if (!File.Exists(_configPath))
             return;
@@ -477,7 +491,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
             if (seenFiles.Count > 0)
             {
                 Console.WriteLine($"AutoScan: Migrating {seenFiles.Count} SeenFiles entries to database...");
-                _mediaFileRepo.BulkInsertSeenFilesAsync(seenFiles).GetAwaiter().GetResult();
+                await _mediaFileRepo.BulkInsertSeenFilesAsync(seenFiles);
                 Console.WriteLine("AutoScan: Migration complete.");
                 SaveConfig();
             }

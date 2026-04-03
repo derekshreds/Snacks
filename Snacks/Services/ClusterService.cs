@@ -68,19 +68,19 @@ public sealed class ClusterService : IHostedService, IDisposable
      ******************************************************************/
 
     private readonly ClusterDiscoveryService     _discovery;
-    private readonly ClusterFileTransferService   _fileTransfer;
-    private readonly ClusterNodeJobService        _nodeJobs;
+    private readonly ClusterFileTransferService  _fileTransfer;
+    private readonly ClusterNodeJobService       _nodeJobs;
 
     /******************************************************************
      *  Internal State
      ******************************************************************/
 
-    private ClusterConfig        _config = new();
-    private Timer?               _heartbeatTimer;
-    private Timer?               _dispatchTimer;
+    private ClusterConfig            _config = new();
+    private Timer?                   _heartbeatTimer;
+    private Timer?                   _dispatchTimer;
     private CancellationTokenSource? _cts;
-    private TaskCompletionSource _recoveryComplete = new(TaskCreationOptions.RunContinuationsAsynchronously);
-    private readonly SemaphoreSlim _dispatchLock = new(1, 1);
+    private TaskCompletionSource     _recoveryComplete = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly SemaphoreSlim   _dispatchLock = new(1, 1);
 
     /// <summary> Completes when crash recovery of remote jobs has finished on startup. </summary>
     public Task RecoveryCompleteTask => _recoveryComplete.Task;
@@ -150,7 +150,7 @@ public sealed class ClusterService : IHostedService, IDisposable
             StartClusterOperations();
 
             if (_config.Role == "master")
-                _ = Task.Run(() => RecoverRemoteJobsAsync());
+                _ = Task.Run(() => RecoverRemoteJobsAsync(_cts?.Token ?? CancellationToken.None));
         }
         else
         {
@@ -209,7 +209,9 @@ public sealed class ClusterService : IHostedService, IDisposable
         _cts?.Cancel();
         _heartbeatTimer?.Dispose();
         _dispatchTimer?.Dispose();
+        _dispatchLock.Dispose();
         _cts?.Dispose();
+        _cts = null;
     }
 
     /******************************************************************
@@ -409,6 +411,7 @@ public sealed class ClusterService : IHostedService, IDisposable
         var jitter = TimeSpan.FromMilliseconds(Random.Shared.Next(0, (int)heartbeatInterval.TotalMilliseconds));
         _heartbeatTimer = new Timer(async _ =>
         {
+            if (_cts?.IsCancellationRequested == true) return;
             try { await RunHeartbeatAsync(); }
             catch (Exception ex) { Console.WriteLine($"Cluster: Heartbeat error: {ex.Message}"); }
         }, null, jitter, heartbeatInterval);
@@ -421,6 +424,7 @@ public sealed class ClusterService : IHostedService, IDisposable
 
             _dispatchTimer = new Timer(async _ =>
             {
+                if (_cts?.IsCancellationRequested == true) return;
                 try { await RunDispatchAsync(); }
                 catch (Exception ex) { Console.WriteLine($"Cluster: Dispatch error: {ex.Message}"); }
             }, null, TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(2));
@@ -611,11 +615,11 @@ public sealed class ClusterService : IHostedService, IDisposable
     {
         if (_nodes.TryGetValue(nodeId, out var node))
         {
-            node.Status          = status;
+            node.Status           = status;
             node.ActiveWorkItemId = workItemId;
-            node.ActiveFileName  = fileName;
-            node.ActiveProgress  = progress;
-            node.LastHeartbeat   = DateTime.UtcNow;
+            node.ActiveFileName   = fileName;
+            node.ActiveProgress   = progress;
+            node.LastHeartbeat    = DateTime.UtcNow;
             _ = _hubContext.Clients.All.SendAsync("WorkerUpdated", node);
         }
     }
@@ -634,6 +638,12 @@ public sealed class ClusterService : IHostedService, IDisposable
 
         try
         {
+            // Skip dispatch entirely if no worker nodes are available
+            bool hasAvailableNodes = _nodes.Values.Any(n =>
+                n.Role == "node" && n.Status == NodeStatus.Online
+                && !n.IsPaused && n.ActiveWorkItemId == null);
+            if (!hasAvailableNodes) return;
+
             var options = LoadEncoderOptions();
 
             while (true)
@@ -650,7 +660,7 @@ public sealed class ClusterService : IHostedService, IDisposable
 
                 // Mark busy immediately to prevent double-dispatch
                 bestNode.ActiveWorkItemId = workItem.Id;
-                bestNode.Status          = NodeStatus.Busy;
+                bestNode.Status           = NodeStatus.Busy;
 
                 _ = Task.Run(() => DispatchToNodeAsync(bestNode, workItem, options));
             }
@@ -764,6 +774,8 @@ public sealed class ClusterService : IHostedService, IDisposable
             workItem.RemoteJobPhase   = null;
             workItem.TransferProgress = 0;
             _remoteJobs.TryRemove(workItem.Id, out _);
+            if (_jobCts.TryRemove(workItem.Id, out var failedCts))
+                failedCts.Dispose();
             await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Queued);
             _transcodingService.RequeueWorkItem(workItem);
             UpdateNodeStatus(node.NodeId, NodeStatus.Online);
@@ -771,8 +783,8 @@ public sealed class ClusterService : IHostedService, IDisposable
         finally
         {
             _activeUploads.TryRemove(workItem.Id, out _);
-            if (_jobCts.TryRemove(workItem.Id, out var removedCts))
-                removedCts.Dispose();
+            // Don't remove/dispose the CTS here — the download phase still needs it.
+            // It is cleaned up in HandleRemoteCompletionAsync or HandleNodeFailureAsync.
         }
     }
 
@@ -807,9 +819,9 @@ public sealed class ClusterService : IHostedService, IDisposable
             if (!File.Exists(workItem.Path))
             {
                 Console.WriteLine($"Cluster: Source file {workItem.Path} no longer exists — discarding remote result");
-                workItem.Status      = WorkItemStatus.Failed;
+                workItem.Status       = WorkItemStatus.Failed;
                 workItem.ErrorMessage = "Source file was removed during encoding";
-                workItem.CompletedAt = DateTime.UtcNow;
+                workItem.CompletedAt  = DateTime.UtcNow;
                 _remoteJobs.TryRemove(jobId, out _);
                 await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Failed);
                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
@@ -821,9 +833,9 @@ public sealed class ClusterService : IHostedService, IDisposable
             workItem.TransferProgress = 0;
             await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
 
-            var options       = _transcodingService.GetLastOptions() ?? new EncoderOptions();
-            var ext           = options.Format == "mp4" ? ".mp4" : ".mkv";
-            var baseName      = Path.GetFileNameWithoutExtension(workItem.FileName);
+            var options        = _transcodingService.GetLastOptions() ?? new EncoderOptions();
+            var ext            = options.Format == "mp4" ? ".mp4" : ".mkv";
+            var baseName       = Path.GetFileNameWithoutExtension(workItem.FileName);
             var outputFileName = $"{baseName} [snacks]{ext}";
 
             string outputDir;
@@ -844,17 +856,11 @@ public sealed class ClusterService : IHostedService, IDisposable
 
             // Validate output
             var outputProbe = await _ffprobeService.ProbeAsync(outputPath);
-            if (!_ffprobeService.ConvertedSuccessfully(workItem.Probe!, outputProbe))
+            if (workItem.Probe != null && !_ffprobeService.ConvertedSuccessfully(workItem.Probe, outputProbe))
             {
                 try { File.Delete(outputPath); } catch { }
 
-                var validationKey = $"_validation_{jobId}";
-                var failCount = 1;
-                if (workItem.ErrorMessage?.StartsWith("Validation failed") == true)
-                {
-                    int.TryParse(workItem.ErrorMessage.Split('(', ')').ElementAtOrDefault(1), out failCount);
-                    failCount++;
-                }
+                var failCount = _downloadRetryCounts.AddOrUpdate($"_validation_{jobId}", 1, (_, c) => c + 1);
 
                 if (failCount >= 3)
                 {
@@ -879,9 +885,12 @@ public sealed class ClusterService : IHostedService, IDisposable
             await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Completed);
             try { await _discovery.CreateAuthenticatedClient().DeleteAsync($"{nodeBaseUrl}/api/cluster/files/{jobId}"); } catch { }
 
-            UpdateNodeStatus(workItem.AssignedNodeId!, NodeStatus.Online);
-            if (_nodes.TryGetValue(workItem.AssignedNodeId!, out var node))
-                node.CompletedJobs++;
+            if (workItem.AssignedNodeId != null)
+            {
+                UpdateNodeStatus(workItem.AssignedNodeId, NodeStatus.Online);
+                if (_nodes.TryGetValue(workItem.AssignedNodeId, out var node))
+                    node.CompletedJobs++;
+            }
 
             _remoteJobs.TryRemove(jobId, out _);
             _downloadRetryCounts.TryRemove(jobId, out _);
@@ -901,6 +910,8 @@ public sealed class ClusterService : IHostedService, IDisposable
                 Console.WriteLine($"Cluster: Download failed after {MaxDownloadRetries} attempts — re-queuing for fresh encode");
                 _remoteJobs.TryRemove(jobId, out _);
                 _downloadRetryCounts.TryRemove(jobId, out _);
+                if (_jobCts.TryRemove(jobId, out var maxRetryCts))
+                    maxRetryCts.Dispose();
                 await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Queued);
                 workItem.AssignedNodeId   = null;
                 workItem.AssignedNodeName = null;
@@ -1021,8 +1032,8 @@ public sealed class ClusterService : IHostedService, IDisposable
 
         if (workItem.RemoteFailureCount >= 3)
         {
-            workItem.Status          = WorkItemStatus.Failed;
-            workItem.CompletedAt     = DateTime.UtcNow;
+            workItem.Status           = WorkItemStatus.Failed;
+            workItem.CompletedAt      = DateTime.UtcNow;
             workItem.AssignedNodeId   = null;
             workItem.AssignedNodeName = null;
             workItem.RemoteJobPhase   = null;
@@ -1079,7 +1090,7 @@ public sealed class ClusterService : IHostedService, IDisposable
     {
         int score = 1;
         var caps  = node.Capabilities;
-        if (caps == null) return score;
+        if (caps == null) return score; // Capabilities not yet received — allow dispatch with base score
 
         if (caps.AvailableDiskSpaceBytes < workItem.Size * 2.5)
             return -100;
@@ -1109,7 +1120,7 @@ public sealed class ClusterService : IHostedService, IDisposable
     ///     previous session ended. Attempts to reconnect to nodes and retrieve results,
     ///     or re-queues for fresh dispatch.
     /// </summary>
-    private async Task RecoverRemoteJobsAsync()
+    private async Task RecoverRemoteJobsAsync(CancellationToken ct = default)
     {
         try
         {
@@ -1120,6 +1131,8 @@ public sealed class ClusterService : IHostedService, IDisposable
 
             foreach (var mediaFile in activeJobs)
             {
+                ct.ThrowIfCancellationRequested();
+
                 if (!File.Exists(mediaFile.FilePath))
                 {
                     Console.WriteLine($"Cluster: Source file missing for {mediaFile.FileName} — clearing assignment");
@@ -1143,7 +1156,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                     continue;
                 }
 
-                var baseUrl = $"http://{mediaFile.AssignedNodeIp}:{mediaFile.AssignedNodePort}";
+                var baseUrl = $"{(_config.UseHttps ? "https" : "http")}://{mediaFile.AssignedNodeIp}:{mediaFile.AssignedNodePort}";
                 bool nodeReachable = false;
 
                 for (int attempt = 0; attempt < 12; attempt++)
@@ -1186,13 +1199,13 @@ public sealed class ClusterService : IHostedService, IDisposable
                                 recoveredProgress = progProp.GetInt32();
 
                             Console.WriteLine($"Cluster: Node is actively encoding {mediaFile.FileName} at {recoveredProgress}% — tracking");
-                            workItem.Status          = WorkItemStatus.Processing;
-                            workItem.Progress        = recoveredProgress;
+                            workItem.Status           = WorkItemStatus.Processing;
+                            workItem.Progress         = recoveredProgress;
                             workItem.AssignedNodeId   = mediaFile.AssignedNodeId;
                             workItem.AssignedNodeName = mediaFile.AssignedNodeName ?? "recovered";
-                            workItem.RemoteJobPhase  = "Encoding";
-                            workItem.ErrorMessage    = null;
-                            _remoteJobs[workItem.Id] = workItem;
+                            workItem.RemoteJobPhase   = "Encoding";
+                            workItem.ErrorMessage     = null;
+                            _remoteJobs[workItem.Id]  = workItem;
                             await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
                             continue;
                         }
@@ -1209,8 +1222,8 @@ public sealed class ClusterService : IHostedService, IDisposable
                     {
                         Console.WriteLine($"Cluster: Node has output for {mediaFile.FileName} — downloading");
                         workItem.Status             = WorkItemStatus.Processing;
-                        workItem.AssignedNodeId      = mediaFile.AssignedNodeId;
-                        workItem.AssignedNodeName    = mediaFile.AssignedNodeName ?? "recovered";
+                        workItem.AssignedNodeId     = mediaFile.AssignedNodeId;
+                        workItem.AssignedNodeName   = mediaFile.AssignedNodeName ?? "recovered";
                         workItem.RemoteJobPhase     = "Downloading";
                         workItem.RemoteFailureCount = mediaFile.RemoteFailureCount;
                         workItem.ErrorMessage       = null;
@@ -1377,8 +1390,8 @@ public sealed class ClusterService : IHostedService, IDisposable
     }
 
     /// <summary> Builds the base URL for inter-node HTTP communication. </summary>
-    private static string NodeBaseUrl(ClusterNode node) =>
-        $"http://{node.IpAddress}:{node.Port}";
+    private string NodeBaseUrl(ClusterNode node) =>
+        $"{(_config.UseHttps ? "https" : "http")}://{node.IpAddress}:{node.Port}";
 
     /// <summary> Creates a deep copy of encoder options via JSON round-trip serialization. </summary>
     private EncoderOptions CloneOptions(EncoderOptions options)

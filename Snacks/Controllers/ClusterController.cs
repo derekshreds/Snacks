@@ -319,6 +319,7 @@ public sealed class ClusterController : ControllerBase
                     });
                 }
 
+                _clusterService.SetReceivingJob(null);
                 return Ok(new { received = true, size = fileSize, hashValid });
             }
             catch (Exception ex)
@@ -391,24 +392,28 @@ public sealed class ClusterController : ControllerBase
             }
 
             long chunkSize = 50L * 1024 * 1024; // 50MB
-            var length = (int)Math.Min(chunkSize, totalSize - offset);
+            var length = (int)Math.Min(chunkSize, Math.Max(totalSize - offset, 0));
 
-            var buffer = new byte[length];
-            using (var fs = new FileStream(outputPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+            // Read chunk and compute hash using a small rolling buffer to avoid LOH allocation
+            using var incrementalHash = System.Security.Cryptography.IncrementalHash.CreateHash(
+                System.Security.Cryptography.HashAlgorithmName.SHA256);
+            var chunkStream = new MemoryStream(length);
+            using (var fs = new FileStream(outputPath, FileMode.Open, FileAccess.Read, FileShare.Read, 81920))
             {
                 fs.Seek(offset, SeekOrigin.Begin);
-                var bytesRead = 0;
-                while (bytesRead < length)
+                var readBuffer = new byte[81920];
+                int remaining = length;
+                while (remaining > 0)
                 {
-                    var read = await fs.ReadAsync(buffer.AsMemory(bytesRead, length - bytesRead));
+                    var read = await fs.ReadAsync(readBuffer.AsMemory(0, Math.Min(readBuffer.Length, remaining)));
                     if (read == 0) break;
-                    bytesRead += read;
+                    chunkStream.Write(readBuffer, 0, read);
+                    incrementalHash.AppendData(readBuffer.AsSpan(0, read));
+                    remaining -= read;
                 }
-                length = bytesRead;
             }
-
-            var chunkHash = Convert.ToHexString(
-                System.Security.Cryptography.SHA256.HashData(buffer.AsSpan(0, length))).ToLower();
+            length = (int)chunkStream.Length;
+            var chunkHash = Convert.ToHexString(incrementalHash.GetHashAndReset()).ToLower();
 
             // Compute full file hash for end-to-end integrity verification (first request only)
             string? fullFileHash = null;
@@ -441,7 +446,8 @@ public sealed class ClusterController : ControllerBase
             if (fullFileHash != null)
                 Response.Headers["X-File-Hash"] = fullFileHash;
 
-            return File(buffer.AsMemory(0, length).ToArray(), "application/octet-stream");
+            chunkStream.Position = 0;
+            return File(chunkStream, "application/octet-stream");
         }
 
         /// <summary>

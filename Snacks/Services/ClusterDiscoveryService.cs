@@ -46,6 +46,7 @@ public sealed class ClusterDiscoveryService
     private volatile ClusterConfig       _config;
     private UdpClient?                   _udpListener;
     private CancellationTokenSource?     _cts;
+    private CancellationTokenSource?     _linkedCts;
     private Task?                        _discoveryTask;
     private Task?                        _manualNodesTask;
     private Task?                        _registerTask;
@@ -106,21 +107,23 @@ public sealed class ClusterDiscoveryService
     public void Start(CancellationToken ct)
     {
         _cts?.Cancel();
+        _cts?.Dispose();
         _cts = new CancellationTokenSource();
 
-        var linked = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, ct);
+        _linkedCts?.Dispose();
+        _linkedCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, ct);
 
         bool needsDiscovery = _config.AutoDiscovery ||
             (_config.Role == "node" && string.IsNullOrEmpty(_config.MasterUrl));
 
         if (needsDiscovery)
-            _discoveryTask = Task.Run(() => RunDiscoveryAsync(linked.Token));
+            _discoveryTask = Task.Run(() => RunDiscoveryAsync(_linkedCts.Token));
 
         if (_config.ManualNodes.Count > 0)
-            _manualNodesTask = Task.Run(() => ConnectToManualNodesAsync(linked.Token));
+            _manualNodesTask = Task.Run(() => ConnectToManualNodesAsync(_linkedCts.Token));
 
         if (_config.Role == "node" && !string.IsNullOrEmpty(_config.MasterUrl))
-            _registerTask = Task.Run(() => RegisterWithMasterAsync(linked.Token));
+            _registerTask = Task.Run(() => RegisterWithMasterAsync(_linkedCts.Token));
 
         var localIp = GetLocalIpAddress();
         var port    = GetListeningPort();
@@ -159,6 +162,8 @@ public sealed class ClusterDiscoveryService
 
         _cts?.Dispose();
         _cts = null;
+        _linkedCts?.Dispose();
+        _linkedCts = null;
 
         Console.WriteLine("ClusterDiscovery: Stopped");
     }
@@ -300,7 +305,8 @@ public sealed class ClusterDiscoveryService
                     continue;
 
                 Console.WriteLine($"ClusterDiscovery: Discovered {role} at {senderIp}:{port} — performing handshake");
-                _ = Task.Run(() => PerformHandshakeAsync($"http://{senderIp}:{port}", ct));
+                var scheme = _config.UseHttps ? "https" : "http";
+                _ = Task.Run(() => PerformHandshakeAsync($"{scheme}://{senderIp}:{port}", ct));
             }
             catch (OperationCanceledException) { break; }
             catch (Exception ex)
@@ -451,11 +457,11 @@ public sealed class ClusterDiscoveryService
     /// </param>
     public void RegisterOrUpdateNode(ClusterNode node, bool fromHandshake = false)
     {
-        var isNew = !_nodes.ContainsKey(node.NodeId);
+        var isNew = !_nodes.TryGetValue(node.NodeId, out var existingNode);
         if (isNew || fromHandshake)
             node.LastHeartbeat = DateTime.UtcNow;
         else
-            node.LastHeartbeat = _nodes[node.NodeId].LastHeartbeat;
+            node.LastHeartbeat = existingNode!.LastHeartbeat;
 
         _nodes[node.NodeId] = node;
 
@@ -632,7 +638,7 @@ public sealed class ClusterDiscoveryService
             if (File.Exists(appSettingsPath))
             {
                 var json = File.ReadAllText(appSettingsPath);
-                var doc  = JsonDocument.Parse(json);
+                using var doc = JsonDocument.Parse(json);
                 if (doc.RootElement.TryGetProperty("Kestrel", out var kestrel) &&
                     kestrel.TryGetProperty("Endpoints", out var endpoints) &&
                     endpoints.TryGetProperty("Http", out var http) &&

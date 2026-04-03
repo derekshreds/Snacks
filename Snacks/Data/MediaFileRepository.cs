@@ -237,11 +237,15 @@ public class MediaFileRepository
         {
             using var context = await _contextFactory.CreateDbContextAsync();
             var dirList = directories.ToList();
-            return await context.MediaFiles
+            var files = await context.MediaFiles
                 .Where(f => dirList.Contains(f.Directory))
-                .ToDictionaryAsync(
-                    f => $"{f.Directory}|{f.BaseName}".ToLowerInvariant(),
-                    f => f.Status);
+                .Select(f => new { Key = (f.Directory + "|" + f.BaseName).ToLower(), f.Status })
+                .ToListAsync();
+
+            var dict = new Dictionary<string, MediaFileStatus>();
+            foreach (var f in files)
+                dict[f.Key] = f.Status; // last-write wins for duplicate base names
+            return dict;
         }
 
         /// <summary> Returns the number of files with a specific processing status. </summary>
@@ -338,6 +342,7 @@ public class MediaFileRepository
             {
                 context.MediaFiles.AddRange(chunk);
                 await SaveChangesWithRetryAsync(context);
+                context.ChangeTracker.Clear();
             }
         }
 
@@ -349,26 +354,28 @@ public class MediaFileRepository
         {
             using var context = await _contextFactory.CreateDbContextAsync();
             var batchSize = 1000;
-            int pruned;
+            int lastProcessedId = 0;
 
-            do
+            while (true)
             {
                 var batch = await context.MediaFiles
+                    .Where(f => f.Id > lastProcessedId)
+                    .OrderBy(f => f.Id)
                     .Take(batchSize)
                     .ToListAsync();
 
                 if (batch.Count == 0) break;
 
-                var toRemove = batch.Where(f => !File.Exists(f.FilePath)).ToList();
-                pruned = toRemove.Count;
+                lastProcessedId = batch[^1].Id;
 
-                if (pruned > 0)
+                var toRemove = batch.Where(f => !File.Exists(f.FilePath)).ToList();
+
+                if (toRemove.Count > 0)
                 {
                     context.MediaFiles.RemoveRange(toRemove);
                     await SaveChangesWithRetryAsync(context);
                 }
             }
-            while (pruned > 0);
         }
 
         #endregion

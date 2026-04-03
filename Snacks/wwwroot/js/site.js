@@ -45,10 +45,10 @@ document.addEventListener('DOMContentLoaded', function() {
  * @returns {string} Formatted string (e.g. "1.23 GB").
  */
 function formatFileSize(bytes) {
-    if (bytes === 0) return '0 Bytes';
+    if (!bytes || bytes <= 0) return '0 Bytes';
     const k = 1024;
     const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    const i = Math.min(Math.floor(Math.log(bytes) / Math.log(k)), sizes.length - 1);
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }
 
@@ -123,7 +123,7 @@ function showToast(message, type = 'info') {
     };
 
     // Create toast
-    const toastId = 'toast-' + Date.now();
+    const toastId = 'toast-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
     const toast = document.createElement('div');
     toast.id = toastId;
     toast.className = `toast align-items-center text-bg-${type} border-0`;
