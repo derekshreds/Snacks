@@ -320,7 +320,6 @@ public sealed class ClusterController : ControllerBase
                     });
                 }
 
-                _clusterService.SetReceivingJob(null);
                 return Ok(new { received = true, size = fileSize, hashValid });
             }
             catch (Exception ex)

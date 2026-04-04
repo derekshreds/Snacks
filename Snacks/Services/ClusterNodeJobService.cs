@@ -342,6 +342,14 @@ public sealed class ClusterNodeJobService
         }
         finally
         {
+            if (encodingSucceeded && _currentRemoteJob != null)
+            {
+                _currentRemoteJob.Status      = WorkItemStatus.Completed;
+                _currentRemoteJob.Progress    = 100;
+                _currentRemoteJob.CompletedAt = DateTime.UtcNow;
+                _ = _hubContext.Clients.All.SendAsync("WorkItemUpdated", _currentRemoteJob);
+            }
+
             _completedJobId = encodingSucceeded ? _currentRemoteJob?.Id : null;
             _currentRemoteJob = null;
             _remoteJobCts?.Dispose();
@@ -591,6 +599,8 @@ public sealed class ClusterNodeJobService
     {
         if (_receivingJobId == jobId) _receivingJobId = null;
         if (_completedJobId == jobId) _completedJobId = null;
+
+        _transcodingService.RemoveWorkItem(jobId);
 
         try
         {

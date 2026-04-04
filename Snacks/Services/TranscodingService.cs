@@ -443,6 +443,10 @@ public class TranscodingService
             return _workItems.Values.OrderByDescending(x => x.CreatedAt).ToList();
         }
 
+        /// <summary>Removes a work item from the in-memory tracking dictionary (e.g. after remote job cleanup).</summary>
+        public void RemoveWorkItem(string id) => _workItems.TryRemove(id, out _);
+
+
         /// <summary>
         ///     Permanently cancels a work item. The file will not be reprocessed unless explicitly reset.
         ///     For remote items, the cancellation is forwarded to the assigned cluster node.
