@@ -77,6 +77,8 @@ public sealed class ClusterController : ControllerBase
                 isPaused,
                 currentJobId = _clusterService.GetCurrentRemoteJobId(),
                 progress = _clusterService.GetCurrentRemoteJobProgress(),
+                completedJobId = _clusterService.GetCompletedJobId(),
+                receivingJobId = _clusterService.GetReceivingJobId(),
                 diskSpace = capabilities.AvailableDiskSpaceBytes,
                 capabilities
             });

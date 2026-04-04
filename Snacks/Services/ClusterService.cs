@@ -283,6 +283,12 @@ public sealed class ClusterService : IHostedService, IDisposable
     /// <summary> Returns the encoding progress of the current remote job. </summary>
     public int GetCurrentRemoteJobProgress() => _nodeJobs.GetCurrentRemoteJobProgress();
 
+    /// <summary> Returns the completed job ID if encoding finished but cleanup hasn't occurred yet. </summary>
+    public string? GetCompletedJobId() => _nodeJobs.GetCompletedJobId();
+
+    /// <summary> Returns the job ID currently being received via file transfer. </summary>
+    public string? GetReceivingJobId() => _nodeJobs.GetReceivingJobId();
+
     /// <summary> Pauses or resumes this node. </summary>
     public void SetNodePaused(bool paused) => _nodeJobs.SetNodePaused(paused);
 
@@ -414,6 +420,14 @@ public sealed class ClusterService : IHostedService, IDisposable
             if (_cts?.IsCancellationRequested == true) return;
             try { await RunHeartbeatAsync(); }
             catch (Exception ex) { Console.WriteLine($"Cluster: Heartbeat error: {ex.Message}"); }
+
+            // On nodes, clear stale receiving state and retry any pending completions
+            if (_config.Role == "node")
+            {
+                _nodeJobs.ExpireStaleReceiving(TimeSpan.FromSeconds(_config.NodeTimeoutSeconds));
+                try { await _nodeJobs.RetryPendingCompletionsAsync(); }
+                catch (Exception ex) { Console.WriteLine($"Cluster: Pending completion retry error: {ex.Message}"); }
+            }
         }, null, jitter, heartbeatInterval);
 
         if (_config.Role == "master")
@@ -1194,13 +1208,40 @@ public sealed class ClusterService : IHostedService, IDisposable
                     continue;
                 }
 
-                // Check if node is actively encoding this job
+                // Check if node is actively encoding or has completed this job
                 try
                 {
                     var hbBody = await (await _discovery.CreateAuthenticatedClient()
                         .GetAsync($"{baseUrl}/api/cluster/heartbeat")).Content.ReadAsStringAsync();
                     var hbData = JsonSerializer.Deserialize<JsonElement>(hbBody);
-                    if (hbData.TryGetProperty("currentJobId", out var curJob) && curJob.ValueKind != JsonValueKind.Null)
+
+                    // Check if encoding already finished — completedJobId means output is ready
+                    if (hbData.TryGetProperty("completedJobId", out var completedJob) &&
+                        completedJob.ValueKind != JsonValueKind.Null &&
+                        completedJob.GetString() == jobId)
+                    {
+                        Console.WriteLine($"Cluster: Node has completed encoding {mediaFile.FileName} — downloading");
+                        workItem.Status             = WorkItemStatus.Processing;
+                        workItem.AssignedNodeId     = mediaFile.AssignedNodeId;
+                        workItem.AssignedNodeName   = mediaFile.AssignedNodeName ?? "recovered";
+                        workItem.RemoteJobPhase     = "Downloading";
+                        workItem.RemoteFailureCount = mediaFile.RemoteFailureCount;
+                        workItem.ErrorMessage       = null;
+                        _remoteJobs[workItem.Id]    = workItem;
+                        if (mediaFile.RemoteFailureCount > 0)
+                            _downloadRetryCounts[workItem.Id] = mediaFile.RemoteFailureCount * 3;
+                        await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
+                        await HandleRemoteCompletionAsync(workItem.Id, baseUrl);
+                        continue;
+                    }
+
+                    // If node is only receiving (not encoding), fall through to the
+                    // partial upload resume path instead of tracking as encoding
+                    bool isOnlyReceiving = hbData.TryGetProperty("receivingJobId", out var recvJob) &&
+                        recvJob.ValueKind != JsonValueKind.Null && recvJob.GetString() == jobId;
+
+                    if (!isOnlyReceiving &&
+                        hbData.TryGetProperty("currentJobId", out var curJob) && curJob.ValueKind != JsonValueKind.Null)
                     {
                         if (curJob.GetString() == jobId)
                         {

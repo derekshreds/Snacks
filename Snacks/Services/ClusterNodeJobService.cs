@@ -43,6 +43,7 @@ public sealed class ClusterNodeJobService
     private volatile CancellationTokenSource? _remoteJobCts;
     private volatile string?                  _completedJobId;
     private volatile string?                  _receivingJobId;
+    private          DateTime                 _lastReceiveActivity;
     private volatile bool                     _nodePaused;
 
     /******************************************************************
@@ -134,6 +135,36 @@ public sealed class ClusterNodeJobService
     /// <returns>A value from 0 to 100, or 0 if no job is active.</returns>
     public int GetCurrentRemoteJobProgress() => _currentRemoteJob?.Progress ?? 0;
 
+    /// <summary> Returns the completed job ID if encoding finished but cleanup hasn't occurred yet. </summary>
+    public string? GetCompletedJobId() => _completedJobId;
+
+    /// <summary> Returns the job ID currently being received via file transfer, or null. </summary>
+    public string? GetReceivingJobId() => _receivingJobId;
+
+    /// <summary>
+    ///     Clears a stale receiving state if no chunks have arrived within the timeout.
+    ///     Called periodically from the heartbeat timer.
+    /// </summary>
+    public void ExpireStaleReceiving(TimeSpan timeout)
+    {
+        if (_receivingJobId != null && _currentRemoteJob == null &&
+            (DateTime.UtcNow - _lastReceiveActivity) > timeout)
+        {
+            var staleId = _receivingJobId;
+            _receivingJobId = null;
+            Console.WriteLine($"Cluster: Cleared stale receiving state for job {staleId} (no activity for {timeout.TotalSeconds:0}s)");
+
+            _ = _hubContext.Clients.All.SendAsync("WorkItemUpdated", new
+            {
+                id             = staleId,
+                status         = "Completed",
+                progress       = 100,
+                remoteJobPhase = (string?)null,
+                completedAt    = DateTime.UtcNow
+            });
+        }
+    }
+
     /// <summary>
     ///     Tracks which job ID is currently being received via file transfer. Used to
     ///     report accurate node status during the upload phase. When a new job ID replaces
@@ -144,6 +175,7 @@ public sealed class ClusterNodeJobService
     {
         var oldJobId = _receivingJobId;
         _receivingJobId = jobId;
+        if (jobId != null) _lastReceiveActivity = DateTime.UtcNow;
 
         if (oldJobId != null && oldJobId != jobId)
         {
@@ -344,9 +376,7 @@ public sealed class ClusterNodeJobService
         {
             if (encodingSucceeded && _currentRemoteJob != null)
             {
-                _currentRemoteJob.Status      = WorkItemStatus.Completed;
-                _currentRemoteJob.Progress    = 100;
-                _currentRemoteJob.CompletedAt = DateTime.UtcNow;
+                _currentRemoteJob.Progress = 100;
                 _ = _hubContext.Clients.All.SendAsync("WorkItemUpdated", _currentRemoteJob);
             }
 
