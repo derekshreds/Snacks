@@ -1013,18 +1013,10 @@ class TranscodingManager {
             }
 
             this.renderWorkItem(workItem);
-            // Don't trigger a full server refresh for transfer progress updates —
-            // they're ephemeral and would be wiped by the server response.
-            // But schedule a fallback refresh in case the final state message is missed.
-            if (workItem.remoteJobPhase === 'Downloading' || workItem.remoteJobPhase === 'Uploading') {
-                if (!this._transferFallbackTimer) {
-                    this._transferFallbackTimer = setTimeout(() => {
-                        this._transferFallbackTimer = null;
-                        this.scheduleQueueRefresh();
-                    }, 30000);
-                }
-                return;
-            }
+            // Don't trigger a full server refresh for processing items —
+            // on nodes, the server-side queue doesn't include remote jobs,
+            // so a refresh would wipe the item from the DOM.
+            return;
         }
 
         this.scheduleQueueRefresh();

@@ -69,6 +69,7 @@ public sealed class ClusterController : ControllerBase
             var config = _clusterService.GetConfig();
             var isPaused = _clusterService.IsNodePaused;
             string status = isPaused ? "paused" : _clusterService.IsProcessingRemoteJob() ? "busy" : "online";
+            var capabilities = _clusterService.GetCapabilities();
             return Ok(new
             {
                 nodeId = config.NodeId,
@@ -76,8 +77,8 @@ public sealed class ClusterController : ControllerBase
                 isPaused,
                 currentJobId = _clusterService.GetCurrentRemoteJobId(),
                 progress = _clusterService.GetCurrentRemoteJobProgress(),
-                diskSpace = GetAvailableDiskSpace(),
-                capabilities = _clusterService.GetCapabilities()
+                diskSpace = capabilities.AvailableDiskSpaceBytes,
+                capabilities
             });
         }
 
@@ -514,25 +515,6 @@ public sealed class ClusterController : ControllerBase
             int ttlHours = 24;
             _clusterService.CleanupOldRemoteJobs(ttlHours);
             return Ok(new { cleaned = true });
-        }
-
-        /******************************************************************
-         *  Utility
-         ******************************************************************/
-
-        /// <summary> Returns the available disk space in bytes on the drive hosting the node's temp directory. </summary>
-        private long GetAvailableDiskSpace()
-        {
-            try
-            {
-                var config = _clusterService.GetConfig();
-                var dir = config.NodeTempDirectory ?? Path.Combine(
-                    Environment.GetEnvironmentVariable("SNACKS_WORK_DIR") ??
-                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Snacks", "work"));
-                var drive = new DriveInfo(Path.GetPathRoot(dir) ?? dir);
-                return drive.AvailableFreeSpace;
-            }
-            catch { return 0; }
         }
 
     }

@@ -1841,7 +1841,7 @@ public class TranscodingService
         ///     clearing node assignment metadata so it can be dispatched again.
         /// </summary>
         /// <param name="item"> The work item to requeue. </param>
-        public void RequeueWorkItem(WorkItem item)
+        public void RequeueWorkItem(WorkItem item, bool silent = false)
         {
             item.Status = WorkItemStatus.Pending;
             item.AssignedNodeId = null;
@@ -1855,8 +1855,11 @@ public class TranscodingService
                 _workQueue.Sort((a, b) => b.Bitrate.CompareTo(a.Bitrate));
             }
 
-            _ = _hubContext.Clients.All.SendAsync("WorkItemUpdated", item);
-            Console.WriteLine($"Cluster: Re-queued {item.FileName} for processing");
+            if (!silent)
+            {
+                _ = _hubContext.Clients.All.SendAsync("WorkItemUpdated", item);
+                Console.WriteLine($"Cluster: Re-queued {item.FileName} for processing");
+            }
         }
 
         /// <summary>

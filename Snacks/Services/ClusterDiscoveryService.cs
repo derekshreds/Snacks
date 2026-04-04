@@ -517,12 +517,14 @@ public sealed class ClusterDiscoveryService
         var workDir = Environment.GetEnvironmentVariable("SNACKS_WORK_DIR")
             ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Snacks", "work");
 
+        var diskSpace = GetAvailableDiskSpace(workDir);
+
         return new WorkerCapabilities
         {
             GpuVendor              = _detectedGpuVendor ?? "none",
             SupportedEncoders      = _supportedEncoders ?? BuildSupportedEncodersList(),
             OsPlatform             = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "Windows" : "Linux",
-            AvailableDiskSpaceBytes = GetAvailableDiskSpace(workDir),
+            AvailableDiskSpaceBytes = diskSpace,
             CanAcceptJobs          = _transcodingService.GetActiveWorkItem() == null
         };
     }
@@ -662,8 +664,11 @@ public sealed class ClusterDiscoveryService
     {
         try
         {
-            var dir   = _config.NodeTempDirectory ?? workDir;
-            var drive = new DriveInfo(Path.GetPathRoot(dir) ?? dir);
+            var dir = string.IsNullOrWhiteSpace(_config.NodeTempDirectory) ? workDir : _config.NodeTempDirectory;
+            Directory.CreateDirectory(dir);
+            var root = Path.GetPathRoot(Path.GetFullPath(dir));
+            if (string.IsNullOrEmpty(root)) return 0;
+            var drive = new DriveInfo(root);
             return drive.AvailableFreeSpace;
         }
         catch

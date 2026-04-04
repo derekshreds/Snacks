@@ -582,9 +582,6 @@ public sealed class ClusterService : IHostedService, IDisposable
                         node.ActiveWorkItemId = null;
                     }
 
-                    if (heartbeat.TryGetProperty("diskSpace", out var diskSpace) && node.Capabilities != null)
-                        node.Capabilities.AvailableDiskSpaceBytes = diskSpace.GetInt64();
-
                     if (heartbeat.TryGetProperty("capabilities", out var caps))
                     {
                         try
@@ -654,7 +651,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                 var bestNode = FindBestWorker(workItem, options);
                 if (bestNode == null)
                 {
-                    _transcodingService.RequeueWorkItem(workItem);
+                    _transcodingService.RequeueWorkItem(workItem, silent: true);
                     break;
                 }
 
@@ -1082,7 +1079,20 @@ public sealed class ClusterService : IHostedService, IDisposable
             }
         }
 
-        return bestScore > 0 ? best : null;
+        if (bestScore <= 0)
+        {
+            foreach (var node in available)
+            {
+                var caps = node.Capabilities;
+                Console.WriteLine($"Cluster: Node {node.Hostname} scored {ScoreNode(node, workItem, options)} — " +
+                    $"disk={caps?.AvailableDiskSpaceBytes / (1024 * 1024)}MB, " +
+                    $"fileSize={workItem.Size / (1024 * 1024)}MB, " +
+                    $"gpu={caps?.GpuVendor ?? "n/a"}");
+            }
+            return null;
+        }
+
+        return best;
     }
 
     /// <summary> Assigns a numeric score to a candidate worker node for the given job. </summary>
