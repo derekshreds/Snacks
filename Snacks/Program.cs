@@ -99,6 +99,7 @@ builder.Services.AddSingleton<MediaFileRepository>();
 builder.Services.AddSingleton<FfprobeService>();
 builder.Services.AddSingleton<FileService>();
 builder.Services.AddSingleton<TranscodingService>();
+builder.Services.AddSingleton<StateTransitionService>();
 builder.Services.AddHttpClient();
 builder.Services.AddSingleton<ClusterService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<ClusterService>());

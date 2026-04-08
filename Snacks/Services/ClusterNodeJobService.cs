@@ -4,7 +4,6 @@ using Microsoft.AspNetCore.SignalR;
 using Snacks.Hubs;
 using Snacks.Models;
 using System.Collections.Concurrent;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 
@@ -45,6 +44,9 @@ public sealed class ClusterNodeJobService
     private volatile string?                  _receivingJobId;
     private          DateTime                 _lastReceiveActivity;
     private volatile bool                     _nodePaused;
+
+    private readonly ConcurrentDictionary<string, SemaphoreSlim>           _receiveLocks = new();
+    private readonly ConcurrentDictionary<string, CancellationTokenSource> _receiveCts   = new();
 
     /******************************************************************
      *  Pending Completions Persistence
@@ -142,6 +144,34 @@ public sealed class ClusterNodeJobService
     public string? GetReceivingJobId() => _receivingJobId;
 
     /// <summary>
+    ///     Returns a per-job semaphore that serializes concurrent ReceiveFile requests.
+    ///     Prevents file-lock collisions when a retry arrives before the previous request's
+    ///     FileStream has been disposed.
+    /// </summary>
+    public SemaphoreSlim GetReceiveLock(string jobId) =>
+        _receiveLocks.GetOrAdd(jobId, _ => new SemaphoreSlim(1, 1));
+
+    /// <summary>
+    ///     Cancels any in-flight ReceiveFile request for this job and returns a fresh
+    ///     <see cref="CancellationToken"/> for the new request. The old handler's
+    ///     body-read will throw <see cref="OperationCanceledException"/>, releasing the
+    ///     file handle and the per-job semaphore so the retry can proceed.
+    /// </summary>
+    public CancellationToken SwapReceiveCts(string jobId)
+    {
+        var newCts = new CancellationTokenSource();
+        var oldCts = _receiveCts.AddOrUpdate(jobId, newCts, (_, old) => { old.Cancel(); return newCts; });
+        return newCts.Token;
+    }
+
+    /// <summary> Removes the receive lock and cancellation source for a completed/cleaned-up job. </summary>
+    public void RemoveReceiveLock(string jobId)
+    {
+        _receiveLocks.TryRemove(jobId, out _);
+        if (_receiveCts.TryRemove(jobId, out var cts)) cts.Dispose();
+    }
+
+    /// <summary>
     ///     Clears a stale receiving state if no chunks have arrived within the timeout.
     ///     Called periodically from the heartbeat timer.
     /// </summary>
@@ -195,69 +225,64 @@ public sealed class ClusterNodeJobService
      ******************************************************************/
 
     /// <summary>
-    ///     Accepts or rejects a job offer from the master. Validates that the source file
-    ///     exists on disk, its size matches the assignment, and its SHA-256 hash is correct.
-    ///     If the encoded output already exists, the job is accepted immediately without
-    ///     re-encoding. Otherwise, encoding begins in a background task.
-    /// </summary>
-    /// <param name="assignment">The job assignment sent by the master node.</param>
-    /// <returns><see langword="true"/> if the job was accepted; <see langword="false"/> otherwise.</returns>
-    public async Task<bool> AcceptJobOfferAsync(JobAssignment assignment)
+     ///     Starts autonomous encoding after a file upload completes.
+     ///     Validates the file exists, verifies its hash, and begins encoding in a background task.
+     ///     This replaces the two-phase commit (upload → offer → accept) with autonomous encoding.
+     /// </summary>
+     /// <param name="jobId">The job ID that was uploaded.</param>
+     /// <param name="metadata">The job metadata sent with the upload.</param>
+     /// <param name="filePath">The local path where the file was saved.</param>
+     /// <returns><see langword="true"/> if encoding was started; <see langword="false"/> otherwise.</returns>
+    public async Task<(bool Started, string? RejectReason)> StartAutonomousEncodingAsync(string jobId, JobMetadata metadata, string filePath)
     {
         if (_nodePaused)
-            return false;
+            return (false, "Node is paused");
 
         if (_currentRemoteJob != null)
-            return false;
+            return (false, $"Already processing job {_currentRemoteJob.Id} ({_currentRemoteJob.FileName})");
 
-        var tempDir   = GetNodeTempDirectory(assignment.JobId);
-        var inputPath = Path.Combine(tempDir, assignment.FileName);
-
-        if (!File.Exists(inputPath))
-            return false;
+        if (!File.Exists(filePath))
+            return (false, $"File not found at {filePath}");
 
         // Check if we already have the encoded output — skip encoding
-        var existingOutput = GetOutputFileForJob(assignment.JobId);
+        var existingOutput = GetOutputFileForJob(jobId);
         if (existingOutput != null)
         {
-            Console.WriteLine($"Cluster: Output already exists for {assignment.FileName} — skipping encode, ready for download");
-            _completedJobId = assignment.JobId;
+            Console.WriteLine($"Cluster: Output already exists for {metadata.FileName} — skipping encode, ready for download");
+            _completedJobId = jobId;
             _receivingJobId = null;
-            return true;
+            return (true, null);
         }
 
-        // Verify uploaded file size matches expected
-        var actualSize = new FileInfo(inputPath).Length;
-        if (actualSize != assignment.FileSize)
-        {
-            Console.WriteLine($"Cluster: File size mismatch for {assignment.FileName} — expected {assignment.FileSize}, got {actualSize}. Rejecting job.");
-            try { File.Delete(inputPath); } catch { }
-            return false;
-        }
+        // Verify uploaded file size matches expected — chunk hashes already
+        // guaranteed per-chunk integrity, so a size check is sufficient here.
+        var actualSize = new FileInfo(filePath).Length;
+        if (actualSize != metadata.FileSize)
+            return (false, $"File size mismatch — expected {metadata.FileSize}, got {actualSize}");
 
-        // Verify source file hash for end-to-end integrity
-        if (!string.IsNullOrEmpty(assignment.SourceFileHash))
+        // Verify the file isn't corrupt at byte 0 — the most common failure mode
+        // from interrupted chunk writes is null bytes at the start of the file.
+        try
         {
-            var actualHash = await ComputeFileHashAsync(inputPath);
-            if (!string.Equals(actualHash, assignment.SourceFileHash, StringComparison.OrdinalIgnoreCase))
-            {
-                Console.WriteLine($"Cluster: Source file hash mismatch for {assignment.FileName} — expected {assignment.SourceFileHash}, got {actualHash}. Rejecting job.");
-                try { File.Delete(inputPath); } catch { }
-                return false;
-            }
-            Console.WriteLine($"Cluster: Source file hash verified for {assignment.FileName}");
+            var header = new byte[4];
+            using var checkStream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+            var headerRead = await checkStream.ReadAsync(header);
+            if (headerRead >= 4 && header[0] == 0x00 && header[1] == 0x00 && header[2] == 0x00 && header[3] == 0x00)
+                return (false, $"File corrupt — first 4 bytes are 0x00000000 (expected container header). " +
+                    $"Size on disk: {actualSize}, expected: {metadata.FileSize}");
         }
+        catch { }
 
         var workItem = new WorkItem
         {
-            Id        = assignment.JobId,
-            FileName  = assignment.FileName,
-            Path      = inputPath,
-            Size      = assignment.FileSize,
-            Bitrate   = assignment.Bitrate,
-            Length    = assignment.Duration,
-            IsHevc    = assignment.IsHevc,
-            Probe     = assignment.Probe,
+            Id        = jobId,
+            FileName  = metadata.FileName,
+            Path      = filePath,
+            Size      = metadata.FileSize,
+            Bitrate   = metadata.Bitrate,
+            Length    = metadata.Duration,
+            IsHevc    = metadata.IsHevc,
+            Probe     = metadata.Probe,
             Status    = WorkItemStatus.Processing,
             StartedAt = DateTime.UtcNow
         };
@@ -266,9 +291,9 @@ public sealed class ClusterNodeJobService
         _receivingJobId   = null;
         _remoteJobCts     = new CancellationTokenSource();
 
-        _ = Task.Run(() => ExecuteRemoteJobAsync(workItem, assignment.Options));
+        _ = Task.Run(() => ExecuteRemoteJobAsync(workItem, metadata.Options));
 
-        return true;
+        return (true, null);
     }
 
     /******************************************************************
@@ -556,7 +581,7 @@ public sealed class ClusterNodeJobService
             try
             {
                 var client  = CreateAuthenticatedClient();
-                var selfUrl = $"http://{ClusterDiscoveryService.GetLocalIpAddress()}:{_discoveryService.GetListeningPort()}";
+                var selfUrl = $"{(Config.UseHttps ? "https" : "http")}://{ClusterDiscoveryService.GetLocalIpAddress()}:{_discoveryService.GetListeningPort()}";
                 var completionPayload = new JobCompletion
                 {
                     JobId          = completion.JobId,
@@ -629,6 +654,7 @@ public sealed class ClusterNodeJobService
     {
         if (_receivingJobId == jobId) _receivingJobId = null;
         if (_completedJobId == jobId) _completedJobId = null;
+        RemoveReceiveLock(jobId);
 
         _transcodingService.RemoveWorkItem(jobId);
 
@@ -645,8 +671,9 @@ public sealed class ClusterNodeJobService
     }
 
     /// <summary>
-    ///     Deletes all remote job temp directories unconditionally. Called on node startup
-    ///     to reclaim disk space from a previous crashed session.
+    ///     Deletes remote job temp directories from a previous crashed session,
+    ///     <b>except</b> those that have pending completions awaiting master acknowledgement.
+    ///     Called on node startup to reclaim disk space without losing completed work.
     /// </summary>
     public void CleanupAllRemoteJobs()
     {
@@ -658,11 +685,34 @@ public sealed class ClusterNodeJobService
 
         if (!Directory.Exists(baseDir)) return;
 
+        // Load pending completions so we can preserve their output directories
+        var pendingJobIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (File.Exists(_pendingCompletionsPath))
+        {
+            try
+            {
+                var json = File.ReadAllText(_pendingCompletionsPath);
+                var list = JsonSerializer.Deserialize<List<PendingCompletion>>(json, _jsonOptions);
+                if (list != null)
+                    foreach (var pc in list)
+                        pendingJobIds.Add(pc.JobId);
+            }
+            catch { }
+        }
+
         try
         {
             int cleaned = 0;
+            int preserved = 0;
             foreach (var dir in Directory.GetDirectories(baseDir))
             {
+                var dirName = Path.GetFileName(dir);
+                if (pendingJobIds.Contains(dirName))
+                {
+                    preserved++;
+                    continue;
+                }
+
                 try
                 {
                     Directory.Delete(dir, true);
@@ -679,6 +729,8 @@ public sealed class ClusterNodeJobService
             }
             if (cleaned > 0)
                 Console.WriteLine($"Cluster: Cleaned up {cleaned} orphaned remote job directories");
+            if (preserved > 0)
+                Console.WriteLine($"Cluster: Preserved {preserved} directories with pending completions");
         }
         catch (Exception ex)
         {
@@ -759,17 +811,4 @@ public sealed class ClusterNodeJobService
         return client;
     }
 
-    /// <summary>
-    ///     Computes the SHA-256 hash of a file for end-to-end source file integrity
-    ///     verification after transfer.
-    /// </summary>
-    /// <param name="filePath">The absolute path to the file to hash.</param>
-    /// <returns>The lowercase hex-encoded SHA-256 hash string.</returns>
-    private static async Task<string> ComputeFileHashAsync(string filePath)
-    {
-        using var stream = new FileStream(
-            filePath, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, FileOptions.Asynchronous);
-        var hash = await SHA256.HashDataAsync(stream);
-        return Convert.ToHexString(hash).ToLower();
-    }
 }

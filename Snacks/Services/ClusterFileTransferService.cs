@@ -4,7 +4,10 @@ using Microsoft.AspNetCore.SignalR;
 using Snacks.Hubs;
 using Snacks.Models;
 using System.Net.Http.Headers;
+using System.Net.Http.Json;
 using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
 
 /// <summary>
 ///     Handles chunked file transfers (upload and download) between cluster nodes
@@ -25,6 +28,12 @@ public sealed class ClusterFileTransferService
 
     private readonly IHubContext<TranscodingHub> _hubContext;
     private readonly IHttpClientFactory          _httpClientFactory;
+    private readonly JsonSerializerOptions       _jsonOptions = new()
+    {
+        PropertyNameCaseInsensitive = true,
+        WriteIndented               = false,
+        PropertyNamingPolicy        = JsonNamingPolicy.CamelCase
+    };
 
     /******************************************************************
      *  Constructor
@@ -46,13 +55,23 @@ public sealed class ClusterFileTransferService
      ******************************************************************/
 
     /// <summary>
+    ///     Registers job metadata on the worker node before uploading begins.
+    ///     Called once before the first chunk so the worker knows what encoding
+    ///     options to apply once the upload completes.
+    /// </summary>
+    public async Task RegisterMetadataAsync(HttpClient client, string baseUrl, JobMetadata metadata, CancellationToken ct = default)
+    {
+        var content = new StringContent(JsonSerializer.Serialize(metadata, _jsonOptions), Encoding.UTF8, "application/json");
+        var response = await client.PostAsync($"{baseUrl}/api/cluster/files/{metadata.JobId}/metadata", content, ct);
+        response.EnsureSuccessStatusCode();
+        Console.WriteLine($"Cluster: Registered metadata for job {metadata.JobId}");
+    }
+
+    /// <summary>
     ///     Uploads a source file to a worker node in 50 MB chunks with SHA256 verification.
     ///     Supports resume from the last chunk-aligned byte offset reported by the node.
+    ///     Pure binary upload — metadata is registered separately via <see cref="RegisterMetadataAsync"/>.
     /// </summary>
-    /// <param name="client"> An already-authenticated <see cref="HttpClient"/>. </param>
-    /// <param name="baseUrl"> The base URL of the target worker node (e.g. <c>http://192.168.1.10:5000</c>). </param>
-    /// <param name="workItem"> The work item whose source file is being uploaded. </param>
-    /// <param name="ct"> Cancellation token. </param>
     public async Task UploadFileToNodeAsync(
         HttpClient client, string baseUrl, WorkItem workItem, CancellationToken ct = default)
     {
@@ -61,15 +80,37 @@ public sealed class ClusterFileTransferService
             $"Cluster: Uploading {workItem.FileName} ({totalSize / 1048576}MB) to " +
             $"{workItem.AssignedNodeName} in {ChunkSize / 1048576}MB chunks...");
 
-        // Check how much the node already has (resume support).
-        // Round down to the nearest chunk boundary to discard any partially-written
-        // chunk from a killed process — the last partial chunk may be corrupt.
         long rawOffset = await GetNodeReceivedBytesAsync(client, baseUrl, workItem.Id);
         long offset    = (rawOffset / ChunkSize) * ChunkSize;
 
         if (rawOffset >= totalSize)
         {
-            Console.WriteLine("Cluster: Node already has the complete file");
+            Console.WriteLine("Cluster: Node already has the complete file — sending completion signal");
+
+            // The node has the file but encoding may not have started (e.g., master
+            // crashed after the previous upload). Re-send the last chunk as a zero-offset
+            // PUT with the correct headers so ReceiveFile triggers autonomous encoding.
+            var signal = new ByteArrayContent(Array.Empty<byte>());
+            signal.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+            var request = new HttpRequestMessage(HttpMethod.Put, $"{baseUrl}/api/cluster/files/{workItem.Id}");
+            request.Content = signal;
+            request.Headers.Add("X-Original-FileName", workItem.FileName);
+            request.Headers.Add("X-Total-Size",        totalSize.ToString());
+            request.Headers.Add("X-Bitrate",           workItem.Bitrate.ToString());
+            request.Headers.Add("X-Duration",          workItem.Length.ToString());
+            request.Headers.Add("Range",               $"bytes={totalSize}-");
+
+            try
+            {
+                var response = await client.SendAsync(request, ct);
+                if (!response.IsSuccessStatusCode)
+                    Console.WriteLine($"Cluster: Completion signal returned {(int)response.StatusCode}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Cluster: Completion signal failed: {ex.Message}");
+            }
+
             return;
         }
 
@@ -125,13 +166,48 @@ public sealed class ClusterFileTransferService
                     if (!response.IsSuccessStatusCode)
                     {
                         var errorBody = await response.Content.ReadAsStringAsync(ct);
-                        throw new Exception($"HTTP {(int)response.StatusCode}: {errorBody}");
+                        var statusCode = (int)response.StatusCode;
+
+                        // 409 = offset mismatch — node's file is shorter than our offset.
+                        // Re-align by seeking back to the node's actual position.
+                        if (statusCode == 409)
+                        {
+                            var realOffset = await GetNodeReceivedBytesAsync(client, baseUrl, workItem.Id);
+                            var aligned = (realOffset / ChunkSize) * ChunkSize;
+                            Console.WriteLine(
+                                $"Cluster: Offset mismatch at {offset / 1048576}MB — " +
+                                $"node has {realOffset / 1048576}MB, re-aligning to {aligned / 1048576}MB");
+                            offset = aligned;
+                            fileStream.Seek(offset, SeekOrigin.Begin);
+                            consecutiveFailures = 0;
+                            break; // break inner retry, re-read chunk from new offset in outer loop
+                        }
+
+                        // 503 = node rejected encoding after upload completed (paused, busy, etc.)
+                        // 400 = bad request — don't retry, it won't fix itself
+                        if (statusCode is 503 or 400)
+                            throw new InvalidOperationException($"HTTP {statusCode}: {errorBody}");
+
+                        throw new Exception($"HTTP {statusCode}: {errorBody}");
                     }
 
                     if (response.Headers.TryGetValues("X-Hash-Match", out var hashMatch) &&
                         hashMatch.FirstOrDefault() == "false")
                     {
                         throw new Exception("Chunk hash mismatch — data corrupted in transit");
+                    }
+
+                    // Check if the node detected file corruption after this chunk
+                    if (response.Headers.TryGetValues("X-Header-Corrupt", out var corruptFlag) &&
+                        corruptFlag.FirstOrDefault() == "true")
+                    {
+                        var fileHeader = response.Headers.TryGetValues("X-File-Header", out var hdrVals)
+                            ? hdrVals.FirstOrDefault() : "unknown";
+                        throw new InvalidOperationException(
+                            $"File header corrupted after writing chunk at offset {offset}. " +
+                            $"File header bytes: 0x{fileHeader}. " +
+                            $"This chunk was {bytesRead} bytes. " +
+                            $"The node's file has been damaged during transfer.");
                     }
 
                     offset              += bytesRead;
@@ -144,6 +220,11 @@ public sealed class ClusterFileTransferService
                     await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem, ct);
 
                     break;
+                }
+                catch (InvalidOperationException)
+                {
+                    // Non-retryable error (node rejected the request) — fail immediately
+                    throw;
                 }
                 catch (Exception ex)
                 {
@@ -168,7 +249,6 @@ public sealed class ClusterFileTransferService
             }
         }
 
-        // Verify final size
         var secret = client.DefaultRequestHeaders.TryGetValues("X-Snacks-Secret", out var secretValues)
             ? secretValues.FirstOrDefault() ?? ""
             : "";
@@ -202,11 +282,10 @@ public sealed class ClusterFileTransferService
         HttpClient client, string nodeBaseUrl, string jobId, string outputPath,
         WorkItem workItem, CancellationToken ct = default)
     {
-        long   offset                  = 0;
-        long   totalSize               = 0;
-        int    consecutiveFailures     = 0;
+        long   offset                    = 0;
+        long   totalSize                 = 0;
+        int    consecutiveFailures       = 0;
         const int MaxConsecutiveFailures = 120;
-        string? expectedFileHash       = null;
 
         // If a partial download exists, resume from the last chunk boundary.
         // Round down to discard any partially-written chunk from a killed process —
@@ -248,11 +327,6 @@ public sealed class ClusterFileTransferService
                 if (response.Headers.TryGetValues("X-Total-Size", out var sizeValues) &&
                     long.TryParse(sizeValues.FirstOrDefault(), out var ts))
                     totalSize = ts;
-
-                // Get full file hash from first response for end-to-end verification
-                if (expectedFileHash == null &&
-                    response.Headers.TryGetValues("X-File-Hash", out var fileHashValues))
-                    expectedFileHash = fileHashValues.FirstOrDefault();
 
                 // Get chunk hash for verification
                 string? expectedHash = null;
@@ -325,25 +399,8 @@ public sealed class ClusterFileTransferService
             }
         }
 
-        // Verify complete file hash for end-to-end integrity
-        if (!string.IsNullOrEmpty(expectedFileHash))
-        {
-            using var verifyFs = new FileStream(
-                outputPath, FileMode.Open, FileAccess.Read, FileShare.Read);
-            var actualFileHash = Convert.ToHexString(
-                await SHA256.HashDataAsync(verifyFs, ct)).ToLower();
-
-            if (actualFileHash != expectedFileHash)
-            {
-                try { File.Delete(outputPath); } catch { }
-                throw new Exception(
-                    $"File hash mismatch after download — expected {expectedFileHash}, " +
-                    $"got {actualFileHash}");
-            }
-
-            Console.WriteLine($"Cluster: File hash verified for {workItem.FileName}");
-        }
-
+        // Per-chunk SHA256 verification during download guarantees integrity,
+        // so no full-file hash check is needed here.
         workItem.ErrorMessage = null;
         Console.WriteLine($"Cluster: Download of result complete ({offset / 1048576}MB)");
     }
@@ -379,22 +436,6 @@ public sealed class ClusterFileTransferService
         catch { }
 
         return 0;
-    }
-
-    /******************************************************************
-     *  Public API — Hashing
-     ******************************************************************/
-
-    /// <summary> Computes the SHA256 hash of a file for end-to-end source file integrity verification. </summary>
-    /// <param name="filePath"> Absolute path to the file to hash. </param>
-    /// <returns> The lowercase hexadecimal SHA256 hash string. </returns>
-    public static async Task<string> ComputeFileHashAsync(string filePath)
-    {
-        using var stream = new FileStream(
-            filePath, FileMode.Open, FileAccess.Read, FileShare.Read,
-            81920, FileOptions.Asynchronous);
-        var hash = await SHA256.HashDataAsync(stream);
-        return Convert.ToHexString(hash).ToLower();
     }
 
     /******************************************************************

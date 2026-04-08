@@ -106,19 +106,32 @@ public sealed class ClusterController : ControllerBase
          ******************************************************************/
 
         /// <summary>
-        ///     Offers a transcoding job to this node. The node accepts when it is not paused,
-        ///     not already processing a job, and the source file is present in the temp directory.
-        ///     Returns 409 Conflict if the offer is rejected.
+        ///     Registers job metadata before a file upload begins.
+        ///     Called once by the master before the first chunk, so the worker
+        ///     knows what encoding options to apply once the upload completes.
         /// </summary>
-        /// <param name="assignment"> Job details including file info and encoding options. </param>
-        [HttpPost("jobs/offer")]
-        public async Task<IActionResult> OfferJob([FromBody] JobAssignment assignment)
+        /// <param name="jobId"> The job ID being registered. </param>
+        /// <param name="metadata"> Job metadata for autonomous encoding. </param>
+        [HttpPost("files/{jobId}/metadata")]
+        public IActionResult RegisterMetadata(string jobId, [FromBody] JobMetadata metadata)
         {
-            var accepted = await _clusterService.AcceptJobOfferAsync(assignment);
-            if (!accepted)
-                return Conflict(new { error = "Node is busy or source file not found" });
+            if (string.IsNullOrEmpty(metadata.JobId) || metadata.JobId != jobId)
+                return BadRequest(new { error = "Job ID mismatch" });
 
-            return Ok(new { accepted = true, jobId = assignment.JobId });
+            // Store metadata in temp directory as a JSON file for later retrieval.
+            var tempDir = _clusterService.GetNodeTempDirectory(jobId);
+            var metadataPath = Path.Combine(tempDir, "_metadata.json");
+            try
+            {
+                System.IO.File.WriteAllText(metadataPath, JsonSerializer.Serialize(metadata, _jsonOptions));
+                Console.WriteLine($"Cluster: Registered metadata for job {jobId}");
+                return Ok(new { registered = true });
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Cluster: Failed to register metadata: {ex.Message}");
+                return StatusCode(500, new { error = ex.Message });
+            }
         }
 
         /// <summary> Pauses or resumes this node. When paused, the node will not accept new job offers. </summary>
@@ -169,7 +182,9 @@ public sealed class ClusterController : ControllerBase
             if (node == null)
                 return Unauthorized(new { error = "Unknown node" });
 
-            var nodeBaseUrl = $"http://{node.IpAddress}:{node.Port}";
+            var config = _clusterService.GetConfig();
+            var scheme = config.UseHttps ? "https" : "http";
+            var nodeBaseUrl = $"{scheme}://{node.IpAddress}:{node.Port}";
             _ = Task.Run(() => _clusterService.HandleRemoteCompletionAsync(jobId, nodeBaseUrl));
             return Ok();
         }
@@ -207,6 +222,16 @@ public sealed class ClusterController : ControllerBase
         [RequestSizeLimit(75_000_000)] // 75MB — chunks are 50MB with headroom
         public async Task<IActionResult> ReceiveFile(string jobId)
         {
+            // Cancel any in-flight request for this job — the old handler's body-read will
+            // throw OperationCanceledException, releasing the file handle and semaphore.
+            var receiveCt   = _clusterService.SwapReceiveCts(jobId);
+            var receiveLock = _clusterService.GetReceiveLock(jobId);
+            var ct = CancellationTokenSource.CreateLinkedTokenSource(
+                HttpContext.RequestAborted, receiveCt).Token;
+
+            if (!await receiveLock.WaitAsync(TimeSpan.FromSeconds(30), ct))
+                return StatusCode(503, new { error = "Previous chunk still being written — try again" });
+
             try
             {
                 // Mark this node as busy receiving so that heartbeat reports the correct state.
@@ -223,43 +248,64 @@ public sealed class ClusterController : ControllerBase
                 if (rangeHeader != null && rangeHeader.StartsWith("bytes="))
                 {
                     var rangeStart = rangeHeader.Replace("bytes=", "").Split('-')[0];
-                    if (long.TryParse(rangeStart, out offset) && offset > 0 && System.IO.File.Exists(filePath))
-                    {
-                        var existingSize = new FileInfo(filePath).Length;
-                        if (offset > existingSize)
-                            offset = 0;
-                    }
+                    long.TryParse(rangeStart, out offset);
                 }
 
-                // Fresh start (offset 0, no Range header) for a job that already has data —
-                // truncate any existing files so we don't accumulate stale data from a previous attempt
-                if (offset == 0 && rangeHeader == null && System.IO.File.Exists(filePath) && new FileInfo(filePath).Length > 0)
+                // Guard: if offset > 0 the file MUST exist and be at least as large as offset.
+                // Writing at a non-zero offset to a missing or too-short file creates a
+                // zero-filled gap on NTFS, corrupting byte 0.
+                if (offset > 0)
                 {
-                    Console.WriteLine($"Cluster: Fresh upload start for job {jobId} — truncating existing {new FileInfo(filePath).Length} bytes");
+                    if (!System.IO.File.Exists(filePath))
+                    {
+                        return StatusCode(409, new
+                        {
+                            error = $"File does not exist but offset is {offset} — re-query received bytes",
+                            receivedBytes = 0L
+                        });
+                    }
+
+                    var existingSize = new FileInfo(filePath).Length;
+                    if (offset > existingSize)
+                    {
+                        return StatusCode(409, new
+                        {
+                            error = $"Offset {offset} beyond file size {existingSize} — re-query received bytes",
+                            receivedBytes = existingSize
+                        });
+                    }
                 }
 
                 var mode = offset > 0 ? FileMode.OpenOrCreate : FileMode.Create;
 
                 // Truncate file to the requested offset — discards any partially-written
-                // chunk from a previous killed process before we append new data
+                // chunk from a previous killed process before we append new data.
+                // If the file is locked (previous handler still unwinding after cancellation),
+                // wait briefly and retry rather than deleting the file which causes corruption.
                 if (offset > 0 && System.IO.File.Exists(filePath))
                 {
-                    try
+                    var currentSize = new FileInfo(filePath).Length;
+                    if (currentSize > offset)
                     {
-                        var currentSize = new FileInfo(filePath).Length;
-                        if (currentSize > offset)
+                        for (int truncAttempt = 0; truncAttempt < 5; truncAttempt++)
                         {
-                            using var truncStream = new FileStream(filePath, FileMode.Open, FileAccess.Write);
-                            truncStream.SetLength(offset);
+                            try
+                            {
+                                using var truncStream = new FileStream(filePath, FileMode.Open, FileAccess.Write);
+                                truncStream.SetLength(offset);
+                                break;
+                            }
+                            catch (IOException) when (truncAttempt < 4)
+                            {
+                                // Previous handler may still be unwinding — wait for it
+                                await Task.Delay(500, ct);
+                            }
+                            catch (IOException)
+                            {
+                                // Still locked after retries — reject this chunk so the master retries
+                                return StatusCode(503, new { error = "File still locked after retries", size = currentSize });
+                            }
                         }
-                    }
-                    catch (IOException)
-                    {
-                        // File is locked by a zombie process — delete and start fresh
-                        Console.WriteLine($"Cluster: File locked for job {jobId} — deleting and starting fresh");
-                        try { System.IO.File.Delete(filePath); } catch { }
-                        offset = 0;
-                        mode = FileMode.Create;
                     }
                 }
 
@@ -268,16 +314,20 @@ public sealed class ClusterController : ControllerBase
                     ? null
                     : System.Security.Cryptography.IncrementalHash.CreateHash(System.Security.Cryptography.HashAlgorithmName.SHA256);
 
-                using (var fileStream = new FileStream(filePath, mode, FileAccess.Write, FileShare.None, 81920))
+                var fileStream = await OpenFileWithRetryAsync(filePath, mode, ct);
+                if (fileStream == null)
+                    return StatusCode(503, new { error = "File locked — previous write still unwinding" });
+
+                using (fileStream)
                 {
                     if (offset > 0)
                         fileStream.Seek(offset, SeekOrigin.Begin);
 
                     var buffer = new byte[81920];
                     int read;
-                    while ((read = await Request.Body.ReadAsync(buffer)) > 0)
+                    while ((read = await Request.Body.ReadAsync(buffer, ct)) > 0)
                     {
-                        await fileStream.WriteAsync(buffer.AsMemory(0, read));
+                        await fileStream.WriteAsync(buffer.AsMemory(0, read), ct);
                         incrementalHash?.AppendData(buffer.AsSpan(0, read));
                     }
                 }
@@ -299,6 +349,21 @@ public sealed class ClusterController : ControllerBase
                 var fileSize = new FileInfo(filePath).Length;
                 Response.Headers["X-Hash-Match"] = hashValid.ToString().ToLower();
 
+                // Diagnostic: verify file header hasn't been corrupted after this chunk write.
+                // Report the first 4 bytes in the response so the master can detect corruption.
+                try
+                {
+                    using var verifyStream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+                    var headerBytes = new byte[4];
+                    _ = await verifyStream.ReadAsync(headerBytes);
+                    var headerHex = Convert.ToHexString(headerBytes).ToLower();
+                    Response.Headers["X-File-Header"] = headerHex;
+
+                    if (headerBytes[0] == 0x00 && headerBytes[1] == 0x00)
+                        Response.Headers["X-Header-Corrupt"] = "true";
+                }
+                catch { }
+
                 var totalSizeHeader = Request.Headers["X-Total-Size"].FirstOrDefault();
                 long.TryParse(Request.Headers["X-Bitrate"].FirstOrDefault(), out var bitrate);
                 double.TryParse(Request.Headers["X-Duration"].FirstOrDefault(), out var duration);
@@ -312,7 +377,7 @@ public sealed class ClusterController : ControllerBase
                         fileName,
                         status = "Processing",
                         progress = 0,
-                        remoteJobPhase = "Downloading",
+                        remoteJobPhase = "Uploading",
                         transferProgress = percent,
                         assignedNodeName = "master",
                         size = totalSize,
@@ -320,15 +385,61 @@ public sealed class ClusterController : ControllerBase
                         length = duration,
                         createdAt = DateTime.UtcNow
                     });
+
+                    // Check if upload is complete and trigger autonomous encoding
+                    if (fileSize >= totalSize)
+                    {
+                        var metadataPath = Path.Combine(tempDir, "_metadata.json");
+                        if (!System.IO.File.Exists(metadataPath))
+                        {
+                            return StatusCode(500, new { error = $"Metadata file missing at {metadataPath}", size = fileSize });
+                        }
+
+                        JobMetadata? metadata;
+                        try
+                        {
+                            var metadataJson = System.IO.File.ReadAllText(metadataPath);
+                            metadata = JsonSerializer.Deserialize<JobMetadata>(metadataJson, _jsonOptions);
+                        }
+                        catch (Exception ex)
+                        {
+                            return StatusCode(500, new { error = $"Metadata deserialization failed: {ex.Message}", size = fileSize });
+                        }
+
+                        if (metadata == null)
+                        {
+                            return StatusCode(500, new { error = "Metadata deserialized to null", size = fileSize });
+                        }
+
+                        var (started, rejectReason) = await _clusterService.StartAutonomousEncodingAsync(jobId, metadata, filePath);
+
+                        // Clean up metadata file
+                        try { System.IO.File.Delete(metadataPath); } catch { }
+
+                        if (!started)
+                        {
+                            return StatusCode(503, new { error = $"Node rejected encoding: {rejectReason}", size = fileSize });
+                        }
+                    }
                 }
 
                 return Ok(new { received = true, size = fileSize, hashValid });
             }
+            catch (OperationCanceledException)
+            {
+                // Client disconnected — silently release the lock so the next request proceeds.
+                return StatusCode(499, new { error = "Client disconnected" });
+            }
             catch (Exception ex)
             {
                 Console.WriteLine($"Cluster: ReceiveFile error for job {jobId}: {ex.Message}");
-                _clusterService.SetReceivingJob(null);
+                // Don't clear receiving state on transient errors — the master will retry
+                // and ExpireStaleReceiving() handles the case where retries stop entirely.
                 return StatusCode(500, new { error = ex.Message });
+            }
+            finally
+            {
+                receiveLock.Release();
             }
         }
 
@@ -350,7 +461,9 @@ public sealed class ClusterController : ControllerBase
                     return Ok();
                 }
 
-                var files = Directory.GetFiles(tempDir).Where(f => !f.Contains("[snacks]")).ToArray();
+                var files = Directory.GetFiles(tempDir)
+                    .Where(f => !f.Contains("[snacks]") && !Path.GetFileName(f).StartsWith("_"))
+                    .ToArray();
                 if (files.Length == 0)
                 {
                     Response.Headers["X-Received-Bytes"] = "0";
@@ -417,15 +530,6 @@ public sealed class ClusterController : ControllerBase
             length = (int)chunkStream.Length;
             var chunkHash = Convert.ToHexString(incrementalHash.GetHashAndReset()).ToLower();
 
-            // Compute full file hash for end-to-end integrity verification (first request only)
-            string? fullFileHash = null;
-            if (offset == 0)
-            {
-                using var fullFs = new FileStream(outputPath, FileMode.Open, FileAccess.Read, FileShare.Read);
-                var fullHash = await System.Security.Cryptography.SHA256.HashDataAsync(fullFs);
-                fullFileHash = Convert.ToHexString(fullHash).ToLower();
-            }
-
             var percent = totalSize > 0 ? (int)((offset + length) * 100 / totalSize) : 0;
             await _hubContext.Clients.All.SendAsync("WorkItemUpdated", new
             {
@@ -445,8 +549,6 @@ public sealed class ClusterController : ControllerBase
             Response.Headers["X-Total-Size"] = totalSize.ToString();
             Response.Headers["X-Chunk-Hash"] = chunkHash;
             Response.Headers["Content-Range"] = $"bytes {offset}-{offset + length - 1}/{totalSize}";
-            if (fullFileHash != null)
-                Response.Headers["X-File-Hash"] = fullFileHash;
 
             chunkStream.Position = 0;
             return File(chunkStream, "application/octet-stream");
@@ -518,5 +620,33 @@ public sealed class ClusterController : ControllerBase
             return Ok(new { cleaned = true });
         }
 
-    }
+        /******************************************************************
+         *  Helpers
+         ******************************************************************/
 
+        /// <summary>
+        ///     Opens a file for writing, retrying up to 5 times with 500ms delays if the
+        ///     file is locked by a previous handler that is still unwinding after cancellation.
+        /// </summary>
+        private static async Task<FileStream?> OpenFileWithRetryAsync(
+            string path, FileMode mode, CancellationToken ct)
+        {
+            for (int attempt = 0; attempt < 5; attempt++)
+            {
+                try
+                {
+                    return new FileStream(path, mode, FileAccess.Write, FileShare.None, 81920);
+                }
+                catch (IOException) when (attempt < 4)
+                {
+                    await Task.Delay(500, ct);
+                }
+                catch (IOException)
+                {
+                    return null;
+                }
+            }
+            return null;
+        }
+
+    }

@@ -92,7 +92,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
             _ = Task.Run(TriggerScanNowAsync);
 
         if (_clusterService.IsNodeMode)
-            _clusterService.CleanupAllRemoteJobs();
+            _clusterService.CleanupOldRemoteJobs(24);
     }
 
     /// <summary> Stops the scan timer. Active scans finish naturally. </summary>

@@ -48,12 +48,14 @@ public sealed class ClusterService : IHostedService, IDisposable
     private readonly IHubContext<TranscodingHub>                _hubContext;
     private readonly IHttpClientFactory                        _httpClientFactory;
     private readonly MediaFileRepository                       _mediaFileRepo;
+    private readonly StateTransitionService                    _stateTransitions;
     private readonly ConcurrentDictionary<string, ClusterNode> _nodes = new();
     private readonly ConcurrentDictionary<string, WorkItem>    _remoteJobs         = new();
     private readonly ConcurrentDictionary<string, bool>        _activeDownloads    = new();
     private readonly ConcurrentDictionary<string, bool>        _activeUploads      = new();
     private readonly ConcurrentDictionary<string, int>         _downloadRetryCounts = new();
     private readonly ConcurrentDictionary<string, CancellationTokenSource> _jobCts = new();
+    private readonly ConcurrentDictionary<string, StateTransitionService.TransitionScope> _activeTransitions = new();
     private readonly string _configPath;
     private readonly string _workDir;
     private readonly JsonSerializerOptions _jsonOptions = new()
@@ -99,7 +101,8 @@ public sealed class ClusterService : IHostedService, IDisposable
         FileService fileService,
         IHubContext<TranscodingHub> hubContext,
         IHttpClientFactory httpClientFactory,
-        MediaFileRepository mediaFileRepo)
+        MediaFileRepository mediaFileRepo,
+        StateTransitionService stateTransitions)
     {
         _transcodingService = transcodingService;
         _ffprobeService     = ffprobeService;
@@ -107,6 +110,7 @@ public sealed class ClusterService : IHostedService, IDisposable
         _hubContext         = hubContext;
         _httpClientFactory  = httpClientFactory;
         _mediaFileRepo      = mediaFileRepo;
+        _stateTransitions   = stateTransitions;
 
         _workDir = _fileService.GetWorkingDirectory();
         var configDir = Path.Combine(_workDir, "config");
@@ -274,6 +278,19 @@ public sealed class ClusterService : IHostedService, IDisposable
     /// <summary> Whether this node is paused and not accepting new jobs. </summary>
     public bool IsNodePaused => _nodeJobs.IsNodePaused;
 
+    /// <summary>
+    ///     Starts autonomous encoding on a worker node after a file upload completes.
+    ///     Called by the ClusterController.ReceiveFileWithMetadata endpoint.
+    /// </summary>
+    /// <param name="jobId"> The job ID that was uploaded. </param>
+    /// <param name="metadata"> The job metadata sent with the upload. </param>
+    /// <param name="filePath"> The local path where the file was saved. </param>
+    /// <returns> A tuple of (started, rejectReason). </returns>
+    public async Task<(bool Started, string? RejectReason)> StartAutonomousEncodingAsync(string jobId, JobMetadata metadata, string filePath)
+    {
+        return await _nodeJobs.StartAutonomousEncodingAsync(jobId, metadata, filePath);
+    }
+
     /// <summary> Whether this node is currently processing a remote job. </summary>
     public bool IsProcessingRemoteJob() => _nodeJobs.IsProcessingRemoteJob();
 
@@ -295,9 +312,11 @@ public sealed class ClusterService : IHostedService, IDisposable
     /// <summary> Sets the job ID being received during file transfer. </summary>
     public void SetReceivingJob(string? jobId) => _nodeJobs.SetReceivingJob(jobId);
 
-    /// <summary> Accepts or rejects a job offer from the master. </summary>
-    public Task<bool> AcceptJobOfferAsync(JobAssignment assignment) =>
-        _nodeJobs.AcceptJobOfferAsync(assignment);
+    /// <summary> Returns the per-job semaphore that serializes ReceiveFile requests. </summary>
+    public SemaphoreSlim GetReceiveLock(string jobId) => _nodeJobs.GetReceiveLock(jobId);
+
+    /// <summary> Cancels any in-flight receive for this job and returns a fresh cancellation token. </summary>
+    public CancellationToken SwapReceiveCts(string jobId) => _nodeJobs.SwapReceiveCts(jobId);
 
     /// <summary> Cancels a job running locally on this node. </summary>
     public void CancelRemoteJob(string jobId) => _nodeJobs.CancelRemoteJob(jobId);
@@ -510,11 +529,22 @@ public sealed class ClusterService : IHostedService, IDisposable
 
                 if (node.ActiveWorkItemId != null)
                 {
-                    if (!_activeUploads.ContainsKey(node.ActiveWorkItemId) &&
-                        !_activeDownloads.ContainsKey(node.ActiveWorkItemId))
-                        await HandleNodeFailureAsync(node.ActiveWorkItemId);
+                    var failJobId = node.ActiveWorkItemId;
+                    bool hasActiveTransfer = _activeUploads.ContainsKey(failJobId)
+                        || _activeDownloads.ContainsKey(failJobId);
+
+                    if (hasActiveTransfer)
+                    {
+                        // Cancel the transfer's CTS so the upload/download fails fast
+                        // instead of retrying against a dead node for hours.
+                        Console.WriteLine($"Cluster: Node {node.Hostname} unreachable — cancelling active transfer for {failJobId}");
+                        if (_jobCts.TryGetValue(failJobId, out var transferCts))
+                            transferCts.Cancel();
+                    }
                     else
-                        Console.WriteLine($"Cluster: Node {node.Hostname} unreachable but transfer active for {node.ActiveWorkItemId} — letting transfer handle retry");
+                    {
+                        await HandleNodeFailureAsync(failJobId);
+                    }
 
                     node.ActiveWorkItemId = null;
                 }
@@ -553,6 +583,10 @@ public sealed class ClusterService : IHostedService, IDisposable
                         node.Status          = NodeStatus.Busy;
                         node.ActiveWorkItemId = nodeJobId;
 
+                        // Node is actively working — clear any idle grace counter
+                        if (nodeJobId != null)
+                            _downloadRetryCounts.TryRemove($"_idle_grace_{nodeJobId}", out _);
+
                         // Sync progress from heartbeat as fallback
                         if (nodeJobId != null && heartbeat.TryGetProperty("progress", out var progProp) &&
                             _remoteJobs.TryGetValue(nodeJobId, out var trackedJob))
@@ -583,13 +617,51 @@ public sealed class ClusterService : IHostedService, IDisposable
                     }
                     else
                     {
-                        // Node is idle — reconcile if master expected a job
+                        // Node is idle — reconcile if master expected a job.
+                        // But DON'T re-queue immediately: there's a window between upload
+                        // completing and the node starting to encode where the heartbeat
+                        // shows idle. Also check completedJobId — the node may have finished.
                         if (node.ActiveWorkItemId != null && _remoteJobs.ContainsKey(node.ActiveWorkItemId)
                             && !_activeUploads.ContainsKey(node.ActiveWorkItemId)
                             && !_activeDownloads.ContainsKey(node.ActiveWorkItemId))
                         {
-                            Console.WriteLine($"Cluster: Node {node.Hostname} is idle but master expected job {node.ActiveWorkItemId} — re-queuing");
-                            await HandleNodeFailureAsync(node.ActiveWorkItemId);
+                            // Check if the node has the completed output for this job
+                            bool hasCompleted = heartbeat.TryGetProperty("completedJobId", out var compId)
+                                && compId.ValueKind != JsonValueKind.Null
+                                && compId.GetString() == node.ActiveWorkItemId;
+
+                            bool isReceiving = heartbeat.TryGetProperty("receivingJobId", out var recvId)
+                                && recvId.ValueKind != JsonValueKind.Null
+                                && recvId.GetString() == node.ActiveWorkItemId;
+
+                            if (hasCompleted)
+                            {
+                                Console.WriteLine($"Cluster: Node {node.Hostname} completed job {node.ActiveWorkItemId} — initiating download");
+                                var completionBaseUrl = NodeBaseUrl(node);
+                                _ = Task.Run(() => HandleRemoteCompletionAsync(node.ActiveWorkItemId, completionBaseUrl));
+                            }
+                            else if (isReceiving)
+                            {
+                                // Node is still receiving chunks — upload is in progress on the node side
+                                Console.WriteLine($"Cluster: Node {node.Hostname} is still receiving job {node.ActiveWorkItemId}");
+                            }
+                            else
+                            {
+                                // Use a grace counter: only re-queue after the node reports idle
+                                // for multiple consecutive heartbeats to avoid racing with encoding startup.
+                                var graceKey = $"_idle_grace_{node.ActiveWorkItemId}";
+                                var graceCount = _downloadRetryCounts.AddOrUpdate(graceKey, 1, (_, c) => c + 1);
+                                if (graceCount >= 3)
+                                {
+                                    Console.WriteLine($"Cluster: Node {node.Hostname} idle for {graceCount} heartbeats for job {node.ActiveWorkItemId} — re-queuing");
+                                    _downloadRetryCounts.TryRemove(graceKey, out _);
+                                    await HandleNodeFailureAsync(node.ActiveWorkItemId);
+                                }
+                                else
+                                {
+                                    Console.WriteLine($"Cluster: Node {node.Hostname} appears idle for job {node.ActiveWorkItemId} (grace {graceCount}/3)");
+                                }
+                            }
                         }
 
                         node.Status          = NodeStatus.Online;
@@ -683,8 +755,8 @@ public sealed class ClusterService : IHostedService, IDisposable
     }
 
     /// <summary>
-    ///     Uploads source file, verifies the upload, and sends the job assignment
-    ///     to the worker node.
+    ///     Uploads source file with embedded metadata, verifies the upload.
+    ///     The worker node begins encoding autonomously upon successful upload.
     /// </summary>
     private async Task DispatchToNodeAsync(ClusterNode node, WorkItem workItem, EncoderOptions options)
     {
@@ -712,6 +784,10 @@ public sealed class ClusterService : IHostedService, IDisposable
                 Console.WriteLine($"Cluster: Reusing previous job ID {workItem.Id} for {workItem.FileName}");
             }
 
+            // WAL: Queued → Uploading
+            var uploadScope = await _stateTransitions.BeginAsync(workItem.Id, "Queued", "Uploading");
+            _activeTransitions[workItem.Id] = uploadScope;
+
             workItem.AssignedNodeId   = node.NodeId;
             workItem.AssignedNodeName = node.Hostname;
             workItem.RemoteJobPhase   = "Uploading";
@@ -723,7 +799,26 @@ public sealed class ClusterService : IHostedService, IDisposable
             _remoteJobs[workItem.Id] = workItem;
             UpdateNodeStatus(node.NodeId, NodeStatus.Busy, workItem.Id, workItem.FileName);
 
+            await uploadScope.CompleteAsync();
+            _activeTransitions.TryRemove(workItem.Id, out _);
+
+            // Build metadata for autonomous encoding on the worker
+            var metadata = new JobMetadata
+            {
+                JobId    = workItem.Id,
+                FileName = workItem.FileName,
+                FileSize = workItem.Size,
+                Options  = CloneOptions(options),
+                Probe    = workItem.Probe,
+                Duration = workItem.Length,
+                Bitrate  = workItem.Bitrate,
+                IsHevc   = workItem.IsHevc
+            };
+
             var client = _discovery.CreateAuthenticatedClient();
+            // Register metadata on worker before uploading
+            await _fileTransfer.RegisterMetadataAsync(client, baseUrl, metadata, jobCts.Token);
+            // Upload file as pure binary chunks
             await _fileTransfer.UploadFileToNodeAsync(client, baseUrl, workItem, jobCts.Token);
 
             // Verify upload
@@ -735,49 +830,24 @@ public sealed class ClusterService : IHostedService, IDisposable
                 throw new Exception("Upload verification failed");
             }
 
+            // WAL: Uploading → Encoding
+            var encodeScope = await _stateTransitions.BeginAsync(workItem.Id, "Uploading", "Encoding");
+            _activeTransitions[workItem.Id] = encodeScope;
+
             workItem.RemoteJobPhase  = "Encoding";
             workItem.TransferProgress = 0;
             await _mediaFileRepo.UpdateRemoteJobPhaseAsync(Path.GetFullPath(workItem.Path), "Encoding");
             await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
 
-            var sourceFileHash = await ClusterFileTransferService.ComputeFileHashAsync(workItem.Path);
-            var assignment = new JobAssignment
-            {
-                JobId          = workItem.Id,
-                FileName       = workItem.FileName,
-                FileSize       = workItem.Size,
-                Options        = CloneOptions(options),
-                Probe          = workItem.Probe,
-                Duration       = workItem.Length,
-                Bitrate        = workItem.Bitrate,
-                IsHevc         = workItem.IsHevc,
-                SourceFileHash = sourceFileHash
-            };
+            await encodeScope.CompleteAsync();
+            _activeTransitions.TryRemove(workItem.Id, out _);
 
-            var assignContent = new StringContent(
-                JsonSerializer.Serialize(assignment, _jsonOptions),
-                Encoding.UTF8, "application/json");
-
-            for (int attempt = 0; attempt < 3; attempt++)
-            {
-                var offerResponse = await _discovery.CreateAuthenticatedClient()
-                    .PostAsync($"{baseUrl}/api/cluster/jobs/offer", assignContent);
-                if (offerResponse.IsSuccessStatusCode)
-                {
-                    Console.WriteLine($"Cluster: Job {workItem.FileName} dispatched to {node.Hostname}");
-                    return;
-                }
-
-                var errorBody = await offerResponse.Content.ReadAsStringAsync();
-                Console.WriteLine($"Cluster: Job offer rejected (attempt {attempt + 1}): {errorBody}");
-                if (attempt < 2) await Task.Delay(TimeSpan.FromSeconds(2));
-            }
-
-            throw new Exception("Job offer rejected after 3 attempts");
+            Console.WriteLine($"Cluster: Job {workItem.FileName} dispatched to {node.Hostname} (autonomous encoding)");
         }
         catch (Exception ex)
         {
             Console.WriteLine($"Cluster: Failed to dispatch {workItem.FileName} to {node.Hostname}: {ex.Message}");
+            await CompleteActiveTransitionAsync(workItem.Id);
             try { await _discovery.CreateAuthenticatedClient().DeleteAsync($"{baseUrl}/api/cluster/files/{workItem.Id}"); } catch { }
 
             workItem.AssignedNodeId   = null;
@@ -818,7 +888,8 @@ public sealed class ClusterService : IHostedService, IDisposable
 
     /// <summary>
     ///     Handles completion of a remote job: downloads the output, validates it,
-    ///     and performs file placement.
+    ///     and performs file placement. Separates download from validation so that
+    ///     download failures trigger re-downloads, not re-encodes.
     /// </summary>
     public async Task HandleRemoteCompletionAsync(string jobId, string nodeBaseUrl)
     {
@@ -840,13 +911,78 @@ public sealed class ClusterService : IHostedService, IDisposable
                 return;
             }
 
-            workItem.RemoteJobPhase  = "Downloading";
-            workItem.TransferProgress = 0;
-            await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
+            // Phase 1: Download
+            var downloadSucceeded = await DownloadOutputAsync(jobId, nodeBaseUrl, workItem);
+            if (!downloadSucceeded) return; // Will retry via pending completions
 
-            var options        = _transcodingService.GetLastOptions() ?? new EncoderOptions();
-            var ext            = options.Format == "mp4" ? ".mp4" : ".mkv";
-            var baseName       = Path.GetFileNameWithoutExtension(workItem.FileName);
+            // Phase 2: Validate
+            var options = _transcodingService.GetLastOptions() ?? new EncoderOptions();
+            var ext     = options.Format == "mp4" ? ".mp4" : ".mkv";
+            var baseName = Path.GetFileNameWithoutExtension(workItem.FileName);
+            var outputFileName = $"{baseName} [snacks]{ext}";
+            string outputDir;
+            if (!string.IsNullOrEmpty(options.EncodeDirectory))
+                outputDir = options.EncodeDirectory;
+            else if (!string.IsNullOrEmpty(options.OutputDirectory))
+                outputDir = options.OutputDirectory;
+            else
+                outputDir = _fileService.GetDirectory(workItem.Path);
+            var outputPath = Path.Combine(outputDir, outputFileName);
+
+            var validation = await ValidateOutputAsync(jobId, workItem, outputPath);
+
+            if (validation == OutputValidation.Success)
+            {
+                await FinalizeCompletionAsync(jobId, workItem, outputPath, options, nodeBaseUrl);
+            }
+            else if (validation == OutputValidation.DownloadCorrupt)
+            {
+                // Re-download, NOT re-encode
+                await RetryDownloadAsync(jobId, nodeBaseUrl, workItem);
+            }
+            else // validation == OutputValidation.EncodeCorrupt
+            {
+                // Output is fundamentally broken — re-encode
+                await RequeueForEncodingAsync(jobId, workItem, nodeBaseUrl);
+            }
+        }
+        finally
+        {
+            _activeDownloads.TryRemove(jobId, out _);
+        }
+    }
+
+    /// <summary>Result of output validation.</summary>
+    private enum OutputValidation { Success, DownloadCorrupt, EncodeCorrupt }
+
+    /// <summary>Downloads the encoded output from the worker node. Returns true on success.</summary>
+    private async Task<bool> DownloadOutputAsync(string jobId, string nodeBaseUrl, WorkItem workItem)
+    {
+        try
+        {
+            // WAL: Encoding → Downloading (only on first attempt, not retries)
+            if (workItem.RemoteJobPhase != "Downloading")
+            {
+                var dlScope = await _stateTransitions.BeginAsync(jobId, workItem.RemoteJobPhase ?? "Encoding", "Downloading");
+
+                workItem.RemoteJobPhase   = "Downloading";
+                workItem.TransferProgress = 0;
+                workItem.ErrorMessage     = null;
+                await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
+                await _mediaFileRepo.UpdateRemoteJobPhaseAsync(Path.GetFullPath(workItem.Path), "Downloading");
+
+                await dlScope.CompleteAsync();
+            }
+            else
+            {
+                workItem.TransferProgress = 0;
+                workItem.ErrorMessage     = null;
+                await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
+            }
+
+            var options  = _transcodingService.GetLastOptions() ?? new EncoderOptions();
+            var ext      = options.Format == "mp4" ? ".mp4" : ".mkv";
+            var baseName = Path.GetFileNameWithoutExtension(workItem.FileName);
             var outputFileName = $"{baseName} [snacks]{ext}";
 
             string outputDir;
@@ -865,53 +1001,11 @@ public sealed class ClusterService : IHostedService, IDisposable
             await _fileTransfer.DownloadFileFromNodeAsync(
                 dlClient, nodeBaseUrl, jobId, outputPath, workItem, dlCts?.Token ?? CancellationToken.None);
 
-            // Validate output
-            var outputProbe = await _ffprobeService.ProbeAsync(outputPath);
-            if (workItem.Probe != null && !_ffprobeService.ConvertedSuccessfully(workItem.Probe, outputProbe))
-            {
-                try { File.Delete(outputPath); } catch { }
-
-                var failCount = _downloadRetryCounts.AddOrUpdate($"_validation_{jobId}", 1, (_, c) => c + 1);
-
-                if (failCount >= 3)
-                {
-                    Console.WriteLine($"Cluster: Output validation failed {failCount} times for {workItem.FileName} — re-queuing for fresh encode");
-                    try { await _discovery.CreateAuthenticatedClient().DeleteAsync($"{nodeBaseUrl}/api/cluster/files/{jobId}"); } catch { }
-                    var prevNodeId = workItem.AssignedNodeId;
-                    _remoteJobs.TryRemove(jobId, out _);
-                    await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Queued);
-                    workItem.AssignedNodeId   = null;
-                    workItem.AssignedNodeName = null;
-                    workItem.RemoteJobPhase   = null;
-                    workItem.ErrorMessage     = null;
-                    _transcodingService.RequeueWorkItem(workItem);
-                    if (prevNodeId != null) UpdateNodeStatus(prevNodeId, NodeStatus.Online);
-                    return;
-                }
-
-                throw new Exception($"Validation failed ({failCount}) — duration mismatch in remote output");
-            }
-
-            await _transcodingService.HandleRemoteCompletion(workItem, outputPath, options);
-            await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Completed);
-            try { await _discovery.CreateAuthenticatedClient().DeleteAsync($"{nodeBaseUrl}/api/cluster/files/{jobId}"); } catch { }
-
-            if (workItem.AssignedNodeId != null)
-            {
-                UpdateNodeStatus(workItem.AssignedNodeId, NodeStatus.Online);
-                if (_nodes.TryGetValue(workItem.AssignedNodeId, out var node))
-                    node.CompletedJobs++;
-            }
-
-            _remoteJobs.TryRemove(jobId, out _);
-            _downloadRetryCounts.TryRemove(jobId, out _);
-            if (_jobCts.TryRemove(jobId, out var completedCts))
-                completedCts.Dispose();
-            Console.WriteLine($"Cluster: Remote job {workItem.FileName} completed successfully");
+            return true;
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Cluster: Remote completion failed for {workItem.FileName}: {ex.Message}");
+            Console.WriteLine($"Cluster: Download failed for {workItem.FileName}: {ex.Message}");
 
             var retryCount = _downloadRetryCounts.AddOrUpdate(jobId, 1, (_, c) => c + 1);
             const int MaxDownloadRetries = 10;
@@ -949,11 +1043,100 @@ public sealed class ClusterService : IHostedService, IDisposable
                     }
                 });
             }
+            return false;
         }
-        finally
+    }
+
+    /// <summary>Validates the downloaded output against the source probe data.</summary>
+    private async Task<OutputValidation> ValidateOutputAsync(string jobId, WorkItem workItem, string outputPath)
+    {
+        if (!File.Exists(outputPath))
+            return OutputValidation.DownloadCorrupt;
+
+        var outputProbe = await _ffprobeService.ProbeAsync(outputPath);
+        if (workItem.Probe != null && !_ffprobeService.ConvertedSuccessfully(workItem.Probe, outputProbe))
         {
-            _activeDownloads.TryRemove(jobId, out _);
+            var failCount = _downloadRetryCounts.AddOrUpdate($"_validation_{jobId}", 1, (_, c) => c + 1);
+
+            if (failCount >= 3)
+            {
+                Console.WriteLine($"Cluster: Output validation failed {failCount} times for {workItem.FileName} — output corrupt, need re-encode");
+                try { File.Delete(outputPath); } catch { }
+                return OutputValidation.EncodeCorrupt;
+            }
+
+            // Transient validation failure — try re-downloading
+            Console.WriteLine($"Cluster: Validation failed ({failCount}) — duration mismatch, retrying download");
+            try { File.Delete(outputPath); } catch { }
+            return OutputValidation.DownloadCorrupt;
         }
+
+        return OutputValidation.Success;
+    }
+
+    /// <summary>Finalizes a successfully validated output.</summary>
+    private async Task FinalizeCompletionAsync(string jobId, WorkItem workItem, string outputPath, EncoderOptions options, string nodeBaseUrl)
+    {
+        // WAL: Downloading → Completed
+        var completeScope = await _stateTransitions.BeginAsync(jobId, "Downloading", "Completed");
+
+        await _transcodingService.HandleRemoteCompletion(workItem, outputPath, options);
+        await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Completed);
+
+        await completeScope.CompleteAsync();
+        _activeTransitions.TryRemove(jobId, out _);
+
+        try { await _discovery.CreateAuthenticatedClient().DeleteAsync($"{nodeBaseUrl}/api/cluster/files/{jobId}"); } catch { }
+
+        if (workItem.AssignedNodeId != null)
+        {
+            UpdateNodeStatus(workItem.AssignedNodeId, NodeStatus.Online);
+            if (_nodes.TryGetValue(workItem.AssignedNodeId, out var node))
+                node.CompletedJobs++;
+        }
+
+        _remoteJobs.TryRemove(jobId, out _);
+        _downloadRetryCounts.TryRemove(jobId, out _);
+        _downloadRetryCounts.TryRemove($"_validation_{jobId}", out _);
+        if (_jobCts.TryRemove(jobId, out var completedCts))
+            completedCts.Dispose();
+        Console.WriteLine($"Cluster: Remote job {workItem.FileName} completed successfully");
+    }
+
+    /// <summary>Schedules a re-download of a corrupt output file without deleting the node's copy.</summary>
+    private async Task RetryDownloadAsync(string jobId, string nodeBaseUrl, WorkItem workItem)
+    {
+        workItem.RemoteJobPhase = "Downloading";
+        workItem.ErrorMessage   = "Output corrupt — re-downloading";
+        await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
+
+        // Schedule retry after the caller's finally block releases _activeDownloads.
+        // Do NOT delete the node's output — we need it for the re-download.
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(TimeSpan.FromSeconds(5));
+            await HandleRemoteCompletionAsync(jobId, nodeBaseUrl);
+        });
+    }
+
+    /// <summary>Re-queues a job for fresh encoding due to corrupt output.</summary>
+    private async Task RequeueForEncodingAsync(string jobId, WorkItem workItem, string nodeBaseUrl)
+    {
+        await CompleteActiveTransitionAsync(jobId);
+        try { await _discovery.CreateAuthenticatedClient().DeleteAsync($"{nodeBaseUrl}/api/cluster/files/{jobId}"); } catch { }
+        var prevNodeId = workItem.AssignedNodeId;
+        _remoteJobs.TryRemove(jobId, out _);
+        _downloadRetryCounts.TryRemove(jobId, out _);
+        _downloadRetryCounts.TryRemove($"_validation_{jobId}", out _);
+        if (_jobCts.TryRemove(jobId, out var cts))
+            cts.Dispose();
+        await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Queued);
+        workItem.AssignedNodeId   = null;
+        workItem.AssignedNodeName = null;
+        workItem.RemoteJobPhase   = null;
+        workItem.ErrorMessage     = null;
+        _transcodingService.RequeueWorkItem(workItem);
+        if (prevNodeId != null) UpdateNodeStatus(prevNodeId, NodeStatus.Online);
     }
 
     /// <summary>
@@ -995,6 +1178,7 @@ public sealed class ClusterService : IHostedService, IDisposable
     public async Task CancelRemoteJobOnNodeAsync(string jobId, string nodeId)
     {
         _remoteJobs.TryRemove(jobId, out _);
+        await CompleteActiveTransitionAsync(jobId);
 
         if (_jobCts.TryRemove(jobId, out var jobCts))
         {
@@ -1027,6 +1211,8 @@ public sealed class ClusterService : IHostedService, IDisposable
     private async Task HandleNodeFailureAsync(string jobId)
     {
         if (!_remoteJobs.TryRemove(jobId, out var workItem)) return;
+
+        await CompleteActiveTransitionAsync(jobId);
 
         if (_jobCts.TryRemove(jobId, out var jobCts))
         {
@@ -1136,8 +1322,126 @@ public sealed class ClusterService : IHostedService, IDisposable
     }
 
     /******************************************************************
+     *  WAL Cleanup
+     ******************************************************************/
+
+    /// <summary>
+    ///     Completes any in-flight WAL transition for a job so that the incomplete
+    ///     entry does not trigger spurious recovery on the next startup. Called from
+    ///     every failure, cancellation, and re-queue path.
+    /// </summary>
+    private async Task CompleteActiveTransitionAsync(string jobId)
+    {
+        if (_activeTransitions.TryRemove(jobId, out var scope))
+        {
+            try { await scope.CompleteAsync(); }
+            catch (Exception ex) { Console.WriteLine($"Cluster: WAL cleanup failed for {jobId}: {ex.Message}"); }
+        }
+    }
+
+    /******************************************************************
      *  Recovery
      ******************************************************************/
+
+    /// <summary>
+    ///     Processes incomplete WAL entries left by the previous session. Each entry
+    ///     represents a phase transition that was started but never completed, meaning
+    ///     the master crashed mid-operation. Corrects the DB phase so that the
+    ///     subsequent node-probing recovery loop starts from the right state.
+    /// </summary>
+    private async Task RecoverIncompleteTransitionsAsync()
+    {
+        var incomplete = await _stateTransitions.GetIncompleteTransitionsAsync();
+        if (incomplete.Count == 0) return;
+
+        Console.WriteLine($"Cluster: Found {incomplete.Count} incomplete WAL transition(s) — reconciling...");
+
+        foreach (var transition in incomplete)
+        {
+            var mediaFile = await _mediaFileRepo.GetByRemoteWorkItemIdAsync(transition.WorkItemId);
+            if (mediaFile == null)
+            {
+                Console.WriteLine($"Cluster: WAL entry for unknown job {transition.WorkItemId} ({transition.FromPhase} → {transition.ToPhase}) — discarding");
+                await _mediaFileRepo.CompleteTransitionAsync(transition.Id);
+                continue;
+            }
+
+            Console.WriteLine($"Cluster: WAL interrupted: {mediaFile.FileName} was transitioning {transition.FromPhase} → {transition.ToPhase} (DB phase: {mediaFile.RemoteJobPhase})");
+
+            switch (transition.ToPhase)
+            {
+                case "Uploading":
+                    // Crash during Queued → Uploading: assignment may be half-written.
+                    // Reset to Queued so dispatch picks it up cleanly.
+                    if (mediaFile.AssignedNodeId != null)
+                    {
+                        Console.WriteLine($"Cluster: Resetting {mediaFile.FileName} to Queued (interrupted assignment)");
+                        await _mediaFileRepo.ClearRemoteAssignmentAsync(mediaFile.FilePath, MediaFileStatus.Queued);
+                    }
+                    break;
+
+                case "Encoding":
+                    // Crash during Uploading → Encoding: upload finished but phase wasn't
+                    // updated. Correct the DB phase so node-probing recovery sees "Encoding".
+                    if (mediaFile.RemoteJobPhase == "Uploading" && mediaFile.AssignedNodeId != null)
+                    {
+                        Console.WriteLine($"Cluster: Advancing {mediaFile.FileName} to Encoding phase (upload was complete)");
+                        await _mediaFileRepo.UpdateRemoteJobPhaseAsync(mediaFile.FilePath, "Encoding");
+                    }
+                    break;
+
+                case "Downloading":
+                    // Crash during Encoding → Downloading: encoding done on node, master
+                    // didn't start downloading. Correct DB phase so node-probing detects output.
+                    if (mediaFile.RemoteJobPhase == "Encoding" && mediaFile.AssignedNodeId != null)
+                    {
+                        Console.WriteLine($"Cluster: Advancing {mediaFile.FileName} to Downloading phase (encoding was complete)");
+                        await _mediaFileRepo.UpdateRemoteJobPhaseAsync(mediaFile.FilePath, "Downloading");
+                    }
+                    break;
+
+                case "Completed":
+                    // Crash during Downloading → Completed: download finished, finalization
+                    // didn't complete. Check if the output file exists locally — if so, the
+                    // work is done and we just need to clear the assignment.
+                    if (mediaFile.AssignedNodeId != null)
+                    {
+                        var options = LoadEncoderOptions();
+                        var ext = options.Format == "mp4" ? ".mp4" : ".mkv";
+                        var baseName = Path.GetFileNameWithoutExtension(mediaFile.FileName);
+                        var outputFileName = $"{baseName} [snacks]{ext}";
+
+                        string outputDir;
+                        if (!string.IsNullOrEmpty(options.EncodeDirectory))
+                            outputDir = options.EncodeDirectory;
+                        else if (!string.IsNullOrEmpty(options.OutputDirectory))
+                            outputDir = options.OutputDirectory;
+                        else
+                            outputDir = _fileService.GetDirectory(mediaFile.FilePath);
+
+                        var outputPath = Path.Combine(outputDir, outputFileName);
+
+                        if (File.Exists(outputPath))
+                        {
+                            Console.WriteLine($"Cluster: Output exists for {mediaFile.FileName} — finalizing interrupted completion");
+                            await _mediaFileRepo.ClearRemoteAssignmentAsync(mediaFile.FilePath, MediaFileStatus.Completed);
+                        }
+                        else
+                        {
+                            // Output didn't survive — fall back to Downloading so node-probing re-downloads
+                            Console.WriteLine($"Cluster: Output missing for {mediaFile.FileName} — reverting to Downloading for re-download");
+                            await _mediaFileRepo.UpdateRemoteJobPhaseAsync(mediaFile.FilePath, "Downloading");
+                        }
+                    }
+                    break;
+            }
+
+            // Mark the WAL entry as resolved regardless of outcome
+            await _mediaFileRepo.CompleteTransitionAsync(transition.Id);
+        }
+
+        Console.WriteLine("Cluster: WAL recovery complete");
+    }
 
     /// <summary>
     ///     On master startup, checks for remote jobs that were in-flight when the
@@ -1148,6 +1452,9 @@ public sealed class ClusterService : IHostedService, IDisposable
     {
         try
         {
+            // Phase 0: Recover from incomplete WAL transitions (crashes mid-phase-change)
+            await RecoverIncompleteTransitionsAsync();
+
             var activeJobs = await _mediaFileRepo.GetActiveRemoteJobsAsync();
             if (activeJobs.Count == 0) return;
 
@@ -1330,7 +1637,21 @@ public sealed class ClusterService : IHostedService, IDisposable
                                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
                                 UpdateNodeStatus(nodeForDispatch.NodeId, NodeStatus.Busy, workItem.Id, workItem.FileName);
 
+                                // Build metadata for autonomous encoding on the worker
+                                var metadata = new JobMetadata
+                                {
+                                    JobId    = workItem.Id,
+                                    FileName = workItem.FileName,
+                                    FileSize = workItem.Size,
+                                    Options  = CloneOptions(options),
+                                    Probe    = workItem.Probe,
+                                    Duration = workItem.Length,
+                                    Bitrate  = workItem.Bitrate,
+                                    IsHevc   = workItem.IsHevc
+                                };
+
                                 var uploadClient = _discovery.CreateAuthenticatedClient();
+                                await _fileTransfer.RegisterMetadataAsync(uploadClient, baseUrl, metadata, recoveryCts.Token);
                                 await _fileTransfer.UploadFileToNodeAsync(uploadClient, baseUrl, workItem, recoveryCts.Token);
 
                                 var finalSize = await _fileTransfer.GetNodeReceivedBytesAsync(uploadClient, baseUrl, workItem.Id);
@@ -1343,49 +1664,22 @@ public sealed class ClusterService : IHostedService, IDisposable
                                     return;
                                 }
 
+                                // WAL: Uploading → Encoding (recovery path)
+                                var recEncScope = await _stateTransitions.BeginAsync(workItem.Id, "Uploading", "Encoding");
+
                                 workItem.RemoteJobPhase  = "Encoding";
                                 workItem.TransferProgress = 0;
                                 await _mediaFileRepo.UpdateRemoteJobPhaseAsync(mediaFile.FilePath, "Encoding");
                                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
 
-                                var sourceFileHash = await ClusterFileTransferService.ComputeFileHashAsync(workItem.Path);
-                                var assignment = new JobAssignment
-                                {
-                                    JobId          = workItem.Id,
-                                    FileName       = workItem.FileName,
-                                    FileSize       = workItem.Size,
-                                    Options        = CloneOptions(options),
-                                    Probe          = workItem.Probe,
-                                    Duration       = workItem.Length,
-                                    Bitrate        = workItem.Bitrate,
-                                    IsHevc         = workItem.IsHevc,
-                                    SourceFileHash = sourceFileHash
-                                };
+                                await recEncScope.CompleteAsync();
 
-                                var assignContent = new StringContent(
-                                    JsonSerializer.Serialize(assignment, _jsonOptions),
-                                    Encoding.UTF8, "application/json");
-
-                                for (int attempt = 0; attempt < 3; attempt++)
-                                {
-                                    var offerResponse = await _discovery.CreateAuthenticatedClient()
-                                        .PostAsync($"{baseUrl}/api/cluster/jobs/offer", assignContent);
-                                    if (offerResponse.IsSuccessStatusCode)
-                                    {
-                                        Console.WriteLine($"Cluster: Recovered job {workItem.FileName} dispatched to {nodeForDispatch.Hostname}");
-                                        return;
-                                    }
-                                    if (attempt < 2) await Task.Delay(2000);
-                                }
-
-                                Console.WriteLine($"Cluster: Job offer rejected after recovery — re-queuing {workItem.FileName}");
-                                _remoteJobs.TryRemove(workItem.Id, out _);
-                                await _mediaFileRepo.ClearRemoteAssignmentAsync(mediaFile.FilePath, MediaFileStatus.Queued);
-                                _transcodingService.RequeueWorkItem(workItem);
+                                Console.WriteLine($"Cluster: Recovered job {workItem.FileName} dispatched to {nodeForDispatch.Hostname} (autonomous encoding)");
                             }
                             catch (Exception ex)
                             {
                                 Console.WriteLine($"Cluster: Recovery upload failed for {workItem.FileName}: {ex.Message}");
+                                await CompleteActiveTransitionAsync(workItem.Id);
                                 _remoteJobs.TryRemove(workItem.Id, out _);
                                 try { await _mediaFileRepo.ClearRemoteAssignmentAsync(mediaFile.FilePath, MediaFileStatus.Queued); } catch { }
                                 _transcodingService.RequeueWorkItem(workItem);
