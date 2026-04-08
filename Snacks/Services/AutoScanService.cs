@@ -86,7 +86,11 @@ public sealed class AutoScanService : IHostedService, IDisposable
             Console.WriteLine("Queue was paused when app last shut down — staying paused.");
         }
 
-        _ = Task.Run(ResumeQueueFromDatabaseAsync);
+        _ = Task.Run(async () =>
+        {
+            await ResumeLocalQueueItemsAsync();
+            await ResumeRemoteQueueItemsAsync();
+        });
 
         if (_config.Enabled && _config.Directories.Count > 0)
             _ = Task.Run(TriggerScanNowAsync);
@@ -210,10 +214,10 @@ public sealed class AutoScanService : IHostedService, IDisposable
      ******************************************************************/
 
     /// <summary>
-    ///     Restores the queue from the database on startup. Files that were Queued or Processing
-    ///     when the app last shut down get re-added to the in-memory queue.
+    ///     Immediately restores local (non-remote) queue items on startup. Runs without
+    ///     waiting for cluster recovery so the UI shows the pending queue right away.
     /// </summary>
-    private async Task ResumeQueueFromDatabaseAsync()
+    private async Task ResumeLocalQueueItemsAsync()
     {
         if (_clusterService.IsNodeMode)
         {
@@ -223,36 +227,20 @@ public sealed class AutoScanService : IHostedService, IDisposable
 
         try
         {
-            if (_clusterService.IsMasterMode)
-            {
-                try
-                {
-                    await _clusterService.RecoveryCompleteTask.WaitAsync(TimeSpan.FromMinutes(3));
-                }
-                catch (TimeoutException)
-                {
-                    Console.WriteLine("Resume: Cluster recovery timed out after 3 minutes — proceeding");
-                }
-            }
-
             var options    = LoadEncoderOptions();
             var queued     = await _mediaFileRepo.GetFilesWithStatusAsync(MediaFileStatus.Queued);
             var processing = await _mediaFileRepo.GetFilesWithStatusAsync(MediaFileStatus.Processing);
-            var toResume   = queued.Concat(processing).ToList();
+            var localItems = queued.Concat(processing)
+                .Where(f => string.IsNullOrEmpty(f.AssignedNodeId))
+                .ToList();
 
-            if (toResume.Count == 0)
+            if (localItems.Count == 0)
                 return;
 
-            Console.WriteLine($"Resuming {toResume.Count} items from database...");
+            Console.WriteLine($"Resume: Immediately restoring {localItems.Count} local item(s) to queue");
 
-            foreach (var file in toResume)
+            foreach (var file in localItems)
             {
-                if (!string.IsNullOrEmpty(file.AssignedNodeId))
-                {
-                    Console.WriteLine($"Resume: Skipping {file.FileName} — assigned to remote node {file.AssignedNodeName}");
-                    continue;
-                }
-
                 if (!File.Exists(file.FilePath))
                 {
                     await _mediaFileRepo.SetStatusAsync(file.FilePath, MediaFileStatus.Unseen);
@@ -271,11 +259,72 @@ public sealed class AutoScanService : IHostedService, IDisposable
                 }
             }
 
-            Console.WriteLine("Queue resume complete.");
+            Console.WriteLine("Resume: Local queue restore complete");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Resume: Error restoring queue: {ex.Message}");
+            Console.WriteLine($"Resume: Error restoring local queue: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    ///     After cluster recovery completes, picks up any remote-assigned items that
+    ///     recovery didn't handle (orphans) and re-queues them locally as a safety net.
+    /// </summary>
+    private async Task ResumeRemoteQueueItemsAsync()
+    {
+        if (_clusterService.IsNodeMode) return;
+        if (!_clusterService.IsMasterMode) return;
+
+        try
+        {
+            try
+            {
+                await _clusterService.RecoveryCompleteTask.WaitAsync(TimeSpan.FromMinutes(3));
+            }
+            catch (TimeoutException)
+            {
+                Console.WriteLine("Resume: Cluster recovery timed out after 3 minutes — checking for orphaned remote items");
+            }
+
+            var options       = LoadEncoderOptions();
+            var queued        = await _mediaFileRepo.GetFilesWithStatusAsync(MediaFileStatus.Queued);
+            var processing    = await _mediaFileRepo.GetFilesWithStatusAsync(MediaFileStatus.Processing);
+            var remoteOrphans = queued.Concat(processing)
+                .Where(f => !string.IsNullOrEmpty(f.AssignedNodeId))
+                .ToList();
+
+            if (remoteOrphans.Count == 0)
+                return;
+
+            Console.WriteLine($"Resume: Checking {remoteOrphans.Count} remote item(s) not recovered by cluster");
+
+            foreach (var file in remoteOrphans)
+            {
+                if (!File.Exists(file.FilePath))
+                {
+                    await _mediaFileRepo.SetStatusAsync(file.FilePath, MediaFileStatus.Unseen);
+                    continue;
+                }
+
+                Console.WriteLine($"Resume: Orphaned remote item {file.FileName} — clearing assignment and re-queuing");
+                await _mediaFileRepo.ClearRemoteAssignmentAsync(file.FilePath, MediaFileStatus.Unseen);
+
+                try
+                {
+                    await _transcodingService.AddFileAsync(file.FilePath, options);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Resume: Failed to re-add {file.FileName}: {ex.Message}");
+                }
+            }
+
+            Console.WriteLine("Resume: Remote orphan check complete");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Resume: Error checking remote orphans: {ex.Message}");
         }
     }
 

@@ -473,7 +473,7 @@ public class TranscodingService
                 workItem.AssignedNodeName = null;
                 workItem.RemoteJobPhase = null;
                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
-                await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Cancelled);
+                await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Cancelled);
             }
             else if (workItem.Status == WorkItemStatus.Processing && _activeWorkItem?.Id == id)
             {
@@ -482,6 +482,17 @@ public class TranscodingService
                 workItem.CompletedAt = DateTime.UtcNow;
                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
                 await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Cancelled);
+            }
+            else if (workItem.Status == WorkItemStatus.Processing)
+            {
+                // Orphaned: processing but not assigned to a remote node or local encoder
+                workItem.Status = WorkItemStatus.Cancelled;
+                workItem.CompletedAt = DateTime.UtcNow;
+                workItem.AssignedNodeId = null;
+                workItem.AssignedNodeName = null;
+                workItem.RemoteJobPhase = null;
+                await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
+                await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Cancelled);
             }
         }
 
@@ -511,7 +522,7 @@ public class TranscodingService
                 workItem.AssignedNodeName = null;
                 workItem.RemoteJobPhase = null;
                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
-                await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Unseen);
+                await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Unseen);
             }
             else if (workItem.Status == WorkItemStatus.Processing && _activeWorkItem?.Id == id)
             {
@@ -520,6 +531,17 @@ public class TranscodingService
                 workItem.CompletedAt = DateTime.UtcNow;
                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
                 await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Unseen);
+            }
+            else if (workItem.Status == WorkItemStatus.Processing)
+            {
+                // Orphaned: processing but not assigned to a remote node or local encoder
+                workItem.Status = WorkItemStatus.Stopped;
+                workItem.CompletedAt = DateTime.UtcNow;
+                workItem.AssignedNodeId = null;
+                workItem.AssignedNodeName = null;
+                workItem.RemoteJobPhase = null;
+                await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
+                await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Unseen);
             }
         }
 

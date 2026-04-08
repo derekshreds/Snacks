@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-2.2.0-8b5cf6?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-2.2.1-8b5cf6?style=flat-square" alt="Version">
   <img src="https://img.shields.io/badge/.NET-10.0-512bd4?style=flat-square" alt=".NET 10">
   <img src="https://img.shields.io/badge/Electron-41-47848f?style=flat-square" alt="Electron">
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License">
@@ -118,7 +118,7 @@ Snacks can run as a standalone desktop app with native GPU acceleration.
 2. Download FFmpeg from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) (release full build)
 3. Place `ffmpeg.exe` and `ffprobe.exe` in `electron-app/ffmpeg/`
 4. Run `build-installer.bat`
-5. Install from `electron-app/dist/Snacks Setup 2.2.0.exe`
+5. Install from `electron-app/dist/Snacks Setup 2.2.1.exe`
 
 **For development:**
 
@@ -343,5 +343,5 @@ Creates a self-contained Windows installer at `electron-app/dist/` with the .NET
 ---
 
 <p align="center">
-  <strong>Snacks</strong> v2.2.0 &copy; 2026 Derek Morris
+  <strong>Snacks</strong> v2.2.1 &copy; 2026 Derek Morris
 </p>

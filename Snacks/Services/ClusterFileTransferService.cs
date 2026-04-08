@@ -221,6 +221,10 @@ public sealed class ClusterFileTransferService
 
                     break;
                 }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
                 catch (InvalidOperationException)
                 {
                     // Non-retryable error (node rejected the request) — fail immediately
@@ -371,6 +375,10 @@ public sealed class ClusterFileTransferService
 
                 // Check if we've downloaded everything
                 if (totalSize > 0 && offset >= totalSize) break;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
             }
             catch (Exception ex)
             {

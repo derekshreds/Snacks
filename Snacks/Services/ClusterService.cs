@@ -715,7 +715,6 @@ public sealed class ClusterService : IHostedService, IDisposable
     private async Task RunDispatchAsync()
     {
         if (!IsMasterMode) return;
-        if (!_recoveryComplete.Task.IsCompleted) return;
         if (_transcodingService.IsPaused) return;
         if (!await _dispatchLock.WaitAsync(0)) return;
 
@@ -843,6 +842,15 @@ public sealed class ClusterService : IHostedService, IDisposable
             _activeTransitions.TryRemove(workItem.Id, out _);
 
             Console.WriteLine($"Cluster: Job {workItem.FileName} dispatched to {node.Hostname} (autonomous encoding)");
+        }
+        catch (OperationCanceledException) when (jobCts.IsCancellationRequested)
+        {
+            // User-initiated cancellation — don't re-queue, let CancelWorkItemAsync handle status
+            Console.WriteLine($"Cluster: Upload cancelled by user for {workItem.FileName}");
+            await CompleteActiveTransitionAsync(workItem.Id);
+            try { await _discovery.CreateAuthenticatedClient().DeleteAsync($"{baseUrl}/api/cluster/files/{workItem.Id}"); } catch { }
+            _remoteJobs.TryRemove(workItem.Id, out _);
+            UpdateNodeStatus(node.NodeId, NodeStatus.Online);
         }
         catch (Exception ex)
         {

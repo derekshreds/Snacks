@@ -44,7 +44,7 @@ namespace Snacks.Controllers
             return Json(new {
                 status = "healthy",
                 timestamp = DateTime.UtcNow,
-                version = "2.2.0"
+                version = "2.2.1"
             });
         }
 
