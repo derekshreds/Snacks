@@ -1,5 +1,13 @@
-// Transcoding functionality with SignalR
+/**
+ * Main controller for the Snacks transcoding UI.
+ * Manages the SignalR connection, work item queue rendering, encoder settings,
+ * auto-scan configuration, and cluster panel for a single-page dashboard.
+ */
 class TranscodingManager {
+    /**
+     * Initializes state, starts SignalR, registers event handlers, and loads initial data.
+     * Re-syncs queue state whenever the page becomes visible (handles iOS Safari background suspension).
+     */
     constructor() {
         this.connection = null;
         this.workItems = new Map();
@@ -12,12 +20,16 @@ class TranscodingManager {
         this.queueTotal = 0;
         this.queueFilter = null; // null = all, 'Pending', 'Completed', 'Failed'
         this.isPaused = false;
+        this.clusterEnabled = false;
+        this.clusterRole = 'standalone';
+        this.workers = new Map();
         this.initializeSignalR();
         this.initializeEventHandlers();
         this.restoreSettings();
         this.loadAutoScanConfig();
         this.loadWorkItems();
         this.loadPauseState();
+        this.loadClusterConfig();
 
         // iOS Safari suspends WebSockets when the tab is backgrounded.
         // Re-check connection when the page becomes visible again.
@@ -33,6 +45,11 @@ class TranscodingManager {
         });
     }
 
+    /**
+     * Connects (or reconnects) to the SignalR hub at `/transcodingHub`.
+     * Registers all hub event handlers and sets up a periodic connection status check.
+     * Guards against concurrent initialization with a flag to prevent duplicate connections.
+     */
     async initializeSignalR() {
         // Prevent concurrent initialization
         if (this._signalingInit) return;
@@ -68,6 +85,40 @@ class TranscodingManager {
             this.connection.on("AutoScanCompleted", (newFiles, total) => {
                 showToast(`Auto-scan complete: ${newFiles} new file(s) found`, newFiles > 0 ? 'success' : 'info');
                 this.loadAutoScanConfig(false);
+            });
+
+            // Cluster events
+            this.connection.on("WorkerConnected", (node) => {
+                if (!this.workers.has(node.nodeId)) {
+                    showToast(`Node "${node.hostname}" connected`, 'success');
+                }
+                this.workers.set(node.nodeId, node);
+                this.renderClusterPanel();
+            });
+
+            this.connection.on("WorkerDisconnected", (nodeId) => {
+                const node = this.workers.get(nodeId);
+                this.workers.delete(nodeId);
+                this.renderClusterPanel();
+                if (node) showToast(`Node "${node.hostname}" disconnected`, 'warning');
+            });
+
+            this.connection.on("WorkerUpdated", (node) => {
+                this.workers.set(node.nodeId, node);
+                this.renderClusterPanel();
+            });
+
+            this.connection.on("ClusterConfigChanged", (config) => {
+                this.clusterEnabled = config.enabled;
+                this.clusterRole = config.role;
+                this.renderClusterPanel();
+                this.updateNodeBanner();
+            });
+
+            // Node: master paused/resumed us
+            this.connection.on("ClusterNodePaused", (paused) => {
+                this.isPaused = paused;
+                this.updatePauseButton();
             });
 
             // Register lifecycle handlers BEFORE start so they catch all events
@@ -110,6 +161,10 @@ class TranscodingManager {
         }
     }
 
+    /**
+     * Binds all static DOM event listeners for modals, settings form, pagination,
+     * filter tabs, and work item action buttons using event delegation where possible.
+     */
     initializeEventHandlers() {
         // Library modal event handlers
         document.getElementById('libraryModal').addEventListener('show.bs.modal', () => {
@@ -124,10 +179,14 @@ class TranscodingManager {
             this.processSelectedFiles();
         });
 
-        // Reload auto-scan config when settings modal opens
+        // Reload auto-scan and cluster config when settings modal opens
         document.getElementById('settingsModal')?.addEventListener('show.bs.modal', () => {
             this.loadAutoScanConfig();
+            this.loadClusterConfig();
         });
+
+        // Cluster event handlers
+        this.initializeClusterEventHandlers();
 
         document.getElementById('processDirectory').addEventListener('click', () => {
             this.processCurrentDirectory();
@@ -168,8 +227,50 @@ class TranscodingManager {
                 }, 1000);
             });
         }
+
+        // --- Delegated event handlers (bound once, survive DOM rebuilds) ---
+
+        // Work item action buttons (cancel/log) in both containers
+        for (const containerId of ['processingContainer', 'workItemsContainer']) {
+            document.getElementById(containerId)?.addEventListener('click', (e) => {
+                const btn = e.target.closest('[data-action]');
+                if (!btn) return;
+                const itemEl = btn.closest('.work-item');
+                const itemId = itemEl?.id?.replace('work-item-', '');
+                if (!itemId) return;
+                if (btn.dataset.action === 'remove') this.showStopCancelDialog(itemId);
+                if (btn.dataset.action === 'log') this.showLog(itemId);
+            });
+        }
+
+        // Pagination buttons
+        document.getElementById('queuePagination')?.addEventListener('click', (e) => {
+            const btn = e.target.closest('[data-page-action]');
+            if (!btn || btn.disabled) return;
+            const totalPages = Math.ceil(this.queueTotal / this.queuePageSize);
+            switch (btn.dataset.pageAction) {
+                case 'first': if (this.queuePage > 0) { this.queuePage = 0; this.loadWorkItems(); } break;
+                case 'prev': if (this.queuePage > 0) { this.queuePage--; this.loadWorkItems(); } break;
+                case 'next': if (this.queuePage < totalPages - 1) { this.queuePage++; this.loadWorkItems(); } break;
+                case 'last': if (this.queuePage < totalPages - 1) { this.queuePage = totalPages - 1; this.loadWorkItems(); } break;
+            }
+        });
+
+        // Filter tab buttons
+        document.getElementById('queueFilterTabs')?.addEventListener('click', (e) => {
+            const btn = e.target.closest('[data-filter]');
+            if (!btn) return;
+            const val = btn.dataset.filter;
+            this.queueFilter = val === '' ? null : val;
+            this.queuePage = 0;
+            this.loadWorkItems();
+        });
     }
 
+    /**
+     * Updates the connection status dot and label in the navbar.
+     * @param {boolean} connected - True when the SignalR hub is connected.
+     */
     updateConnectionStatus(connected) {
         const dot = document.getElementById('connectionDot');
         const text = document.getElementById('connectionText');
@@ -186,6 +287,10 @@ class TranscodingManager {
         }
     }
 
+    /**
+     * Fetches the top-level video directories from the server and renders them in the library modal.
+     * Each directory entry includes a "Watch" button to add it to auto-scan.
+     */
     async loadDirectories() {
         const container = document.getElementById('directoryList');
         const fileList = document.getElementById('fileList');
@@ -212,12 +317,12 @@ class TranscodingManager {
             
             const directoriesHtml = data.directories.map(dir => `
                 <div class="directory-item p-2 border-bottom d-flex justify-content-between align-items-center">
-                    <div class="flex-grow-1" data-path="${dir.path}" data-count="${dir.videoCount}" style="cursor: pointer;">
+                    <div class="flex-grow-1" data-path="${escapeHtml(dir.path)}" data-count="${dir.videoCount}" style="cursor: pointer;">
                         <i class="fas ${dir.videoCount === 0 ? 'fa-hdd' : 'fa-folder'} text-warning me-2"></i>
-                        <span>${dir.name}</span>
+                        <span>${escapeHtml(dir.name)}</span>
                         ${dir.videoCount > 0 ? `<small class="text-muted ms-2">${dir.videoCount} videos</small>` : ''}
                     </div>
-                    <button class="btn btn-sm btn-link p-0 ms-2 watch-dir-btn" data-path="${dir.path}" title="Watch (Auto-Scan)">
+                    <button class="btn btn-sm btn-link p-0 ms-2 watch-dir-btn" data-path="${escapeHtml(dir.path)}" title="Watch (Auto-Scan)">
                         <i class="fas fa-eye" style="color: var(--primary); opacity: 0.6;"></i>
                     </button>
                 </div>
@@ -241,10 +346,15 @@ class TranscodingManager {
             });
             
         } catch (error) {
-            container.innerHTML = `<div class="alert alert-danger">Error loading directories: ${error.message}</div>`;
+            container.innerHTML = `<div class="alert alert-danger">Error loading directories: ${escapeHtml(error.message)}</div>`;
         }
     }
 
+    /**
+     * Navigates into a directory, showing its subdirectories and process/watch action items.
+     * Also triggers a shallow file list load for the selected directory.
+     * @param {string} directoryPath - Absolute path of the directory to navigate into.
+     */
     async loadSubdirectories(directoryPath) {
         this.currentDirectory = directoryPath;
         const container = document.getElementById('directoryList');
@@ -334,10 +444,15 @@ class TranscodingManager {
             this.loadDirectoryFilesShallow(directoryPath);
 
         } catch (error) {
-            container.innerHTML = `<div class="alert alert-danger">Error: ${error.message}</div>`;
+            container.innerHTML = `<div class="alert alert-danger">Error: ${escapeHtml(error.message)}</div>`;
         }
     }
 
+    /**
+     * Loads video files directly inside a directory (non-recursive) into the file list panel.
+     * Clears the current selection and renders checkboxes for individual file selection.
+     * @param {string} directoryPath - Absolute path of the directory to list.
+     */
     async loadDirectoryFilesShallow(directoryPath) {
         this.currentDirectory = directoryPath;
         this.selectedFiles.clear();
@@ -357,14 +472,14 @@ class TranscodingManager {
             }
 
             const filesHtml = data.files.map(file => `
-                <div class="file-item p-2 border-bottom" data-path="${file.path}">
+                <div class="file-item p-2 border-bottom" data-path="${escapeHtml(file.path)}">
                     <div class="form-check d-flex align-items-center">
-                        <input class="form-check-input me-3" type="checkbox" value="${file.path}" id="file-${file.path.replace(/[^a-zA-Z0-9]/g, '_')}">
+                        <input class="form-check-input me-3" type="checkbox" value="${escapeHtml(file.path)}" id="file-${file.path.replace(/[^a-zA-Z0-9]/g, '_')}">
                         <label class="form-check-label w-100" for="file-${file.path.replace(/[^a-zA-Z0-9]/g, '_')}">
                             <div class="d-flex justify-content-between align-items-center">
                                 <div>
                                     <i class="fas fa-file-video text-primary me-2"></i>
-                                    <strong>${file.name}</strong>
+                                    <strong>${escapeHtml(file.name)}</strong>
                                 </div>
                                 <small class="text-muted">${this.formatFileSize(file.size)}</small>
                             </div>
@@ -384,26 +499,31 @@ class TranscodingManager {
             });
 
         } catch (error) {
-            container.innerHTML = `<div class="alert alert-danger">Error: ${error.message}</div>`;
+            container.innerHTML = `<div class="alert alert-danger">Error: ${escapeHtml(error.message)}</div>`;
         }
     }
 
+    /**
+     * Renders a summary view for a directory in the file list panel with "Process All" and "Browse" buttons.
+     * @param {string} directoryPath - Absolute path of the selected directory.
+     * @param {number} videoCount - Number of video files found in the directory.
+     */
     showDirectorySummary(directoryPath, videoCount) {
         this.currentDirectory = directoryPath;
         this.selectedFiles.clear();
         const container = document.getElementById('fileList');
-        const dirName = directoryPath.split('/').pop() || 'Root';
+        const dirName = directoryPath.split(/[/\\]/).pop() || 'Root';
 
         container.innerHTML = `
             <div class="text-center py-5">
                 <i class="fas fa-folder-open fa-3x text-warning mb-3"></i>
-                <h5>${dirName}</h5>
+                <h5>${escapeHtml(dirName)}</h5>
                 <p class="text-muted mb-4">${videoCount} video files</p>
                 <button class="btn btn-primary btn-lg mb-3" onclick="transcodingManager.processCurrentDirectory()">
                     <i class="fas fa-play me-2"></i>Process All ${videoCount} Files
                 </button>
                 <br>
-                <button class="btn btn-sm btn-outline-secondary" onclick="transcodingManager.loadDirectoryFiles('${directoryPath.replace(/'/g, "\\'")}')">
+                <button class="btn btn-sm btn-outline-secondary" onclick="transcodingManager.loadDirectoryFiles('${escapeHtml(directoryPath).replace(/'/g, "\\'")}')">
                     <i class="fas fa-list me-1"></i>Browse Individual Files
                 </button>
             </div>
@@ -412,6 +532,10 @@ class TranscodingManager {
         this.updateProcessButton();
     }
 
+    /**
+     * Loads all video files in a directory (recursively by default) into the file list panel.
+     * @param {string} directoryPath - Absolute path of the directory to list.
+     */
     async loadDirectoryFiles(directoryPath) {
         this.currentDirectory = directoryPath;
         this.selectedFiles.clear();
@@ -433,16 +557,16 @@ class TranscodingManager {
             }
 
             const filesHtml = data.files.map(file => `
-                <div class="file-item p-2 border-bottom" data-path="${file.path}">
+                <div class="file-item p-2 border-bottom" data-path="${escapeHtml(file.path)}">
                     <div class="form-check d-flex align-items-center">
-                        <input class="form-check-input me-3" type="checkbox" value="${file.path}" id="file-${file.path.replace(/[^a-zA-Z0-9]/g, '_')}">
+                        <input class="form-check-input me-3" type="checkbox" value="${escapeHtml(file.path)}" id="file-${file.path.replace(/[^a-zA-Z0-9]/g, '_')}">
                         <div class="flex-grow-1">
                             <label class="form-check-label w-100" for="file-${file.path.replace(/[^a-zA-Z0-9]/g, '_')}">
                                 <div class="d-flex justify-content-between align-items-center">
                                     <div>
                                         <i class="fas fa-file-video text-primary me-2"></i>
-                                        <strong>${file.name}</strong><br>
-                                        <small class="text-muted">${file.relativePath}</small>
+                                        <strong>${escapeHtml(file.name)}</strong><br>
+                                        <small class="text-muted">${escapeHtml(file.relativePath)}</small>
                                     </div>
                                     <div class="text-end">
                                         <small class="text-muted">
@@ -472,10 +596,14 @@ class TranscodingManager {
             });
 
         } catch (error) {
-            container.innerHTML = `<div class="alert alert-danger">Error loading files: ${error.message}</div>`;
+            container.innerHTML = `<div class="alert alert-danger">Error loading files: ${escapeHtml(error.message)}</div>`;
         }
     }
 
+    /**
+     * Toggles all file checkboxes in the file list between selected and deselected,
+     * and updates the "Select All / Deselect All" button label accordingly.
+     */
     selectAllFiles() {
         const checkboxes = document.querySelectorAll('#fileList input[type="checkbox"]');
         const allSelected = Array.from(checkboxes).every(cb => cb.checked);
@@ -498,18 +626,24 @@ class TranscodingManager {
             '<i class="fas fa-square me-1"></i> Deselect All';
     }
 
+    /** Updates the "Process Selected" button's disabled state and file count label. */
     updateProcessButton() {
         const button = document.getElementById('processSelectedFiles');
         button.disabled = this.selectedFiles.size === 0;
         button.innerHTML = `<i class="fas fa-play me-1"></i> Process Selected (${this.selectedFiles.size})`;
     }
 
+    /** Closes the library modal using Bootstrap's JS API. */
     closeLibraryModal() {
         const modalEl = document.getElementById('libraryModal');
         const modal = bootstrap.Modal.getInstance(modalEl) || bootstrap.Modal.getOrCreateInstance(modalEl);
         modal.hide();
     }
 
+    /**
+     * Submits each individually selected file to the transcoding queue.
+     * Closes the modal immediately for perceived performance and reports final count.
+     */
     async processSelectedFiles() {
         if (this.selectedFiles.size === 0) {
             showToast('No files selected', 'warning');
@@ -544,6 +678,10 @@ class TranscodingManager {
         showToast(`Added ${successCount} file(s) to transcoding queue`, 'success');
     }
 
+    /**
+     * Submits the current directory for batch transcoding.
+     * @param {boolean} [recursive=true] - When true, processes subdirectories as well.
+     */
     async processCurrentDirectory(recursive = true) {
         // If no directory selected, process the entire root (all listed directories)
         const dirPath = this.currentDirectory || this.rootDirectory;
@@ -554,7 +692,7 @@ class TranscodingManager {
 
         const options = this.getEncoderOptions('settings');
         const dirName = this.currentDirectory
-            ? (this.currentDirectory.split('/').pop() || this.currentDirectory)
+            ? (this.currentDirectory.split(/[/\\]/).pop() || this.currentDirectory)
             : 'all directories';
 
         // Close modal FIRST, then yield to let the browser process the close
@@ -589,6 +727,11 @@ class TranscodingManager {
         }
     }
 
+    /**
+     * Reads encoder settings from the form inputs, persists them to the server, and returns the options object.
+     * @param {string} [prefix=''] - ID prefix used to distinguish settings form inputs from other modal inputs.
+     * @returns {object} The current encoder options as a plain object.
+     */
     getEncoderOptions(prefix = '') {
         const codec = document.getElementById(`${prefix}Codec`).value;
         const hwAccel = document.getElementById(`${prefix}HardwareAcceleration`).value;
@@ -614,6 +757,10 @@ class TranscodingManager {
         return options;
     }
 
+    /**
+     * Persists encoder options to the server so they survive page reloads.
+     * @param {object} options - Encoder options object to save.
+     */
     async saveSettingsToServer(options) {
         try {
             await fetch('/Home/SaveSettings', {
@@ -624,6 +771,10 @@ class TranscodingManager {
         } catch { }
     }
 
+    /**
+     * Fetches persisted encoder settings from the server and populates the form inputs.
+     * @param {string} [prefix='settings'] - ID prefix matching {@link getEncoderOptions}.
+     */
     async restoreSettings(prefix = 'settings') {
         try {
             const response = await fetch('/Home/GetSettings');
@@ -655,6 +806,11 @@ class TranscodingManager {
         } catch { }
     }
 
+    /**
+     * Fetches the current page of queue items and active processing items from the server,
+     * reconciles the DOM without a full rebuild to preserve CSS transitions, and updates
+     * stat counters, pagination, and filter tabs.
+     */
     async loadWorkItems() {
         try {
             const skip = this.queuePage * this.queuePageSize;
@@ -670,15 +826,36 @@ class TranscodingManager {
             const processingItems = data.processing || [];
             this.queueTotal = data.total;
 
-            // Clear queue container only — processing is handled separately
-            this.workItems.clear();
-            document.getElementById('workItemsContainer').innerHTML = '';
+            // Save ephemeral transfer items before clearing (they come from SignalR, not server)
+            const ephemeralItems = new Map();
+            for (const [id, item] of this.workItems) {
+                if (item.remoteJobPhase === 'Downloading' || item.remoteJobPhase === 'Uploading') {
+                    ephemeralItems.set(id, item);
+                }
+            }
 
-            // Render processing items (always shown regardless of page/filter)
+            this.workItems.clear();
+
+            // Restore ephemeral items to the Map
+            for (const [id, item] of ephemeralItems) {
+                this.workItems.set(id, item);
+            }
+
+            // --- Reconcile processing container (no nuclear clear) ---
             const processingContainer = document.getElementById('processingContainer');
             const processingSection = document.getElementById('processingSection');
-            processingContainer.innerHTML = '';
-            if (processingItems.length > 0) {
+            const ephemeralIds = new Set(ephemeralItems.keys());
+            const expectedProcessingIds = new Set(processingItems.map(i => `work-item-${i.id}`));
+
+            // Remove processing DOM children no longer expected (and not ephemeral)
+            for (const child of [...processingContainer.children]) {
+                if (child.id && !expectedProcessingIds.has(child.id) && !ephemeralIds.has(child.id?.replace('work-item-', ''))) {
+                    child.remove();
+                }
+            }
+
+            // Render/update server-side processing items
+            if (processingItems.length > 0 || ephemeralIds.size > 0) {
                 processingSection.style.display = '';
                 for (const item of processingItems) {
                     this.workItems.set(item.id, item);
@@ -688,10 +865,31 @@ class TranscodingManager {
                 processingSection.style.display = 'none';
             }
 
-            // Render queue items
+            // --- Reconcile queue container (no nuclear clear) ---
+            const queueContainer = document.getElementById('workItemsContainer');
+            const expectedQueueIds = new Set(queueItems.map(i => `work-item-${i.id}`));
+
+            // Remove queue DOM children no longer in server response
+            for (const child of [...queueContainer.children]) {
+                if (child.id && !expectedQueueIds.has(child.id)) {
+                    child.remove();
+                } else if (!child.id) {
+                    child.remove(); // Remove empty-state messages etc.
+                }
+            }
+
+            // Render/update queue items
             for (const workItem of queueItems) {
                 this.workItems.set(workItem.id, workItem);
                 this.renderWorkItem(workItem);
+            }
+
+            // Reorder queue children to match server order
+            for (let i = 0; i < queueItems.length; i++) {
+                const el = document.getElementById(`work-item-${queueItems[i].id}`);
+                if (el && el !== queueContainer.children[i]) {
+                    queueContainer.insertBefore(el, queueContainer.children[i]);
+                }
             }
 
             // Update stats (desktop + mobile)
@@ -701,7 +899,7 @@ class TranscodingManager {
                 const msg = this.queueFilter
                     ? `No ${this.queueFilter.toLowerCase()} items`
                     : 'No files in queue';
-                document.getElementById('workItemsContainer').innerHTML = `<div class="text-muted text-center py-4"><i class="fas fa-inbox fa-2x mb-2"></i><br>${msg}</div>`;
+                queueContainer.innerHTML = `<div class="text-muted text-center py-4"><i class="fas fa-inbox fa-2x mb-2"></i><br>${msg}</div>`;
             }
 
             this.renderPagination();
@@ -713,12 +911,20 @@ class TranscodingManager {
         }
     }
 
+    /**
+     * Sets the queue status filter and reloads the first page.
+     * @param {string|null} filter - Status string to filter by ('Pending', 'Completed', 'Failed'), or null for all.
+     */
     setFilter(filter) {
         this.queueFilter = filter;
         this.queuePage = 0;
         this.loadWorkItems();
     }
 
+    /**
+     * Renders the queue filter tab buttons with live counts from the stats object.
+     * @param {object} stats - Work item stats with `pending`, `completed`, and `failed` counts.
+     */
     renderFilterTabs(stats) {
         const container = document.getElementById('queueFilterTabs');
         if (!container) return;
@@ -734,15 +940,10 @@ class TranscodingManager {
             const active = this.queueFilter === f.value ? 'active' : '';
             return `<button class="btn btn-sm btn-outline-secondary ${active} queue-filter-btn" data-filter="${f.value ?? ''}">${f.label} <span class="badge bg-secondary ms-1">${f.count}</span></button>`;
         }).join('');
-
-        container.querySelectorAll('.queue-filter-btn').forEach(btn => {
-            btn.addEventListener('click', () => {
-                const val = btn.dataset.filter;
-                this.setFilter(val === '' ? null : val);
-            });
-        });
+        // Event handlers are delegated on #queueFilterTabs — no per-button binding needed
     }
 
+    /** Renders first/prev/next/last pagination buttons, hiding the container when only one page exists. */
     renderPagination() {
         let paginationEl = document.getElementById('queuePagination');
         if (!paginationEl) return;
@@ -758,55 +959,73 @@ class TranscodingManager {
             <nav class="d-flex justify-content-between align-items-center mt-3">
                 <small class="text-muted">${this.queueTotal} items</small>
                 <div class="btn-group btn-group-sm">
-                    <button class="btn btn-outline-secondary" ${page === 0 ? 'disabled' : ''} id="pageFirst" title="First page">
+                    <button class="btn btn-outline-secondary" ${page === 0 ? 'disabled' : ''} data-page-action="first" title="First page">
                         <i class="fas fa-angle-double-left"></i>
                     </button>
-                    <button class="btn btn-outline-secondary" ${page === 0 ? 'disabled' : ''} id="pagePrev">
+                    <button class="btn btn-outline-secondary" ${page === 0 ? 'disabled' : ''} data-page-action="prev">
                         <i class="fas fa-chevron-left"></i>
                     </button>
                     <button class="btn btn-outline-secondary disabled">${page + 1} / ${totalPages}</button>
-                    <button class="btn btn-outline-secondary" ${page >= totalPages - 1 ? 'disabled' : ''} id="pageNext">
+                    <button class="btn btn-outline-secondary" ${page >= totalPages - 1 ? 'disabled' : ''} data-page-action="next">
                         <i class="fas fa-chevron-right"></i>
                     </button>
-                    <button class="btn btn-outline-secondary" ${page >= totalPages - 1 ? 'disabled' : ''} id="pageLast" title="Last page">
+                    <button class="btn btn-outline-secondary" ${page >= totalPages - 1 ? 'disabled' : ''} data-page-action="last" title="Last page">
                         <i class="fas fa-angle-double-right"></i>
                     </button>
                 </div>
             </nav>
         `;
-
-        document.getElementById('pageFirst')?.addEventListener('click', () => {
-            if (this.queuePage > 0) { this.queuePage = 0; this.loadWorkItems(); }
-        });
-        document.getElementById('pagePrev')?.addEventListener('click', () => {
-            if (this.queuePage > 0) { this.queuePage--; this.loadWorkItems(); }
-        });
-        document.getElementById('pageNext')?.addEventListener('click', () => {
-            if (this.queuePage < totalPages - 1) { this.queuePage++; this.loadWorkItems(); }
-        });
-        document.getElementById('pageLast')?.addEventListener('click', () => {
-            if (this.queuePage < totalPages - 1) { this.queuePage = totalPages - 1; this.loadWorkItems(); }
-        });
+        // Event handlers are delegated on #queuePagination — no per-button binding needed
     }
 
+    /**
+     * Handles a `WorkItemAdded` SignalR event by storing the item and scheduling a queue refresh.
+     * @param {object} workItem - The new work item received from the hub.
+     */
     addWorkItem(workItem) {
         this.workItems.set(workItem.id, workItem);
         this.scheduleQueueRefresh();
     }
 
+    /**
+     * Handles a `WorkItemUpdated` SignalR event.
+     * Renders processing items immediately; for upload/download transfer phases only a
+     * short-lived fallback refresh is scheduled to avoid wiping ephemeral progress from
+     * a full server reload.
+     * @param {object} workItem - The updated work item received from the hub.
+     */
     updateWorkItem(workItem) {
         this.workItems.set(workItem.id, workItem);
         const statusString = this.getStatusString(workItem.status);
 
         // Processing items get rendered immediately to the dedicated section
         if (statusString === 'Processing') {
+            // Remove orphaned items for the same file (e.g., master restarted with a new job ID)
+            if (workItem.fileName && (workItem.remoteJobPhase === 'Downloading' || workItem.remoteJobPhase === 'Uploading')) {
+                for (const [existingId, existing] of this.workItems) {
+                    if (existingId !== workItem.id &&
+                        existing.fileName === workItem.fileName &&
+                        this.getStatusString(existing.status) === 'Processing') {
+                        this.workItems.delete(existingId);
+                        document.getElementById(`work-item-${existingId}`)?.remove();
+                    }
+                }
+            }
+
             this.renderWorkItem(workItem);
+            // Don't trigger a full server refresh for processing items —
+            // on nodes, the server-side queue doesn't include remote jobs,
+            // so a refresh would wipe the item from the DOM.
+            return;
         }
 
         this.scheduleQueueRefresh();
     }
 
-    // Throttle full queue + stats refresh to avoid flooding the server during rapid SignalR events
+    /**
+     * Throttles full queue and stats refreshes to at most once per 2 seconds,
+     * preventing server flooding during rapid SignalR event bursts.
+     */
     scheduleQueueRefresh() {
         if (this._refreshTimer) return;
         this._refreshTimer = setTimeout(() => {
@@ -815,6 +1034,7 @@ class TranscodingManager {
         }, 2000);
     }
 
+    /** Fetches the current queue pause state from the server and updates the pause button. */
     async loadPauseState() {
         try {
             const response = await fetch('/Home/GetPausedState');
@@ -827,6 +1047,7 @@ class TranscodingManager {
         }
     }
 
+    /** Toggles the queue between paused and running and updates the pause button state. */
     async togglePause() {
         try {
             const newState = !this.isPaused;
@@ -846,6 +1067,7 @@ class TranscodingManager {
         }
     }
 
+    /** Syncs the pause/resume button icon and style with the current `isPaused` state. */
     updatePauseButton() {
         const btn = document.getElementById('pauseResumeBtn');
         const icon = document.getElementById('pauseResumeIcon');
@@ -862,7 +1084,11 @@ class TranscodingManager {
         }
     }
 
-    // Helper method to convert numeric status to string
+    /**
+     * Converts a numeric or string work item status to its canonical string name.
+     * @param {number|string} status - Numeric status code (0–5) or existing string.
+     * @returns {string} Human-readable status string (e.g. 'Pending', 'Processing', 'Completed').
+     */
     getStatusString(status) {
         const statusMap = {
             0: 'Pending',
@@ -876,6 +1102,10 @@ class TranscodingManager {
         return typeof status === 'string' ? status : statusMap[status] || 'Unknown';
     }
 
+    /**
+     * Updates the stat counter badges in both the desktop navbar and the mobile summary bar.
+     * @param {object} stats - Object with `pending`, `processing`, `completed`, `failed` counts.
+     */
     updateStatCounters(stats) {
         const set = (id, val) => {
             const el = document.getElementById(id);
@@ -891,6 +1121,12 @@ class TranscodingManager {
         set('failedCountMobile', stats.failed);
     }
 
+    /**
+     * Renders or updates a work item element in the correct container (processing or queue).
+     * Creates a new DOM element on first render; uses differential DOM updates on subsequent calls
+     * to preserve CSS transitions.
+     * @param {object} workItem - The work item to render.
+     */
     renderWorkItem(workItem) {
         const queueContainer = document.getElementById('workItemsContainer');
         const processingContainer = document.getElementById('processingContainer');
@@ -908,9 +1144,6 @@ class TranscodingManager {
         // Move element to the correct container based on status
         if (statusString === 'Processing') {
             if (element.parentNode !== processingContainer) {
-                while (processingContainer.firstChild) {
-                    processingContainer.removeChild(processingContainer.firstChild);
-                }
                 processingContainer.appendChild(element);
             }
             processingSection.style.display = '';
@@ -933,31 +1166,131 @@ class TranscodingManager {
         }
 
         element.className = `work-item ${statusString.toLowerCase()}`;
-        element.innerHTML = this.getWorkItemHtml({...workItem, status: statusString});
 
-        // Add event listeners
-        const removeBtn = element.querySelector('.remove-btn');
-        if (removeBtn) {
-            removeBtn.addEventListener('click', () => this.showStopCancelDialog(workItem.id));
+        if (element.dataset.status) {
+            // Element already exists — do a differential update instead of full innerHTML rebuild
+            this.updateWorkItemDOM(element, workItem, statusString);
+        } else {
+            // First render — full HTML
+            element.innerHTML = this.getWorkItemHtml({...workItem, status: statusString});
+        }
+        element.dataset.status = statusString;
+        // Event listeners are handled by delegation on the container — no per-element binding needed
+    }
+
+    /**
+     * Performs a surgical DOM update on an existing work item element, targeting only the
+     * changed fields (status badge, progress bar, action buttons) instead of rebuilding innerHTML.
+     * @param {HTMLElement} element - The existing work item DOM node.
+     * @param {object} workItem - Updated work item data.
+     * @param {string} statusString - Pre-resolved status string for the work item.
+     */
+    updateWorkItemDOM(element, workItem, statusString) {
+        const prevStatus = element.dataset.status;
+
+        // Update status badge
+        const badge = element.querySelector('.status-badge');
+        if (badge) {
+            const newClass = `status-badge status-${statusString.toLowerCase()} flex-shrink-0`;
+            if (badge.className !== newClass) badge.className = newClass;
+            if (badge.textContent !== statusString) badge.textContent = statusString;
         }
 
-        const logBtn = element.querySelector('.log-btn');
-        if (logBtn) {
-            logBtn.addEventListener('click', () => this.showLog(workItem.id));
+        // Update progress bar (processing items only)
+        const isTransfer = workItem.remoteJobPhase === 'Uploading' || workItem.remoteJobPhase === 'Downloading';
+        const pct = isTransfer ? (workItem.transferProgress || 0) : (workItem.progress || 0);
+        const progressContainer = element.querySelector('.progress');
+
+        if (statusString === 'Processing') {
+            if (progressContainer) {
+                // Update existing progress bar width directly (preserves CSS transition)
+                const bar = progressContainer.querySelector('.progress-bar');
+                if (bar) bar.style.width = pct + '%';
+                const label = progressContainer.querySelector('.progress-label');
+                if (label) {
+                    const labelText = workItem.remoteJobPhase === 'Uploading' ? `Uploading ${workItem.transferProgress || 0}%`
+                        : workItem.remoteJobPhase === 'Downloading' ? `Downloading ${workItem.transferProgress || 0}%`
+                        : `${pct}%`;
+                    if (label.textContent !== labelText) label.textContent = labelText;
+                }
+            } else {
+                // Status just changed to Processing — need to add progress bar.
+                // Fall through to full rebuild for this transition.
+                element.innerHTML = this.getWorkItemHtml({...workItem, status: statusString});
+                return;
+            }
+        } else if (progressContainer) {
+            progressContainer.remove();
+        }
+
+        // Update action buttons only if status changed
+        if (prevStatus !== statusString) {
+            const actionsDiv = element.querySelector('.ms-2.flex-shrink-0');
+            if (actionsDiv) actionsDiv.innerHTML = this.getActionButtons({...workItem, status: statusString});
+        }
+
+        // Update error message
+        const existingError = element.querySelector('.alert-danger');
+        if (workItem.errorMessage) {
+            if (existingError) {
+                const newMsg = `<i class="fas fa-exclamation-triangle me-2"></i>${escapeHtml(workItem.errorMessage)}`;
+                if (existingError.innerHTML !== newMsg) existingError.innerHTML = newMsg;
+            } else {
+                const errorDiv = document.createElement('div');
+                errorDiv.className = 'alert alert-danger alert-sm mb-0 mt-2';
+                errorDiv.innerHTML = `<i class="fas fa-exclamation-triangle me-2"></i>${escapeHtml(workItem.errorMessage)}`;
+                const timeEl = element.querySelector('.text-muted.small.mt-1');
+                if (timeEl) timeEl.before(errorDiv);
+            }
+        } else if (existingError) {
+            existingError.remove();
+        }
+
+        // Update node badge
+        const nodeBadge = element.querySelector('.badge.bg-secondary');
+        if (this.clusterEnabled && workItem.assignedNodeName) {
+            if (nodeBadge) {
+                const expectedText = workItem.assignedNodeName;
+                if (!nodeBadge.textContent.includes(expectedText)) {
+                    nodeBadge.innerHTML = `<i class="fas fa-server me-1"></i>${escapeHtml(workItem.assignedNodeName)}`;
+                }
+            }
+        } else if (nodeBadge && !workItem.assignedNodeName) {
+            nodeBadge.remove();
+        }
+
+        // Update timestamp
+        const timeEl = element.querySelector('.text-muted.small.mt-1');
+        if (timeEl) {
+            const newTime = `${new Date(workItem.createdAt).toLocaleString()}${workItem.completedAt ? ` &rarr; ${new Date(workItem.completedAt).toLocaleString()}` : ''}`;
+            if (timeEl.innerHTML !== newTime) timeEl.innerHTML = newTime;
         }
     }
 
+    /**
+     * Returns the full HTML string for a work item card (used on first render only).
+     * @param {object} workItem - Work item data with status already converted to a string.
+     * @returns {string} HTML markup for the work item card.
+     */
     getWorkItemHtml(workItem) {
         const statusClass = `status-${workItem.status.toLowerCase()}`;
         const progressPercent = workItem.progress || 0;
         
+        const badges = [
+            `<span class="status-badge ${statusClass} flex-shrink-0">${workItem.status}</span>`,
+            this.clusterEnabled && workItem.assignedNodeName ? `<span class="badge bg-secondary flex-shrink-0" title="Processing on remote node"><i class="fas fa-server me-1"></i>${escapeHtml(workItem.assignedNodeName)}</span>` : '',
+            ''
+        ].filter(Boolean).join(' ');
+
         return `
             <div class="d-flex justify-content-between align-items-start mb-2">
-                <div class="flex-grow-1 min-width-0">
-                    <div class="d-flex align-items-center flex-wrap mb-1">
-                        <i class="fas fa-file-video me-2 text-primary"></i>
-                        <strong class="me-2 text-truncate">${workItem.fileName}</strong>
-                        <span class="status-badge ${statusClass}">${workItem.status}</span>
+                <div class="flex-grow-1" style="min-width:0;">
+                    <div class="d-flex align-items-center flex-wrap gap-1 mb-1" style="min-width:0;">
+                        <div class="d-flex align-items-center" style="min-width:0; max-width:100%;">
+                            <i class="fas fa-file-video me-2 text-primary flex-shrink-0"></i>
+                            <strong style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(workItem.fileName)}</strong>
+                        </div>
+                        ${badges}
                     </div>
                     <small class="text-muted">
                         ${formatFileSize(workItem.size)} &bull; ${formatBitrate(workItem.bitrate)} &bull; ${formatDuration(workItem.length)}
@@ -972,12 +1305,12 @@ class TranscodingManager {
                 <div class="progress mb-2" style="position: relative;">
                     <div class="progress-bar progress-bar-striped progress-bar-animated"
                          role="progressbar"
-                         style="width: ${progressPercent}%"
+                         style="width: ${workItem.remoteJobPhase === 'Uploading' || workItem.remoteJobPhase === 'Downloading' ? (workItem.transferProgress || 0) : progressPercent}%"
                          aria-valuenow="${progressPercent}"
                          aria-valuemin="0"
                          aria-valuemax="100">
                     </div>
-                    <span class="progress-label">${progressPercent}%</span>
+                    <span class="progress-label">${workItem.remoteJobPhase === 'Uploading' ? `Uploading ${workItem.transferProgress || 0}%` : workItem.remoteJobPhase === 'Downloading' ? `Downloading ${workItem.transferProgress || 0}%` : `${progressPercent}%`}</span>
                 </div>
             ` : ''}
             
@@ -994,28 +1327,38 @@ class TranscodingManager {
         `;
     }
 
+    /**
+     * Returns the HTML for the action button(s) appropriate to the work item's current status.
+     * @param {object} workItem - Work item with a string `status` property.
+     * @returns {string} HTML for one or more action buttons.
+     */
     getActionButtons(workItem) {
         switch (workItem.status) {
             case 'Pending':
-                return '<button class="btn btn-sm btn-outline-danger remove-btn" title="Remove from queue"><i class="fas fa-times"></i></button>';
+                return '<button class="btn btn-sm btn-outline-danger remove-btn" data-action="remove" title="Remove from queue"><i class="fas fa-times"></i></button>';
             case 'Processing':
                 return `
                     <div class="btn-group" role="group">
-                        <button class="btn btn-sm btn-outline-danger remove-btn" title="Stop/Cancel"><i class="fas fa-times"></i></button>
-                        <button class="btn btn-sm btn-outline-info log-btn" title="View Log"><i class="fas fa-terminal"></i></button>
+                        <button class="btn btn-sm btn-outline-danger remove-btn" data-action="remove" title="Stop/Cancel"><i class="fas fa-times"></i></button>
+                        <button class="btn btn-sm btn-outline-info log-btn" data-action="log" title="View Log"><i class="fas fa-terminal"></i></button>
                     </div>
                 `;
             case 'Completed':
-                return '<button class="btn btn-sm btn-outline-info log-btn" title="View Log"><i class="fas fa-terminal"></i></button>';
+                return '<button class="btn btn-sm btn-outline-info log-btn" data-action="log" title="View Log"><i class="fas fa-terminal"></i></button>';
             case 'Failed':
             case 'Cancelled':
             case 'Stopped':
-                return '<button class="btn btn-sm btn-outline-info log-btn" title="View Log"><i class="fas fa-terminal"></i></button>';
+                return '<button class="btn btn-sm btn-outline-info log-btn" data-action="log" title="View Log"><i class="fas fa-terminal"></i></button>';
             default:
                 return '';
         }
     }
 
+    /**
+     * Opens the stop/cancel confirmation modal for the specified work item.
+     * Replaces button nodes to remove stale event listeners before attaching new ones.
+     * @param {string} workItemId - ID of the work item to stop or cancel.
+     */
     showStopCancelDialog(workItemId) {
         const modalEl = document.getElementById('stopCancelModal');
         const modal = bootstrap.Modal.getOrCreateInstance(modalEl);
@@ -1041,6 +1384,10 @@ class TranscodingManager {
         modal.show();
     }
 
+    /**
+     * Stops the specified work item and re-queues it for retry on the next scan.
+     * @param {string} id - Work item ID to stop.
+     */
     async stopWorkItem(id) {
         try {
             const response = await fetch(`/Home/StopWorkItem?id=${id}`, { method: 'POST' });
@@ -1051,6 +1398,10 @@ class TranscodingManager {
         }
     }
 
+    /**
+     * Permanently cancels the specified work item so it will not be reprocessed.
+     * @param {string} id - Work item ID to cancel.
+     */
     async cancelWorkItem(id) {
         try {
             const response = await fetch(`/Home/CancelWorkItem?id=${id}`, { method: 'POST' });
@@ -1061,6 +1412,13 @@ class TranscodingManager {
         }
     }
 
+    /**
+     * Appends a log message received via SignalR to the in-memory log buffer.
+     * If the log modal is currently open for this work item, appends the entry live
+     * and auto-scrolls if the user was already at the bottom.
+     * @param {string} workItemId - ID of the work item the message belongs to.
+     * @param {string} message - Log line text from the transcoding service.
+     */
     addLogMessage(workItemId, message) {
         if (!this.logs.has(workItemId)) {
             this.logs.set(workItemId, []);
@@ -1088,6 +1446,11 @@ class TranscodingManager {
         }
     }
 
+    /**
+     * Opens the log modal for a work item, loading persisted server logs first and overlaying
+     * any additional in-memory SignalR entries.
+     * @param {string} workItemId - ID of the work item whose log to display.
+     */
     async showLog(workItemId) {
         const workItem = this.workItems.get(workItemId);
         const logModal = document.getElementById('logModal');
@@ -1107,6 +1470,10 @@ class TranscodingManager {
         bootstrap.Modal.getOrCreateInstance(logModal).show();
     }
 
+    /**
+     * Fetches persisted log lines from the server and replaces the in-memory log buffer for the item.
+     * @param {string} workItemId - ID of the work item to load logs for.
+     */
     async loadLogsFromServer(workItemId) {
         try {
             const response = await fetch(`/Home/GetWorkItemLogs?id=${workItemId}`);
@@ -1123,6 +1490,10 @@ class TranscodingManager {
         } catch { }
     }
 
+    /**
+     * Rebuilds the log modal content from the in-memory log buffer and scrolls to the bottom.
+     * @param {string} workItemId - ID of the work item whose logs to render.
+     */
     updateLogModal(workItemId) {
         const logContent = document.getElementById('logContent');
         const logs = this.logs.get(workItemId) || [];
@@ -1137,6 +1508,7 @@ class TranscodingManager {
         logContent.scrollTop = logContent.scrollHeight;
     }
 
+    /** @deprecated Delegates to `refreshStats`. Use `loadWorkItems` for a full refresh. */
     updateStatistics() {
         // Delegate to refreshStats which fetches real counts from the server
         this.refreshStats();
@@ -1144,6 +1516,11 @@ class TranscodingManager {
 
     // --- Auto-Scan methods ---
 
+    /**
+     * Loads auto-scan configuration from the server.
+     * @param {boolean} [fullLoad=true] - When true, also populates the enabled/interval form inputs.
+     *   Pass false for lightweight refreshes after adding/removing directories.
+     */
     async loadAutoScanConfig(fullLoad = true) {
         try {
             const response = await fetch('/Home/GetAutoScanConfig');
@@ -1177,6 +1554,10 @@ class TranscodingManager {
         }
     }
 
+    /**
+     * Renders the list of auto-scan watched directories with per-item remove buttons.
+     * @param {string[]} directories - Array of absolute directory paths to display.
+     */
     renderAutoScanDirectories(directories) {
         const container = document.getElementById('autoScanDirectories');
         if (!container) return;
@@ -1202,6 +1583,10 @@ class TranscodingManager {
         });
     }
 
+    /**
+     * Adds a directory to the auto-scan watch list via a quick-action button in the library modal.
+     * @param {string} path - Absolute path of the directory to watch.
+     */
     async watchDirectory(path) {
         try {
             const response = await fetch('/Home/AddAutoScanDirectory', {
@@ -1218,6 +1603,7 @@ class TranscodingManager {
         }
     }
 
+    /** Reads the directory path from the auto-scan input field and adds it to the watch list. */
     async addAutoScanDirectory() {
         const input = document.getElementById('autoScanDirInput');
         const path = input?.value?.trim();
@@ -1243,6 +1629,10 @@ class TranscodingManager {
         }
     }
 
+    /**
+     * Removes a directory from the auto-scan watch list and refreshes the directory display.
+     * @param {string} path - Absolute path of the directory to remove.
+     */
     async removeAutoScanDirectory(path) {
         try {
             const response = await fetch('/Home/RemoveAutoScanDirectory', {
@@ -1260,6 +1650,10 @@ class TranscodingManager {
         }
     }
 
+    /**
+     * Enables or disables the auto-scan background service.
+     * @param {boolean} enabled - True to enable automatic scanning.
+     */
     async setAutoScanEnabled(enabled) {
         try {
             const response = await fetch('/Home/SetAutoScanEnabled', {
@@ -1276,6 +1670,10 @@ class TranscodingManager {
         }
     }
 
+    /**
+     * Updates the auto-scan polling interval on the server.
+     * @param {number} minutes - Scan interval in minutes (must be ≥ 1).
+     */
     async setAutoScanInterval(minutes) {
         if (isNaN(minutes) || minutes < 1) return;
         try {
@@ -1293,6 +1691,7 @@ class TranscodingManager {
         }
     }
 
+    /** Requests an immediate auto-scan run outside of the normal schedule. */
     async triggerAutoScan() {
         try {
             showToast('Starting auto-scan...', 'info');
@@ -1309,8 +1708,9 @@ class TranscodingManager {
         }
     }
 
+    /** Prompts for confirmation then clears all auto-scan history from the server. */
     async clearAutoScanHistory() {
-        if (!confirm('Clear all auto-scan history? This cannot be undone.')) return;
+        if (!await showConfirmModal('Clear History', '<p>Clear all auto-scan history? This cannot be undone.</p>', 'Clear History')) return;
         try {
             const response = await fetch('/Home/ClearAutoScanHistory', {
                 method: 'POST'
@@ -1326,6 +1726,12 @@ class TranscodingManager {
         }
     }
 
+    /**
+     * Returns a human-readable relative time string (e.g. "3 hours ago").
+     * Falls back to locale date string for dates older than a week.
+     * @param {Date} date - The date to compare against now.
+     * @returns {string} Relative time description.
+     */
     formatTimeAgo(date) {
         const now = new Date();
         const diffMs = now - date;
@@ -1341,13 +1747,407 @@ class TranscodingManager {
         return date.toLocaleString();
     }
 
-    // Helper method to format file size
+    /**
+     * Formats a byte count into a human-readable size string (e.g. "1.23 GB").
+     * @param {number} bytes - File size in bytes.
+     * @returns {string} Formatted size string.
+     */
     formatFileSize(bytes) {
-        if (bytes === 0) return '0 Bytes';
-        const k = 1024;
-        const sizes = ['Bytes', 'KB', 'MB', 'GB'];
-        const i = Math.floor(Math.log(bytes) / Math.log(k));
-        return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        return formatFileSize(bytes);
+    }
+
+    // --- Cluster functionality ---
+
+    /**
+     * Loads cluster configuration from the server and optionally populates the cluster settings form.
+     * @param {boolean} [updateUI=true] - When true, fills in all cluster settings form inputs.
+     */
+    async loadClusterConfig(updateUI = true) {
+        try {
+            const response = await fetch('/Home/GetClusterConfig');
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const config = await response.json();
+            this.clusterEnabled = config.enabled;
+            this.clusterRole = config.role;
+
+            if (updateUI) {
+                // Populate settings form
+                const el = (id) => document.getElementById(id);
+                if (el('clusterEnabled')) el('clusterEnabled').checked = config.enabled;
+                if (el('clusterRole')) el('clusterRole').value = config.role;
+                if (el('clusterNodeName')) el('clusterNodeName').value = config.nodeName || '';
+                this._hasExistingSecret = config.hasSecret;
+                if (el('clusterSecret')) {
+                    el('clusterSecret').value = '';
+                    el('clusterSecret').placeholder = config.hasSecret ? '(secret configured)' : 'Enter a shared secret';
+                }
+                if (el('clusterAutoDiscovery')) el('clusterAutoDiscovery').checked = config.autoDiscovery !== false;
+                if (el('clusterLocalEncoding')) el('clusterLocalEncoding').checked = config.localEncodingEnabled !== false;
+                if (el('clusterMasterUrl')) el('clusterMasterUrl').value = config.masterUrl || '';
+                if (el('clusterNodeTempDir')) el('clusterNodeTempDir').value = config.nodeTempDirectory || '';
+
+                this.updateClusterRoleUI(config.role);
+                this.renderManualNodes(config.manualNodes || []);
+            }
+
+            // Load workers if cluster is active
+            if (config.enabled && config.role !== 'standalone') {
+                await this.loadWorkers();
+            }
+
+            this.renderClusterPanel();
+            this.updateNodeBanner();
+        } catch (error) {
+            console.error('Failed to load cluster config:', error);
+        }
+    }
+
+    /** Fetches the current list of connected worker nodes and refreshes the local `workers` map. */
+    async loadWorkers() {
+        try {
+            const response = await fetch('/Home/GetWorkers');
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const nodes = await response.json();
+            this.workers.clear();
+            for (const node of nodes) {
+                this.workers.set(node.nodeId, node);
+            }
+        } catch (error) {
+            console.error('Failed to load workers:', error);
+        }
+    }
+
+    /**
+     * Reads cluster settings from the form, merges them with the existing server config (to preserve
+     * fields not shown in the UI), and saves to the server. Prompts for restart when cluster mode
+     * is toggled on or off, and confirms before switching to node mode.
+     */
+    async saveClusterConfig() {
+        // Load existing config first to preserve nodeId, timeouts, etc.
+        // Also use it to detect if cluster mode is being toggled (for restart prompt)
+        let config;
+        let serverWasCluster = false;
+        try {
+            const existing = await fetch('/Home/GetClusterConfig');
+            config = await existing.json();
+            serverWasCluster = config.enabled && config.role !== 'standalone';
+        } catch {
+            config = {};
+        }
+
+        const el = (id) => document.getElementById(id);
+        config.enabled = el('clusterEnabled')?.checked || false;
+        config.role = el('clusterRole')?.value || 'standalone';
+        config.nodeName = el('clusterNodeName')?.value || '';
+        // Only send secret if user typed a new one (field is blank on load for security)
+        const newSecret = el('clusterSecret')?.value;
+        if (newSecret) config.sharedSecret = newSecret;
+        config.autoDiscovery = el('clusterAutoDiscovery')?.checked !== false;
+        config.localEncodingEnabled = el('clusterLocalEncoding')?.checked !== false;
+        config.masterUrl = el('clusterMasterUrl')?.value || '';
+        config.nodeTempDirectory = el('clusterNodeTempDir')?.value || '';
+        config.manualNodes = this._manualNodes || [];
+
+        // Require secret for cluster mode
+        if (config.enabled && config.role !== 'standalone' && !config.sharedSecret && !this._hasExistingSecret) {
+            showToast('A shared secret is required to enable cluster mode. Enter one or click Generate.', 'danger');
+            return;
+        }
+
+        // Warn when switching to node mode
+        if (config.role === 'node' && this.clusterRole !== 'node') {
+            const confirmed = await showConfirmModal(
+                'Switch to Node Mode',
+                '<p>Switching to Node mode will:</p><ul><li>Stop any active encoding</li><li>Clear the local queue</li><li>Disable auto-scanning</li></ul><p>This instance will only process jobs delegated by a master.</p>',
+                'Switch to Node Mode'
+            );
+            if (!confirmed) return;
+        }
+
+        try {
+            const response = await fetch('/Home/SaveClusterConfig', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(config)
+            });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const result = await response.json();
+            if (result.success) {
+                const isCluster = config.enabled && config.role !== 'standalone';
+
+                this.clusterEnabled = config.enabled;
+                this.clusterRole = config.role;
+                const status = document.getElementById('clusterSaveStatus');
+                if (status) {
+                    status.style.display = 'inline';
+                    setTimeout(() => status.style.display = 'none', 3000);
+                }
+                if (serverWasCluster !== isCluster) {
+                    const confirmed = await showConfirmModal(
+                        'Restart Required',
+                        '<p>Snacks needs to restart to apply network binding changes.</p><p>Any active encoding will be stopped and re-queued after restart.</p>',
+                        'Restart Now'
+                    );
+                    if (confirmed) {
+                        await fetch('/Home/Restart', { method: 'POST' });
+                        // App will restart — page will reconnect automatically
+                    }
+                } else {
+                    showToast('Cluster settings saved', 'success');
+                }
+                this.renderClusterPanel();
+                this.updateNodeBanner();
+                if (config.enabled) await this.loadWorkers();
+            } else {
+                showToast('Error saving cluster settings: ' + (result.error || 'Unknown error'), 'danger');
+            }
+        } catch (error) {
+            showToast('Error saving cluster settings: ' + error.message, 'danger');
+        }
+    }
+
+    /**
+     * Shows or hides role-specific settings sections (master vs. node) and updates the description text.
+     * @param {string} role - Cluster role: 'standalone', 'master', or 'node'.
+     */
+    updateClusterRoleUI(role) {
+        const masterSettings = document.getElementById('masterSettings');
+        const nodeSettings = document.getElementById('nodeSettings');
+        const roleDesc = document.getElementById('roleDescription');
+
+        if (masterSettings) masterSettings.style.display = role === 'master' ? '' : 'none';
+        if (nodeSettings) nodeSettings.style.display = role === 'node' ? '' : 'none';
+
+        if (roleDesc) {
+            switch (role) {
+                case 'master': roleDesc.textContent = 'Has the media library, delegates encoding to nodes, and encodes locally'; break;
+                case 'node': roleDesc.textContent = 'Accepts encoding jobs from a master instance'; break;
+                default: roleDesc.textContent = 'Standard single-instance mode'; break;
+            }
+        }
+    }
+
+    /**
+     * Renders the list of manually configured cluster nodes with per-item remove buttons.
+     * @param {Array<{name: string, url: string}>} nodes - Array of manual node entries.
+     */
+    renderManualNodes(nodes) {
+        this._manualNodes = nodes || [];
+        const container = document.getElementById('manualNodesList');
+        if (!container) return;
+
+        if (this._manualNodes.length === 0) {
+            container.innerHTML = '<div class="text-muted text-center py-2"><small>No manual nodes configured</small></div>';
+            return;
+        }
+
+        container.innerHTML = this._manualNodes.map((node, idx) => `
+            <div class="d-flex justify-content-between align-items-center mb-1 p-1 border rounded">
+                <div>
+                    <strong class="me-2">${escapeHtml(node.name)}</strong>
+                    <small class="text-muted">${escapeHtml(node.url)}</small>
+                </div>
+                <button class="btn btn-sm btn-outline-danger remove-manual-node" data-idx="${idx}">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+        `).join('');
+
+        container.querySelectorAll('.remove-manual-node').forEach(btn => {
+            btn.addEventListener('click', () => {
+                this._manualNodes.splice(parseInt(btn.dataset.idx), 1);
+                this.renderManualNodes(this._manualNodes);
+            });
+        });
+    }
+
+    /**
+     * Renders the cluster worker node panel, showing a card per connected node with status,
+     * GPU info, job counts, and pause/resume buttons (master-only).
+     */
+    renderClusterPanel() {
+        const panel = document.getElementById('clusterPanel');
+        const container = document.getElementById('clusterNodesContainer');
+        const countBadge = document.getElementById('clusterNodeCount');
+        if (!panel || !container) return;
+
+        const showPanel = this.clusterEnabled && this.clusterRole !== 'standalone';
+        panel.style.display = showPanel ? '' : 'none';
+        if (!showPanel) return;
+
+        const nodes = Array.from(this.workers.values());
+        if (countBadge) countBadge.textContent = `${nodes.length} node${nodes.length !== 1 ? 's' : ''}`;
+
+        if (nodes.length === 0) {
+            container.innerHTML = '<div class="text-muted"><i class="fas fa-search me-1"></i>Discovering nodes...</div>';
+            return;
+        }
+
+        // NodeStatus enum: 0=Online, 1=Busy, 2=Offline, 3=Unreachable, 4=Paused
+        const statusNames = { 0: 'Online', 1: 'Busy', 2: 'Offline', 3: 'Unreachable', 4: 'Paused',
+            'Online': 'Online', 'Busy': 'Busy', 'Offline': 'Offline', 'Unreachable': 'Unreachable', 'Paused': 'Paused' };
+        const statusColors = {
+            'Online': 'var(--success-color, #28a745)',
+            'Busy': 'var(--info-color, #17a2b8)',
+            'Offline': 'var(--danger-color, #dc3545)',
+            'Unreachable': 'var(--warning-color, #ffc107)',
+            'Paused': 'var(--warning-color, #ffc107)'
+        };
+
+        container.innerHTML = nodes.map(node => {
+            const statusName = statusNames[node.status] || 'Unknown';
+            const statusColor = statusColors[statusName] || 'gray';
+
+            const statusText = statusName;
+
+            const gpuInfo = node.capabilities?.gpuVendor && node.capabilities.gpuVendor !== 'none'
+                ? node.capabilities.gpuVendor.charAt(0).toUpperCase() + node.capabilities.gpuVendor.slice(1)
+                : 'CPU only';
+
+            const osInfo = node.capabilities?.osPlatform || '';
+
+            return `
+                <div class="card hover-lift" style="min-width: 180px; max-width: 240px; flex: 1 1 200px;">
+                    <div class="card-body p-2" style="overflow:hidden;">
+                        <div class="d-flex align-items-center mb-1" style="min-width:0;">
+                            <span class="flex-shrink-0" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${statusColor};margin-right:6px;"></span>
+                            <strong style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(node.hostname)}</strong>
+                        </div>
+                        <div class="text-muted small">
+                            <div>${escapeHtml(node.role)} &bull; ${escapeHtml(osInfo)}${gpuInfo ? ' / ' + escapeHtml(gpuInfo) : ''}</div>
+                            <div style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(statusText)}</div>
+                            <div class="mt-1">Jobs: ${node.completedJobs || 0} done, ${node.failedJobs || 0} failed</div>
+                            ${this.clusterRole === 'master' && node.role === 'node' ? `
+                                <button class="btn btn-sm ${node.isPaused ? 'btn-outline-success' : 'btn-outline-warning'} mt-1 w-100 cluster-node-pause" data-node-id="${node.nodeId}" data-paused="${node.isPaused}">
+                                    <i class="fas fa-${node.isPaused ? 'play' : 'pause'} me-1"></i>${node.isPaused ? 'Resume' : 'Pause'}
+                                </button>
+                            ` : ''}
+                        </div>
+                    </div>
+                </div>
+            `;
+        }).join('');
+
+        // Bind pause/resume buttons
+        container.querySelectorAll('.cluster-node-pause').forEach(btn => {
+            btn.addEventListener('click', async () => {
+                const nodeId = btn.dataset.nodeId;
+                const isPaused = btn.dataset.paused === 'true';
+                try {
+                    await fetch('/Home/SetNodePaused', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ nodeId, paused: !isPaused })
+                    });
+                } catch (error) {
+                    showToast('Error: ' + error.message, 'danger');
+                }
+            });
+        });
+    }
+
+    /** Shows or hides the "node mode" banner and updates the master hostname display. */
+    updateNodeBanner() {
+        const banner = document.getElementById('nodeBanner');
+        if (!banner) return;
+
+        if (this.clusterEnabled && this.clusterRole === 'node') {
+            banner.style.display = '';
+            // Find master in workers
+            const master = Array.from(this.workers.values()).find(n => n.role === 'master');
+            const masterName = document.getElementById('nodeBannerMaster');
+            if (masterName) {
+                masterName.textContent = master ? `${master.hostname} (${master.ipAddress})` : 'a master';
+            }
+        } else {
+            banner.style.display = 'none';
+        }
+    }
+
+    /**
+     * Binds all cluster settings panel event handlers: role selector, save, secret generation,
+     * secret visibility toggle, manual node addition, and standalone switch.
+     */
+    initializeClusterEventHandlers() {
+        // Role selector changes
+        const roleSelect = document.getElementById('clusterRole');
+        if (roleSelect) {
+            roleSelect.addEventListener('change', () => {
+                this.updateClusterRoleUI(roleSelect.value);
+            });
+        }
+
+        // Save cluster config
+        const saveBtn = document.getElementById('saveClusterConfig');
+        if (saveBtn) {
+            saveBtn.addEventListener('click', () => this.saveClusterConfig());
+        }
+
+        // Generate secret
+        const genBtn = document.getElementById('generateSecret');
+        if (genBtn) {
+            genBtn.addEventListener('click', () => {
+                const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+                const array = new Uint8Array(32);
+                crypto.getRandomValues(array);
+                let secret = '';
+                for (let i = 0; i < 32; i++) secret += chars.charAt(array[i] % chars.length);
+                document.getElementById('clusterSecret').value = secret;
+            });
+        }
+
+        // Toggle secret visibility
+        const toggleBtn = document.getElementById('toggleSecretVisibility');
+        if (toggleBtn) {
+            toggleBtn.addEventListener('click', () => {
+                const input = document.getElementById('clusterSecret');
+                const isPassword = input.type === 'password';
+                input.type = isPassword ? 'text' : 'password';
+                toggleBtn.innerHTML = `<i class="fas fa-eye${isPassword ? '-slash' : ''}"></i>`;
+            });
+        }
+
+        // Add manual node
+        const addNodeBtn = document.getElementById('addManualNode');
+        if (addNodeBtn) {
+            addNodeBtn.addEventListener('click', () => {
+                const name = document.getElementById('manualNodeName')?.value?.trim();
+                const url = document.getElementById('manualNodeUrl')?.value?.trim();
+                if (name && url) {
+                    if (!this._manualNodes) this._manualNodes = [];
+                    this._manualNodes.push({ name, url });
+                    this.renderManualNodes(this._manualNodes);
+                    document.getElementById('manualNodeName').value = '';
+                    document.getElementById('manualNodeUrl').value = '';
+                }
+            });
+        }
+
+        // Switch to standalone button on node banner
+        const standaloneBtn = document.getElementById('switchToStandalone');
+        if (standaloneBtn) {
+            standaloneBtn.addEventListener('click', async () => {
+                const confirmed = await showConfirmModal('Switch to Standalone', '<p>Switch back to standalone mode? This will disconnect from the cluster.</p>', 'Switch to Standalone');
+                if (confirmed) {
+                    const response = await fetch('/Home/GetClusterConfig');
+                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                    const config = await response.json();
+                    config.role = 'standalone';
+                    config.enabled = false;
+                    const saveResp = await fetch('/Home/SaveClusterConfig', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(config)
+                    });
+                    if (!saveResp.ok) throw new Error(`HTTP ${saveResp.status}`);
+                    this.clusterEnabled = false;
+                    this.clusterRole = 'standalone';
+                    this.renderClusterPanel();
+                    this.updateNodeBanner();
+                    showToast('Switched to standalone mode', 'success');
+                }
+            });
+        }
     }
 }
 
@@ -1356,89 +2156,46 @@ document.addEventListener('DOMContentLoaded', function() {
     window.transcodingManager = new TranscodingManager();
 });
 
-// Escape HTML to prevent XSS from FFmpeg output or error messages
+/**
+ * Escapes HTML special characters to prevent XSS injection from FFmpeg output or server error messages.
+ * @param {string} text - Raw text to escape.
+ * @returns {string} HTML-safe string.
+ */
 function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
 }
 
-// Global utility functions
-function formatFileSize(bytes) {
-    if (bytes === 0) return '0 Bytes';
-    const k = 1024;
-    const sizes = ['Bytes', 'KB', 'MB', 'GB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-}
+/**
+ * Shows a Bootstrap confirmation modal and returns a Promise that resolves to true
+ * if the user confirms, or false if they dismiss it.
+ * @param {string} title - Modal header title.
+ * @param {string} message - HTML body content.
+ * @param {string} [confirmText='Confirm'] - Label for the confirm button.
+ * @returns {Promise<boolean>} Resolves to true on confirm, false on dismiss.
+ */
+function showConfirmModal(title, message, confirmText = 'Confirm') {
+    return new Promise((resolve) => {
+        const modalEl = document.getElementById('confirmModal');
+        document.getElementById('confirmModalTitle').innerHTML = `<i class="fas fa-exclamation-triangle me-2"></i>${escapeHtml(title)}`;
+        document.getElementById('confirmModalBody').innerHTML = message;
+        const confirmBtn = document.getElementById('confirmModalConfirm');
+        confirmBtn.textContent = confirmText;
 
-function formatBitrate(bitrate) {
-    if (bitrate === 0) return '0 kbps';
-    if (bitrate < 1000) return bitrate + ' kbps';
-    return (bitrate / 1000).toFixed(1) + ' Mbps';
-}
+        const modal = bootstrap.Modal.getOrCreateInstance(modalEl);
+        const newBtn = confirmBtn.cloneNode(true);
+        confirmBtn.replaceWith(newBtn);
 
-function formatDuration(seconds) {
-    if (seconds === 0) return '0:00';
-    const hours = Math.floor(seconds / 3600);
-    const minutes = Math.floor((seconds % 3600) / 60);
-    const secs = Math.floor(seconds % 60);
-    
-    if (hours > 0) {
-        return `${hours}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
-    } else {
-        return `${minutes}:${secs.toString().padStart(2, '0')}`;
-    }
-}
+        newBtn.addEventListener('click', () => {
+            modal.hide();
+            resolve(true);
+        });
+        modalEl.addEventListener('hidden.bs.modal', () => resolve(false), { once: true });
 
-function showToast(message, type = 'info') {
-    // Create toast container if it doesn't exist
-    let container = document.getElementById('toast-container');
-    if (!container) {
-        container = document.createElement('div');
-        container.id = 'toast-container';
-        container.className = 'toast-container position-fixed top-0 end-0 p-3';
-        container.style.zIndex = '9999';
-        document.body.appendChild(container);
-    }
-
-    // Create toast element
-    const toastId = 'toast-' + Date.now();
-    const toastHtml = `
-        <div id="${toastId}" class="toast align-items-center text-white bg-${type === 'danger' ? 'danger' : type === 'success' ? 'success' : type === 'warning' ? 'warning' : 'primary'} border-0" role="alert" aria-live="assertive" aria-atomic="true">
-            <div class="d-flex">
-                <div class="toast-body">
-                    ${message}
-                </div>
-                <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" aria-label="Close"></button>
-            </div>
-        </div>
-    `;
-    
-    container.insertAdjacentHTML('beforeend', toastHtml);
-    
-    // Show toast
-    const toastElement = document.getElementById(toastId);
-    const toast = new bootstrap.Toast(toastElement, {
-        autohide: true,
-        delay: 5000
-    });
-    
-    toast.show();
-    
-    // Remove from DOM after hiding
-    toastElement.addEventListener('hidden.bs.toast', () => {
-        toastElement.remove();
+        modal.show();
     });
 }
 
-function showLoading(button, text = 'Processing...') {
-    const originalText = button.innerHTML;
-    button.innerHTML = `<span class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>${text}`;
-    button.disabled = true;
-    
-    return function hideLoading() {
-        button.innerHTML = originalText;
-        button.disabled = false;
-    };
-}
+// Global utility functions (formatFileSize, formatDuration, formatBitrate, showToast, showLoading)
+// are defined in site.js which is loaded before this file.

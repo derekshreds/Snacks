@@ -52,6 +52,46 @@
 </div>
 
 
+<!-- Node Mode Banner (hidden by default, shown via JS when in node mode) -->
+<div class="row mb-3" id="nodeBanner" style="display: none;">
+    <div class="col-12">
+        <div class="alert alert-info d-flex align-items-center justify-content-between mb-0">
+            <div>
+                <i class="fas fa-satellite-dish me-2"></i>
+                <strong>Node Mode</strong> — This instance is operating as a worker node for
+                <span id="nodeBannerMaster">a master</span>.
+                <span id="nodeBannerStatus" class="ms-2 text-muted">Waiting for jobs...</span>
+            </div>
+            <button class="btn btn-sm btn-outline-light" id="switchToStandalone">
+                <i class="fas fa-unlink me-1"></i>Switch to Standalone
+            </button>
+        </div>
+    </div>
+</div>
+
+<!-- Cluster Status Panel (hidden by default, shown when cluster enabled) -->
+<div class="row mb-3" id="clusterPanel" style="display: none;">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center" style="cursor: pointer;" data-bs-toggle="collapse" data-bs-target="#clusterPanelBody">
+                <h6 class="mb-0">
+                    <i class="fas fa-network-wired me-2"></i>
+                    Cluster
+                    <span class="badge bg-secondary ms-2" id="clusterNodeCount">0 nodes</span>
+                </h6>
+                <i class="fas fa-chevron-down" id="clusterCollapseIcon"></i>
+            </div>
+            <div class="collapse show" id="clusterPanelBody">
+                <div class="card-body">
+                    <div class="d-flex flex-wrap gap-3" id="clusterNodesContainer">
+                        <div class="text-muted"><i class="fas fa-search me-1"></i>Discovering nodes...</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
 <!-- Now Processing Section -->
 <div class="row mb-4" id="processingSection" style="display: none;">
     <div class="col-md-12">
@@ -157,12 +197,31 @@
             <div class="modal-header">
                 <h5 class="modal-title">
                     <i class="fas fa-cog me-2"></i>
-                    Encoder Settings
+                    Settings
                 </h5>
                 <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
             </div>
             <div class="modal-body">
-                @await Html.PartialAsync("_EncoderOptions", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })
+                <ul class="nav nav-tabs mb-3" role="tablist">
+                    <li class="nav-item">
+                        <button class="nav-link active" data-bs-toggle="tab" data-bs-target="#encodingTab" type="button" role="tab">
+                            <i class="fas fa-film me-1"></i> Encoding
+                        </button>
+                    </li>
+                    <li class="nav-item">
+                        <button class="nav-link" data-bs-toggle="tab" data-bs-target="#clusterTab" type="button" role="tab">
+                            <i class="fas fa-network-wired me-1"></i> Cluster
+                        </button>
+                    </li>
+                </ul>
+                <div class="tab-content">
+                    <div class="tab-pane fade show active" id="encodingTab" role="tabpanel">
+                        @await Html.PartialAsync("_EncoderOptions", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })
+                    </div>
+                    <div class="tab-pane fade" id="clusterTab" role="tabpanel">
+                        @await Html.PartialAsync("_ClusterSettings")
+                    </div>
+                </div>
             </div>
             <div class="modal-footer">
                 <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
@@ -215,6 +274,27 @@
             </div>
             <div class="modal-footer">
                 <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Confirm Modal -->
+<div class="modal fade" id="confirmModal" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="confirmModalTitle">
+                    <i class="fas fa-exclamation-triangle me-2"></i>
+                    Confirm
+                </h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body" id="confirmModalBody">
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-danger" id="confirmModalConfirm">Confirm</button>
             </div>
         </div>
     </div>

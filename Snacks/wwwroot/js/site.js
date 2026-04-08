@@ -1,4 +1,8 @@
-// Basic site functionality
+/**
+ * Bootstraps global site functionality on DOM ready:
+ * initializes Bootstrap tooltips, enables smooth scrolling, and sets up
+ * an IntersectionObserver fade-in animation for `.card.hover-lift` elements.
+ */
 document.addEventListener('DOMContentLoaded', function() {
     // Initialize tooltips
     var tooltipTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="tooltip"]'));
@@ -34,14 +38,25 @@ document.addEventListener('DOMContentLoaded', function() {
 });
 
 // Utility functions
+
+/**
+ * Formats a byte count as a human-readable size string.
+ * @param {number} bytes - File size in bytes.
+ * @returns {string} Formatted string (e.g. "1.23 GB").
+ */
 function formatFileSize(bytes) {
-    if (bytes === 0) return '0 Bytes';
+    if (!bytes || bytes <= 0) return '0 Bytes';
     const k = 1024;
     const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    const i = Math.min(Math.floor(Math.log(bytes) / Math.log(k)), sizes.length - 1);
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }
 
+/**
+ * Formats a duration in seconds as a compact time string.
+ * @param {number} seconds - Duration in seconds.
+ * @returns {string} Time string in `H:MM:SS` or `M:SS` format.
+ */
 function formatDuration(seconds) {
     const hours = Math.floor(seconds / 3600);
     const minutes = Math.floor((seconds % 3600) / 60);
@@ -54,6 +69,11 @@ function formatDuration(seconds) {
     }
 }
 
+/**
+ * Formats a bitrate in kbps as a human-readable string, converting to Mbps above 1000 kbps.
+ * @param {number} kbps - Bitrate in kilobits per second.
+ * @returns {string} Formatted string (e.g. "4.5 Mbps" or "800 kbps").
+ */
 function formatBitrate(kbps) {
     if (kbps >= 1000) {
         return (kbps / 1000).toFixed(1) + ' Mbps';
@@ -61,7 +81,11 @@ function formatBitrate(kbps) {
     return kbps + ' kbps';
 }
 
-// Show loading spinner
+/**
+ * Replaces a button's content with a loading spinner and disables it.
+ * @param {HTMLElement} element - The button element to show the spinner on.
+ * @returns {function} A restore function that returns the button to its original state.
+ */
 function showLoading(element) {
     const originalText = element.innerHTML;
     element.innerHTML = '<span class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>Loading...';
@@ -73,7 +97,12 @@ function showLoading(element) {
     };
 }
 
-// Enhanced toast notification with icons
+/**
+ * Displays a dismissible Bootstrap toast notification with a Font Awesome icon at the top-right.
+ * Uses slide-in/out CSS animations injected into the document head on first call.
+ * @param {string} message - Text or HTML content to display.
+ * @param {'info'|'success'|'warning'|'danger'} [type='info'] - Bootstrap color variant.
+ */
 function showToast(message, type = 'info') {
     // Create toast container if it doesn't exist
     let toastContainer = document.getElementById('toast-container');
@@ -94,7 +123,7 @@ function showToast(message, type = 'info') {
     };
 
     // Create toast
-    const toastId = 'toast-' + Date.now();
+    const toastId = 'toast-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
     const toast = document.createElement('div');
     toast.id = toastId;
     toast.className = `toast align-items-center text-bg-${type} border-0`;

@@ -6,6 +6,7 @@ services:
     container_name: snacks
     ports:
       - "6767:6767"
+      - "6768:6768/udp"  # Cluster discovery
     volumes:
       # Mount your video library directory (read-write for in-place processing)
       - ./video-library:/app/work/uploads
@@ -33,3 +34,4 @@ services:
     # environment:
     #   - NVIDIA_VISIBLE_DEVICES=all
     #   - NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
+

@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Snacks.Data;
 
@@ -10,9 +11,11 @@ using Snacks.Data;
 namespace Snacks.Data.Migrations
 {
     [DbContext(typeof(SnacksDbContext))]
-    partial class SnacksDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260403122458_AddRemoteJobColumns")]
+    partial class AddRemoteJobColumns
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder.HasAnnotation("ProductVersion", "10.0.0");
@@ -111,10 +114,6 @@ namespace Snacks.Data.Migrations
                         .HasMaxLength(32)
                         .HasColumnType("TEXT");
 
-                    b.Property<string>("RemoteWorkItemId")
-                        .HasMaxLength(64)
-                        .HasColumnType("TEXT");
-
                     b.Property<int>("Status")
                         .HasColumnType("INTEGER");
 
@@ -131,39 +130,6 @@ namespace Snacks.Data.Migrations
                     b.HasIndex("Directory", "BaseName");
 
                     b.ToTable("MediaFiles");
-                });
-
-            modelBuilder.Entity("Snacks.Models.StateTransition", b =>
-                {
-                    b.Property<int>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("INTEGER");
-
-                    b.Property<bool>("Completed")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<string>("FromPhase")
-                        .HasMaxLength(32)
-                        .HasColumnType("TEXT");
-
-                    b.Property<DateTime>("Timestamp")
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("ToPhase")
-                        .IsRequired()
-                        .HasMaxLength(32)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("WorkItemId")
-                        .IsRequired()
-                        .HasMaxLength(64)
-                        .HasColumnType("TEXT");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("WorkItemId", "Completed");
-
-                    b.ToTable("StateTransitions");
                 });
 #pragma warning restore 612, 618
         }

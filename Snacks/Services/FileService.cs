@@ -1,21 +1,28 @@
 using Snacks.Models;
 
-namespace Snacks.Services
-{
-    /// <summary> The class responsible for anything related to file handling </summary>
-    public class FileService
+namespace Snacks.Services;
+
+/// <summary>
+///     File system utilities for directory traversal, video file detection, and resilient file operations.
+/// </summary>
+public class FileService
     {
+        /// <summary>Video file extensions recognized by the application (case-insensitive).</summary>
         private readonly HashSet<string> _videoExtensions = new(StringComparer.OrdinalIgnoreCase)
         {
             "mkv", "mp4", "ts", "wmv", "avi", "m4v", "mpeg", "mov", "3gp", "webm", "flv"
         };
 
-        /// <summary> Returns whether the app is allowed to access all paths (Electron desktop mode) </summary>
+        /// <summary>Returns <c>true</c> when running in Electron desktop mode, allowing access to all drive paths.</summary>
         public bool AllowAllPaths() => Environment.GetEnvironmentVariable("SNACKS_ALLOW_ALL_PATHS") == "true";
 
-        /// <summary> Returns a list of all subdirectories within a folder </summary>
-        /// <param name="input"> The path of the directory </param>
-        /// <returns> All sub-directories in the path </returns>
+        /// <summary>
+        /// Recursively enumerates all subdirectories under <paramref name="input"/>,
+        /// including the root directory itself (appended last).
+        /// </summary>
+        /// <param name="input">The root directory path to walk.</param>
+        /// <param name="top">Controls whether the root directory itself is appended to the result. Pass <see langword="true"/> from all external call sites; the recursive calls pass <see langword="false"/> to avoid appending intermediate directories.</param>
+        /// <returns>All directories found under <paramref name="input"/>, plus the root itself.</returns>
         public List<string> RecursivelyFindDirectories(string input, bool top = true)
         {
             var dirs = new List<string>();
@@ -38,15 +45,15 @@ namespace Snacks.Services
             }
             catch
             {
-                // Ignore permission errors and continue
+                // Permission-denied and access errors are non-fatal; skip inaccessible paths.
             }
 
             return dirs;
         }
 
-        /// <summary> Returns a list of all video files within a list of directories </summary>
-        /// <param name="directories"> The list of directories to search </param>
-        /// <returns> A list of video file paths </returns>
+        /// <summary>Returns all video files found in the specified directories (non-recursive, one level per directory).</summary>
+        /// <param name="directories">The list of directory paths to search.</param>
+        /// <returns>All video file paths found across the specified directories.</returns>
         public List<string> GetAllVideoFiles(List<string> directories)
         {
             var videoFiles = new List<string>();
@@ -63,23 +70,25 @@ namespace Snacks.Services
                 }
                 catch
                 {
-                    // Ignore permission errors and continue
+                    // Permission-denied and access errors are non-fatal; skip inaccessible paths.
                 }
             }
 
             return videoFiles;
         }
 
-        /// <summary> Determines if a file is a video type </summary>
-        /// <param name="input"> The path of the file to check </param>
-        /// <returns> Boolean value of whether the file is a video </returns>
+        /// <summary>
+        /// Returns <c>true</c> if the file has a recognized video extension and is not
+        /// an already-encoded <c>[snacks]</c> output file.
+        /// </summary>
+        /// <param name="input">The file path to check.</param>
+        /// <returns><c>true</c> if the file is a video eligible for encoding.</returns>
         public bool IsVideoFile(string input)
         {
             string ext = GetExtension(input);
             if (!_videoExtensions.Contains(ext))
                 return false;
 
-            // Skip already-encoded [snacks] files
             string fileName = Path.GetFileNameWithoutExtension(input);
             if (fileName.Contains("[snacks]"))
                 return false;
@@ -87,50 +96,56 @@ namespace Snacks.Services
             return true;
         }
 
-        /// <summary> Returns the directory of a file </summary>
-        /// <param name="input"> The file path to get the directory from </param>
-        /// <returns> The path to the directory </returns>
+        /// <summary>Returns the parent directory of a file path, or an empty string if none.</summary>
+        /// <param name="input">The file path.</param>
+        /// <returns>The directory component of the path.</returns>
         public string GetDirectory(string input)
         {
             return Path.GetDirectoryName(input) ?? "";
         }
 
-        /// <summary> Returns the extension of a filename </summary>
-        /// <param name="input"> The file path to get the extension from </param>
-        /// <returns> The extension of the file </returns>
+        /// <summary>Returns the file extension without the leading dot (e.g., "mkv").</summary>
+        /// <param name="input">The file path.</param>
+        /// <returns>The extension without a leading dot.</returns>
         public string GetExtension(string input)
         {
             return Path.GetExtension(input).TrimStart('.');
         }
 
-        /// <summary> Removes the extension from a filename </summary>
-        /// <param name="input"> The file path to remove the extension from </param>
-        /// <returns> The file path with the extension removed </returns>
+        /// <summary>Returns the file path with the extension removed.</summary>
+        /// <param name="input">The file path.</param>
+        /// <returns>The path without its extension.</returns>
         public string RemoveExtension(string input)
         {
             return Path.ChangeExtension(input, null) ?? input;
         }
 
-        /// <summary> Returns the file/folder name from a full path </summary>
-        /// <param name="input"> The path of the file </param>
-        /// <returns> The filename without the path </returns>
+        /// <summary>Returns just the file name and extension from a full path.</summary>
+        /// <param name="input">The full file path.</param>
+        /// <returns>The file name with extension.</returns>
         public string GetFileName(string input)
         {
             return Path.GetFileName(input);
         }
 
+        /// <summary>Maximum number of retry attempts for file operations.</summary>
         private const int MaxRetries = 10;
+
+        /// <summary>Base delay in milliseconds between retry attempts (multiplied by attempt number).</summary>
         private const int RetryDelayMs = 3000;
 
-        /// <summary> Move a file with retries to handle NAS filesystem delays </summary>
-        /// <param name="input"> The path of the file to move </param>
-        /// <param name="output"> The path to move the file to </param>
+        /// <summary>
+        /// Moves a file with retry logic to handle transient NAS filesystem errors.
+        /// Creates the destination directory if it does not exist.
+        /// No-op if source and destination are the same path.
+        /// </summary>
+        /// <param name="input">Source file path.</param>
+        /// <param name="output">Destination file path.</param>
         public async Task FileMoveAsync(string input, string output)
         {
             if (input.Equals(output, StringComparison.OrdinalIgnoreCase))
                 return;
 
-            // Ensure output directory exists
             var outputDir = Path.GetDirectoryName(output);
             if (!string.IsNullOrEmpty(outputDir) && !Directory.Exists(outputDir))
                 Directory.CreateDirectory(outputDir);
@@ -145,8 +160,8 @@ namespace Snacks.Services
             }, $"Move {Path.GetFileName(input)} -> {Path.GetFileName(output)}");
         }
 
-        /// <summary> Delete a file with retries to handle NAS filesystem delays </summary>
-        /// <param name="path"> The path of the file to delete </param>
+        /// <summary>Deletes a file with retry logic to handle transient NAS filesystem errors. No-op if the file does not exist.</summary>
+        /// <param name="path">The path of the file to delete.</param>
         public async Task FileDeleteAsync(string path)
         {
             if (!File.Exists(path))
@@ -159,7 +174,13 @@ namespace Snacks.Services
             }, $"Delete {Path.GetFileName(path)}");
         }
 
-        /// <summary> Retry an operation with exponential backoff for NAS filesystem resilience </summary>
+        /// <summary>
+        /// Retries a file operation up to <see cref="MaxRetries"/> times with linearly increasing delays.
+        /// Catches <see cref="IOException"/> and <see cref="UnauthorizedAccessException"/> for resilience
+        /// against NAS filesystem delays and file locks.
+        /// </summary>
+        /// <param name="operation">The file operation to execute.</param>
+        /// <param name="description">Human-readable description for logging retry attempts.</param>
         private async Task RetryAsync(Func<Task> operation, string description)
         {
             for (int attempt = 1; attempt <= MaxRetries; attempt++)
@@ -182,9 +203,9 @@ namespace Snacks.Services
             }
         }
 
-        /// <summary> Ensures a directory path ends with a separator </summary>
-        /// <param name="path"> The directory path </param>
-        /// <returns> The directory path with a trailing separator </returns>
+        /// <summary>Ensures a directory path ends with the platform directory separator character.</summary>
+        /// <param name="path">The directory path to normalize.</param>
+        /// <returns>The path with a trailing separator, or the original string if null or empty.</returns>
         public string EnsureTrailingSlash(string path)
         {
             if (string.IsNullOrEmpty(path))
@@ -193,20 +214,23 @@ namespace Snacks.Services
             return path.EndsWith(Path.DirectorySeparatorChar) ? path : path + Path.DirectorySeparatorChar;
         }
 
-        /// <summary> Gets the working directory for uploads and processing </summary>
-        /// <returns> The working directory path </returns>
+        /// <summary>
+        /// Returns the application working directory, creating it if needed.
+        /// Resolves from the <c>SNACKS_WORK_DIR</c> environment variable, defaulting to <c>/app/work</c>.
+        /// </summary>
+        /// <returns>The working directory path with a trailing separator.</returns>
         public string GetWorkingDirectory()
         {
             var baseDir = Environment.GetEnvironmentVariable("SNACKS_WORK_DIR") ?? "/app/work";
-            
+
             if (!Directory.Exists(baseDir))
                 Directory.CreateDirectory(baseDir);
-                
+
             return EnsureTrailingSlash(baseDir);
         }
 
-        /// <summary> Gets the uploads directory </summary>
-        /// <returns> The uploads directory path </returns>
+        /// <summary>Returns the uploads subdirectory within the working directory, creating it if needed.</summary>
+        /// <returns>The uploads directory path with a trailing separator.</returns>
         public string GetUploadsDirectory()
         {
             var uploadsDir = Path.Combine(GetWorkingDirectory(), "uploads");
@@ -216,6 +240,4 @@ namespace Snacks.Services
                 
             return EnsureTrailingSlash(uploadsDir);
         }
-
-    }
 }

@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-2.1.0-8b5cf6?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-2.2.0-8b5cf6?style=flat-square" alt="Version">
   <img src="https://img.shields.io/badge/.NET-10.0-512bd4?style=flat-square" alt=".NET 10">
   <img src="https://img.shields.io/badge/Electron-41-47848f?style=flat-square" alt="Electron">
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License">
@@ -36,6 +36,8 @@
 - **Change detection** -- replaced files are automatically detected and re-queued
 - **Transfer-safe scanning** -- files modified within the last 30 minutes are skipped to avoid mid-transfer processing
 - **Settings backup** -- atomic writes with `.bak` fallback for crash resilience
+- **Distributed encoding** -- cluster multiple Snacks instances to distribute encoding across your network
+- **Automatic node discovery** -- nodes find each other automatically, no manual IP configuration needed
 - **Dark mode UI** -- clean, responsive interface that works on desktop, tablet, and mobile
 
 ---
@@ -115,7 +117,7 @@ Snacks can run as a standalone desktop app with native GPU acceleration.
 2. Download FFmpeg from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) (release full build)
 3. Place `ffmpeg.exe` and `ffprobe.exe` in `electron-app/ffmpeg/`
 4. Run `build-installer.bat`
-5. Install from `electron-app/dist/Snacks Setup 2.1.0.exe`
+5. Install from `electron-app/dist/Snacks Setup 2.2.0.exe`
 
 **For development:**
 
@@ -175,6 +177,19 @@ Snacks can watch directories and automatically re-scan them on a configurable in
 - Partial `[snacks]` files from interrupted encodes are detected, deleted, and the original is re-queued
 
 Settings are saved server-side in `settings.json` (with automatic `.bak` backup) and persist across container restarts and devices.
+
+### Distributed Encoding (Cluster)
+
+Snacks can distribute encoding work across multiple machines on your network.
+
+- Open the **Settings** panel and enable **Cluster Mode**
+- Set a **shared secret** that all nodes will use to authenticate with each other
+- Nodes on the local network discover each other automatically
+- One instance acts as the **coordinator**, assigning jobs to available **worker nodes**
+- Source files are transferred to workers before encoding and results are transferred back on completion
+- If a worker goes offline mid-encode, the job is automatically reassigned to another node
+- Job state transitions (queued, assigned, transferring, encoding, completed, failed) are tracked in the database
+- The cluster status panel shows discovered nodes with health indicators and active jobs
 
 ### Monitor
 
@@ -283,9 +298,9 @@ Check that the backend is running and SignalR is connected (green dot in the nav
 Snacks/
   Snacks/                 ASP.NET Core 10.0 backend + web UI
     Controllers/           API endpoints
-    Services/              Transcoding, file handling, FFprobe, AutoScanService, logging
+    Services/              Transcoding, file handling, FFprobe, AutoScan, cluster services
     Data/                  SQLite database context, migrations, repository
-    Models/                WorkItem, MediaFile, EncoderOptions, AutoScanConfig
+    Models/                WorkItem, MediaFile, EncoderOptions, ClusterConfig, JobAssignment
     Hubs/                  SignalR real-time communication
     Views/                 Razor pages
     wwwroot/               Static assets (JS, CSS, fonts)
@@ -327,5 +342,5 @@ Creates a self-contained Windows installer at `electron-app/dist/` with the .NET
 ---
 
 <p align="center">
-  <strong>Snacks</strong> v2.1.0 &copy; 2026 Derek Morris
+  <strong>Snacks</strong> v2.2.0 &copy; 2026 Derek Morris
 </p>
