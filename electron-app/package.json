@@ -1,6 +1,6 @@
 {
   "name": "snacks",
-  "version": "2.2.1",
+  "version": "2.2.2",
   "description": "Snacks - Automated video transcoding",
   "main": "main.js",
   "scripts": {

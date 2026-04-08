@@ -573,7 +573,12 @@ public sealed class ClusterService : IHostedService, IDisposable
                     if (heartbeat.TryGetProperty("isPaused", out var pausedProp))
                         node.IsPaused = pausedProp.GetBoolean();
 
-                    if (node.IsPaused)
+                    if (node.Status == NodeStatus.Uploading || node.Status == NodeStatus.Downloading)
+                    {
+                        // Master-side transfer in progress — heartbeat cannot override this.
+                        // The upload/download codepath owns the state transition.
+                    }
+                    else if (node.IsPaused)
                     {
                         node.Status = NodeStatus.Paused;
                     }
@@ -621,9 +626,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                         // But DON'T re-queue immediately: there's a window between upload
                         // completing and the node starting to encode where the heartbeat
                         // shows idle. Also check completedJobId — the node may have finished.
-                        if (node.ActiveWorkItemId != null && _remoteJobs.ContainsKey(node.ActiveWorkItemId)
-                            && !_activeUploads.ContainsKey(node.ActiveWorkItemId)
-                            && !_activeDownloads.ContainsKey(node.ActiveWorkItemId))
+                        if (node.ActiveWorkItemId != null && _remoteJobs.ContainsKey(node.ActiveWorkItemId))
                         {
                             // Check if the node has the completed output for this job
                             bool hasCompleted = heartbeat.TryGetProperty("completedJobId", out var compId)
@@ -637,6 +640,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                             if (hasCompleted)
                             {
                                 Console.WriteLine($"Cluster: Node {node.Hostname} completed job {node.ActiveWorkItemId} — initiating download");
+                                node.Status = NodeStatus.Downloading;
                                 var completionBaseUrl = NodeBaseUrl(node);
                                 _ = Task.Run(() => HandleRemoteCompletionAsync(node.ActiveWorkItemId, completionBaseUrl));
                             }
@@ -656,6 +660,8 @@ public sealed class ClusterService : IHostedService, IDisposable
                                     Console.WriteLine($"Cluster: Node {node.Hostname} idle for {graceCount} heartbeats for job {node.ActiveWorkItemId} — re-queuing");
                                     _downloadRetryCounts.TryRemove(graceKey, out _);
                                     await HandleNodeFailureAsync(node.ActiveWorkItemId);
+                                    node.Status          = NodeStatus.Online;
+                                    node.ActiveWorkItemId = null;
                                 }
                                 else
                                 {
@@ -663,9 +669,11 @@ public sealed class ClusterService : IHostedService, IDisposable
                                 }
                             }
                         }
-
-                        node.Status          = NodeStatus.Online;
-                        node.ActiveWorkItemId = null;
+                        else
+                        {
+                            node.Status          = NodeStatus.Online;
+                            node.ActiveWorkItemId = null;
+                        }
                     }
 
                     if (heartbeat.TryGetProperty("capabilities", out var caps))
@@ -740,9 +748,9 @@ public sealed class ClusterService : IHostedService, IDisposable
                     break;
                 }
 
-                // Mark busy immediately to prevent double-dispatch
+                // Mark as uploading immediately to prevent double-dispatch
                 bestNode.ActiveWorkItemId = workItem.Id;
-                bestNode.Status           = NodeStatus.Busy;
+                bestNode.Status           = NodeStatus.Uploading;
 
                 _ = Task.Run(() => DispatchToNodeAsync(bestNode, workItem, options));
             }
@@ -762,11 +770,14 @@ public sealed class ClusterService : IHostedService, IDisposable
         if (!_activeUploads.TryAdd(workItem.Id, true))
         {
             Console.WriteLine($"Cluster: Upload already in progress for {workItem.FileName} — skipping");
+            UpdateNodeStatus(node.NodeId, NodeStatus.Online);
+            _transcodingService.RequeueWorkItem(workItem, silent: true);
             return;
         }
 
-        var baseUrl = NodeBaseUrl(node);
-        var jobCts  = new CancellationTokenSource();
+        var baseUrl  = NodeBaseUrl(node);
+        var jobCts   = new CancellationTokenSource();
+        var uploadId = workItem.Id; // Track the original ID for _activeUploads cleanup
         _jobCts[workItem.Id] = jobCts;
 
         try
@@ -780,6 +791,10 @@ public sealed class ClusterService : IHostedService, IDisposable
                 _transcodingService.ReplaceWorkItemId(oldId, workItem.Id, workItem);
                 _jobCts.TryRemove(oldId, out _);
                 _jobCts[workItem.Id] = jobCts;
+                // Fix up _activeUploads to track the new ID
+                _activeUploads.TryRemove(oldId, out _);
+                _activeUploads.TryAdd(workItem.Id, true);
+                uploadId = workItem.Id;
                 Console.WriteLine($"Cluster: Reusing previous job ID {workItem.Id} for {workItem.FileName}");
             }
 
@@ -796,7 +811,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                 Path.GetFullPath(workItem.Path), workItem.Id, node.NodeId, node.Hostname,
                 node.IpAddress, node.Port, "Uploading");
             _remoteJobs[workItem.Id] = workItem;
-            UpdateNodeStatus(node.NodeId, NodeStatus.Busy, workItem.Id, workItem.FileName);
+            UpdateNodeStatus(node.NodeId, NodeStatus.Uploading, workItem.Id, workItem.FileName);
 
             await uploadScope.CompleteAsync();
             _activeTransitions.TryRemove(workItem.Id, out _);
@@ -845,12 +860,32 @@ public sealed class ClusterService : IHostedService, IDisposable
         }
         catch (OperationCanceledException) when (jobCts.IsCancellationRequested)
         {
-            // User-initiated cancellation — don't re-queue, let CancelWorkItemAsync handle status
-            Console.WriteLine($"Cluster: Upload cancelled by user for {workItem.FileName}");
-            await CompleteActiveTransitionAsync(workItem.Id);
-            try { await _discovery.CreateAuthenticatedClient().DeleteAsync($"{baseUrl}/api/cluster/files/{workItem.Id}"); } catch { }
-            _remoteJobs.TryRemove(workItem.Id, out _);
-            UpdateNodeStatus(node.NodeId, NodeStatus.Online);
+            if (node.Status == NodeStatus.Unreachable)
+            {
+                // Node timed out mid-upload — requeue the work item
+                Console.WriteLine($"Cluster: Upload cancelled due to node timeout for {workItem.FileName} — re-queuing");
+                await CompleteActiveTransitionAsync(workItem.Id);
+                try { await _discovery.CreateAuthenticatedClient().DeleteAsync($"{baseUrl}/api/cluster/files/{workItem.Id}"); } catch { }
+                workItem.AssignedNodeId   = null;
+                workItem.AssignedNodeName = null;
+                workItem.RemoteJobPhase   = null;
+                workItem.TransferProgress = 0;
+                _remoteJobs.TryRemove(workItem.Id, out _);
+                if (_jobCts.TryRemove(workItem.Id, out var timeoutCts))
+                    timeoutCts.Dispose();
+                await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Queued);
+                _transcodingService.RequeueWorkItem(workItem);
+                UpdateNodeStatus(node.NodeId, NodeStatus.Unreachable);
+            }
+            else
+            {
+                // User-initiated cancellation — don't re-queue, let CancelWorkItemAsync handle status
+                Console.WriteLine($"Cluster: Upload cancelled by user for {workItem.FileName}");
+                await CompleteActiveTransitionAsync(workItem.Id);
+                try { await _discovery.CreateAuthenticatedClient().DeleteAsync($"{baseUrl}/api/cluster/files/{workItem.Id}"); } catch { }
+                _remoteJobs.TryRemove(workItem.Id, out _);
+                UpdateNodeStatus(node.NodeId, NodeStatus.Online);
+            }
         }
         catch (Exception ex)
         {
@@ -871,7 +906,7 @@ public sealed class ClusterService : IHostedService, IDisposable
         }
         finally
         {
-            _activeUploads.TryRemove(workItem.Id, out _);
+            _activeUploads.TryRemove(uploadId, out _);
             // Don't remove/dispose the CTS here — the download phase still needs it.
             // It is cleaned up in HandleRemoteCompletionAsync or HandleNodeFailureAsync.
         }
@@ -901,7 +936,18 @@ public sealed class ClusterService : IHostedService, IDisposable
     /// </summary>
     public async Task HandleRemoteCompletionAsync(string jobId, string nodeBaseUrl)
     {
-        if (!_remoteJobs.TryGetValue(jobId, out var workItem)) return;
+        if (!_remoteJobs.TryGetValue(jobId, out var workItem))
+        {
+            // Job was cancelled/removed — release the node if it's stuck on this job
+            var stuckNode = _nodes.Values.FirstOrDefault(n => n.ActiveWorkItemId == jobId);
+            if (stuckNode != null)
+            {
+                stuckNode.ActiveWorkItemId = null;
+                if (stuckNode.Status == NodeStatus.Downloading)
+                    stuckNode.Status = NodeStatus.Online;
+            }
+            return;
+        }
         if (!_activeDownloads.TryAdd(jobId, true)) return;
 
         try
@@ -957,6 +1003,17 @@ public sealed class ClusterService : IHostedService, IDisposable
         finally
         {
             _activeDownloads.TryRemove(jobId, out _);
+
+            // Only release the node if the job is fully done (removed from _remoteJobs).
+            // If it's still tracked, a retry is pending and the node should stay reserved.
+            if (!_remoteJobs.ContainsKey(jobId)
+                && workItem.AssignedNodeId != null
+                && _nodes.TryGetValue(workItem.AssignedNodeId, out var dlNode)
+                && dlNode.ActiveWorkItemId == jobId)
+            {
+                dlNode.ActiveWorkItemId = null;
+                dlNode.Status = NodeStatus.Online;
+            }
         }
     }
 
@@ -1021,6 +1078,13 @@ public sealed class ClusterService : IHostedService, IDisposable
             if (retryCount >= MaxDownloadRetries)
             {
                 Console.WriteLine($"Cluster: Download failed after {MaxDownloadRetries} attempts — re-queuing for fresh encode");
+                // Release the node before clearing the assignment
+                if (workItem.AssignedNodeId != null && _nodes.TryGetValue(workItem.AssignedNodeId, out var maxRetryNode)
+                    && maxRetryNode.ActiveWorkItemId == jobId)
+                {
+                    maxRetryNode.ActiveWorkItemId = null;
+                    maxRetryNode.Status = NodeStatus.Online;
+                }
                 _remoteJobs.TryRemove(jobId, out _);
                 _downloadRetryCounts.TryRemove(jobId, out _);
                 if (_jobCts.TryRemove(jobId, out var maxRetryCts))
@@ -1100,7 +1164,12 @@ public sealed class ClusterService : IHostedService, IDisposable
         {
             UpdateNodeStatus(workItem.AssignedNodeId, NodeStatus.Online);
             if (_nodes.TryGetValue(workItem.AssignedNodeId, out var node))
+            {
                 node.CompletedJobs++;
+                // Release the node so dispatch can assign new work
+                if (node.ActiveWorkItemId == jobId)
+                    node.ActiveWorkItemId = null;
+            }
         }
 
         _remoteJobs.TryRemove(jobId, out _);
@@ -1133,6 +1202,11 @@ public sealed class ClusterService : IHostedService, IDisposable
         await CompleteActiveTransitionAsync(jobId);
         try { await _discovery.CreateAuthenticatedClient().DeleteAsync($"{nodeBaseUrl}/api/cluster/files/{jobId}"); } catch { }
         var prevNodeId = workItem.AssignedNodeId;
+
+        // Release the node before clearing the assignment
+        if (prevNodeId != null && _nodes.TryGetValue(prevNodeId, out var requeueNode) && requeueNode.ActiveWorkItemId == jobId)
+            requeueNode.ActiveWorkItemId = null;
+
         _remoteJobs.TryRemove(jobId, out _);
         _downloadRetryCounts.TryRemove(jobId, out _);
         _downloadRetryCounts.TryRemove($"_validation_{jobId}", out _);
@@ -1546,6 +1620,12 @@ public sealed class ClusterService : IHostedService, IDisposable
                         if (mediaFile.RemoteFailureCount > 0)
                             _downloadRetryCounts[workItem.Id] = mediaFile.RemoteFailureCount * 3;
                         await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
+                        // Set node to Downloading so heartbeat won't interfere
+                        if (mediaFile.AssignedNodeId != null && _nodes.TryGetValue(mediaFile.AssignedNodeId, out var dlRecNode))
+                        {
+                            dlRecNode.ActiveWorkItemId = workItem.Id;
+                            dlRecNode.Status = NodeStatus.Downloading;
+                        }
                         await HandleRemoteCompletionAsync(workItem.Id, baseUrl);
                         continue;
                     }
@@ -1597,6 +1677,12 @@ public sealed class ClusterService : IHostedService, IDisposable
                         if (mediaFile.RemoteFailureCount > 0)
                             _downloadRetryCounts[workItem.Id] = mediaFile.RemoteFailureCount * 3;
                         await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
+                        // Set node to Downloading so heartbeat won't interfere
+                        if (mediaFile.AssignedNodeId != null && _nodes.TryGetValue(mediaFile.AssignedNodeId, out var dlRecNode2))
+                        {
+                            dlRecNode2.ActiveWorkItemId = workItem.Id;
+                            dlRecNode2.Status = NodeStatus.Downloading;
+                        }
                         await HandleRemoteCompletionAsync(workItem.Id, baseUrl);
                         continue;
                     }
@@ -1636,6 +1722,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                                 if (!_activeUploads.TryAdd(workItem.Id, true))
                                 {
                                     Console.WriteLine($"Cluster: Upload already active for {workItem.FileName}");
+                                    UpdateNodeStatus(nodeForDispatch.NodeId, NodeStatus.Online);
                                     return;
                                 }
 
@@ -1643,7 +1730,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                                 workItem.RemoteJobPhase = "Uploading";
                                 workItem.ErrorMessage   = null;
                                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
-                                UpdateNodeStatus(nodeForDispatch.NodeId, NodeStatus.Busy, workItem.Id, workItem.FileName);
+                                UpdateNodeStatus(nodeForDispatch.NodeId, NodeStatus.Uploading, workItem.Id, workItem.FileName);
 
                                 // Build metadata for autonomous encoding on the worker
                                 var metadata = new JobMetadata
@@ -1669,6 +1756,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                                     _remoteJobs.TryRemove(workItem.Id, out _);
                                     await _mediaFileRepo.ClearRemoteAssignmentAsync(mediaFile.FilePath, MediaFileStatus.Queued);
                                     _transcodingService.RequeueWorkItem(workItem);
+                                    UpdateNodeStatus(nodeForDispatch.NodeId, NodeStatus.Online);
                                     return;
                                 }
 
@@ -1691,6 +1779,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                                 _remoteJobs.TryRemove(workItem.Id, out _);
                                 try { await _mediaFileRepo.ClearRemoteAssignmentAsync(mediaFile.FilePath, MediaFileStatus.Queued); } catch { }
                                 _transcodingService.RequeueWorkItem(workItem);
+                                UpdateNodeStatus(nodeForDispatch.NodeId, NodeStatus.Online);
                             }
                             finally
                             {

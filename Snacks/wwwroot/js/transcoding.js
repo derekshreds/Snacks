@@ -1983,12 +1983,15 @@ class TranscodingManager {
             return;
         }
 
-        // NodeStatus enum: 0=Online, 1=Busy, 2=Offline, 3=Unreachable, 4=Paused
-        const statusNames = { 0: 'Online', 1: 'Busy', 2: 'Offline', 3: 'Unreachable', 4: 'Paused',
-            'Online': 'Online', 'Busy': 'Busy', 'Offline': 'Offline', 'Unreachable': 'Unreachable', 'Paused': 'Paused' };
+        // NodeStatus enum: 0=Online, 1=Busy, 2=Uploading, 3=Downloading, 4=Offline, 5=Unreachable, 6=Paused
+        const statusNames = { 0: 'Online', 1: 'Busy', 2: 'Uploading', 3: 'Downloading', 4: 'Offline', 5: 'Unreachable', 6: 'Paused',
+            'Online': 'Online', 'Busy': 'Busy', 'Uploading': 'Uploading', 'Downloading': 'Downloading',
+            'Offline': 'Offline', 'Unreachable': 'Unreachable', 'Paused': 'Paused' };
         const statusColors = {
             'Online': 'var(--success-color, #28a745)',
             'Busy': 'var(--info-color, #17a2b8)',
+            'Uploading': 'var(--info-color, #17a2b8)',
+            'Downloading': 'var(--info-color, #17a2b8)',
             'Offline': 'var(--danger-color, #dc3545)',
             'Unreachable': 'var(--warning-color, #ffc107)',
             'Paused': 'var(--warning-color, #ffc107)'

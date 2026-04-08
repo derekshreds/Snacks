@@ -104,6 +104,12 @@ public enum NodeStatus
     /// <summary> Node is actively processing a job. </summary>
     Busy,
 
+    /// <summary> Master is uploading a job to this node. </summary>
+    Uploading,
+
+    /// <summary> Master is downloading a completed job from this node. </summary>
+    Downloading,
+
     /// <summary> Node has been gracefully taken offline. </summary>
     Offline,
 

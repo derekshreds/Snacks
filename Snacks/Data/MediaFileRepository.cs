@@ -286,7 +286,14 @@ public class MediaFileRepository
                 s.SetProperty(f => f.Status, MediaFileStatus.Unseen)
                  .SetProperty(f => f.FailureCount, 0)
                  .SetProperty(f => f.FailureReason, (string?)null)
-                 .SetProperty(f => f.CompletedAt, (DateTime?)null));
+                 .SetProperty(f => f.CompletedAt, (DateTime?)null)
+                 .SetProperty(f => f.AssignedNodeId, (string?)null)
+                 .SetProperty(f => f.AssignedNodeName, (string?)null)
+                 .SetProperty(f => f.AssignedNodeIp, (string?)null)
+                 .SetProperty(f => f.AssignedNodePort, (int?)null)
+                 .SetProperty(f => f.RemoteWorkItemId, (string?)null)
+                 .SetProperty(f => f.RemoteJobPhase, (string?)null)
+                 .SetProperty(f => f.RemoteFailureCount, 0));
         }
 
         /// <summary>
@@ -426,9 +433,9 @@ public class MediaFileRepository
 
         /// <summary>
         ///     Clears the remote node assignment fields and applies <paramref name="newStatus" />.
-        ///     <see cref="MediaFile.RemoteWorkItemId" /> is intentionally preserved unless
-        ///     <paramref name="newStatus" /> is <see cref="MediaFileStatus.Completed" />, so that
-        ///     the node's partial temp files can be located on retry.
+        ///     <see cref="MediaFile.RemoteWorkItemId" /> is preserved only when re-queuing
+        ///     (<see cref="MediaFileStatus.Queued" />) so the node's partial data can be reused
+        ///     on retry. For all other statuses (completed, cancelled, failed, etc.) it is cleared.
         /// </summary>
         /// <param name="normalizedPath"> The normalized absolute path of the file. </param>
         /// <param name="newStatus"> The status to apply after clearing the assignment. </param>
@@ -438,8 +445,9 @@ public class MediaFileRepository
             var file = await context.MediaFiles.FirstOrDefaultAsync(f => f.FilePath == normalizedPath);
             if (file == null) return;
 
-            // Clearing RemoteWorkItemId on completion signals that no temp files remain to clean up.
-            if (newStatus == MediaFileStatus.Completed)
+            // Clear RemoteWorkItemId when the job is done (completed or cancelled).
+            // Preserve it only for Queued (requeue for retry) so the node's partial data can be reused.
+            if (newStatus != MediaFileStatus.Queued)
                 file.RemoteWorkItemId = null;
             file.AssignedNodeId = null;
             file.AssignedNodeName = null;
