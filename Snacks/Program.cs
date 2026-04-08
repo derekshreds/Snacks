@@ -56,19 +56,17 @@ else
     }
 }
 
-// Clear ASPNETCORE_URLS so Kestrel only uses the explicit ConfigureKestrel binding below.
-// Without this, .NET also tries to bind via the env var, causing duplicate or conflicting listeners.
-Environment.SetEnvironmentVariable("ASPNETCORE_URLS", null);
+// Parse the port from the resolved listen URL.
+var normalizedUrl = listenUrl.Split(';')[0].Replace("://+", "://0.0.0.0").Replace("://*", "://0.0.0.0");
+var listenPort = new Uri(normalizedUrl).Port;
 
 builder.WebHost.ConfigureKestrel(serverOptions =>
 {
-    // Normalize .NET URL wildcards (+, *) to a parseable hostname.
-    var rawUrl = listenUrl.Split(';')[0].Replace("://+", "://0.0.0.0").Replace("://*", "://0.0.0.0");
-    var uri = new Uri(rawUrl);
+    // Explicit Kestrel config overrides ASPNETCORE_URLS — no duplicate listeners.
     if (bindAllInterfaces)
-        serverOptions.ListenAnyIP(uri.Port);
+        serverOptions.ListenAnyIP(listenPort);
     else
-        serverOptions.ListenLocalhost(uri.Port);
+        serverOptions.ListenLocalhost(listenPort);
 
     // 100MB — chunks are 50MB, leaves headroom.
     serverOptions.Limits.MaxRequestBodySize = 100 * 1024 * 1024;

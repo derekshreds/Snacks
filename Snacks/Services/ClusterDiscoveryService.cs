@@ -627,7 +627,8 @@ public sealed class ClusterDiscoveryService
         {
             try
             {
-                var uri = new Uri(urls.Split(';')[0]);
+                var raw = urls.Split(';')[0].Replace("://+", "://0.0.0.0").Replace("://*", "://0.0.0.0");
+                var uri = new Uri(raw);
                 _resolvedPort = uri.Port;
                 return _resolvedPort;
             }

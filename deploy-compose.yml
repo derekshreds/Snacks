@@ -11,9 +11,9 @@ services:
   snacks:
     image: derekshreds/snacks-docker:latest
     container_name: snacks
-    ports:
-      - "6767:6767"
-      - "6768:6768/udp"  # Cluster discovery
+    ## Host networking required for cluster UDP broadcast discovery to reach the LAN.
+    ## Bridge mode only forwards unicast traffic, so broadcasts never arrive.
+    network_mode: host
     volumes:
       ## CHANGE THIS to your actual media folder on the NAS
       - /share/Public/Media:/app/work/uploads

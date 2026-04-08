@@ -4,9 +4,8 @@ services:
       context: .
       dockerfile: Snacks/Dockerfile
     container_name: snacks
-    ports:
-      - "6767:6767"
-      - "6768:6768/udp"  # Cluster discovery
+    ## Host networking required for cluster UDP broadcast discovery to reach the LAN.
+    network_mode: host
     volumes:
       # Mount your video library directory (read-write for in-place processing)
       - ./video-library:/app/work/uploads
