@@ -21,35 +21,50 @@ if (listenUrl == null)
 }
 else
 {
-    // Electron sets ASPNETCORE_URLS. Check if cluster is enabled to decide binding.
-    var clusterConfigPath = Path.Combine(
-        Environment.GetEnvironmentVariable("SNACKS_WORK_DIR")
-        ?? Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "Snacks", "work"),
-        "config", "cluster.json");
-
-    if (File.Exists(clusterConfigPath))
+    // If the URL already specifies a wildcard host, bind all interfaces.
+    var firstUrl = listenUrl.Split(';')[0];
+    if (firstUrl.Contains("://+") || firstUrl.Contains("://*") || firstUrl.Contains("://0.0.0.0"))
     {
-        try
+        bindAllInterfaces = true;
+    }
+    else
+    {
+        // Electron sets ASPNETCORE_URLS to localhost. Check if cluster is enabled to decide binding.
+        var clusterConfigPath = Path.Combine(
+            Environment.GetEnvironmentVariable("SNACKS_WORK_DIR")
+            ?? Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "Snacks", "work"),
+            "config", "cluster.json");
+
+        if (File.Exists(clusterConfigPath))
         {
-            var clusterJson = File.ReadAllText(clusterConfigPath);
-            using var clusterDoc = System.Text.Json.JsonDocument.Parse(clusterJson);
-            if (clusterDoc.RootElement.TryGetProperty("enabled", out var enabled)
-                && enabled.GetBoolean()
-                && clusterDoc.RootElement.TryGetProperty("role", out var role)
-                && role.GetString() != "standalone")
+            try
             {
-                bindAllInterfaces = true;
+                var clusterJson = File.ReadAllText(clusterConfigPath);
+                using var clusterDoc = System.Text.Json.JsonDocument.Parse(clusterJson);
+                if (clusterDoc.RootElement.TryGetProperty("enabled", out var enabled)
+                    && enabled.GetBoolean()
+                    && clusterDoc.RootElement.TryGetProperty("role", out var role)
+                    && role.GetString() != "standalone")
+                {
+                    bindAllInterfaces = true;
+                }
             }
+            catch { }
         }
-        catch { }
     }
 }
 
+// Clear ASPNETCORE_URLS so Kestrel only uses the explicit ConfigureKestrel binding below.
+// Without this, .NET also tries to bind via the env var, causing duplicate or conflicting listeners.
+Environment.SetEnvironmentVariable("ASPNETCORE_URLS", null);
+
 builder.WebHost.ConfigureKestrel(serverOptions =>
 {
-    var uri = new Uri(listenUrl.Split(';')[0]);
+    // Normalize .NET URL wildcards (+, *) to a parseable hostname.
+    var rawUrl = listenUrl.Split(';')[0].Replace("://+", "://0.0.0.0").Replace("://*", "://0.0.0.0");
+    var uri = new Uri(rawUrl);
     if (bindAllInterfaces)
         serverOptions.ListenAnyIP(uri.Port);
     else
