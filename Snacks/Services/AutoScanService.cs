@@ -33,6 +33,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
     private readonly object _configLock = new();
     private AutoScanConfig  _config = new();
     private Timer?          _timer;
+    private CancellationTokenSource? _scanCts;
 
     /******************************************************************
      *  Constructor
@@ -203,10 +204,42 @@ public sealed class AutoScanService : IHostedService, IDisposable
     /// </summary>
     public async Task ClearHistoryAsync()
     {
-        await _mediaFileRepo.ResetAllStatusesAsync();
-        _config.LastScanTime     = null;
-        _config.LastScanNewFiles = 0;
-        SaveConfig();
+        Console.WriteLine("ClearHistory: Starting full state reset...");
+
+        // 1. Cancel any active scan (stops ffprobe operations and file enumeration)
+        _scanCts?.Cancel();
+
+        // 2. Wait for scan to fully stop
+        await _scanLock.WaitAsync();
+        try
+        {
+            // 3. Cancel all remote jobs and clear cluster state
+            if (_clusterService.IsMasterMode)
+                await _clusterService.ClearAllRemoteStateAsync();
+
+            // 4. Clear in-memory queue and kill any active local FFmpeg process
+            await _transcodingService.ClearAllInMemoryState();
+
+            // 5. Reset all database statuses
+            await _mediaFileRepo.ResetAllStatusesAsync();
+
+            // 6. Clear WAL table
+            try { await _mediaFileRepo.ClearAllTransitionsAsync(); } catch { }
+
+            // 7. Clear scan timestamps
+            _config.LastScanTime     = null;
+            _config.LastScanNewFiles = 0;
+            SaveConfig();
+
+            // 8. Notify UI
+            await _hubContext.Clients.All.SendAsync("HistoryCleared");
+
+            Console.WriteLine("ClearHistory: Full state reset complete");
+        }
+        finally
+        {
+            _scanLock.Release();
+        }
     }
 
     /******************************************************************
@@ -237,7 +270,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
             if (localItems.Count == 0)
                 return;
 
-            Console.WriteLine($"Resume: Immediately restoring {localItems.Count} local item(s) to queue");
+            Console.WriteLine($"Resume: Immediately restoring {localItems.Count} local item(s) to queue (no re-probe)");
 
             foreach (var file in localItems)
             {
@@ -247,11 +280,11 @@ public sealed class AutoScanService : IHostedService, IDisposable
                     continue;
                 }
 
-                await _mediaFileRepo.SetStatusAsync(file.FilePath, MediaFileStatus.Unseen);
-
                 try
                 {
-                    await _transcodingService.AddFileAsync(file.FilePath, options);
+                    var id = await _transcodingService.RestoreToQueueAsync(file, options);
+                    if (id == null)
+                        await _mediaFileRepo.SetStatusAsync(file.FilePath, MediaFileStatus.Unseen);
                 }
                 catch (Exception ex)
                 {
@@ -312,7 +345,9 @@ public sealed class AutoScanService : IHostedService, IDisposable
 
                 try
                 {
-                    await _transcodingService.AddFileAsync(file.FilePath, options);
+                    var id = await _transcodingService.RestoreToQueueAsync(file, options);
+                    if (id == null)
+                        await _mediaFileRepo.SetStatusAsync(file.FilePath, MediaFileStatus.Unseen);
                 }
                 catch (Exception ex)
                 {
@@ -359,6 +394,10 @@ public sealed class AutoScanService : IHostedService, IDisposable
         if (!_scanLock.Wait(0))
             return;
 
+        _scanCts?.Dispose();
+        _scanCts = new CancellationTokenSource();
+        var ct = _scanCts.Token;
+
         try
         {
             if (!_config.Enabled || _config.Directories.Count == 0)
@@ -384,6 +423,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
             var newFiles = new List<string>();
             foreach (var file in allVideoFiles)
             {
+                ct.ThrowIfCancellationRequested();
                 var normalizedPath = Path.GetFullPath(file);
 
                 if (knownPaths.TryGetValue(normalizedPath, out var info) &&
@@ -451,8 +491,8 @@ public sealed class AutoScanService : IHostedService, IDisposable
                     {
                         try
                         {
-                            var originalProbe = await _ffprobeService.ProbeAsync(file);
-                            var snacksProbe   = await _ffprobeService.ProbeAsync(snacksFile);
+                            var originalProbe = await _ffprobeService.ProbeAsync(file, ct);
+                            var snacksProbe   = await _ffprobeService.ProbeAsync(snacksFile, ct);
                             if (_ffprobeService.ConvertedSuccessfully(originalProbe, snacksProbe))
                             {
                                 validSnacksExists = true;
@@ -480,7 +520,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
 
                 try
                 {
-                    await _transcodingService.AddFileAsync(file, options);
+                    await _transcodingService.AddFileAsync(file, options, cancellationToken: ct);
                     newFileCount++;
                 }
                 catch (Exception ex)
@@ -496,6 +536,10 @@ public sealed class AutoScanService : IHostedService, IDisposable
             SaveConfig();
 
             await _hubContext.Clients.All.SendAsync("AutoScanCompleted", newFileCount, allVideoFiles.Count);
+        }
+        catch (OperationCanceledException)
+        {
+            Console.WriteLine("AutoScan: Scan cancelled");
         }
         catch (Exception ex)
         {

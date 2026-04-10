@@ -377,5 +377,8 @@ video-library/
 # Code signing certificates
 signing/
 
+# Snacks runtime data (SQLite databases, config)
+data/
+
 # Claude Code
 .claude/

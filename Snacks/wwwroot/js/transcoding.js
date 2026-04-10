@@ -74,7 +74,7 @@ class TranscodingManager {
             });
 
             this.connection.on("WorkItemUpdated", (workItem) => {
-                console.log('WorkItemUpdated', workItem.id, 'status:', workItem.status, 'progress:', workItem.progress);
+                console.log('WorkItemUpdated', workItem.id, 'status:', workItem.status, 'progress:', workItem.progress, workItem.errorMessage ? 'error: ' + workItem.errorMessage : '');
                 this.updateWorkItem(workItem);
             });
 
@@ -826,36 +826,22 @@ class TranscodingManager {
             const processingItems = data.processing || [];
             this.queueTotal = data.total;
 
-            // Save ephemeral transfer items before clearing (they come from SignalR, not server)
-            const ephemeralItems = new Map();
-            for (const [id, item] of this.workItems) {
-                if (item.remoteJobPhase === 'Downloading' || item.remoteJobPhase === 'Uploading') {
-                    ephemeralItems.set(id, item);
-                }
-            }
-
             this.workItems.clear();
 
-            // Restore ephemeral items to the Map
-            for (const [id, item] of ephemeralItems) {
-                this.workItems.set(id, item);
-            }
-
-            // --- Reconcile processing container (no nuclear clear) ---
+            // --- Reconcile processing container ---
             const processingContainer = document.getElementById('processingContainer');
             const processingSection = document.getElementById('processingSection');
-            const ephemeralIds = new Set(ephemeralItems.keys());
             const expectedProcessingIds = new Set(processingItems.map(i => `work-item-${i.id}`));
 
-            // Remove processing DOM children no longer expected (and not ephemeral)
+            // Remove processing DOM children no longer in server response
             for (const child of [...processingContainer.children]) {
-                if (child.id && !expectedProcessingIds.has(child.id) && !ephemeralIds.has(child.id?.replace('work-item-', ''))) {
+                if (child.id && !expectedProcessingIds.has(child.id)) {
                     child.remove();
                 }
             }
 
-            // Render/update server-side processing items
-            if (processingItems.length > 0 || ephemeralIds.size > 0) {
+            // Render/update processing items (includes Uploading/Downloading)
+            if (processingItems.length > 0) {
                 processingSection.style.display = '';
                 for (const item of processingItems) {
                     this.workItems.set(item.id, item);
@@ -999,7 +985,7 @@ class TranscodingManager {
         const statusString = this.getStatusString(workItem.status);
 
         // Processing items get rendered immediately to the dedicated section
-        if (statusString === 'Processing') {
+        if (['Processing', 'Uploading', 'Downloading'].includes(statusString)) {
             // Remove orphaned items for the same file (e.g., master restarted with a new job ID)
             if (workItem.fileName && (workItem.remoteJobPhase === 'Downloading' || workItem.remoteJobPhase === 'Uploading')) {
                 for (const [existingId, existing] of this.workItems) {
@@ -1096,7 +1082,9 @@ class TranscodingManager {
             2: 'Completed',
             3: 'Failed',
             4: 'Cancelled',
-            5: 'Stopped'
+            5: 'Stopped',
+            6: 'Uploading',
+            7: 'Downloading'
         };
         
         return typeof status === 'string' ? status : statusMap[status] || 'Unknown';
@@ -1142,7 +1130,7 @@ class TranscodingManager {
         }
 
         // Move element to the correct container based on status
-        if (statusString === 'Processing') {
+        if (['Processing', 'Uploading', 'Downloading'].includes(statusString)) {
             if (element.parentNode !== processingContainer) {
                 processingContainer.appendChild(element);
             }
@@ -1201,16 +1189,14 @@ class TranscodingManager {
         const pct = isTransfer ? (workItem.transferProgress || 0) : (workItem.progress || 0);
         const progressContainer = element.querySelector('.progress');
 
-        if (statusString === 'Processing') {
+        if (['Processing', 'Uploading', 'Downloading'].includes(statusString)) {
             if (progressContainer) {
                 // Update existing progress bar width directly (preserves CSS transition)
                 const bar = progressContainer.querySelector('.progress-bar');
                 if (bar) bar.style.width = pct + '%';
                 const label = progressContainer.querySelector('.progress-label');
                 if (label) {
-                    const labelText = workItem.remoteJobPhase === 'Uploading' ? `Uploading ${workItem.transferProgress || 0}%`
-                        : workItem.remoteJobPhase === 'Downloading' ? `Downloading ${workItem.transferProgress || 0}%`
-                        : `${pct}%`;
+                    const labelText = `${pct}%`;
                     if (label.textContent !== labelText) label.textContent = labelText;
                 }
             } else {
@@ -1301,16 +1287,16 @@ class TranscodingManager {
                 </div>
             </div>
             
-            ${workItem.status === 'Processing' ? `
+            ${['Processing', 'Uploading', 'Downloading'].includes(workItem.status) ? `
                 <div class="progress mb-2" style="position: relative;">
                     <div class="progress-bar progress-bar-striped progress-bar-animated"
                          role="progressbar"
-                         style="width: ${workItem.remoteJobPhase === 'Uploading' || workItem.remoteJobPhase === 'Downloading' ? (workItem.transferProgress || 0) : progressPercent}%"
+                         style="width: ${workItem.status === 'Uploading' || workItem.status === 'Downloading' ? (workItem.transferProgress || 0) : progressPercent}%"
                          aria-valuenow="${progressPercent}"
                          aria-valuemin="0"
                          aria-valuemax="100">
                     </div>
-                    <span class="progress-label">${workItem.remoteJobPhase === 'Uploading' ? `Uploading ${workItem.transferProgress || 0}%` : workItem.remoteJobPhase === 'Downloading' ? `Downloading ${workItem.transferProgress || 0}%` : `${progressPercent}%`}</span>
+                    <span class="progress-label">${['Uploading', 'Downloading'].includes(workItem.status) ? `${workItem.transferProgress || 0}%` : `${progressPercent}%`}</span>
                 </div>
             ` : ''}
             
@@ -1337,6 +1323,8 @@ class TranscodingManager {
             case 'Pending':
                 return '<button class="btn btn-sm btn-outline-danger remove-btn" data-action="remove" title="Remove from queue"><i class="fas fa-times"></i></button>';
             case 'Processing':
+            case 'Uploading':
+            case 'Downloading':
                 return `
                     <div class="btn-group" role="group">
                         <button class="btn btn-sm btn-outline-danger remove-btn" data-action="remove" title="Stop/Cancel"><i class="fas fa-times"></i></button>

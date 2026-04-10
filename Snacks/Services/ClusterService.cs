@@ -56,6 +56,10 @@ public sealed class ClusterService : IHostedService, IDisposable
     private readonly ConcurrentDictionary<string, int>         _downloadRetryCounts = new();
     private readonly ConcurrentDictionary<string, CancellationTokenSource> _jobCts = new();
     private readonly ConcurrentDictionary<string, StateTransitionService.TransitionScope> _activeTransitions = new();
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _nodeDispatchLocks = new();
+    private readonly ConcurrentDictionary<string, Task>          _activeDispatchTasks = new();
+    private readonly ConcurrentDictionary<string, DateTime>      _nodeDispatchCooldowns = new();
+    private readonly ConcurrentDictionary<string, int>           _nodeConsecutiveFailures = new();
     private readonly string _configPath;
     private readonly string _workDir;
     private readonly JsonSerializerOptions _jsonOptions = new()
@@ -219,6 +223,82 @@ public sealed class ClusterService : IHostedService, IDisposable
     }
 
     /******************************************************************
+     *  Full State Reset
+     ******************************************************************/
+
+    /// <summary>
+    ///     Clears all remote job state: cancels in-flight transfers, notifies worker nodes
+    ///     to stop and clean up, clears all tracking dictionaries, resets node states,
+    ///     and purges the WAL table. Called by ClearHistoryAsync for a full system reset.
+    /// </summary>
+    public async Task ClearAllRemoteStateAsync()
+    {
+        Console.WriteLine("Cluster: Clearing all remote job state...");
+
+        // Cancel all active transfer CTS
+        foreach (var kvp in _jobCts)
+        {
+            try { kvp.Value.Cancel(); kvp.Value.Dispose(); } catch { }
+        }
+        _jobCts.Clear();
+
+        // Send cancel + cleanup to all worker nodes (best-effort)
+        var client = _discovery.CreateAuthenticatedClient();
+        foreach (var kvp in _remoteJobs)
+        {
+            var workItem = kvp.Value;
+            if (!string.IsNullOrEmpty(workItem.AssignedNodeId) &&
+                _nodes.TryGetValue(workItem.AssignedNodeId, out var node))
+            {
+                try
+                {
+                    var baseUrl = NodeBaseUrl(node);
+                    await client.DeleteAsync($"{baseUrl}/api/cluster/jobs/{kvp.Key}");
+                    await client.DeleteAsync($"{baseUrl}/api/cluster/files/{kvp.Key}");
+                }
+                catch { }
+            }
+        }
+
+        // Complete and clear all active WAL transitions
+        foreach (var kvp in _activeTransitions)
+        {
+            try { await kvp.Value.CompleteAsync(); } catch { }
+        }
+        _activeTransitions.Clear();
+
+        // Clear all tracking dictionaries
+        _remoteJobs.Clear();
+        _activeUploads.Clear();
+        _activeDownloads.Clear();
+        _downloadRetryCounts.Clear();
+        _nodeDispatchCooldowns.Clear();
+        _nodeConsecutiveFailures.Clear();
+        _activeDispatchTasks.Clear();
+        foreach (var kvp in _nodeDispatchLocks)
+        {
+            if (_nodeDispatchLocks.TryRemove(kvp.Key, out var sl))
+                sl.Dispose();
+        }
+
+        // Reset all worker node states
+        foreach (var node in _nodes.Values.Where(n => n.Role == "node"))
+        {
+            node.ActiveWorkItemId = null;
+            node.ActiveFileName   = null;
+            node.ActiveProgress   = 0;
+            if (node.Status != NodeStatus.Unreachable && node.Status != NodeStatus.Offline)
+                node.Status = NodeStatus.Online;
+            _ = _hubContext.Clients.All.SendAsync("WorkerUpdated", node);
+        }
+
+        // Clear WAL table
+        try { await _mediaFileRepo.ClearAllTransitionsAsync(); } catch { }
+
+        Console.WriteLine("Cluster: Remote state cleared");
+    }
+
+    /******************************************************************
      *  Configuration
      ******************************************************************/
 
@@ -347,7 +427,7 @@ public sealed class ClusterService : IHostedService, IDisposable
     public WorkerCapabilities GetCapabilities() => _discovery.GetCapabilities();
 
     /// <summary> Registers or updates a cluster node. </summary>
-    public void RegisterOrUpdateNode(ClusterNode node, bool fromHandshake = false) =>
+    public (bool Accepted, string? RejectReason) RegisterOrUpdateNode(ClusterNode node, bool fromHandshake = false) =>
         _discovery.RegisterOrUpdateNode(node, fromHandshake);
 
     /******************************************************************
@@ -517,6 +597,12 @@ public sealed class ClusterService : IHostedService, IDisposable
                 {
                     Console.WriteLine($"Cluster: Removed unreachable node {node.Hostname}");
                     await _hubContext.Clients.All.SendAsync("WorkerDisconnected", node.NodeId);
+                    // Clean up dispatch tracking for removed node
+                    _nodeDispatchCooldowns.TryRemove(kvp.Key, out _);
+                    _nodeConsecutiveFailures.TryRemove(kvp.Key, out _);
+                    _activeDispatchTasks.TryRemove(kvp.Key, out _);
+                    if (_nodeDispatchLocks.TryRemove(kvp.Key, out var removedLock))
+                        removedLock.Dispose();
                 }
                 continue;
             }
@@ -626,7 +712,15 @@ public sealed class ClusterService : IHostedService, IDisposable
                         // But DON'T re-queue immediately: there's a window between upload
                         // completing and the node starting to encode where the heartbeat
                         // shows idle. Also check completedJobId — the node may have finished.
-                        if (node.ActiveWorkItemId != null && _remoteJobs.ContainsKey(node.ActiveWorkItemId))
+
+                        // Skip idle detection entirely if an upload or dispatch is in progress
+                        if (node.ActiveWorkItemId != null &&
+                            (_activeUploads.ContainsKey(node.ActiveWorkItemId) ||
+                             (_activeDispatchTasks.TryGetValue(node.NodeId, out var pendingDispatch) && !pendingDispatch.IsCompleted)))
+                        {
+                            // Master-side upload or dispatch task in progress — don't count as idle
+                        }
+                        else if (node.ActiveWorkItemId != null && _remoteJobs.ContainsKey(node.ActiveWorkItemId))
                         {
                             // Check if the node has the completed output for this job
                             bool hasCompleted = heartbeat.TryGetProperty("completedJobId", out var compId)
@@ -694,6 +788,29 @@ public sealed class ClusterService : IHostedService, IDisposable
                 // HTTP failed — don't update LastHeartbeat so timeout logic kicks in
             }
         }
+
+        // Periodic master conflict detection
+        if (IsMasterMode)
+        {
+            var otherMasters = _nodes.Values.Where(n => n.Role == "master").ToList();
+            if (otherMasters.Count > 0)
+            {
+                // Deterministic tiebreaker: lower NodeId wins
+                var selfNode = _discovery.BuildSelfNode();
+                var allMasters = otherMasters.Concat(new[] { selfNode }).OrderBy(n => n.NodeId, StringComparer.Ordinal).ToList();
+                var winner = allMasters.First();
+
+                if (winner.NodeId != _config.NodeId)
+                {
+                    Console.WriteLine($"Cluster: WARNING — another master detected: {otherMasters[0].Hostname}. " +
+                        $"This node lost tiebreak ({_config.NodeId} > {winner.NodeId}) — disabling dispatch");
+                    _dispatchTimer?.Dispose();
+                    _dispatchTimer = null;
+                    await _hubContext.Clients.All.SendAsync("ClusterWarning",
+                        $"Master conflict: {otherMasters[0].Hostname} has priority. Dispatch disabled on this node.");
+                }
+            }
+        }
     }
 
     /******************************************************************
@@ -706,11 +823,14 @@ public sealed class ClusterService : IHostedService, IDisposable
     {
         if (_nodes.TryGetValue(nodeId, out var node))
         {
-            node.Status           = status;
-            node.ActiveWorkItemId = workItemId;
-            node.ActiveFileName   = fileName;
-            node.ActiveProgress   = progress;
-            node.LastHeartbeat    = DateTime.UtcNow;
+            lock (node)
+            {
+                node.Status           = status;
+                node.ActiveWorkItemId = workItemId;
+                node.ActiveFileName   = fileName;
+                node.ActiveProgress   = progress;
+                node.LastHeartbeat    = DateTime.UtcNow;
+            }
             _ = _hubContext.Clients.All.SendAsync("WorkerUpdated", node);
         }
     }
@@ -728,10 +848,18 @@ public sealed class ClusterService : IHostedService, IDisposable
 
         try
         {
+            // Clean up completed dispatch tasks
+            foreach (var kvp in _activeDispatchTasks)
+            {
+                if (kvp.Value.IsCompleted)
+                    _activeDispatchTasks.TryRemove(kvp.Key, out _);
+            }
+
             // Skip dispatch entirely if no worker nodes are available
             bool hasAvailableNodes = _nodes.Values.Any(n =>
                 n.Role == "node" && n.Status == NodeStatus.Online
-                && !n.IsPaused && n.ActiveWorkItemId == null);
+                && !n.IsPaused && n.ActiveWorkItemId == null
+                && !_activeDispatchTasks.ContainsKey(n.NodeId));
             if (!hasAvailableNodes) return;
 
             var options = LoadEncoderOptions();
@@ -748,11 +876,22 @@ public sealed class ClusterService : IHostedService, IDisposable
                     break;
                 }
 
+                // Acquire per-node dispatch lock to serialize state changes
+                var nodeLock = _nodeDispatchLocks.GetOrAdd(bestNode.NodeId, _ => new SemaphoreSlim(1, 1));
+                if (!await nodeLock.WaitAsync(0))
+                {
+                    // Node is busy with another dispatch — requeue and try next
+                    _transcodingService.RequeueWorkItem(workItem, silent: true);
+                    break;
+                }
+
                 // Mark as uploading immediately to prevent double-dispatch
                 bestNode.ActiveWorkItemId = workItem.Id;
                 bestNode.Status           = NodeStatus.Uploading;
 
-                _ = Task.Run(() => DispatchToNodeAsync(bestNode, workItem, options));
+                // Track the dispatch task instead of fire-and-forget
+                var dispatchTask = Task.Run(() => DispatchToNodeAsync(bestNode, workItem, options, nodeLock));
+                _activeDispatchTasks[bestNode.NodeId] = dispatchTask;
             }
         }
         finally
@@ -765,15 +904,19 @@ public sealed class ClusterService : IHostedService, IDisposable
     ///     Uploads source file with embedded metadata, verifies the upload.
     ///     The worker node begins encoding autonomously upon successful upload.
     /// </summary>
-    private async Task DispatchToNodeAsync(ClusterNode node, WorkItem workItem, EncoderOptions options)
+    private async Task DispatchToNodeAsync(ClusterNode node, WorkItem workItem, EncoderOptions options, SemaphoreSlim nodeLock)
     {
         if (!_activeUploads.TryAdd(workItem.Id, true))
         {
             Console.WriteLine($"Cluster: Upload already in progress for {workItem.FileName} — skipping");
             UpdateNodeStatus(node.NodeId, NodeStatus.Online);
             _transcodingService.RequeueWorkItem(workItem, silent: true);
+            nodeLock.Release();
             return;
         }
+
+        // Node lock acquired in RunDispatchAsync — release it now that _activeUploads guards us
+        nodeLock.Release();
 
         var baseUrl  = NodeBaseUrl(node);
         var jobCts   = new CancellationTokenSource();
@@ -782,26 +925,45 @@ public sealed class ClusterService : IHostedService, IDisposable
 
         try
         {
-            // Reuse previous work item ID if the node has partial data
+            // Check if we can reuse a previous work item ID for upload resume
             var dbFile = await _mediaFileRepo.GetByPathAsync(Path.GetFullPath(workItem.Path));
             if (dbFile?.RemoteWorkItemId != null)
             {
-                var oldId = workItem.Id;
-                workItem.Id = dbFile.RemoteWorkItemId;
-                _transcodingService.ReplaceWorkItemId(oldId, workItem.Id, workItem);
-                _jobCts.TryRemove(oldId, out _);
-                _jobCts[workItem.Id] = jobCts;
-                // Fix up _activeUploads to track the new ID
-                _activeUploads.TryRemove(oldId, out _);
-                _activeUploads.TryAdd(workItem.Id, true);
-                uploadId = workItem.Id;
-                Console.WriteLine($"Cluster: Reusing previous job ID {workItem.Id} for {workItem.FileName}");
+                // Verify the node still has partial data before committing to the old ID
+                long partialBytes = 0;
+                try
+                {
+                    var checkClient = _discovery.CreateAuthenticatedClient();
+                    partialBytes = await _fileTransfer.GetNodeReceivedBytesAsync(checkClient, baseUrl, dbFile.RemoteWorkItemId);
+                }
+                catch { }
+
+                if (partialBytes > 0)
+                {
+                    // Node has partial data — reuse the ID for resume
+                    var oldId = workItem.Id;
+                    workItem.Id = dbFile.RemoteWorkItemId;
+                    _transcodingService.ReplaceWorkItemId(oldId, workItem.Id, workItem);
+                    _jobCts.TryRemove(oldId, out _);
+                    _jobCts[workItem.Id] = jobCts;
+                    _activeUploads.TryRemove(oldId, out _);
+                    _activeUploads.TryAdd(workItem.Id, true);
+                    uploadId = workItem.Id;
+                    Console.WriteLine($"Cluster: Reusing previous job ID {workItem.Id} for {workItem.FileName} (node has {partialBytes} bytes)");
+                }
+                else
+                {
+                    // Node doesn't have this job anymore — clear stale ID and start fresh
+                    Console.WriteLine($"Cluster: Stale RemoteWorkItemId {dbFile.RemoteWorkItemId} for {workItem.FileName} — node has no data, starting fresh");
+                    await _mediaFileRepo.ClearRemoteWorkItemIdAsync(Path.GetFullPath(workItem.Path));
+                }
             }
 
             // WAL: Queued → Uploading
             var uploadScope = await _stateTransitions.BeginAsync(workItem.Id, "Queued", "Uploading");
             _activeTransitions[workItem.Id] = uploadScope;
 
+            workItem.Status           = WorkItemStatus.Uploading;
             workItem.AssignedNodeId   = node.NodeId;
             workItem.AssignedNodeName = node.Hostname;
             workItem.RemoteJobPhase   = "Uploading";
@@ -815,6 +977,10 @@ public sealed class ClusterService : IHostedService, IDisposable
 
             await uploadScope.CompleteAsync();
             _activeTransitions.TryRemove(workItem.Id, out _);
+
+            // Lazy probe: items restored from DB on startup don't have probe data yet
+            if (workItem.Probe == null)
+                workItem.Probe = await _ffprobeService.ProbeAsync(workItem.Path, jobCts.Token);
 
             // Build metadata for autonomous encoding on the worker
             var metadata = new JobMetadata
@@ -848,6 +1014,7 @@ public sealed class ClusterService : IHostedService, IDisposable
             var encodeScope = await _stateTransitions.BeginAsync(workItem.Id, "Uploading", "Encoding");
             _activeTransitions[workItem.Id] = encodeScope;
 
+            workItem.Status          = WorkItemStatus.Processing;
             workItem.RemoteJobPhase  = "Encoding";
             workItem.TransferProgress = 0;
             await _mediaFileRepo.UpdateRemoteJobPhaseAsync(Path.GetFullPath(workItem.Path), "Encoding");
@@ -855,6 +1022,13 @@ public sealed class ClusterService : IHostedService, IDisposable
 
             await encodeScope.CompleteAsync();
             _activeTransitions.TryRemove(workItem.Id, out _);
+
+            // Node is no longer receiving — transition from Uploading to Busy
+            UpdateNodeStatus(node.NodeId, NodeStatus.Busy, workItem.Id, workItem.FileName);
+
+            // Dispatch succeeded — clear any cooldowns for this node
+            _nodeConsecutiveFailures.TryRemove(node.NodeId, out _);
+            _nodeDispatchCooldowns.TryRemove(node.NodeId, out _);
 
             Console.WriteLine($"Cluster: Job {workItem.FileName} dispatched to {node.Hostname} (autonomous encoding)");
         }
@@ -875,6 +1049,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                     timeoutCts.Dispose();
                 await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Queued);
                 _transcodingService.RequeueWorkItem(workItem);
+                ApplyDispatchCooldown(node.NodeId);
                 UpdateNodeStatus(node.NodeId, NodeStatus.Unreachable);
             }
             else
@@ -890,6 +1065,9 @@ public sealed class ClusterService : IHostedService, IDisposable
         catch (Exception ex)
         {
             Console.WriteLine($"Cluster: Failed to dispatch {workItem.FileName} to {node.Hostname}: {ex.Message}");
+            Console.WriteLine($"Cluster: Dispatch stack trace: {ex}");
+            workItem.ErrorMessage = $"Dispatch failed: {ex.Message}";
+            await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
             await CompleteActiveTransitionAsync(workItem.Id);
             try { await _discovery.CreateAuthenticatedClient().DeleteAsync($"{baseUrl}/api/cluster/files/{workItem.Id}"); } catch { }
 
@@ -902,6 +1080,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                 failedCts.Dispose();
             await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Queued);
             _transcodingService.RequeueWorkItem(workItem);
+            ApplyDispatchCooldown(node.NodeId);
             UpdateNodeStatus(node.NodeId, NodeStatus.Online);
         }
         finally
@@ -1030,9 +1209,15 @@ public sealed class ClusterService : IHostedService, IDisposable
             {
                 var dlScope = await _stateTransitions.BeginAsync(jobId, workItem.RemoteJobPhase ?? "Encoding", "Downloading");
 
+                workItem.Status           = WorkItemStatus.Downloading;
                 workItem.RemoteJobPhase   = "Downloading";
                 workItem.TransferProgress = 0;
                 workItem.ErrorMessage     = null;
+
+                // Update node status to Downloading (direct completion path bypasses heartbeat)
+                if (workItem.AssignedNodeId != null && _nodes.TryGetValue(workItem.AssignedNodeId, out var dlStatusNode))
+                    UpdateNodeStatus(dlStatusNode.NodeId, NodeStatus.Downloading, workItem.Id, workItem.FileName);
+
                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
                 await _mediaFileRepo.UpdateRemoteJobPhaseAsync(Path.GetFullPath(workItem.Path), "Downloading");
 
@@ -1268,6 +1453,13 @@ public sealed class ClusterService : IHostedService, IDisposable
             jobCts.Dispose();
         }
 
+        // Symmetric cleanup — match HandleNodeFailureAsync
+        _activeUploads.TryRemove(jobId, out _);
+        _activeDownloads.TryRemove(jobId, out _);
+        _downloadRetryCounts.TryRemove(jobId, out _);
+        _downloadRetryCounts.TryRemove($"_idle_grace_{jobId}", out _);
+        _downloadRetryCounts.TryRemove($"_validation_{jobId}", out _);
+
         if (_nodes.TryGetValue(nodeId, out var node))
         {
             try
@@ -1275,6 +1467,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                 var client  = _discovery.CreateAuthenticatedClient();
                 var baseUrl = NodeBaseUrl(node);
                 await client.DeleteAsync($"{baseUrl}/api/cluster/jobs/{jobId}");
+                await client.DeleteAsync($"{baseUrl}/api/cluster/files/{jobId}");
                 Console.WriteLine($"Cluster: Sent cancel for job {jobId} to {node.Hostname}");
             }
             catch (Exception ex)
@@ -1292,6 +1485,13 @@ public sealed class ClusterService : IHostedService, IDisposable
     /// </summary>
     private async Task HandleNodeFailureAsync(string jobId)
     {
+        // Don't interfere with an active download — let it complete or fail on its own
+        if (_activeDownloads.ContainsKey(jobId))
+        {
+            Console.WriteLine($"Cluster: Skipping failure handling for {jobId} — download in progress");
+            return;
+        }
+
         if (!_remoteJobs.TryRemove(jobId, out var workItem)) return;
 
         await CompleteActiveTransitionAsync(jobId);
@@ -1304,6 +1504,9 @@ public sealed class ClusterService : IHostedService, IDisposable
 
         _activeUploads.TryRemove(jobId, out _);
         _activeDownloads.TryRemove(jobId, out _);
+        _downloadRetryCounts.TryRemove(jobId, out _);
+        _downloadRetryCounts.TryRemove($"_idle_grace_{jobId}", out _);
+        _downloadRetryCounts.TryRemove($"_validation_{jobId}", out _);
 
         workItem.RemoteFailureCount++;
         workItem.ErrorMessage = $"Remote: failed (attempt {workItem.RemoteFailureCount})";
@@ -1342,7 +1545,9 @@ public sealed class ClusterService : IHostedService, IDisposable
     {
         var available = _nodes.Values
             .Where(n => n.Role == "node" && n.Status == NodeStatus.Online
-                && !n.IsPaused && n.ActiveWorkItemId == null)
+                && !n.IsPaused && n.ActiveWorkItemId == null
+                && (!_activeDispatchTasks.TryGetValue(n.NodeId, out var dt) || dt.IsCompleted)
+                && (!_nodeDispatchCooldowns.TryGetValue(n.NodeId, out var cd) || DateTime.UtcNow >= cd))
             .ToList();
 
         if (available.Count == 0) return null;
@@ -1401,6 +1606,109 @@ public sealed class ClusterService : IHostedService, IDisposable
             score += 3;
 
         return score;
+    }
+
+    /******************************************************************
+     *  Dispatch Cooldown & Node Reset
+     ******************************************************************/
+
+    /// <summary>
+    ///     Applies exponential backoff cooldown to a node after a dispatch failure.
+    ///     After reaching the failure threshold, automatically resets the node.
+    /// </summary>
+    private void ApplyDispatchCooldown(string nodeId)
+    {
+        var failures = _nodeConsecutiveFailures.AddOrUpdate(nodeId, 1, (_, c) => c + 1);
+        var cooldownSeconds = Math.Min(60, 5 * Math.Pow(2, failures - 1));
+        _nodeDispatchCooldowns[nodeId] = DateTime.UtcNow.AddSeconds(cooldownSeconds);
+
+        if (failures >= 5)
+        {
+            Console.WriteLine($"Cluster: Node {nodeId} has failed {failures} consecutive dispatches — triggering auto-reset");
+            _ = Task.Run(() => ResetNodeAsync(nodeId));
+        }
+        else
+        {
+            var nodeName = _nodes.TryGetValue(nodeId, out var n) ? n.Hostname : nodeId;
+            Console.WriteLine($"Cluster: Node {nodeName} dispatch failed ({failures} consecutive) — cooling down for {cooldownSeconds:F0}s");
+        }
+    }
+
+    /// <summary>
+    ///     Force-resets a worker node by cancelling all active jobs, clearing all
+    ///     tracking state on both master and worker, and requeuing any in-flight items.
+    ///     Triggered automatically when consecutive dispatch failures exceed the threshold.
+    /// </summary>
+    public async Task ResetNodeAsync(string nodeId)
+    {
+        if (!_nodes.TryGetValue(nodeId, out var node)) return;
+
+        Console.WriteLine($"Cluster: Auto-resetting node {node.Hostname} ({nodeId})...");
+
+        // Find any active job for this node
+        var activeJobId = node.ActiveWorkItemId;
+        WorkItem? activeWorkItem = null;
+
+        if (activeJobId != null)
+            _remoteJobs.TryGetValue(activeJobId, out activeWorkItem);
+
+        // Also scan _remoteJobs for anything assigned to this node
+        var nodeJobs = _remoteJobs.Where(kvp => kvp.Value.AssignedNodeId == nodeId).ToList();
+
+        foreach (var (jobId, workItem) in nodeJobs)
+        {
+            // Cancel the CTS
+            if (_jobCts.TryRemove(jobId, out var cts))
+            {
+                try { cts.Cancel(); cts.Dispose(); } catch { }
+            }
+
+            // Clear tracking
+            await CompleteActiveTransitionAsync(jobId);
+            _remoteJobs.TryRemove(jobId, out _);
+            _activeUploads.TryRemove(jobId, out _);
+            _activeDownloads.TryRemove(jobId, out _);
+            _downloadRetryCounts.TryRemove(jobId, out _);
+            _downloadRetryCounts.TryRemove($"_idle_grace_{jobId}", out _);
+            _downloadRetryCounts.TryRemove($"_validation_{jobId}", out _);
+
+            // Tell the worker to cancel and clean up
+            try
+            {
+                var client  = _discovery.CreateAuthenticatedClient();
+                var baseUrl = NodeBaseUrl(node);
+                await client.DeleteAsync($"{baseUrl}/api/cluster/jobs/{jobId}");
+                await client.DeleteAsync($"{baseUrl}/api/cluster/files/{jobId}");
+            }
+            catch { }
+
+            // Clear DB assignment and requeue
+            workItem.AssignedNodeId   = null;
+            workItem.AssignedNodeName = null;
+            workItem.RemoteJobPhase   = null;
+            workItem.TransferProgress = 0;
+            workItem.ErrorMessage     = null;
+            try
+            {
+                await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Queued);
+            }
+            catch { }
+            _transcodingService.RequeueWorkItem(workItem);
+        }
+
+        // Reset the node state
+        node.ActiveWorkItemId = null;
+        node.ActiveFileName   = null;
+        node.ActiveProgress   = 0;
+        node.Status           = NodeStatus.Online;
+        await _hubContext.Clients.All.SendAsync("WorkerUpdated", node);
+
+        // Clear dispatch tracking and apply a post-reset cooldown
+        _activeDispatchTasks.TryRemove(nodeId, out _);
+        _nodeConsecutiveFailures.TryRemove(nodeId, out _);
+        _nodeDispatchCooldowns[nodeId] = DateTime.UtcNow.AddSeconds(30);
+
+        Console.WriteLine($"Cluster: Node {node.Hostname} reset complete — {nodeJobs.Count} job(s) requeued, 30s cooldown applied");
     }
 
     /******************************************************************
@@ -1610,7 +1918,9 @@ public sealed class ClusterService : IHostedService, IDisposable
                         completedJob.GetString() == jobId)
                     {
                         Console.WriteLine($"Cluster: Node has completed encoding {mediaFile.FileName} — downloading");
-                        workItem.Status             = WorkItemStatus.Processing;
+                        var recDlCts1 = new CancellationTokenSource();
+                        _jobCts[workItem.Id]        = recDlCts1;
+                        workItem.Status             = WorkItemStatus.Downloading;
                         workItem.AssignedNodeId     = mediaFile.AssignedNodeId;
                         workItem.AssignedNodeName   = mediaFile.AssignedNodeName ?? "recovered";
                         workItem.RemoteJobPhase     = "Downloading";
@@ -1645,6 +1955,8 @@ public sealed class ClusterService : IHostedService, IDisposable
                                 recoveredProgress = progProp.GetInt32();
 
                             Console.WriteLine($"Cluster: Node is actively encoding {mediaFile.FileName} at {recoveredProgress}% — tracking");
+                            var recEncCts = new CancellationTokenSource();
+                            _jobCts[workItem.Id]      = recEncCts;
                             workItem.Status           = WorkItemStatus.Processing;
                             workItem.Progress         = recoveredProgress;
                             workItem.AssignedNodeId   = mediaFile.AssignedNodeId;
@@ -1667,7 +1979,9 @@ public sealed class ClusterService : IHostedService, IDisposable
                     if (outputResponse.IsSuccessStatusCode)
                     {
                         Console.WriteLine($"Cluster: Node has output for {mediaFile.FileName} — downloading");
-                        workItem.Status             = WorkItemStatus.Processing;
+                        var recDlCts2 = new CancellationTokenSource();
+                        _jobCts[workItem.Id]        = recDlCts2;
+                        workItem.Status             = WorkItemStatus.Downloading;
                         workItem.AssignedNodeId     = mediaFile.AssignedNodeId;
                         workItem.AssignedNodeName   = mediaFile.AssignedNodeName ?? "recovered";
                         workItem.RemoteJobPhase     = "Downloading";
@@ -1726,7 +2040,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                                     return;
                                 }
 
-                                workItem.Status         = WorkItemStatus.Processing;
+                                workItem.Status         = WorkItemStatus.Uploading;
                                 workItem.RemoteJobPhase = "Uploading";
                                 workItem.ErrorMessage   = null;
                                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
@@ -1769,6 +2083,9 @@ public sealed class ClusterService : IHostedService, IDisposable
                                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
 
                                 await recEncScope.CompleteAsync();
+
+                                // Node is no longer receiving — transition from Uploading to Busy
+                                UpdateNodeStatus(nodeForDispatch.NodeId, NodeStatus.Busy, workItem.Id, workItem.FileName);
 
                                 Console.WriteLine($"Cluster: Recovered job {workItem.FileName} dispatched to {nodeForDispatch.Hostname} (autonomous encoding)");
                             }

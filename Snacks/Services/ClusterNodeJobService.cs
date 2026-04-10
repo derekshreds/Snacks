@@ -402,7 +402,8 @@ public sealed class ClusterNodeJobService
             if (encodingSucceeded && _currentRemoteJob != null)
             {
                 _currentRemoteJob.Progress = 100;
-                _ = _hubContext.Clients.All.SendAsync("WorkItemUpdated", _currentRemoteJob);
+                _currentRemoteJob.Status   = WorkItemStatus.Downloading;
+                await _hubContext.Clients.All.SendAsync("WorkItemUpdated", _currentRemoteJob);
             }
 
             _completedJobId = encodingSucceeded ? _currentRemoteJob?.Id : null;

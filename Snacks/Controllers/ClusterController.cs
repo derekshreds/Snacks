@@ -53,9 +53,29 @@ public sealed class ClusterController : ControllerBase
         [HttpPost("handshake")]
         public IActionResult Handshake([FromBody] ClusterNode senderNode)
         {
-            _clusterService.RegisterOrUpdateNode(senderNode, fromHandshake: true);
+            var (accepted, rejectReason) = _clusterService.RegisterOrUpdateNode(senderNode, fromHandshake: true);
+            if (!accepted)
+                return Conflict(new { error = rejectReason });
             var selfNode = _clusterService.BuildSelfNode();
             return Ok(selfNode);
+        }
+
+        /// <summary>
+        ///     Force-resets a worker node by cancelling all active jobs and clearing stale state.
+        ///     Primarily used by the master's automated resilience, but exposed for internal use.
+        /// </summary>
+        [HttpPost("nodes/{nodeId}/reset")]
+        public async Task<IActionResult> ResetNode(string nodeId)
+        {
+            try
+            {
+                await _clusterService.ResetNodeAsync(nodeId);
+                return Ok(new { success = true });
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(new { error = ex.Message });
+            }
         }
 
         /// <summary>
@@ -359,7 +379,8 @@ public sealed class ClusterController : ControllerBase
                     var headerHex = Convert.ToHexString(headerBytes).ToLower();
                     Response.Headers["X-File-Header"] = headerHex;
 
-                    if (headerBytes[0] == 0x00 && headerBytes[1] == 0x00)
+                    if (headerBytes[0] == 0x00 && headerBytes[1] == 0x00 &&
+                        headerBytes[2] == 0x00 && headerBytes[3] == 0x00)
                         Response.Headers["X-Header-Corrupt"] = "true";
                 }
                 catch { }
@@ -375,7 +396,7 @@ public sealed class ClusterController : ControllerBase
                     {
                         id = jobId,
                         fileName,
-                        status = "Processing",
+                        status = WorkItemStatus.Uploading,
                         progress = 0,
                         remoteJobPhase = "Uploading",
                         transferProgress = percent,
@@ -535,9 +556,9 @@ public sealed class ClusterController : ControllerBase
             {
                 id = jobId,
                 fileName = Path.GetFileName(outputPath).Replace(" [snacks]", ""),
-                status = "Processing",
+                status = WorkItemStatus.Downloading,
                 progress = 100,
-                remoteJobPhase = "Uploading",
+                remoteJobPhase = "Downloading",
                 transferProgress = percent,
                 assignedNodeName = "master",
                 size = totalSize,

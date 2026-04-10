@@ -214,7 +214,7 @@ public sealed class ClusterFileTransferService
                     consecutiveFailures  = 0;
 
                     workItem.TransferProgress = (int)(offset * 100 / totalSize);
-                    workItem.Status           = WorkItemStatus.Processing;
+                    workItem.Status           = WorkItemStatus.Uploading;
                     workItem.RemoteJobPhase   = "Uploading";
                     workItem.ErrorMessage     = null;
                     await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem, ct);

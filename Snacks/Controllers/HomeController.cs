@@ -44,7 +44,7 @@ namespace Snacks.Controllers
             return Json(new {
                 status = "healthy",
                 timestamp = DateTime.UtcNow,
-                version = "2.2.2"
+                version = "2.2.3"
             });
         }
 
@@ -299,9 +299,11 @@ namespace Snacks.Controllers
             var allItems = _transcodingService.GetAllWorkItems();
 
             // Processing items are always returned in full so they don't count against the page limit.
-            var processingItems = allItems.Where(w => w.Status == WorkItemStatus.Processing).ToList();
+            var processingItems = allItems.Where(w => w.Status is WorkItemStatus.Processing
+                or WorkItemStatus.Uploading or WorkItemStatus.Downloading).ToList();
 
-            var queueItems = allItems.Where(w => w.Status != WorkItemStatus.Processing).ToList();
+            var queueItems = allItems.Where(w => w.Status is not WorkItemStatus.Processing
+                and not WorkItemStatus.Uploading and not WorkItemStatus.Downloading).ToList();
 
             if (!string.IsNullOrEmpty(status))
             {
@@ -342,7 +344,8 @@ namespace Snacks.Controllers
             return Json(new
             {
                 pending = workItems.Count(w => w.Status == WorkItemStatus.Pending),
-                processing = workItems.Count(w => w.Status == WorkItemStatus.Processing),
+                processing = workItems.Count(w => w.Status is WorkItemStatus.Processing
+                    or WorkItemStatus.Uploading or WorkItemStatus.Downloading),
                 completed = workItems.Count(w => w.Status == WorkItemStatus.Completed),
                 failed = workItems.Count(w => w.Status == WorkItemStatus.Failed),
                 total = workItems.Count

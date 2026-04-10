@@ -24,7 +24,7 @@ public class FfprobeService
     /// </summary>
     /// <param name="fileInput">Absolute path to the media file to probe.</param>
     /// <returns>A <see cref="ProbeResult"/> containing all stream and format metadata.</returns>
-    public async Task<ProbeResult> ProbeAsync(string fileInput)
+    public async Task<ProbeResult> ProbeAsync(string fileInput, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(fileInput);
 
@@ -61,7 +61,15 @@ public class FfprobeService
         process.BeginOutputReadLine();
         process.BeginErrorReadLine();
 
-        await process.WaitForExitAsync();
+        try
+        {
+            await process.WaitForExitAsync(cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            try { if (!process.HasExited) process.Kill(entireProcessTree: true); } catch { }
+            throw;
+        }
         process.WaitForExit(); // Ensures async OutputDataReceived/ErrorDataReceived events have finished firing
 
         // ffprobe writes JSON to stdout, but some builds redirect it to stderr.

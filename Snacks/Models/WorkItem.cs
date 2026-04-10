@@ -123,5 +123,11 @@ public enum WorkItemStatus
     /// <summary>
     ///     Job was stopped by the user — removed from queue but can be reprocessed later.
     /// </summary>
-    Stopped
+    Stopped,
+
+    /// <summary> Source file is being uploaded to a remote worker node. </summary>
+    Uploading,
+
+    /// <summary> Encoded output is being downloaded from a remote worker node. </summary>
+    Downloading
 }

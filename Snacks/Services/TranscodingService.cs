@@ -169,12 +169,13 @@ public class TranscodingService
         /// <param name="options">Encoder options for this job.</param>
         /// <param name="force">When <c>true</c>, bypasses DB status checks — used for explicit user selection.</param>
         /// <returns>The work item ID (may be a previously existing ID if the file was already tracked).</returns>
-        public async Task<string> AddFileAsync(string filePath, EncoderOptions options, bool force = false)
+        public async Task<string> AddFileAsync(string filePath, EncoderOptions options, bool force = false, CancellationToken cancellationToken = default)
         {
             try
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 var fileInfo = new FileInfo(filePath);
-                var probe = await _ffprobeService.ProbeAsync(filePath);
+                var probe = await _ffprobeService.ProbeAsync(filePath, cancellationToken);
 
                 var length = _ffprobeService.GetVideoDuration(probe);
                 var isHevc = false;
@@ -252,9 +253,10 @@ public class TranscodingService
                 }
 
                 int fourKMultiplier = Math.Clamp(options.FourKBitrateMultiplier, 2, 8);
-                if (alreadyTargetCodec && isHighDef && bitrate > 0 && bitrate <= options.TargetBitrate * fourKMultiplier)
+                int fourKTarget = options.TargetBitrate * fourKMultiplier;
+                if (alreadyTargetCodec && isHighDef && bitrate > 0 && bitrate <= fourKTarget * 1.2)
                 {
-                    Console.WriteLine($"Skipping {workItem.FileName}: already {targetCodecLabel} 4K at {bitrate}kbps (target {options.TargetBitrate}kbps)");
+                    Console.WriteLine($"Skipping {workItem.FileName}: already {targetCodecLabel} 4K at {bitrate}kbps (4K target {fourKTarget}kbps)");
                     await MarkSkippedInDb();
                     return workItem.Id;
                 }
@@ -275,7 +277,8 @@ public class TranscodingService
 
                 if (_workItems.Values.Any(w =>
                     Path.GetFullPath(w.Path).Equals(normalizedPath, StringComparison.OrdinalIgnoreCase) &&
-                    w.Status is WorkItemStatus.Pending or WorkItemStatus.Processing))
+                    w.Status is WorkItemStatus.Pending or WorkItemStatus.Processing
+                        or WorkItemStatus.Uploading or WorkItemStatus.Downloading))
                 {
                     return workItem.Id;
                 }
@@ -434,7 +437,8 @@ public class TranscodingService
             var normalizedPath = Path.GetFullPath(filePath);
             return _workItems.Values.Any(w =>
                 Path.GetFullPath(w.Path).Equals(normalizedPath, StringComparison.OrdinalIgnoreCase) &&
-                w.Status is WorkItemStatus.Pending or WorkItemStatus.Processing);
+                w.Status is WorkItemStatus.Pending or WorkItemStatus.Processing
+                    or WorkItemStatus.Uploading or WorkItemStatus.Downloading);
         }
 
         /// <summary>Returns all known work items ordered by creation time descending.</summary>
@@ -463,7 +467,8 @@ public class TranscodingService
                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
                 await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Cancelled);
             }
-            else if (workItem.Status == WorkItemStatus.Processing && workItem.IsRemote)
+            else if (workItem.Status is WorkItemStatus.Processing or WorkItemStatus.Uploading or WorkItemStatus.Downloading
+                     && workItem.IsRemote)
             {
                 if (_remoteJobCanceller != null && workItem.AssignedNodeId != null)
                     await _remoteJobCanceller.Invoke(id, workItem.AssignedNodeId);
@@ -483,9 +488,9 @@ public class TranscodingService
                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
                 await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Cancelled);
             }
-            else if (workItem.Status == WorkItemStatus.Processing)
+            else if (workItem.Status is WorkItemStatus.Processing or WorkItemStatus.Uploading or WorkItemStatus.Downloading)
             {
-                // Orphaned: processing but not assigned to a remote node or local encoder
+                // Orphaned: processing/transferring but not assigned to a remote node or local encoder
                 workItem.Status = WorkItemStatus.Cancelled;
                 workItem.CompletedAt = DateTime.UtcNow;
                 workItem.AssignedNodeId = null;
@@ -512,7 +517,8 @@ public class TranscodingService
                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
                 await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Unseen);
             }
-            else if (workItem.Status == WorkItemStatus.Processing && workItem.IsRemote)
+            else if (workItem.Status is WorkItemStatus.Processing or WorkItemStatus.Uploading or WorkItemStatus.Downloading
+                     && workItem.IsRemote)
             {
                 if (_remoteJobCanceller != null && workItem.AssignedNodeId != null)
                     await _remoteJobCanceller.Invoke(id, workItem.AssignedNodeId);
@@ -532,9 +538,9 @@ public class TranscodingService
                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
                 await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Unseen);
             }
-            else if (workItem.Status == WorkItemStatus.Processing)
+            else if (workItem.Status is WorkItemStatus.Processing or WorkItemStatus.Uploading or WorkItemStatus.Downloading)
             {
-                // Orphaned: processing but not assigned to a remote node or local encoder
+                // Orphaned: processing/transferring but not assigned to a remote node or local encoder
                 workItem.Status = WorkItemStatus.Stopped;
                 workItem.CompletedAt = DateTime.UtcNow;
                 workItem.AssignedNodeId = null;
@@ -661,6 +667,12 @@ public class TranscodingService
                 workItem.Progress = 0;
                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
                 await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Processing);
+
+                // Lazy probe: items restored from DB on startup don't have probe data yet
+                if (workItem.Probe == null)
+                {
+                    workItem.Probe = await _ffprobeService.ProbeAsync(workItem.Path);
+                }
 
                 await ConvertVideoAsync(workItem, options);
 
@@ -932,9 +944,20 @@ public class TranscodingService
             {
                 int multiplier = Math.Clamp(options.FourKBitrateMultiplier, 2, 8);
                 int hdBitrate = options.TargetBitrate * multiplier;
-                targetBitrate = $"{hdBitrate}k";
-                minBitrate = $"{hdBitrate - 500}k";
-                maxBitrate = $"{hdBitrate + 1000}k";
+
+                if (workItem.Bitrate < hdBitrate + 700 && !workItem.IsHevc)
+                {
+                    // Low-bitrate 4K H.264 — compress to 70% like non-4K
+                    targetBitrate = $"{(int)(workItem.Bitrate * 0.7)}k";
+                    minBitrate = $"{(int)(workItem.Bitrate * 0.6)}k";
+                    maxBitrate = $"{(int)(workItem.Bitrate * 0.8)}k";
+                }
+                else
+                {
+                    targetBitrate = $"{hdBitrate}k";
+                    minBitrate = $"{hdBitrate - 500}k";
+                    maxBitrate = $"{hdBitrate + 1000}k";
+                }
             }
             else if (workItem.Bitrate < options.TargetBitrate + 700 && !workItem.IsHevc)
             {
@@ -1841,6 +1864,95 @@ public class TranscodingService
             _workItems.Clear();
 
             Console.WriteLine($"Cluster: Queue cleared ({pendingItems.Count} items stopped)");
+        }
+
+        /// <summary>
+        ///     Fast-path queue restoration from a database record. Skips ffprobe entirely by
+        ///     building the WorkItem from persisted fields. The probe will be performed lazily
+        ///     when the item is actually picked up for processing or cluster dispatch.
+        ///     Used during startup to avoid re-probing every file in the queue.
+        /// </summary>
+        public async Task<string?> RestoreToQueueAsync(MediaFile dbFile, EncoderOptions options)
+        {
+            if (!File.Exists(dbFile.FilePath))
+                return null;
+
+            var normalizedPath = Path.GetFullPath(dbFile.FilePath);
+
+            // Skip if already in memory
+            if (_workItems.Values.Any(w =>
+                Path.GetFullPath(w.Path).Equals(normalizedPath, StringComparison.OrdinalIgnoreCase) &&
+                w.Status is WorkItemStatus.Pending or WorkItemStatus.Processing
+                    or WorkItemStatus.Uploading or WorkItemStatus.Downloading))
+            {
+                return null;
+            }
+
+            if (_isRemoteJobChecker != null && await _isRemoteJobChecker(normalizedPath))
+                return null;
+
+            var workItem = new WorkItem
+            {
+                FileName = dbFile.FileName,
+                Path     = dbFile.FilePath,
+                Size     = dbFile.FileSize,
+                Bitrate  = dbFile.Bitrate,
+                Length   = dbFile.Duration,
+                IsHevc   = dbFile.IsHevc,
+                Probe    = null // Lazily probed when processing starts
+            };
+
+            _workItems[workItem.Id] = workItem;
+            lock (_queueLock)
+            {
+                _workQueue.Add(workItem);
+                _workQueue.Sort((a, b) => b.Bitrate.CompareTo(a.Bitrate));
+            }
+
+            await _hubContext.Clients.All.SendAsync("WorkItemAdded", workItem);
+            return workItem.Id;
+        }
+
+        /// <summary>
+        ///     Clears all in-memory state: kills any active FFmpeg process, clears the queue
+        ///     and work items dictionary. Used by ClearHistoryAsync for a full reset. Does not
+        ///     touch the database — the caller is responsible for DB reset.
+        /// </summary>
+        public async Task ClearAllInMemoryState()
+        {
+            Console.WriteLine("TranscodingService: Clearing all in-memory state...");
+
+            // Kill active FFmpeg process
+            WorkItem? activeItem;
+            Process? activeProc;
+            lock (_activeLock)
+            {
+                activeItem = _activeWorkItem;
+                activeProc = _activeProcess;
+                _activeWorkItem = null;
+                _activeProcess = null;
+            }
+
+            if (activeProc != null)
+            {
+                try { if (!activeProc.HasExited) activeProc.Kill(entireProcessTree: true); } catch { }
+            }
+
+            if (activeItem != null)
+            {
+                activeItem.Status = WorkItemStatus.Stopped;
+                activeItem.CompletedAt = DateTime.UtcNow;
+                await _hubContext.Clients.All.SendAsync("WorkItemUpdated", activeItem);
+            }
+
+            // Clear queue and work items
+            lock (_queueLock)
+            {
+                _workQueue.Clear();
+            }
+            _workItems.Clear();
+
+            Console.WriteLine("TranscodingService: In-memory state cleared");
         }
 
         /// <summary>

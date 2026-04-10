@@ -41,7 +41,7 @@ public sealed class ClusterDiscoveryService
     };
 
     /// <summary> Protocol version for cluster inter-node communication. </summary>
-    internal const string ClusterVersion = "2.2.2";
+    internal const string ClusterVersion = "2.2.3";
 
     private volatile ClusterConfig       _config;
     private UdpClient?                   _udpListener;
@@ -304,6 +304,13 @@ public sealed class ClusterDiscoveryService
                 if (port < 1 || port > 65535)
                     continue;
 
+                // Reject second master via discovery
+                if (role == "master" && (_config.Role == "master" || _nodes.Values.Any(n => n.Role == "master")))
+                {
+                    Console.WriteLine($"ClusterDiscovery: Ignoring master announcement from {senderIp}:{port} — a master already exists in the cluster");
+                    continue;
+                }
+
                 Console.WriteLine($"ClusterDiscovery: Discovered {role} at {senderIp}:{port} — performing handshake");
                 var scheme = _config.UseHttps ? "https" : "http";
                 _ = Task.Run(() => PerformHandshakeAsync($"{scheme}://{senderIp}:{port}", ct));
@@ -419,6 +426,14 @@ public sealed class ClusterDiscoveryService
 
             var response = await client.PostAsync(url, content, ct);
 
+            if (response.StatusCode == System.Net.HttpStatusCode.Conflict)
+            {
+                var body = await response.Content.ReadAsStringAsync(ct);
+                Console.WriteLine($"ClusterDiscovery: Handshake rejected by {baseUrl} — {body}");
+                Console.WriteLine("ClusterDiscovery: Another master exists in the cluster. Reconfigure this node as 'node' or 'standalone'.");
+                return;
+            }
+
             if (!response.IsSuccessStatusCode)
             {
                 var body = await response.Content.ReadAsStringAsync(ct);
@@ -455,8 +470,25 @@ public sealed class ClusterDiscoveryService
     ///     When <see langword="true"/>, resets <see cref="ClusterNode.LastHeartbeat"/> to now
     ///     because a successful handshake confirms the node is alive.
     /// </param>
-    public void RegisterOrUpdateNode(ClusterNode node, bool fromHandshake = false)
+    public (bool Accepted, string? RejectReason) RegisterOrUpdateNode(ClusterNode node, bool fromHandshake = false)
     {
+        // Reject a second master joining the cluster
+        if (node.Role == "master")
+        {
+            if (_config.Role == "master")
+            {
+                Console.WriteLine($"ClusterDiscovery: Rejecting master {node.Hostname} ({node.IpAddress}:{node.Port}) — this node is already a master");
+                return (false, "A master already exists in the cluster");
+            }
+
+            var existingMaster = _nodes.Values.FirstOrDefault(n => n.Role == "master");
+            if (existingMaster != null)
+            {
+                Console.WriteLine($"ClusterDiscovery: Rejecting master {node.Hostname} — master {existingMaster.Hostname} already in cluster");
+                return (false, $"A master already exists in the cluster: {existingMaster.Hostname}");
+            }
+        }
+
         var isNew = !_nodes.TryGetValue(node.NodeId, out var existingNode);
         if (isNew || fromHandshake)
             node.LastHeartbeat = DateTime.UtcNow;
@@ -474,6 +506,8 @@ public sealed class ClusterDiscoveryService
         {
             _ = _hubContext.Clients.All.SendAsync("WorkerUpdated", node);
         }
+
+        return (true, null);
     }
 
     /******************************************************************

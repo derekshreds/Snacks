@@ -297,6 +297,28 @@ public class MediaFileRepository
         }
 
         /// <summary>
+        ///     Clears only the <c>RemoteWorkItemId</c> for a file without changing its status.
+        ///     Used when a stale remote ID is detected (node no longer has partial data).
+        /// </summary>
+        public async Task ClearRemoteWorkItemIdAsync(string normalizedPath)
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            var file = await context.MediaFiles.FirstOrDefaultAsync(f => f.FilePath == normalizedPath);
+            if (file != null)
+            {
+                file.RemoteWorkItemId = null;
+                await SaveChangesWithRetryAsync(context);
+            }
+        }
+
+        /// <summary> Deletes all entries from the StateTransitions WAL table. </summary>
+        public async Task ClearAllTransitionsAsync()
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            await context.StateTransitions.ExecuteDeleteAsync();
+        }
+
+        /// <summary>
         ///     Resets a single file to <see cref="MediaFileStatus.Unseen" /> and clears its failure fields.
         ///     Used when a file has changed on disk or needs to be retried after a failure.
         /// </summary>
