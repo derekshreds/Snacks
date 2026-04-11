@@ -101,6 +101,19 @@
                     Leave 4K content untouched
                 </div>
             </div>
+
+            <div class="mb-2">
+                <label for="@(formPrefix)SkipPercentAboveTarget" class="form-label">
+                    <i class="fas fa-forward me-1"></i> Skip Threshold
+                </label>
+                <div class="input-group input-group-sm">
+                    <input type="number" class="form-control" id="@(formPrefix)SkipPercentAboveTarget" name="SkipPercentAboveTarget" min="0" max="100" value="20" oninput="this.value=Math.max(0,Math.min(100,parseInt(this.value)||0))">
+                    <span class="input-group-text">% above target</span>
+                </div>
+                <div class="form-text">
+                    Skip files already in target codec within this % above target bitrate
+                </div>
+            </div>
         </div>
     </div>
 

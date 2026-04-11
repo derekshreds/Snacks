@@ -87,6 +87,12 @@ class TranscodingManager {
                 this.loadAutoScanConfig(false);
             });
 
+            this.connection.on("HistoryCleared", () => {
+                this.workItems.clear();
+                this.logs.clear();
+                this.loadWorkItems();
+            });
+
             // Cluster events
             this.connection.on("WorkerConnected", (node) => {
                 if (!this.workers.has(node.nodeId)) {
@@ -126,6 +132,7 @@ class TranscodingManager {
                 console.log("SignalR Reconnected — resyncing state");
                 this.updateConnectionStatus(true);
                 this.loadWorkItems();
+                this.loadClusterConfig();
             });
 
             this.connection.onreconnecting(() => {
@@ -143,6 +150,8 @@ class TranscodingManager {
             await this.connection.start();
             console.log("SignalR Connected");
             this.updateConnectionStatus(true);
+            this.loadWorkItems();
+            this.loadClusterConfig();
         } catch (err) {
             console.error("SignalR Connection Error: ", err);
             this.updateConnectionStatus(false);
@@ -356,6 +365,11 @@ class TranscodingManager {
      * @param {string} directoryPath - Absolute path of the directory to navigate into.
      */
     async loadSubdirectories(directoryPath) {
+        // Normalize bare Windows drive letters (e.g. "D:") to include trailing backslash
+        // Without this, Windows resolves "D:" to the process CWD on that drive
+        if (/^[A-Za-z]:$/.test(directoryPath)) {
+            directoryPath += '\\';
+        }
         this.currentDirectory = directoryPath;
         const container = document.getElementById('directoryList');
 
@@ -398,12 +412,10 @@ class TranscodingManager {
 
             // Back button — go to parent or back to top-level directory list
             document.getElementById('dirBack').addEventListener('click', () => {
-                // Try both Windows and Unix path separators
-                const parent = directoryPath.replace(/[/\\][^/\\]+[/\\]?$/, '');
-                if (!parent || parent === directoryPath || parent.length < 2) {
-                    this.loadDirectories(); // back to top-level list
+                if (data.parentPath) {
+                    this.loadSubdirectories(data.parentPath);
                 } else {
-                    this.loadSubdirectories(parent);
+                    this.loadDirectories();
                 }
             });
 
@@ -751,6 +763,7 @@ class TranscodingManager {
             StrictBitrate: document.getElementById(`${prefix}StrictBitrate`).checked,
             FourKBitrateMultiplier: parseInt(document.getElementById(`${prefix}FourKBitrateMultiplier`)?.value || '4'),
             Skip4K: document.getElementById(`${prefix}Skip4K`)?.checked || false,
+            SkipPercentAboveTarget: Math.max(0, parseInt(document.getElementById(`${prefix}SkipPercentAboveTarget`)?.value || '20')),
             OutputDirectory: document.getElementById(`${prefix}OutputDirectory`)?.value || ''
         };
         this.saveSettingsToServer(options);
@@ -802,6 +815,7 @@ class TranscodingManager {
             set('StrictBitrate', saved.StrictBitrate ?? saved.strictBitrate);
             set('FourKBitrateMultiplier', saved.FourKBitrateMultiplier || saved.fourKBitrateMultiplier);
             set('Skip4K', saved.Skip4K ?? saved.skip4K);
+            set('SkipPercentAboveTarget', Math.max(0, saved.SkipPercentAboveTarget ?? saved.skipPercentAboveTarget ?? 20));
             set('OutputDirectory', saved.OutputDirectory || saved.outputDirectory || '');
         } catch { }
     }

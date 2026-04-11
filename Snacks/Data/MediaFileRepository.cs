@@ -57,6 +57,16 @@ public class MediaFileRepository
         public async Task InitializeAsync()
         {
             using var context = await _contextFactory.CreateDbContextAsync();
+
+            // Clear any stale EF Core migration lock left by a previous crash.
+            // This is safe because Snacks is a single-instance app — if we're
+            // starting up, no other instance is legitimately holding the lock.
+            try
+            {
+                await context.Database.ExecuteSqlRawAsync("DELETE FROM __EFMigrationsLock;");
+            }
+            catch { /* Table may not exist yet on first run */ }
+
             await context.Database.MigrateAsync();
 
             // WAL allows concurrent readers during writes. NORMAL synchronous only syncs at

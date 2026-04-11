@@ -397,29 +397,39 @@ public sealed class ClusterNodeJobService
                 catch { }
             }
         }
-        finally
+
+        // Check if encoding succeeded but the output was deleted (no savings case).
+        // ConvertAsync deletes the output when the encoded file isn't smaller than the
+        // original, so we need to detect this before reporting completion to the master.
+        var noSavings = encodingSucceeded && GetOutputFileForJob(workItem.Id) == null;
+        if (noSavings)
+            Console.WriteLine($"Cluster: Encoding succeeded for {workItem.FileName} but no savings — will notify master to skip download");
+
+        try
         {
-            if (encodingSucceeded && _currentRemoteJob != null)
+            if (encodingSucceeded && !noSavings && _currentRemoteJob != null)
             {
                 _currentRemoteJob.Progress = 100;
                 _currentRemoteJob.Status   = WorkItemStatus.Downloading;
                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", _currentRemoteJob);
             }
 
-            _completedJobId = encodingSucceeded ? _currentRemoteJob?.Id : null;
+            _completedJobId = encodingSucceeded && !noSavings ? _currentRemoteJob?.Id : null;
             _currentRemoteJob = null;
             _remoteJobCts?.Dispose();
             _remoteJobCts = null;
             _transcodingService.SetProgressCallback(null);
             _transcodingService.SetLogCallback(null);
         }
+        catch { }
 
         // Report completion OUTSIDE the try/catch — encoding succeeded,
         // so even if this POST fails, the output file still exists on disk
         // and the master can discover it via heartbeat or recovery
         if (encodingSucceeded && masterUrl != null)
         {
-            await PersistCompletedJobAsync(workItem.Id, masterUrl, selfUrl: null, outputFileName: workItem.FileName);
+            if (!noSavings)
+                await PersistCompletedJobAsync(workItem.Id, masterUrl, selfUrl: null, outputFileName: workItem.FileName);
 
             for (int attempt = 0; attempt < 10; attempt++)
             {
@@ -431,15 +441,17 @@ public sealed class ClusterNodeJobService
                     {
                         JobId          = workItem.Id,
                         Success        = true,
+                        NoSavings      = noSavings,
                         OutputFileName = workItem.FileName
                     };
                     var content = new StringContent(
                         JsonSerializer.Serialize(new { completion, nodeBaseUrl = selfUrl }, _jsonOptions),
                         Encoding.UTF8, "application/json");
                     await client.PostAsync($"{masterUrl}/api/cluster/jobs/{workItem.Id}/complete", content);
-                    Console.WriteLine($"Cluster: Reported completion for {workItem.FileName} to master");
+                    Console.WriteLine($"Cluster: Reported {(noSavings ? "no-savings" : "completion")} for {workItem.FileName} to master");
 
-                    await RemoveCompletedJobAsync(workItem.Id);
+                    if (!noSavings)
+                        await RemoveCompletedJobAsync(workItem.Id);
                     break;
                 }
                 catch (Exception ex)
@@ -449,6 +461,10 @@ public sealed class ClusterNodeJobService
                         await Task.Delay(TimeSpan.FromSeconds(10));
                 }
             }
+
+            // Clean up temp files immediately for no-savings jobs since there's nothing to download
+            if (noSavings)
+                CleanupJobFiles(workItem.Id);
         }
     }
 

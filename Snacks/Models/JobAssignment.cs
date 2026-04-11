@@ -81,4 +81,7 @@ public sealed class JobCompletion
 
     /// <summary> Name of the output file (e.g., "Movie [snacks].mkv"). </summary>
     public string OutputFileName { get; set; } = "";
+
+    /// <summary> Whether encoding produced no size savings and the output was discarded. </summary>
+    public bool NoSavings { get; set; }
 }

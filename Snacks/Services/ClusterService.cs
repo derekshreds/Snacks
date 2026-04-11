@@ -1105,7 +1105,20 @@ public sealed class ClusterService : IHostedService, IDisposable
         await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
 
         if (!string.IsNullOrEmpty(progress.LogLine))
+        {
             await _hubContext.Clients.All.SendAsync("TranscodingLog", jobId, progress.LogLine);
+
+            // Persist remote logs to disk so they survive page refreshes and restarts
+            try
+            {
+                var logPath = _transcodingService.BuildLogFilePath(jobId, workItem.FileName);
+                Directory.CreateDirectory(Path.GetDirectoryName(logPath)!);
+                await File.AppendAllTextAsync(logPath, progress.LogLine.EndsWith('\n')
+                    ? progress.LogLine
+                    : progress.LogLine + "\n");
+            }
+            catch { }
+        }
     }
 
     /// <summary>
@@ -1113,7 +1126,7 @@ public sealed class ClusterService : IHostedService, IDisposable
     ///     and performs file placement. Separates download from validation so that
     ///     download failures trigger re-downloads, not re-encodes.
     /// </summary>
-    public async Task HandleRemoteCompletionAsync(string jobId, string nodeBaseUrl)
+    public async Task HandleRemoteCompletionAsync(string jobId, string nodeBaseUrl, bool noSavings = false)
     {
         if (!_remoteJobs.TryGetValue(jobId, out var workItem))
         {
@@ -1127,6 +1140,35 @@ public sealed class ClusterService : IHostedService, IDisposable
             }
             return;
         }
+
+        // Encoding produced no savings — skip download and mark as skipped
+        if (noSavings)
+        {
+            Console.WriteLine($"Cluster: No savings for {workItem.FileName} — skipping download");
+            workItem.Status         = WorkItemStatus.Completed;
+            workItem.CompletedAt    = DateTime.UtcNow;
+            workItem.Progress       = 100;
+            workItem.ErrorMessage   = null;
+            workItem.RemoteJobPhase = null;
+            await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Skipped);
+            await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
+
+            _remoteJobs.TryRemove(jobId, out _);
+            _downloadRetryCounts.TryRemove(jobId, out _);
+            if (_jobCts.TryRemove(jobId, out var skipCts)) skipCts.Dispose();
+
+            if (workItem.AssignedNodeId != null && _nodes.TryGetValue(workItem.AssignedNodeId, out var skipNode))
+            {
+                skipNode.CompletedJobs++;
+                if (skipNode.ActiveWorkItemId == jobId)
+                {
+                    skipNode.ActiveWorkItemId = null;
+                    skipNode.Status = NodeStatus.Online;
+                }
+            }
+            return;
+        }
+
         if (!_activeDownloads.TryAdd(jobId, true)) return;
 
         try
@@ -1849,6 +1891,30 @@ public sealed class ClusterService : IHostedService, IDisposable
             if (activeJobs.Count == 0) return;
 
             Console.WriteLine($"Cluster: Recovering {activeJobs.Count} remote job(s) from database...");
+
+            // Phase 0.5: Rebuild node registry from database assignments so that
+            // the master's in-memory _nodes dictionary is restored after a restart.
+            // Nodes are marked Unreachable until heartbeats confirm they're alive.
+            var knownNodeIds = new HashSet<string>();
+            foreach (var mediaFile in activeJobs)
+            {
+                if (string.IsNullOrEmpty(mediaFile.AssignedNodeId) || !knownNodeIds.Add(mediaFile.AssignedNodeId))
+                    continue;
+
+                var recoveredNode = new ClusterNode
+                {
+                    NodeId        = mediaFile.AssignedNodeId,
+                    Hostname      = mediaFile.AssignedNodeName ?? "recovered",
+                    IpAddress     = mediaFile.AssignedNodeIp ?? "unknown",
+                    Port          = mediaFile.AssignedNodePort ?? 6767,
+                    Role          = "node",
+                    Status        = NodeStatus.Unreachable,
+                    LastHeartbeat = DateTime.UtcNow,
+                    Capabilities  = new WorkerCapabilities()
+                };
+                _discovery.RegisterOrUpdateNode(recoveredNode, fromHandshake: false);
+                Console.WriteLine($"Cluster: Recovered node {recoveredNode.Hostname} ({recoveredNode.IpAddress}:{recoveredNode.Port}) from database");
+            }
 
             foreach (var mediaFile in activeJobs)
             {

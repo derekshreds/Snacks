@@ -100,4 +100,12 @@ public sealed class EncoderOptions
     ///     "auto" detects available hardware at runtime.
     /// </summary>
     public string HardwareAcceleration { get; set; } = "auto";
+
+    /// <summary>
+    ///     Skip files already in the target codec if their bitrate is within this
+    ///     percentage above the target. Default: 20 (skip if within 20% above target).
+    ///     Set to 0 to only skip files at or below target. Set to 100 to skip files
+    ///     up to 2x target.
+    /// </summary>
+    public int SkipPercentAboveTarget { get; set; } = 20;
 }

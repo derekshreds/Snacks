@@ -41,7 +41,7 @@ public sealed class ClusterDiscoveryService
     };
 
     /// <summary> Protocol version for cluster inter-node communication. </summary>
-    internal const string ClusterVersion = "2.2.3";
+    internal const string ClusterVersion = "2.2.4";
 
     private volatile ClusterConfig       _config;
     private UdpClient?                   _udpListener;
@@ -383,20 +383,39 @@ public sealed class ClusterDiscoveryService
         }
     }
 
-    /// <summary> Repeatedly attempts to register with the master, retrying every 10 seconds until successful or cancelled. </summary>
+    /// <summary>
+    ///     Keeps re-handshaking with the configured master on a loop.
+    ///     Retries every 10 seconds while unregistered, then slows to every
+    ///     30 seconds to re-announce in case the master restarted and lost
+    ///     its in-memory node list.
+    /// </summary>
     /// <param name="ct">Cancelled when the cluster is stopping.</param>
     private async Task RegisterWithMasterAsync(CancellationToken ct)
     {
+        bool registered = false;
         while (!ct.IsCancellationRequested)
         {
             try
             {
                 await PerformHandshakeAsync(_config.MasterUrl!, ct);
-                return;
+                if (!registered)
+                {
+                    registered = true;
+                    Console.WriteLine("ClusterDiscovery: Registered with master — switching to periodic re-handshake");
+                }
+                await Task.Delay(TimeSpan.FromSeconds(30), ct);
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"ClusterDiscovery: Failed to register with master: {ex.Message}");
+                if (registered)
+                {
+                    Console.WriteLine($"ClusterDiscovery: Lost contact with master — {ex.Message}");
+                    registered = false;
+                }
+                else
+                {
+                    Console.WriteLine($"ClusterDiscovery: Failed to register with master: {ex.Message}");
+                }
                 await Task.Delay(TimeSpan.FromSeconds(10), ct);
             }
         }
@@ -482,7 +501,7 @@ public sealed class ClusterDiscoveryService
             }
 
             var existingMaster = _nodes.Values.FirstOrDefault(n => n.Role == "master");
-            if (existingMaster != null)
+            if (existingMaster != null && existingMaster.NodeId != node.NodeId)
             {
                 Console.WriteLine($"ClusterDiscovery: Rejecting master {node.Hostname} — master {existingMaster.Hostname} already in cluster");
                 return (false, $"A master already exists in the cluster: {existingMaster.Hostname}");

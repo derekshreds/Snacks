@@ -191,8 +191,9 @@ public sealed class ClusterController : ControllerBase
         ///     body to prevent SSRF attacks.
         /// </summary>
         /// <param name="jobId"> The completed job ID. </param>
+        /// <param name="body"> Optional JSON body containing the <c>completion</c> payload. </param>
         [HttpPost("jobs/{jobId}/complete")]
-        public IActionResult ReportCompletion(string jobId)
+        public IActionResult ReportCompletion(string jobId, [FromBody] JsonElement body)
         {
             var nodes = _clusterService.GetNodes();
             var remoteIp = HttpContext.Connection.RemoteIpAddress?.ToString();
@@ -202,10 +203,15 @@ public sealed class ClusterController : ControllerBase
             if (node == null)
                 return Unauthorized(new { error = "Unknown node" });
 
+            bool noSavings = false;
+            if (body.TryGetProperty("completion", out var completionProp) &&
+                completionProp.TryGetProperty("noSavings", out var noSavingsProp))
+                noSavings = noSavingsProp.GetBoolean();
+
             var config = _clusterService.GetConfig();
             var scheme = config.UseHttps ? "https" : "http";
             var nodeBaseUrl = $"{scheme}://{node.IpAddress}:{node.Port}";
-            _ = Task.Run(() => _clusterService.HandleRemoteCompletionAsync(jobId, nodeBaseUrl));
+            _ = Task.Run(() => _clusterService.HandleRemoteCompletionAsync(jobId, nodeBaseUrl, noSavings));
             return Ok();
         }
 

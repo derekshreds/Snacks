@@ -142,6 +142,22 @@ public class TranscodingService
                 try { return File.ReadAllLines(logPath).ToList(); }
                 catch { }
             }
+
+            // Fallback: search logs directory by short ID — picks up remote job logs
+            // written by ClusterService that aren't in the local _workItems dictionary.
+            var shortId = workItemId.Length > 8 ? workItemId[..8] : workItemId;
+            var logsDir = Path.Combine(_fileService.GetWorkingDirectory(), "logs");
+            if (Directory.Exists(logsDir))
+            {
+                try
+                {
+                    var match = Directory.GetFiles(logsDir, $"*_{shortId}.log").FirstOrDefault();
+                    if (match != null)
+                        return File.ReadAllLines(match).ToList();
+                }
+                catch { }
+            }
+
             return new List<string>();
         }
 
@@ -151,11 +167,19 @@ public class TranscodingService
         /// </summary>
         private string? GetLogFilePath(string workItemId)
         {
-            if (!_workItems.TryGetValue(workItemId, out var workItem))
-                return null;
+            if (_workItems.TryGetValue(workItemId, out var workItem))
+                return BuildLogFilePath(workItemId, workItem.FileName);
+            return null;
+        }
 
+        /// <summary>
+        /// Builds the log file path from a work item ID and file name. Public so that
+        /// ClusterService can write remote job logs to the same location.
+        /// </summary>
+        public string BuildLogFilePath(string workItemId, string fileName)
+        {
             var logsDir = Path.Combine(_fileService.GetWorkingDirectory(), "logs");
-            var safeName = string.Join("_", _fileService.RemoveExtension(workItem.FileName).Split(Path.GetInvalidFileNameChars()));
+            var safeName = string.Join("_", _fileService.RemoveExtension(fileName).Split(Path.GetInvalidFileNameChars()));
             var shortId = workItemId.Length > 8 ? workItemId[..8] : workItemId;
             return Path.Combine(logsDir, $"{safeName}_{shortId}.log");
         }
@@ -191,7 +215,29 @@ public class TranscodingService
                     }
                 }
 
-                long bitrate = length > 0 ? (long)(fileInfo.Length * 8 / length / 1000) : 0;
+                long totalBitrate = length > 0 ? (long)(fileInfo.Length * 8 / length / 1000) : 0;
+                long bitrate = totalBitrate;
+
+                // For files near the target bitrate, measure the actual video-only bitrate
+                // with a quick 15s copy pass. Total bitrate includes audio/subs which can
+                // inflate the number by 1000-4000kbps and cause bad skip/encode decisions.
+                // Only bother for files where audio could tip the decision — within 2x target.
+                int effectiveTarget = probe.Streams.Any(s => s.CodecType == "video" && s.Width > 1920)
+                    ? options.TargetBitrate * Math.Clamp(options.FourKBitrateMultiplier, 2, 8)
+                    : options.TargetBitrate;
+                if (bitrate > 0 && bitrate <= effectiveTarget * 2 && length > 5)
+                {
+                    long videoBitrate = await MeasureVideoBitrateAsync(new WorkItem { Path = filePath, Length = length });
+                    if (videoBitrate > 0 && videoBitrate <= totalBitrate)
+                    {
+                        Console.WriteLine($"Video bitrate for {_fileService.GetFileName(filePath)}: {videoBitrate}kbps (total was {totalBitrate}kbps)");
+                        bitrate = videoBitrate;
+                    }
+                    else if (videoBitrate > totalBitrate)
+                    {
+                        Console.WriteLine($"Video bitrate measurement for {_fileService.GetFileName(filePath)} was {videoBitrate}kbps but total is only {totalBitrate}kbps — using total");
+                    }
+                }
 
                 var workItem = new WorkItem
                 {
@@ -245,16 +291,17 @@ public class TranscodingService
                 }
 
                 string targetCodecLabel = targetIsAv1 ? "AV1" : (isHevc ? "HEVC" : "H.264");
-                if (alreadyTargetCodec && bitrate > 0 && bitrate <= options.TargetBitrate * 1.2 && !isHighDef)
+                double skipMultiplier = 1.0 + (Math.Clamp(options.SkipPercentAboveTarget, 0, 100) / 100.0);
+                if (alreadyTargetCodec && bitrate > 0 && bitrate <= options.TargetBitrate * skipMultiplier && !isHighDef)
                 {
-                    Console.WriteLine($"Skipping {workItem.FileName}: already {targetCodecLabel} at {bitrate}kbps (target {options.TargetBitrate}kbps)");
+                    Console.WriteLine($"Skipping {workItem.FileName}: already {targetCodecLabel} at {bitrate}kbps (target {options.TargetBitrate}kbps, skip threshold {skipMultiplier:P0})");
                     await MarkSkippedInDb();
                     return workItem.Id;
                 }
 
                 int fourKMultiplier = Math.Clamp(options.FourKBitrateMultiplier, 2, 8);
                 int fourKTarget = options.TargetBitrate * fourKMultiplier;
-                if (alreadyTargetCodec && isHighDef && bitrate > 0 && bitrate <= fourKTarget * 1.2)
+                if (alreadyTargetCodec && isHighDef && bitrate > 0 && bitrate <= fourKTarget * skipMultiplier)
                 {
                     Console.WriteLine($"Skipping {workItem.FileName}: already {targetCodecLabel} 4K at {bitrate}kbps (4K target {fourKTarget}kbps)");
                     await MarkSkippedInDb();
@@ -624,25 +671,28 @@ public class TranscodingService
                     if (workItem.Status is WorkItemStatus.Cancelled or WorkItemStatus.Stopped)
                         continue;
 
-                    // Clone options so retries don't mutate settings for subsequent queue items
+                    // Clone from _lastOptions so settings changes take effect on the next item.
+                    // _lastOptions gets updated when the user saves new settings.
+                    var current = _lastOptions ?? options;
                     var itemOptions = new EncoderOptions
                     {
-                        Format = options.Format,
-                        Codec = options.Codec,
-                        Encoder = options.Encoder,
-                        TargetBitrate = options.TargetBitrate,
-                        TwoChannelAudio = options.TwoChannelAudio,
-                        DeleteOriginalFile = options.DeleteOriginalFile,
-                        EnglishOnlyAudio = options.EnglishOnlyAudio,
-                        EnglishOnlySubtitles = options.EnglishOnlySubtitles,
-                        RemoveBlackBorders = options.RemoveBlackBorders,
-                        RetryOnFail = options.RetryOnFail,
-                        OutputDirectory = options.OutputDirectory,
-                        EncodeDirectory = options.EncodeDirectory,
-                        StrictBitrate = options.StrictBitrate,
-                        HardwareAcceleration = options.HardwareAcceleration,
-                        FourKBitrateMultiplier = options.FourKBitrateMultiplier,
-                        Skip4K = options.Skip4K
+                        Format = current.Format,
+                        Codec = current.Codec,
+                        Encoder = current.Encoder,
+                        TargetBitrate = current.TargetBitrate,
+                        TwoChannelAudio = current.TwoChannelAudio,
+                        DeleteOriginalFile = current.DeleteOriginalFile,
+                        EnglishOnlyAudio = current.EnglishOnlyAudio,
+                        EnglishOnlySubtitles = current.EnglishOnlySubtitles,
+                        RemoveBlackBorders = current.RemoveBlackBorders,
+                        RetryOnFail = current.RetryOnFail,
+                        OutputDirectory = current.OutputDirectory,
+                        EncodeDirectory = current.EncodeDirectory,
+                        StrictBitrate = current.StrictBitrate,
+                        HardwareAcceleration = current.HardwareAcceleration,
+                        FourKBitrateMultiplier = current.FourKBitrateMultiplier,
+                        Skip4K = current.Skip4K,
+                        SkipPercentAboveTarget = current.SkipPercentAboveTarget
                     };
                     await ProcessWorkItemAsync(workItem, itemOptions);
                 }
@@ -725,12 +775,25 @@ public class TranscodingService
             // Resolve "auto" to a concrete hardware type before building the command
             await ResolveHardwareAccelerationAsync(options);
             await LogAsync(workItem.Id, $"Hardware acceleration: {options.HardwareAcceleration}");
-            await LogAsync(workItem.Id, $"Current Bitrate: {workItem.Bitrate}kbps");
+            await LogAsync(workItem.Id, $"Video Bitrate: {workItem.Bitrate}kbps");
 
             var (targetBitrate, minBitrate, maxBitrate, videoCopy) = CalculateBitrates(workItem, options);
 
-            // Resolve the actual encoder — may fall back to software if VAAPI doesn't support this codec
+            // Resolve the actual encoder — verify it works, fall back to software if not
             string encoder = videoCopy ? "copy" : GetEncoder(options);
+            string hwAccel = options.HardwareAcceleration;
+            if (!videoCopy && !encoder.StartsWith("lib") && encoder != "copy")
+            {
+                string testHwFlags = GetInitFlags(hwAccel);
+                if (!await TestEncoderAsync(testHwFlags, encoder))
+                {
+                    string swEncoder = GetSoftwareFallbackEncoder(options);
+                    await LogAsync(workItem.Id,
+                        $"{encoder} not available — falling back to {swEncoder}");
+                    encoder = swEncoder;
+                    hwAccel = "none"; // Don't use hardware init flags with software encoder
+                }
+            }
             bool useVaapi = !videoCopy && encoder.Contains("vaapi");
 
             // VAAPI on Elkhart Lake (J6412) only supports CQP reliably.
@@ -759,15 +822,40 @@ public class TranscodingService
             }
             else if (encoder == "libsvtav1")
             {
-                // SVT-AV1 doesn't support forced keyframes in VBR mode.
-                // Use CRF with a bitrate cap — CRF 30 is a good middle ground,
-                // and maxrate constrains output to our target. This gives quality-adaptive
-                // encoding that won't exceed the target bitrate.
+                // SVT-AV1 v4.1+ VBR (rc=1) undershoots -b:v by ~5% on full encodes.
+                // -maxrate is only supported in CRF mode, not VBR. Inflate the target
+                // by 5% to compensate for the systematic undershoot.
+                long targetKbps = long.Parse(targetBitrate.TrimEnd('k'));
+                long adjustedBv = (long)(targetKbps * 1.05);
+                compressionFlags = $"-svtav1-params rc=1 -b:v {adjustedBv}k ";
+            }
+            else if (encoder.Contains("nvenc"))
+            {
+                // NVENC VBR doesn't strictly enforce -maxrate, but lookahead + adaptive QP
+                // gets it within ~2-4%. This is the best VBR can do on NVENC — CBR would be
+                // exact but wastes bits on simple scenes.
                 int maxBitrateVal = int.Parse(maxBitrate.TrimEnd('k'));
-                compressionFlags = $"-crf 30 -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
+                compressionFlags = $"-g 25 -rc vbr -rc-lookahead 32 -spatial_aq 1 -temporal_aq 1 -b:v {targetBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
+            }
+            else if (encoder.Contains("amf"))
+            {
+                // AMF ignores -maxrate in generic VBR mode (confirmed bug in FFmpeg >= 7.1).
+                // Use vbr_peak (peak-constrained VBR) with enforce_hrd to enforce the ceiling.
+                int maxBitrateVal = int.Parse(maxBitrate.TrimEnd('k'));
+                compressionFlags = $"-g 25 -rc vbr_peak -enforce_hrd 1 -b:v {targetBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
+            }
+            else if (encoder.Contains("qsv"))
+            {
+                // QSV needs lookahead and extbrc for reliable maxrate enforcement.
+                int maxBitrateVal = int.Parse(maxBitrate.TrimEnd('k'));
+                compressionFlags = $"-g 25 -extbrc 1 -look_ahead 1 -look_ahead_depth 40 -b:v {targetBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
             }
             else
-                compressionFlags = $"-g 25 -b:v {targetBitrate} -minrate {minBitrate} -maxrate {maxBitrate} -bufsize {maxBitrate} ";
+            {
+                // Software encoders (libx264, libx265) — standard VBR with maxrate enforcement.
+                int maxBitrateVal = int.Parse(maxBitrate.TrimEnd('k'));
+                compressionFlags = $"-g 25 -b:v {targetBitrate} -minrate {minBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
+            }
 
             // Detect 10-bit content — VAAPI needs p010 format instead of nv12 for 10-bit
             bool is10Bit = workItem.Probe?.Streams?.Any(s =>
@@ -782,7 +870,7 @@ public class TranscodingService
                     "Using software decode + VAAPI encode (hwaccel decode disabled)");
             }
 
-            string initFlags = useVaapi ? GetInitFlags(options.HardwareAcceleration, canHwDecode) : GetInitFlags("none");
+            string initFlags = useVaapi ? GetInitFlags(hwAccel, canHwDecode) : GetInitFlags(hwAccel);
             string vaapiFormat = is10Bit ? "p010" : "nv12";
             string hwFilter = useVaapi ? $"-vf format={vaapiFormat}|vaapi,hwupload " : "";
             bool isSvtAv1 = encoder == "libsvtav1";
@@ -841,10 +929,8 @@ public class TranscodingService
                             ? $"-vf {cropFilter.Replace("-vf ", "")},format=nv12|vaapi,hwupload "
                             : $"{cropFilter} ";
                         videoFlags = $"{_ffprobeService.MapVideo(workItem.Probe!)} -c:v {encoder} {presetFlag}{cropHwFilter}";
-                        compressionFlags = useVaapi
-                            ? $"-g 25 -rc_mode CQP -global_quality 25 "
-                            : isSvtAv1 ? $"-crf 30 -maxrate {maxBitrate} -bufsize {int.Parse(maxBitrate.TrimEnd('k')) * 2}k "
-                            : $"-g 25 -b:v {targetBitrate} -minrate {minBitrate} -maxrate {maxBitrate} -bufsize {maxBitrate} ";
+                        compressionFlags = GetCropCompressionFlags(encoder, useVaapi, isSvtAv1,
+                            targetBitrate, minBitrate, maxBitrate);
                     }
                     else
                     {
@@ -955,8 +1041,8 @@ public class TranscodingService
                 else
                 {
                     targetBitrate = $"{hdBitrate}k";
-                    minBitrate = $"{hdBitrate - 500}k";
-                    maxBitrate = $"{hdBitrate + 1000}k";
+                    minBitrate = $"{hdBitrate - 200}k";
+                    maxBitrate = $"{hdBitrate + 500}k";
                 }
             }
             else if (workItem.Bitrate < options.TargetBitrate + 700 && !workItem.IsHevc)
@@ -983,6 +1069,30 @@ public class TranscodingService
             }
 
             return (targetBitrate, minBitrate, maxBitrate, videoCopy);
+        }
+
+        /// <summary>
+        /// Returns compression flags for crop-triggered re-encodes, matching the same
+        /// per-encoder rate control logic used by the main encoding path.
+        /// </summary>
+        private static string GetCropCompressionFlags(string encoder, bool useVaapi, bool isSvtAv1,
+            string targetBitrate, string minBitrate, string maxBitrate)
+        {
+            int maxBitrateVal = int.Parse(maxBitrate.TrimEnd('k'));
+            if (useVaapi)
+                return $"-g 25 -rc_mode CQP -global_quality 25 ";
+            if (isSvtAv1)
+            {
+                long tbr = long.Parse(targetBitrate.TrimEnd('k'));
+                return $"-svtav1-params rc=1 -b:v {(long)(tbr * 1.05)}k ";
+            }
+            if (encoder.Contains("nvenc"))
+                return $"-g 25 -rc vbr -rc-lookahead 32 -spatial_aq 1 -temporal_aq 1 -b:v {targetBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
+            if (encoder.Contains("amf"))
+                return $"-g 25 -rc vbr_peak -enforce_hrd 1 -b:v {targetBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
+            if (encoder.Contains("qsv"))
+                return $"-g 25 -extbrc 1 -look_ahead 1 -look_ahead_depth 40 -b:v {targetBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
+            return $"-g 25 -b:v {targetBitrate} -minrate {minBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
         }
 
         private string? _detectedHardware = null;
@@ -1269,6 +1379,19 @@ public class TranscodingService
         }
 
         /// <summary>
+        /// Returns the software fallback encoder for the user's codec preference.
+        /// Used when the requested hardware encoder isn't available on the system.
+        /// </summary>
+        private static string GetSoftwareFallbackEncoder(EncoderOptions options)
+        {
+            bool isAv1 = options.Encoder.Contains("av1") || options.Encoder.Contains("svt");
+            bool isH264 = !isAv1 && options.Encoder.Contains("264");
+            if (isAv1) return "libsvtav1";
+            if (isH264) return "libx264";
+            return "libx265";
+        }
+
+        /// <summary>
         /// Computes the output file path for a work item.
         /// Prefers <c>EncodeDirectory</c>, then <c>OutputDirectory</c>, then the source file's directory.
         /// Output file is named <c>"{basename} [snacks].{ext}"</c>.
@@ -1306,19 +1429,33 @@ public class TranscodingService
         }
 
         /// <summary>
-        /// Does iterative 30-second test encodes to find the right QP for the target bitrate.
-        /// Starts at QP 24, measures output, adjusts, and retests until within 15% of target
-        /// or max 3 iterations.
+        /// Does iterative test encodes at two file locations to find the right QP for the
+        /// target bitrate. Samples at ~25% and ~60% of the file (30s each) and averages the
+        /// results. For short files (<90s) falls back to a single sample. Starts at QP 24,
+        /// adjusts per iteration, and stops when within 15% of target or after 6 iterations.
         /// </summary>
         private async Task<(int qp, bool useLowPower)> CalibrateVaapiQualityAsync(WorkItem workItem, EncoderOptions options, string inputPath, long targetKbps)
         {
-            int testDuration = 60;
             int maxIterations = 6;
-            double tolerance = 0.20; // within 20% of target
+            double tolerance = 0.15; // within 15% of target
 
-            // Seek to ~40% into the file for a representative sample (avoids intros/credits)
-            int seekSeconds = Math.Max(0, (int)(workItem.Length * 0.40));
-            string seekTime = $"{seekSeconds / 3600:D2}:{(seekSeconds % 3600) / 60:D2}:{seekSeconds % 60:D2}";
+            // Build sample points: two 30s samples at 25% and 60%, or one shorter sample for short files
+            var samples = new List<(string seekTime, int duration)>();
+            if (workItem.Length >= 90)
+            {
+                samples.Add((FormatSeekTime((int)(workItem.Length * 0.25)), 30));
+                samples.Add((FormatSeekTime((int)(workItem.Length * 0.60)), 30));
+            }
+            else
+            {
+                // Short file — single sample, capped to avoid overrunning the file
+                int sampleDuration = Math.Max(5, (int)(workItem.Length * 0.4));
+                int seekSeconds = Math.Max(0, (int)(workItem.Length * 0.30));
+                // Don't seek + duration past the end of the file
+                if (seekSeconds + sampleDuration > (int)workItem.Length)
+                    seekSeconds = Math.Max(0, (int)workItem.Length - sampleDuration);
+                samples.Add((FormatSeekTime(seekSeconds), sampleDuration));
+            }
 
             bool canHwDecode = CanVaapiDecode(workItem.Probe);
             string initFlags = GetInitFlags(options.HardwareAcceleration, canHwDecode);
@@ -1340,40 +1477,47 @@ public class TranscodingService
                 for (int iteration = 1; iteration <= maxIterations; iteration++)
                 {
                     await LogAsync(workItem.Id,
-                        $"Calibration pass {iteration}/{maxIterations} ({modeLabel}) — testing QP {currentQp}...");
+                        $"Calibration pass {iteration}/{maxIterations} ({modeLabel}) — testing QP {currentQp} at {samples.Count} location(s)...");
 
-                    long measuredKbps = await RunTestEncodeAsync(inputPath, initFlags, encoder, hwFilter, lpFlag, currentQp, seekTime, testDuration);
-
-                    if (measuredKbps <= 0)
+                    // Run test encodes at each sample point, track per-sample bitrates
+                    var sampleResults = new List<long>();
+                    bool sampleFailed = false;
+                    foreach (var (seekTime, duration) in samples)
                     {
-                        if (lowPower)
+                        long kbps = await RunTestEncodeAsync(inputPath, initFlags, encoder, hwFilter, lpFlag, currentQp, seekTime, duration);
+                        if (kbps <= 0)
                         {
-                            await LogAsync(workItem.Id,
-                                "LP mode produced no output — retrying without low_power...");
-                            break; // try next mode
-                        }
-                        await LogAsync(workItem.Id,
-                            "VAAPI produced no measurable output — encoder incompatible with this file");
-                        return (-1, false);
-                    }
-
-                    // Detect absurd output (more than 5x source bitrate = encoder broken for this file)
-                    if (workItem.Bitrate > 0 && measuredKbps > workItem.Bitrate * 5)
-                    {
-                        if (lowPower)
-                        {
-                            await LogAsync(workItem.Id,
-                                $"LP mode output ({measuredKbps}kbps) is absurdly high — retrying without low_power...");
+                            sampleFailed = true;
                             break;
                         }
-                        await LogAsync(workItem.Id,
-                            $"VAAPI output ({measuredKbps}kbps) is absurdly high — encoder broken for this file");
+                        if (workItem.Bitrate > 0 && kbps > workItem.Bitrate * 5)
+                        {
+                            sampleFailed = true;
+                            if (lowPower)
+                                await LogAsync(workItem.Id,
+                                    $"LP mode output ({kbps}kbps at {seekTime}) is absurdly high — retrying without low_power...");
+                            else
+                                await LogAsync(workItem.Id,
+                                    $"VAAPI output ({kbps}kbps at {seekTime}) is absurdly high — encoder broken for this file");
+                            break;
+                        }
+                        sampleResults.Add(kbps);
+                    }
+
+                    if (sampleFailed)
+                    {
+                        if (lowPower) break; // try normal mode
                         return (-1, false);
                     }
 
-                    double ratio = (double)measuredKbps / targetKbps;
+                    // Use the peak (highest bitrate) sample for calibration — complex scenes
+                    // are what overshoot the target, so we tune QP to the worst case
+                    long peakKbps = sampleResults.Max();
+                    long avgKbps = sampleResults.Sum() / sampleResults.Count;
+
+                    double ratio = (double)peakKbps / targetKbps;
                     await LogAsync(workItem.Id,
-                        $"Pass {iteration}: QP {currentQp} → {measuredKbps}kbps (target {targetKbps}kbps, ratio {ratio:F2}x)");
+                        $"Pass {iteration}: QP {currentQp} → peak {peakKbps}kbps, avg {avgKbps}kbps (target {targetKbps}kbps, ratio {ratio:F2}x)");
 
                     if (ratio >= (1 - tolerance) && ratio <= (1 + tolerance))
                     {
@@ -1383,17 +1527,17 @@ public class TranscodingService
                     }
 
                     // Already below target and at minimum QP — can't increase quality further
-                    if (measuredKbps <= targetKbps && currentQp <= 18)
+                    if (peakKbps <= targetKbps && currentQp <= 18)
                     {
                         await LogAsync(workItem.Id,
                             $"QP {currentQp} already at minimum and below target. Using QP {currentQp} ({modeLabel}).");
                         return (currentQp, lowPower);
                     }
 
-                    // Calculate adjustment: each +2 QP ≈ 0.72x bitrate
-                    double qpDelta = 2.0 * Math.Log((double)targetKbps / measuredKbps) / Math.Log(0.72);
+                    // Calculate adjustment based on peak sample: each +2 QP ≈ 0.72x bitrate
+                    double qpDelta = 2.0 * Math.Log((double)targetKbps / peakKbps) / Math.Log(0.72);
                     int adjustment = (int)Math.Round(qpDelta);
-                    if (adjustment == 0) adjustment = measuredKbps > targetKbps ? 1 : -1;
+                    if (adjustment == 0) adjustment = peakKbps > targetKbps ? 1 : -1;
 
                     currentQp = Math.Clamp(currentQp + adjustment, 18, 51);
                 }
@@ -1406,6 +1550,198 @@ public class TranscodingService
 
             // Both LP and normal mode failed
             return (-1, false);
+        }
+
+        /// <summary>
+        ///     Measures the true video-only bitrate by remuxing 30 seconds of video
+        ///     (no audio, no subs) with -c:v copy to null. This is near-instant since
+        ///     it's just a copy, and gives us the actual video bitrate without audio
+        ///     inflating the number. Returns 0 if measurement fails.
+        /// </summary>
+        private async Task<long> MeasureVideoBitrateAsync(WorkItem workItem)
+        {
+            const int sampleDuration = 15;
+
+            // Seek to ~30% into the file for a representative sample
+            int seekSeconds = Math.Max(0, (int)(workItem.Length * 0.30));
+            // Don't seek past the end
+            if (seekSeconds + sampleDuration > (int)workItem.Length)
+                seekSeconds = Math.Max(0, (int)workItem.Length - sampleDuration);
+
+            int actualDuration = Math.Min(sampleDuration, Math.Max(5, (int)workItem.Length));
+            string seekTime = FormatSeekTime(seekSeconds);
+
+            string command = $"-y -ss {seekTime} -i \"{workItem.Path}\" -t {actualDuration} " +
+                $"-c:v copy -an -sn -f null -";
+
+            try
+            {
+                var psi = new ProcessStartInfo(_ffmpegPath)
+                {
+                    Arguments = command,
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                };
+
+                using var process = new Process { StartInfo = psi };
+                process.Start();
+
+                var stderrTask = process.StandardError.ReadToEndAsync();
+                var stdoutTask = process.StandardOutput.ReadToEndAsync();
+
+                var completed = process.WaitForExit(30000);
+                if (!completed)
+                {
+                    try { process.Kill(entireProcessTree: true); } catch { }
+                    return 0;
+                }
+
+                var outputText = await stderrTask;
+                var sizeMatch = Regex.Match(outputText, @"video:\s*(\d+)\s*(?:kB|KiB)");
+                var timeMatch = Regex.Match(outputText, @"time=\s*(\d+):(\d+):(\d+)\.(\d+)");
+                if (sizeMatch.Success && timeMatch.Success)
+                {
+                    long videoKb = long.Parse(sizeMatch.Groups[1].Value);
+                    double measuredSeconds = int.Parse(timeMatch.Groups[1].Value) * 3600
+                                           + int.Parse(timeMatch.Groups[2].Value) * 60
+                                           + int.Parse(timeMatch.Groups[3].Value)
+                                           + double.Parse("0." + timeMatch.Groups[4].Value);
+                    if (measuredSeconds < 1) return 0;
+                    return (long)(videoKb * 8 / measuredSeconds);
+                }
+            }
+            catch { }
+
+            return 0;
+        }
+
+        /// <summary> Formats a duration in seconds as an HH:MM:SS seek time string for FFmpeg. </summary>
+        private static string FormatSeekTime(int seconds)
+        {
+            return $"{seconds / 3600:D2}:{(seconds % 3600) / 60:D2}:{seconds % 60:D2}";
+        }
+
+        /// <summary>
+        ///     Calibrates the -b:v value for SVT-AV1 VBR mode by running iterative 30s
+        ///     test encodes at two positions and adjusting until the output straddles
+        ///     the target. SVT-AV1's VBR consistently undershoots by ~20-25%, so we
+        ///     inflate -b:v until the measured output matches the desired bitrate.
+        /// </summary>
+        private async Task<long> CalibrateSvtAv1BitrateAsync(WorkItem workItem, EncoderOptions options, string inputPath, long targetKbps)
+        {
+            const int sampleDuration = 30;
+            const int maxIterations = 6;
+
+            // Two sample points at ~25% and ~60% of the file, with short-file fallback
+            var samples = new List<(string seekTime, int duration)>();
+            if (workItem.Length >= 90)
+            {
+                samples.Add((FormatSeekTime((int)(workItem.Length * 0.25)), sampleDuration));
+                samples.Add((FormatSeekTime((int)(workItem.Length * 0.60)), sampleDuration));
+            }
+            else
+            {
+                int dur = Math.Max(5, (int)(workItem.Length * 0.4));
+                int seekSec = Math.Max(0, (int)(workItem.Length * 0.30));
+                if (seekSec + dur > (int)workItem.Length)
+                    seekSec = Math.Max(0, (int)workItem.Length - dur);
+                samples.Add((FormatSeekTime(seekSec), dur));
+            }
+
+            string initFlags = GetInitFlags(options.HardwareAcceleration);
+            long currentBv = targetKbps;
+
+            for (int iter = 1; iter <= maxIterations; iter++)
+            {
+                await LogAsync(workItem.Id,
+                    $"SVT-AV1 calibration pass {iter}/{maxIterations} — testing b:v {currentBv}k...");
+
+                var sampleBitrates = new List<long>();
+                foreach (var (seekTime, dur) in samples)
+                {
+                    long measured = await RunSvtAv1TestEncodeAsync(inputPath, initFlags, currentBv, seekTime, dur);
+                    if (measured > 0)
+                        sampleBitrates.Add(measured);
+                }
+
+                if (sampleBitrates.Count == 0)
+                {
+                    await LogAsync(workItem.Id, "SVT-AV1 calibration failed — using target bitrate as-is");
+                    return targetKbps;
+                }
+
+                long lo = sampleBitrates.Min();
+                long hi = sampleBitrates.Max();
+                long avg = sampleBitrates.Sum() / sampleBitrates.Count;
+
+                await LogAsync(workItem.Id,
+                    $"Pass {iter}: b:v {currentBv}k → lo={lo}k hi={hi}k avg={avg}k (target {targetKbps}k)");
+
+                // Done when the average is within 5% of target — individual samples
+                // can vary more due to content complexity, the average is what matters
+                double avgError = Math.Abs((double)(avg - targetKbps) / targetKbps);
+                if (avgError <= 0.05)
+                    break;
+
+                // Scale currentBv by the ratio of target to measured average
+                double correctionRatio = (double)targetKbps / avg;
+                currentBv = (long)(currentBv * correctionRatio);
+                currentBv = Math.Clamp(currentBv, targetKbps, targetKbps * 4);
+            }
+
+            await LogAsync(workItem.Id, $"SVT-AV1 calibration complete — using b:v {currentBv}k for target {targetKbps}k");
+            return currentBv;
+        }
+
+        /// <summary>
+        ///     Runs a short SVT-AV1 VBR test encode and returns the measured bitrate in kbps.
+        ///     Returns 0 if the encode produced no measurable output.
+        /// </summary>
+        private async Task<long> RunSvtAv1TestEncodeAsync(string inputPath, string initFlags, long bitrateKbps, string seekTime, int duration)
+        {
+            string command = $"{initFlags} -ss {seekTime} -i \"{inputPath}\" -t {duration} " +
+                $"-c:v libsvtav1 -preset 6 -svtav1-params rc=1 -b:v {bitrateKbps}k " +
+                $"-an -sn -f null -";
+
+            Console.WriteLine($"SVT-AV1 calibration command: ffmpeg {command}");
+
+            try
+            {
+                var psi = new ProcessStartInfo(_ffmpegPath)
+                {
+                    Arguments = command,
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                };
+
+                using var process = new Process { StartInfo = psi };
+                process.Start();
+
+                var stderrTask = process.StandardError.ReadToEndAsync();
+                var stdoutTask = process.StandardOutput.ReadToEndAsync();
+
+                var completed = process.WaitForExit(180000);
+                if (!completed)
+                {
+                    try { process.Kill(entireProcessTree: true); } catch { }
+                    return 0;
+                }
+
+                var outputText = await stderrTask;
+                var sizeMatch = Regex.Match(outputText, @"video:\s*(\d+)\s*(?:kB|KiB)");
+                if (sizeMatch.Success)
+                {
+                    long outputKb = long.Parse(sizeMatch.Groups[1].Value);
+                    return outputKb * 8 / duration;
+                }
+            }
+            catch (Exception ex) { Console.WriteLine($"SVT-AV1 calibration test exception: {ex.Message}"); }
+
+            return 0;
         }
 
         /// <summary>
@@ -1754,6 +2090,12 @@ public class TranscodingService
         public EncoderOptions? GetLastOptions() => _lastOptions;
 
         /// <summary>
+        /// Updates the cached encoder options so that queued items pick up
+        /// settings changes without needing a new scan.
+        /// </summary>
+        public void UpdateOptions(EncoderOptions options) => _lastOptions = options;
+
+        /// <summary>
         ///     Suspends or resumes the local processing loop. When suspended, pending items remain
         ///     in the queue for the cluster dispatch loop to assign to remote nodes instead.
         /// </summary>
@@ -1762,6 +2104,16 @@ public class TranscodingService
         {
             _localEncodingPaused = paused;
             Console.WriteLine($"Cluster: Local encoding {(paused ? "paused" : "resumed")}");
+
+            // When unpausing, kick off queue processing for any items already waiting
+            if (!paused && _lastOptions != null)
+            {
+                _ = Task.Run(async () =>
+                {
+                    try { await ProcessQueueAsync(_lastOptions); }
+                    catch (Exception ex) { Console.WriteLine($"Error in ProcessQueueAsync after unpause: {ex.Message}"); }
+                });
+            }
         }
 
         /// <summary>Returns the detected hardware acceleration type (e.g., <c>"nvidia"</c>, <c>"intel"</c>, <c>"none"</c>), or <c>null</c> if detection hasn't completed.</summary>

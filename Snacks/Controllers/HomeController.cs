@@ -44,7 +44,7 @@ namespace Snacks.Controllers
             return Json(new {
                 status = "healthy",
                 timestamp = DateTime.UtcNow,
-                version = "2.2.3"
+                version = "2.2.4"
             });
         }
 
@@ -84,9 +84,8 @@ namespace Snacks.Controllers
                         {
                             path = dir,
                             name = Path.GetFileName(dir),
-                            videoCount = CountVideoFilesRecursive(dir)
+                            videoCount = 0
                         })
-                        .Where(d => d.videoCount > 0)
                         .OrderBy(d => d.name)
                         .ToList();
 
@@ -135,8 +134,8 @@ namespace Snacks.Controllers
                 if (!_fileService.AllowAllPaths())
                 {
                     var inputDir = _fileService.GetUploadsDirectory();
-                    var fullRequestPath = Path.GetFullPath(request.DirectoryPath);
-                    var fullInputDir = Path.GetFullPath(inputDir);
+                    var fullRequestPath = Path.GetFullPath(request.DirectoryPath).TrimEnd(Path.DirectorySeparatorChar);
+                    var fullInputDir = Path.GetFullPath(inputDir).TrimEnd(Path.DirectorySeparatorChar);
 
                     if (!fullRequestPath.StartsWith(fullInputDir + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
                         && !fullRequestPath.Equals(fullInputDir, StringComparison.OrdinalIgnoreCase))
@@ -190,10 +189,9 @@ namespace Snacks.Controllers
                 {
                     var inputDir = _fileService.GetUploadsDirectory();
                     var fullRequestPath = Path.GetFullPath(request.FilePath);
-                    var fullInputDir = Path.GetFullPath(inputDir);
+                    var fullInputDir = Path.GetFullPath(inputDir).TrimEnd(Path.DirectorySeparatorChar);
 
-                    if (!fullRequestPath.StartsWith(fullInputDir + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
-                        && !fullRequestPath.Equals(fullInputDir, StringComparison.OrdinalIgnoreCase))
+                    if (!fullRequestPath.StartsWith(fullInputDir + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
                     {
                         return BadRequest("File is not within allowed library path");
                     }
@@ -378,8 +376,8 @@ namespace Snacks.Controllers
                 if (!_fileService.AllowAllPaths())
                 {
                     var inputDir = _fileService.GetUploadsDirectory();
-                    var fullRequestPath = Path.GetFullPath(directoryPath);
-                    var fullInputDir = Path.GetFullPath(inputDir);
+                    var fullRequestPath = Path.GetFullPath(directoryPath).TrimEnd(Path.DirectorySeparatorChar);
+                    var fullInputDir = Path.GetFullPath(inputDir).TrimEnd(Path.DirectorySeparatorChar);
                     if (!fullRequestPath.StartsWith(fullInputDir + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
                         && !fullRequestPath.Equals(fullInputDir, StringComparison.OrdinalIgnoreCase))
                         return BadRequest("Directory is not within allowed library path");
@@ -394,11 +392,37 @@ namespace Snacks.Controllers
                     .OrderBy(d => d.name)
                     .ToArray();
 
-                return Json(new { directories = dirs, parentPath = directoryPath });
+                // Compute the parent path for back-navigation.
+                // Returns null when at a filesystem root OR at the configured library root,
+                // so the frontend knows to show the top-level directory listing.
+                string parentPath = null;
+                var rawParent = Path.GetDirectoryName(directoryPath);
+                if (rawParent != null)
+                {
+                    if (_fileService.AllowAllPaths())
+                    {
+                        parentPath = rawParent;
+                    }
+                    else
+                    {
+                        var inputDir = _fileService.GetUploadsDirectory();
+                        var normalizedParent = Path.GetFullPath(rawParent).TrimEnd(Path.DirectorySeparatorChar);
+                        var normalizedRoot = Path.GetFullPath(inputDir).TrimEnd(Path.DirectorySeparatorChar);
+                        // Only return a parent if it's strictly inside the library root.
+                        // When parent IS the root, return null so the frontend shows the
+                        // top-level filtered listing via loadDirectories() instead.
+                        if (normalizedParent.StartsWith(normalizedRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                        {
+                            parentPath = rawParent;
+                        }
+                    }
+                }
+
+                return Json(new { directories = dirs, parentPath });
             }
             catch (UnauthorizedAccessException)
             {
-                return Json(new { directories = Array.Empty<object>(), parentPath = directoryPath });
+                return Json(new { directories = Array.Empty<object>(), parentPath = (string)null });
             }
             catch (Exception ex)
             {
@@ -425,8 +449,8 @@ namespace Snacks.Controllers
                 if (!_fileService.AllowAllPaths())
                 {
                     var inputDir = _fileService.GetUploadsDirectory();
-                    var fullRequestPath = Path.GetFullPath(directoryPath);
-                    var fullInputDir = Path.GetFullPath(inputDir);
+                    var fullRequestPath = Path.GetFullPath(directoryPath).TrimEnd(Path.DirectorySeparatorChar);
+                    var fullInputDir = Path.GetFullPath(inputDir).TrimEnd(Path.DirectorySeparatorChar);
 
                     if (!fullRequestPath.StartsWith(fullInputDir + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
                         && !fullRequestPath.Equals(fullInputDir, StringComparison.OrdinalIgnoreCase))
@@ -523,20 +547,34 @@ namespace Snacks.Controllers
         /// </summary>
         /// <param name="settings"> The settings object to serialize and persist. </param>
         [HttpPost]
-        public IActionResult SaveSettings([FromBody] object settings)
+        public IActionResult SaveSettings([FromBody] System.Text.Json.JsonElement settings)
         {
             try
             {
                 var settingsPath = GetSettingsPath();
                 var backupPath = settingsPath + ".bak";
                 var tempPath = settingsPath + ".tmp";
-                var json = System.Text.Json.JsonSerializer.Serialize(settings, new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
+                var jsonOptions = new System.Text.Json.JsonSerializerOptions
+                {
+                    WriteIndented = true,
+                    PropertyNameCaseInsensitive = true
+                };
+                var json = System.Text.Json.JsonSerializer.Serialize(settings, jsonOptions);
 
                 // Atomic write: write to .tmp, rename current to .bak, rename .tmp to settings.json
                 System.IO.File.WriteAllText(tempPath, json);
                 if (System.IO.File.Exists(settingsPath))
                     System.IO.File.Copy(settingsPath, backupPath, overwrite: true);
                 System.IO.File.Move(tempPath, settingsPath, overwrite: true);
+
+                // Update in-memory options so queued items pick up changes immediately
+                try
+                {
+                    var parsed = System.Text.Json.JsonSerializer.Deserialize<EncoderOptions>(json, jsonOptions);
+                    if (parsed != null)
+                        _transcodingService.UpdateOptions(parsed);
+                }
+                catch { } // Non-fatal — settings are still saved to disk
 
                 return Json(new { success = true });
             }
@@ -585,8 +623,8 @@ namespace Snacks.Controllers
                 if (!_fileService.AllowAllPaths())
                 {
                     var inputDir = _fileService.GetUploadsDirectory();
-                    var fullRequestPath = Path.GetFullPath(request.Path);
-                    var fullInputDir = Path.GetFullPath(inputDir);
+                    var fullRequestPath = Path.GetFullPath(request.Path).TrimEnd(Path.DirectorySeparatorChar);
+                    var fullInputDir = Path.GetFullPath(inputDir).TrimEnd(Path.DirectorySeparatorChar);
 
                     if (!fullRequestPath.StartsWith(fullInputDir + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
                         && !fullRequestPath.Equals(fullInputDir, StringComparison.OrdinalIgnoreCase))
@@ -642,17 +680,10 @@ namespace Snacks.Controllers
 
         /// <summary> Runs an immediate scan outside the scheduled interval. </summary>
         [HttpPost]
-        public async Task<IActionResult> TriggerAutoScan()
+        public IActionResult TriggerAutoScan()
         {
-            try
-            {
-                await _autoScanService.TriggerScanNowAsync();
-                return Json(new { success = true });
-            }
-            catch (Exception ex)
-            {
-                return BadRequest(ex.Message);
-            }
+            _ = Task.Run(() => _autoScanService.TriggerScanNowAsync());
+            return Json(new { success = true });
         }
 
         /// <summary> Resets all file statuses to Unseen so every file will be re-evaluated on the next scan. </summary>
