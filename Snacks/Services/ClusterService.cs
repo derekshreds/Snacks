@@ -749,7 +749,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                                 // for multiple consecutive heartbeats to avoid racing with encoding startup.
                                 var graceKey = $"_idle_grace_{node.ActiveWorkItemId}";
                                 var graceCount = _downloadRetryCounts.AddOrUpdate(graceKey, 1, (_, c) => c + 1);
-                                if (graceCount >= 3)
+                                if (graceCount >= 10)
                                 {
                                     Console.WriteLine($"Cluster: Node {node.Hostname} idle for {graceCount} heartbeats for job {node.ActiveWorkItemId} — re-queuing");
                                     _downloadRetryCounts.TryRemove(graceKey, out _);
@@ -913,6 +913,43 @@ public sealed class ClusterService : IHostedService, IDisposable
             _transcodingService.RequeueWorkItem(workItem, silent: true);
             nodeLock.Release();
             return;
+        }
+
+        // Pre-dispatch check: ask the node what it's doing before committing.
+        // The master's in-memory state can drift from reality (e.g., node is still
+        // retrying a failed encode that the master already re-queued). The node is
+        // the source of truth — if it says it's busy, don't dispatch.
+        var preCheckUrl = NodeBaseUrl(node);
+        try
+        {
+            var hbResponse = await _discovery.CreateAuthenticatedClient()
+                .GetAsync($"{preCheckUrl}/api/cluster/heartbeat");
+            if (hbResponse.IsSuccessStatusCode)
+            {
+                var hbBody = await hbResponse.Content.ReadAsStringAsync();
+                var hbData = JsonSerializer.Deserialize<JsonElement>(hbBody);
+
+                bool nodeIsBusy = false;
+                if (hbData.TryGetProperty("currentJobId", out var curJob) && curJob.ValueKind != JsonValueKind.Null)
+                    nodeIsBusy = true;
+                else if (hbData.TryGetProperty("status", out var statusProp) && statusProp.GetString() == "busy")
+                    nodeIsBusy = true;
+
+                if (nodeIsBusy)
+                {
+                    var busyJobId = curJob.ValueKind != JsonValueKind.Null ? curJob.GetString() : "unknown";
+                    Console.WriteLine($"Cluster: Node {node.Hostname} is busy (job {busyJobId}) — re-queuing {workItem.FileName}");
+                    _activeUploads.TryRemove(workItem.Id, out _);
+                    UpdateNodeStatus(node.NodeId, NodeStatus.Busy);
+                    _transcodingService.RequeueWorkItem(workItem, silent: true);
+                    nodeLock.Release();
+                    return;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Cluster: Pre-dispatch check failed for {node.Hostname}: {ex.Message} — proceeding with dispatch");
         }
 
         // Node lock acquired in RunDispatchAsync — release it now that _activeUploads guards us
