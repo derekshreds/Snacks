@@ -395,7 +395,7 @@ namespace Snacks.Controllers
                 // Compute the parent path for back-navigation.
                 // Returns null when at a filesystem root OR at the configured library root,
                 // so the frontend knows to show the top-level directory listing.
-                string parentPath = null;
+                string? parentPath = null;
                 var rawParent = Path.GetDirectoryName(directoryPath);
                 if (rawParent != null)
                 {
@@ -422,7 +422,7 @@ namespace Snacks.Controllers
             }
             catch (UnauthorizedAccessException)
             {
-                return Json(new { directories = Array.Empty<object>(), parentPath = (string)null });
+                return Json(new { directories = Array.Empty<object>(), parentPath = (string?)null });
             }
             catch (Exception ex)
             {
@@ -844,6 +844,78 @@ namespace Snacks.Controllers
             return Json(new { success = true, message = "Restarting..." });
         }
 
+        /******************************************************************
+         *  Node Settings
+         ******************************************************************/
+
+        /// <summary> Returns all per-node settings. </summary>
+        [HttpGet]
+        public IActionResult GetNodeSettings()
+        {
+            return Json(_clusterService.GetNodeSettingsConfig());
+        }
+
+        /// <summary> Saves settings for a single cluster node. </summary>
+        [HttpPost]
+        public IActionResult SaveNodeSettings([FromBody] NodeSettings settings)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(settings.NodeId))
+                    return BadRequest("NodeId is required");
+
+                if (settings.Only4K == true && settings.Exclude4K == true)
+                    return BadRequest("Only4K and Exclude4K are mutually exclusive");
+
+                _clusterService.SaveNodeSettings(settings);
+                return Json(new { success = true });
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(ex.Message);
+            }
+        }
+
+        /// <summary> Removes settings for a cluster node. </summary>
+        [HttpPost]
+        public IActionResult DeleteNodeSettings([FromBody] DeleteNodeSettingsRequest request)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(request.NodeId))
+                    return BadRequest("NodeId is required");
+
+                _clusterService.DeleteNodeSettings(request.NodeId);
+                return Json(new { success = true });
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(ex.Message);
+            }
+        }
+
+        /******************************************************************
+         *  Folder Settings
+         ******************************************************************/
+
+        /// <summary> Saves encoding overrides for a watched folder. </summary>
+        [HttpPost]
+        public IActionResult SaveFolderSettings([FromBody] SaveFolderSettingsRequest request)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(request.Path))
+                    return BadRequest("Path is required");
+
+                _autoScanService.SaveFolderSettings(request.Path, request.EncodingOverrides);
+                return Json(new { success = true });
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(ex.Message);
+            }
+        }
+
         /// <summary> Renders the error page view. </summary>
         public IActionResult Error()
         {
@@ -920,5 +992,22 @@ namespace Snacks.Controllers
     {
         /// <summary> Absolute path to the file that should be retried. </summary>
         public string FilePath { get; set; } = "";
+    }
+
+    /// <summary> Request body for <see cref="HomeController.DeleteNodeSettings"/>. </summary>
+    public class DeleteNodeSettingsRequest
+    {
+        /// <summary> The NodeId to remove settings for. </summary>
+        public string NodeId { get; set; } = "";
+    }
+
+    /// <summary> Request body for <see cref="HomeController.SaveFolderSettings"/>. </summary>
+    public class SaveFolderSettingsRequest
+    {
+        /// <summary> Absolute path of the watched folder. </summary>
+        public string Path { get; set; } = "";
+
+        /// <summary> Encoding overrides to apply. Pass null to clear overrides. </summary>
+        public EncoderOptionsOverride? EncodingOverrides { get; set; }
     }
 }

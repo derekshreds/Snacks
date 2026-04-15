@@ -136,15 +136,15 @@
 </div>
 
 <!-- Library Browser Modal -->
-<div class="modal fade modal-fullscreen-mobile" id="libraryModal" tabindex="-1">
-    <div class="modal-dialog modal-xl">
-        <div class="modal-content">
+<div class="snacks-modal-backdrop" id="libraryModal">
+    <div class="snacks-modal-wrapper">
+        <div class="snacks-modal-dialog">
             <div class="modal-header">
                 <h5 class="modal-title">
                     <i class="fas fa-folder-open me-2"></i>
                     Video Library Browser
                 </h5>
-                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                <button type="button" class="btn-close" onclick="document.getElementById('libraryModal').classList.remove('open')"></button>
             </div>
             <div class="modal-body">
                 <div class="row">
@@ -180,7 +180,7 @@
                 </div>
             </div>
             <div class="modal-footer">
-                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                <button type="button" class="btn btn-secondary" onclick="document.getElementById('libraryModal').classList.remove('open')">Close</button>
                 <button type="button" class="btn btn-primary" id="processDirectory">
                     <i class="fas fa-folder-plus me-2"></i>
                     Process Entire Directory
@@ -191,15 +191,12 @@
 </div>
 
 <!-- Settings Modal -->
-<div class="modal fade modal-fullscreen-mobile" id="settingsModal" tabindex="-1">
-    <div class="modal-dialog modal-xl">
-        <div class="modal-content">
+<div class="snacks-modal-backdrop" id="settingsModal">
+    <div class="snacks-modal-wrapper">
+        <div class="snacks-modal-dialog">
             <div class="modal-header">
-                <h5 class="modal-title">
-                    <i class="fas fa-cog me-2"></i>
-                    Settings
-                </h5>
-                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                <h5 class="modal-title"><i class="fas fa-cog me-2"></i>Settings</h5>
+                <button type="button" class="btn-close" onclick="document.getElementById('settingsModal').classList.remove('open')"></button>
             </div>
             <div class="modal-body">
                 <ul class="nav nav-tabs mb-3" role="tablist">
@@ -224,7 +221,130 @@
                 </div>
             </div>
             <div class="modal-footer">
-                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                <button type="button" class="btn btn-secondary" onclick="document.getElementById('settingsModal').classList.remove('open')">Close</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Override Dialog (sits above settings modal via higher z-index) -->
+<div class="snacks-modal-backdrop" id="overrideDialog" style="--snacks-modal-z: 9100">
+    <div class="snacks-modal-wrapper">
+        <div class="snacks-modal-dialog" style="max-width: 800px;">
+            <div class="modal-header">
+                <h5 id="overrideDialogTitle"></h5>
+                <button type="button" class="btn-close" onclick="document.getElementById('overrideDialog').classList.remove('open')"></button>
+            </div>
+            <div class="modal-body">
+        <div id="overrideNodeRules" style="display: none;">
+            <h6 class="fw-bold mb-2"><i class="fas fa-filter me-1"></i> 4K Dispatch Rules</h6>
+            <div class="form-check mb-2">
+                <input class="form-check-input" type="checkbox" id="nodeOnly4K">
+                <label class="form-check-label" for="nodeOnly4K">Only dispatch 4K jobs to this node</label>
+            </div>
+            <div class="form-check mb-3">
+                <input class="form-check-input" type="checkbox" id="nodeExclude4K">
+                <label class="form-check-label" for="nodeExclude4K">Never dispatch 4K jobs to this node</label>
+            </div>
+            <hr>
+        </div>
+        <h6 class="fw-bold mb-2">
+            <i class="fas fa-cogs me-1"></i> Encoding Overrides
+            <small class="text-muted fw-normal ms-2">Only checked fields override the global settings</small>
+        </h6>
+        <div id="overrideFields">
+            <div class="row g-2">
+                <div class="col-md-6">
+                    <div class="form-check mb-2">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_Format" data-field="Format">
+                        <label class="form-check-label" for="ovr_Format">Format</label>
+                        <select class="form-select form-select-sm mt-1" id="ovrFormat" disabled>
+                            <option value="mkv">MKV</option><option value="mp4">MP4</option>
+                        </select>
+                    </div>
+                    <div class="form-check mb-2">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_Codec" data-field="Codec">
+                        <label class="form-check-label" for="ovr_Codec">Codec</label>
+                        <select class="form-select form-select-sm mt-1" id="ovrCodec" disabled>
+                            <option value="h265">H.265/HEVC</option><option value="h264">H.264/AVC</option><option value="av1">AV1</option>
+                        </select>
+                    </div>
+                    <div class="form-check mb-2">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_HardwareAcceleration" data-field="HardwareAcceleration">
+                        <label class="form-check-label" for="ovr_HardwareAcceleration">Hardware Acceleration</label>
+                        <select class="form-select form-select-sm mt-1" id="ovrHardwareAcceleration" disabled>
+                            <option value="auto">Auto Detect</option><option value="intel">Intel QSV</option><option value="amd">AMD VAAPI</option><option value="nvidia">NVIDIA NVENC</option><option value="none">Software Only</option>
+                        </select>
+                    </div>
+                    <div class="form-check mb-2">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_TargetBitrate" data-field="TargetBitrate">
+                        <label class="form-check-label" for="ovr_TargetBitrate">Target Bitrate (kbps)</label>
+                        <input type="number" class="form-control form-control-sm mt-1" id="ovrTargetBitrate" min="500" max="50000" step="100" value="3500" disabled>
+                    </div>
+                    <div class="form-check mb-2">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_FourKBitrateMultiplier" data-field="FourKBitrateMultiplier">
+                        <label class="form-check-label" for="ovr_FourKBitrateMultiplier">4K Bitrate Multiplier</label>
+                        <select class="form-select form-select-sm mt-1" id="ovrFourKBitrateMultiplier" disabled>
+                            <option value="2">2x</option><option value="3">3x</option><option value="4" selected>4x</option><option value="5">5x</option><option value="6">6x</option><option value="8">8x</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="col-md-6">
+                    <div class="form-check mb-2">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_Skip4K" data-field="Skip4K">
+                        <label class="form-check-label" for="ovr_Skip4K">Skip 4K Videos</label>
+                        <div class="form-check form-switch mt-1">
+                            <input class="form-check-input" type="checkbox" id="ovrSkip4K" disabled>
+                        </div>
+                    </div>
+                    <div class="form-check mb-2">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_StrictBitrate" data-field="StrictBitrate">
+                        <label class="form-check-label" for="ovr_StrictBitrate">Strict Bitrate</label>
+                        <div class="form-check form-switch mt-1">
+                            <input class="form-check-input" type="checkbox" id="ovrStrictBitrate" disabled>
+                        </div>
+                    </div>
+                    <div class="form-check mb-2">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_TwoChannelAudio" data-field="TwoChannelAudio">
+                        <label class="form-check-label" for="ovr_TwoChannelAudio">Convert to Stereo</label>
+                        <div class="form-check form-switch mt-1">
+                            <input class="form-check-input" type="checkbox" id="ovrTwoChannelAudio" disabled>
+                        </div>
+                    </div>
+                    <div class="form-check mb-2">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_EnglishOnlyAudio" data-field="EnglishOnlyAudio">
+                        <label class="form-check-label" for="ovr_EnglishOnlyAudio">English Audio Only</label>
+                        <div class="form-check form-switch mt-1">
+                            <input class="form-check-input" type="checkbox" id="ovrEnglishOnlyAudio" disabled>
+                        </div>
+                    </div>
+                    <div class="form-check mb-2">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_EnglishOnlySubtitles" data-field="EnglishOnlySubtitles">
+                        <label class="form-check-label" for="ovr_EnglishOnlySubtitles">English Subtitles Only</label>
+                        <div class="form-check form-switch mt-1">
+                            <input class="form-check-input" type="checkbox" id="ovrEnglishOnlySubtitles" disabled>
+                        </div>
+                    </div>
+                    <div class="form-check mb-2">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_DeleteOriginalFile" data-field="DeleteOriginalFile">
+                        <label class="form-check-label" for="ovr_DeleteOriginalFile">Replace Original Files</label>
+                        <div class="form-check form-switch mt-1">
+                            <input class="form-check-input" type="checkbox" id="ovrDeleteOriginalFile" disabled>
+                        </div>
+                    </div>
+                    <div class="form-check mb-2">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_SkipPercentAboveTarget" data-field="SkipPercentAboveTarget">
+                        <label class="form-check-label" for="ovr_SkipPercentAboveTarget">Skip Threshold (%)</label>
+                        <input type="number" class="form-control form-control-sm mt-1" id="ovrSkipPercentAboveTarget" min="0" max="100" value="20" disabled>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" onclick="document.getElementById('overrideDialog').classList.remove('open')">Cancel</button>
+                <button type="button" class="btn btn-danger" id="overrideDialogReset">Reset to Defaults</button>
+                <button type="button" class="btn btn-primary" id="overrideDialogSave"><i class="fas fa-save me-1"></i>Save</button>
             </div>
         </div>
     </div>
@@ -258,7 +378,7 @@
 
 <!-- Log Modal -->
 <div class="modal fade modal-fullscreen-mobile" id="logModal" tabindex="-1">
-    <div class="modal-dialog modal-xl">
+    <div class="modal-dialog modal-xl modal-dialog-centered">
         <div class="modal-content">
             <div class="modal-header">
                 <h5 class="modal-title">

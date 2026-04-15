@@ -82,6 +82,8 @@ public sealed class ClusterService : IHostedService, IDisposable
      ******************************************************************/
 
     private ClusterConfig            _config = new();
+    private NodeSettingsConfig       _nodeSettingsConfig = new();
+    private readonly string          _nodeSettingsPath;
     private Timer?                   _heartbeatTimer;
     private Timer?                   _dispatchTimer;
     private CancellationTokenSource? _cts;
@@ -119,7 +121,8 @@ public sealed class ClusterService : IHostedService, IDisposable
         _workDir = _fileService.GetWorkingDirectory();
         var configDir = Path.Combine(_workDir, "config");
         Directory.CreateDirectory(configDir);
-        _configPath = Path.Combine(configDir, "cluster.json");
+        _configPath       = Path.Combine(configDir, "cluster.json");
+        _nodeSettingsPath = Path.Combine(configDir, "node-settings.json");
 
         // Sub-services share the node registry and are configured after config load
         _discovery = new ClusterDiscoveryService(
@@ -142,6 +145,7 @@ public sealed class ClusterService : IHostedService, IDisposable
     public Task StartAsync(CancellationToken cancellationToken)
     {
         LoadConfig();
+        LoadNodeSettings();
         Console.WriteLine($"Cluster: Config loaded — enabled={_config.Enabled}, role={_config.Role}, nodeId={_config.NodeId}");
 
         if (_config.Enabled && _config.Role != "standalone")
@@ -862,14 +866,18 @@ public sealed class ClusterService : IHostedService, IDisposable
                 && !_activeDispatchTasks.ContainsKey(n.NodeId));
             if (!hasAvailableNodes) return;
 
-            var options = LoadEncoderOptions();
+            var globalOptions = LoadEncoderOptions();
 
             while (true)
             {
                 var workItem = _transcodingService.DequeueForRemoteProcessing();
                 if (workItem == null) break;
 
-                var bestNode = FindBestWorker(workItem, options);
+                // Resolve folder-level overrides for worker selection (GPU/encoder matching)
+                var folderOverride = FolderOverrideResolver?.Invoke(workItem.Path);
+                var folderOptions  = EncoderOptionsOverride.ApplyOverrides(globalOptions, folderOverride, null);
+
+                var bestNode = FindBestWorker(workItem, folderOptions);
                 if (bestNode == null)
                 {
                     _transcodingService.RequeueWorkItem(workItem, silent: true);
@@ -885,12 +893,16 @@ public sealed class ClusterService : IHostedService, IDisposable
                     break;
                 }
 
+                // Final options: global → folder → node overrides
+                var nodeOverride  = GetNodeSettings(bestNode.NodeId)?.EncodingOverrides;
+                var finalOptions  = EncoderOptionsOverride.ApplyOverrides(globalOptions, folderOverride, nodeOverride);
+
                 // Mark as uploading immediately to prevent double-dispatch
                 bestNode.ActiveWorkItemId = workItem.Id;
                 bestNode.Status           = NodeStatus.Uploading;
 
                 // Track the dispatch task instead of fire-and-forget
-                var dispatchTask = Task.Run(() => DispatchToNodeAsync(bestNode, workItem, options, nodeLock));
+                var dispatchTask = Task.Run(() => DispatchToNodeAsync(bestNode, workItem, finalOptions, nodeLock));
                 _activeDispatchTasks[bestNode.NodeId] = dispatchTask;
             }
         }
@@ -1662,8 +1674,17 @@ public sealed class ClusterService : IHostedService, IDisposable
     }
 
     /// <summary> Assigns a numeric score to a candidate worker node for the given job. </summary>
-    private static int ScoreNode(ClusterNode node, WorkItem workItem, EncoderOptions options)
+    private int ScoreNode(ClusterNode node, WorkItem workItem, EncoderOptions options)
     {
+        // Check node-level 4K routing constraints
+        var ns = GetNodeSettings(node.NodeId);
+        if (ns != null)
+        {
+            bool is4K = workItem.Probe?.Streams?.Any(s => s.CodecType == "video" && s.Width > 1920) == true;
+            if (ns.Only4K == true && !is4K) return -100;
+            if (ns.Exclude4K == true && is4K) return -100;
+        }
+
         int score = 1;
         var caps  = node.Capabilities;
         if (caps == null) return score; // Capabilities not yet received — allow dispatch with base score
@@ -1875,7 +1896,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                     // work is done and we just need to clear the assignment.
                     if (mediaFile.AssignedNodeId != null)
                     {
-                        var options = LoadEncoderOptions();
+                        var options = ResolveOptionsForJob(mediaFile.FilePath, mediaFile.AssignedNodeId);
                         var ext = options.Format == "mp4" ? ".mp4" : ".mkv";
                         var baseName = Path.GetFileNameWithoutExtension(mediaFile.FileName);
                         var outputFileName = $"{baseName} [snacks]{ext}";
@@ -2120,7 +2141,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                         _remoteJobs[workItem.Id]  = workItem;
                         await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
 
-                        var options = LoadEncoderOptions();
+                        var options = ResolveOptionsForJob(mediaFile.FilePath, mediaFile.AssignedNodeId);
                         var nodeForDispatch = _nodes.Values.FirstOrDefault(n => n.NodeId == mediaFile.AssignedNodeId)
                             ?? new ClusterNode
                             {
@@ -2260,6 +2281,80 @@ public sealed class ClusterService : IHostedService, IDisposable
     {
         var json = JsonSerializer.Serialize(options, _jsonOptions);
         return JsonSerializer.Deserialize<EncoderOptions>(json, _jsonOptions) ?? new EncoderOptions();
+    }
+
+    /******************************************************************
+     *  Node Settings Persistence
+     ******************************************************************/
+
+    /// <summary>
+    ///     Delegate set by <see cref="AutoScanService"/> at startup to resolve
+    ///     per-folder encoding overrides without a circular dependency.
+    /// </summary>
+    public Func<string, EncoderOptionsOverride?>? FolderOverrideResolver { get; set; }
+
+    /// <summary> Returns the full node settings config. </summary>
+    public NodeSettingsConfig GetNodeSettingsConfig() => _nodeSettingsConfig;
+
+    /// <summary> Returns settings for a specific node, or null if none configured. </summary>
+    public NodeSettings? GetNodeSettings(string nodeId) =>
+        _nodeSettingsConfig.Nodes.TryGetValue(nodeId, out var s) ? s : null;
+
+    /// <summary> Saves settings for a single node and persists to disk. </summary>
+    public void SaveNodeSettings(NodeSettings settings)
+    {
+        _nodeSettingsConfig.Nodes[settings.NodeId] = settings;
+        PersistNodeSettings();
+    }
+
+    /// <summary> Removes settings for a node and persists to disk. </summary>
+    public void DeleteNodeSettings(string nodeId)
+    {
+        _nodeSettingsConfig.Nodes.Remove(nodeId);
+        PersistNodeSettings();
+    }
+
+    /// <summary>
+    ///     Builds a final <see cref="EncoderOptions"/> for a specific job and target node,
+    ///     merging global → folder → node overrides.
+    /// </summary>
+    public EncoderOptions ResolveOptionsForJob(string? filePath, string? nodeId)
+    {
+        var global = LoadEncoderOptions();
+        var folderOverride = filePath != null ? FolderOverrideResolver?.Invoke(filePath) : null;
+        var nodeOverride   = nodeId != null ? GetNodeSettings(nodeId)?.EncodingOverrides : null;
+        return EncoderOptionsOverride.ApplyOverrides(global, folderOverride, nodeOverride);
+    }
+
+    private void LoadNodeSettings()
+    {
+        if (File.Exists(_nodeSettingsPath))
+        {
+            try
+            {
+                var json = File.ReadAllText(_nodeSettingsPath);
+                _nodeSettingsConfig = JsonSerializer.Deserialize<NodeSettingsConfig>(json, _jsonOptions)
+                    ?? new NodeSettingsConfig();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Cluster: Failed to load node settings: {ex.Message}");
+                _nodeSettingsConfig = new NodeSettingsConfig();
+            }
+        }
+    }
+
+    private void PersistNodeSettings()
+    {
+        try
+        {
+            var json = JsonSerializer.Serialize(_nodeSettingsConfig, _jsonOptions);
+            File.WriteAllText(_nodeSettingsPath, json);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Cluster: Failed to save node settings: {ex.Message}");
+        }
     }
 
     /// <summary> Loads cluster configuration from disk. </summary>

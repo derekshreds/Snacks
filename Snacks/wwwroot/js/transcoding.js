@@ -23,6 +23,8 @@ class TranscodingManager {
         this.clusterEnabled = false;
         this.clusterRole = 'standalone';
         this.workers = new Map();
+        this._lastAutoScanConfig = null;
+
         this.initializeSignalR();
         this.initializeEventHandlers();
         this.restoreSettings();
@@ -175,9 +177,14 @@ class TranscodingManager {
      * filter tabs, and work item action buttons using event delegation where possible.
      */
     initializeEventHandlers() {
-        // Library modal event handlers
-        document.getElementById('libraryModal').addEventListener('show.bs.modal', () => {
+        // Library modal
+        const libraryEl = document.getElementById('libraryModal');
+        document.getElementById('openLibraryBtn')?.addEventListener('click', () => {
+            libraryEl.classList.add('open');
             this.loadDirectories();
+        });
+        libraryEl.querySelector('.snacks-modal-wrapper').addEventListener('mousedown', function(e) {
+            if (e.target === this) libraryEl.classList.remove('open');
         });
 
         document.getElementById('selectAllFiles').addEventListener('click', () => {
@@ -188,10 +195,35 @@ class TranscodingManager {
             this.processSelectedFiles();
         });
 
-        // Reload auto-scan and cluster config when settings modal opens
-        document.getElementById('settingsModal')?.addEventListener('show.bs.modal', () => {
+        // Settings modal — open/close via .open class
+        document.getElementById('openSettingsBtn')?.addEventListener('click', () => {
+            document.getElementById('settingsModal').classList.add('open');
             this.loadAutoScanConfig();
             this.loadClusterConfig();
+        });
+
+        // Close settings also closes override dialog
+        const settingsEl = document.getElementById('settingsModal');
+        new MutationObserver(() => {
+            if (!settingsEl.classList.contains('open')) this.closeOverrideDialog();
+        }).observe(settingsEl, { attributes: true, attributeFilter: ['class'] });
+
+        // Escape key closes topmost open modal
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') {
+                const override = document.getElementById('overrideDialog');
+                if (override.classList.contains('open')) { override.classList.remove('open'); return; }
+                if (settingsEl.classList.contains('open')) { settingsEl.classList.remove('open'); return; }
+                if (libraryEl.classList.contains('open')) { libraryEl.classList.remove('open'); return; }
+            }
+        });
+
+        // Click backdrop to close (not the dialog itself)
+        settingsEl.querySelector('.snacks-modal-wrapper').addEventListener('mousedown', function(e) {
+            if (e.target === this) settingsEl.classList.remove('open');
+        });
+        document.getElementById('overrideDialog').querySelector('.snacks-modal-wrapper').addEventListener('mousedown', function(e) {
+            if (e.target === this) document.getElementById('overrideDialog').classList.remove('open');
         });
 
         // Cluster event handlers
@@ -201,16 +233,14 @@ class TranscodingManager {
             this.processCurrentDirectory();
         });
 
-        // Save encoder settings on change (exclude auto-scan inputs)
-        document.getElementById('settingsModal').addEventListener('change', (e) => {
-            if (!e.target.id.startsWith('autoScan')) {
-                this.getEncoderOptions('settings');
-            }
+        // Save encoder settings on change (exclude auto-scan and override dialog inputs)
+        const isMainSettingsField = (e) =>
+            !e.target.id.startsWith('autoScan') && !e.target.closest('#overrideDialog');
+        settingsEl.addEventListener('change', (e) => {
+            if (isMainSettingsField(e)) this.getEncoderOptions('settings');
         });
-        document.getElementById('settingsModal').addEventListener('input', (e) => {
-            if (!e.target.id.startsWith('autoScan')) {
-                this.getEncoderOptions('settings');
-            }
+        settingsEl.addEventListener('input', (e) => {
+            if (isMainSettingsField(e)) this.getEncoderOptions('settings');
         });
 
         document.getElementById('pauseResumeBtn')?.addEventListener('click', () => this.togglePause());
@@ -645,11 +675,9 @@ class TranscodingManager {
         button.innerHTML = `<i class="fas fa-play me-1"></i> Process Selected (${this.selectedFiles.size})`;
     }
 
-    /** Closes the library modal using Bootstrap's JS API. */
+    /** Closes the library modal. */
     closeLibraryModal() {
-        const modalEl = document.getElementById('libraryModal');
-        const modal = bootstrap.Modal.getInstance(modalEl) || bootstrap.Modal.getOrCreateInstance(modalEl);
-        modal.hide();
+        document.getElementById('libraryModal').classList.remove('open');
     }
 
     /**
@@ -1528,6 +1556,7 @@ class TranscodingManager {
             const response = await fetch('/Home/GetAutoScanConfig');
             if (!response.ok) return;
             const config = await response.json();
+            this._lastAutoScanConfig = config;
 
             // Only set form inputs on full load (page init), not after every action
             if (fullLoad) {
@@ -1569,19 +1598,33 @@ class TranscodingManager {
             return;
         }
 
-        container.innerHTML = directories.map(dir => `
+        container.innerHTML = directories.map(dir => {
+            // Support both legacy string format and new WatchedFolder object format
+            const path = typeof dir === 'string' ? dir : (dir.path || '');
+            const hasOverrides = typeof dir === 'object' && dir.encodingOverrides &&
+                Object.values(dir.encodingOverrides).some(v => v !== null && v !== undefined);
+            return `
             <div class="d-flex justify-content-between align-items-center py-1 px-2 border-bottom">
-                <small class="text-truncate me-2" title="${escapeHtml(dir)}">
-                    <i class="fas fa-folder text-warning me-1"></i>${escapeHtml(dir)}
+                <small class="text-truncate me-2" title="${escapeHtml(path)}">
+                    <i class="fas fa-folder text-warning me-1"></i>${escapeHtml(path)}
+                    ${hasOverrides ? '<i class="fas fa-sliders-h text-info ms-1" title="Has custom encoding settings"></i>' : ''}
                 </small>
-                <button class="btn btn-sm btn-outline-danger border-0 p-0 px-1" data-path="${escapeHtml(dir)}" title="Remove">
-                    <i class="fas fa-times"></i>
-                </button>
-            </div>
-        `).join('');
+                <div class="d-flex gap-1 flex-shrink-0">
+                    <button class="btn btn-sm btn-outline-secondary border-0 p-0 px-1 folder-settings-btn" data-path="${escapeHtml(path)}" title="Folder encoding settings">
+                        <i class="fas fa-cog"></i>
+                    </button>
+                    <button class="btn btn-sm btn-outline-danger border-0 p-0 px-1 folder-remove-btn" data-path="${escapeHtml(path)}" title="Remove">
+                        <i class="fas fa-times"></i>
+                    </button>
+                </div>
+            </div>`;
+        }).join('');
 
-        container.querySelectorAll('button[data-path]').forEach(btn => {
+        container.querySelectorAll('.folder-remove-btn').forEach(btn => {
             btn.addEventListener('click', () => this.removeAutoScanDirectory(btn.getAttribute('data-path')));
+        });
+        container.querySelectorAll('.folder-settings-btn').forEach(btn => {
+            btn.addEventListener('click', () => this.openFolderSettings(btn.getAttribute('data-path')));
         });
     }
 
@@ -2023,9 +2066,14 @@ class TranscodingManager {
                             <div style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(statusText)}</div>
                             <div class="mt-1">Jobs: ${node.completedJobs || 0} done, ${node.failedJobs || 0} failed</div>
                             ${this.clusterRole === 'master' && node.role === 'node' ? `
-                                <button class="btn btn-sm ${node.isPaused ? 'btn-outline-success' : 'btn-outline-warning'} mt-1 w-100 cluster-node-pause" data-node-id="${node.nodeId}" data-paused="${node.isPaused}">
-                                    <i class="fas fa-${node.isPaused ? 'play' : 'pause'} me-1"></i>${node.isPaused ? 'Resume' : 'Pause'}
-                                </button>
+                                <div class="d-flex gap-1 mt-1">
+                                    <button class="btn btn-sm ${node.isPaused ? 'btn-outline-success' : 'btn-outline-warning'} flex-grow-1 cluster-node-pause" data-node-id="${node.nodeId}" data-paused="${node.isPaused}">
+                                        <i class="fas fa-${node.isPaused ? 'play' : 'pause'} me-1"></i>${node.isPaused ? 'Resume' : 'Pause'}
+                                    </button>
+                                    <button class="btn btn-sm btn-outline-secondary cluster-node-settings" data-node-id="${node.nodeId}" data-hostname="${escapeHtml(node.hostname)}" title="Node settings">
+                                        <i class="fas fa-cog"></i>
+                                    </button>
+                                </div>
                             ` : ''}
                         </div>
                     </div>
@@ -2047,6 +2095,13 @@ class TranscodingManager {
                 } catch (error) {
                     showToast('Error: ' + error.message, 'danger');
                 }
+            });
+        });
+
+        // Bind node settings buttons
+        container.querySelectorAll('.cluster-node-settings').forEach(btn => {
+            btn.addEventListener('click', () => {
+                this.openNodeSettings(btn.dataset.nodeId, btn.dataset.hostname);
             });
         });
     }
@@ -2153,6 +2208,246 @@ class TranscodingManager {
                 }
             });
         }
+    }
+
+    /******************************************************************
+     *  Override Dialog — built entirely in JS, appended to <body>
+     ******************************************************************/
+
+    /** Shows the override dialog. */
+    openOverrideDialog(title, showNodeRules, onSave, onReset) {
+        document.getElementById('overrideDialogTitle').innerHTML = title;
+        document.getElementById('overrideNodeRules').style.display = showNodeRules ? '' : 'none';
+
+        // Wire save/reset buttons (clone to clear old listeners)
+        for (const [id, handler] of [['overrideDialogSave', onSave], ['overrideDialogReset', onReset]]) {
+            const btn = document.getElementById(id);
+            const clone = btn.cloneNode(true);
+            btn.replaceWith(clone);
+            clone.addEventListener('click', handler);
+        }
+
+        document.getElementById('overrideDialog').classList.add('open');
+    }
+
+    /** Hides the override dialog. */
+    closeOverrideDialog() {
+        document.getElementById('overrideDialog').classList.remove('open');
+    }
+
+    /******************************************************************
+     *  Node Settings
+     ******************************************************************/
+
+    /** Opens the node settings overlay. */
+    async openNodeSettings(nodeId, hostname) {
+        this.resetOverrideForm();
+        document.getElementById('nodeOnly4K').checked = false;
+        document.getElementById('nodeExclude4K').checked = false;
+
+        try {
+            const resp = await fetch('/Home/GetNodeSettings');
+            if (resp.ok) {
+                const config = await resp.json();
+                const ns = config.nodes?.[nodeId];
+                if (ns) {
+                    document.getElementById('nodeOnly4K').checked = ns.only4K || false;
+                    document.getElementById('nodeExclude4K').checked = ns.exclude4K || false;
+                    if (ns.encodingOverrides) this.populateOverrideForm(ns.encodingOverrides);
+                }
+            }
+        } catch (e) { console.error('Failed to load node settings', e); }
+
+        this.initOverrideToggles();
+
+        const only4K = document.getElementById('nodeOnly4K');
+        const excl4K = document.getElementById('nodeExclude4K');
+        only4K.onchange = () => { if (only4K.checked) excl4K.checked = false; };
+        excl4K.onchange = () => { if (excl4K.checked) only4K.checked = false; };
+
+        this.openOverrideDialog(
+            `<i class="fas fa-server me-2"></i>Node Settings: ${escapeHtml(hostname)}`,
+            true,
+            () => this.saveNodeSettings(nodeId),
+            () => this.deleteNodeSettings(nodeId)
+        );
+    }
+
+    async saveNodeSettings(nodeId) {
+        const overrides = this.readOverrideForm();
+        const settings = {
+            nodeId,
+            only4K: document.getElementById('nodeOnly4K').checked || null,
+            exclude4K: document.getElementById('nodeExclude4K').checked || null,
+            encodingOverrides: Object.values(overrides).some(v => v !== null) ? overrides : null
+        };
+        try {
+            const resp = await fetch('/Home/SaveNodeSettings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(settings)
+            });
+            if (!resp.ok) throw new Error(await resp.text());
+            showToast('Node settings saved', 'success');
+            this.closeOverrideDialog();
+        } catch (e) { showToast('Error saving node settings: ' + e.message, 'danger'); }
+    }
+
+    async deleteNodeSettings(nodeId) {
+        try {
+            const resp = await fetch('/Home/DeleteNodeSettings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ nodeId })
+            });
+            if (!resp.ok) throw new Error(await resp.text());
+            showToast('Node settings reset to defaults', 'success');
+            this.closeOverrideDialog();
+        } catch (e) { showToast('Error resetting node settings: ' + e.message, 'danger'); }
+    }
+
+    /******************************************************************
+     *  Folder Settings
+     ******************************************************************/
+
+    /** Opens the folder settings overlay. */
+    openFolderSettings(path) {
+        this.resetOverrideForm();
+
+        const config = this._lastAutoScanConfig;
+        if (config?.directories) {
+            const folder = config.directories.find(d =>
+                (typeof d === 'string' ? d : d.path) === path
+            );
+            if (folder && typeof folder === 'object' && folder.encodingOverrides) {
+                this.populateOverrideForm(folder.encodingOverrides);
+            }
+        }
+
+        this.initOverrideToggles();
+
+        const displayName = path.split(/[/\\]/).filter(Boolean).pop() || path;
+        this.openOverrideDialog(
+            `<i class="fas fa-folder-open me-2"></i>Folder Settings: ${escapeHtml(displayName)}`,
+            false,
+            () => this.saveFolderSettings(path),
+            () => this.resetFolderSettings(path)
+        );
+    }
+
+    async saveFolderSettings(path) {
+        const overrides = this.readOverrideForm();
+        const hasOverrides = Object.values(overrides).some(v => v !== null);
+        try {
+            const resp = await fetch('/Home/SaveFolderSettings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ path, encodingOverrides: hasOverrides ? overrides : null })
+            });
+            if (!resp.ok) throw new Error(await resp.text());
+            showToast('Folder settings saved', 'success');
+            this.closeOverrideDialog();
+            this.loadAutoScanConfig(false);
+        } catch (e) { showToast('Error saving folder settings: ' + e.message, 'danger'); }
+    }
+
+    async resetFolderSettings(path) {
+        try {
+            const resp = await fetch('/Home/SaveFolderSettings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ path, encodingOverrides: null })
+            });
+            if (!resp.ok) throw new Error(await resp.text());
+            showToast('Folder settings reset to defaults', 'success');
+            this.closeOverrideDialog();
+            this.loadAutoScanConfig(false);
+        } catch (e) { showToast('Error resetting folder settings: ' + e.message, 'danger'); }
+    }
+
+    /******************************************************************
+     *  Override Form Helpers (shared single form with 'ovr' prefix)
+     ******************************************************************/
+
+    /** The list of override fields and their types for form reading/writing. */
+    static OVERRIDE_FIELDS = {
+        Format: 'select', Codec: 'select', HardwareAcceleration: 'select',
+        TargetBitrate: 'number', FourKBitrateMultiplier: 'select',
+        Skip4K: 'bool', StrictBitrate: 'bool', TwoChannelAudio: 'bool',
+        EnglishOnlyAudio: 'bool', EnglishOnlySubtitles: 'bool',
+        DeleteOriginalFile: 'bool', SkipPercentAboveTarget: 'number'
+    };
+
+    /** Wire up override toggle checkboxes to enable/disable their associated fields. */
+    initOverrideToggles() {
+        const defaults = { TargetBitrate: '3500', FourKBitrateMultiplier: '4', SkipPercentAboveTarget: '20' };
+        document.querySelectorAll('#overrideFields .override-toggle').forEach(toggle => {
+            toggle.onchange = () => {
+                const field = toggle.dataset.field;
+                const type = TranscodingManager.OVERRIDE_FIELDS[field];
+                const el = document.getElementById(`ovr${field}`);
+                if (!el) return;
+                el.disabled = !toggle.checked;
+                if (!toggle.checked) {
+                    if (type === 'bool') el.checked = false;
+                    else if (type === 'number') el.value = defaults[field] || '0';
+                    else el.selectedIndex = 0;
+                }
+            };
+        });
+    }
+
+    /** Resets all override toggles to unchecked and resets all field values to defaults. */
+    resetOverrideForm() {
+        const defaults = { TargetBitrate: '3500', FourKBitrateMultiplier: '4', SkipPercentAboveTarget: '20' };
+        for (const [field, type] of Object.entries(TranscodingManager.OVERRIDE_FIELDS)) {
+            const toggle = document.getElementById(`ovr_${field}`);
+            if (toggle) toggle.checked = false;
+            const el = document.getElementById(`ovr${field}`);
+            if (!el) continue;
+            el.disabled = true;
+            if (type === 'bool') el.checked = false;
+            else if (type === 'number') el.value = defaults[field] || '0';
+            else el.selectedIndex = 0;
+        }
+    }
+
+    /** Populates the override form from a server-returned overrides object. */
+    populateOverrideForm(overrides) {
+        for (const [field, type] of Object.entries(TranscodingManager.OVERRIDE_FIELDS)) {
+            const key = field.charAt(0).toLowerCase() + field.slice(1);
+            const val = overrides[key];
+            if (val === null || val === undefined) continue;
+
+            const toggle = document.getElementById(`ovr_${field}`);
+            if (toggle) toggle.checked = true;
+
+            const el = document.getElementById(`ovr${field}`);
+            if (!el) continue;
+            el.disabled = false;
+
+            if (type === 'bool') el.checked = val;
+            else if (type === 'number') el.value = val;
+            else el.value = val;
+        }
+    }
+
+    /** Reads the override form and returns an overrides object (null for unset fields). */
+    readOverrideForm() {
+        const result = {};
+        for (const [field, type] of Object.entries(TranscodingManager.OVERRIDE_FIELDS)) {
+            const key = field.charAt(0).toLowerCase() + field.slice(1);
+            const toggle = document.getElementById(`ovr_${field}`);
+            if (!toggle?.checked) { result[key] = null; continue; }
+
+            const el = document.getElementById(`ovr${field}`);
+            if (!el) { result[key] = null; continue; }
+
+            if (type === 'bool') result[key] = el.checked;
+            else if (type === 'number') result[key] = parseInt(el.value) || 0;
+            else result[key] = el.value;
+        }
+        return result;
     }
 }
 
