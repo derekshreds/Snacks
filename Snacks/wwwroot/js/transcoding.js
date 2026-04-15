@@ -2047,17 +2047,20 @@ class TranscodingManager {
             'Paused': 'var(--warning-color, #ffc107)'
         };
 
-        // Show master node card with pause + settings when in master mode
+        // Show master node card matching the same layout as worker cards
         const localPaused = !this.localEncodingEnabled;
+        const masterStatus = localPaused ? 'Paused' : 'Online';
+        const masterStatusColor = statusColors[masterStatus] || 'gray';
         const masterCard = this.clusterRole === 'master' && this.clusterNodeId ? `
-            <div class="card hover-lift" style="min-width: 180px; max-width: 240px; flex: 1 1 200px; border-color: var(--primary, #8b5cf6);">
+            <div class="card hover-lift" style="min-width: 180px; max-width: 240px; flex: 1 1 200px;">
                 <div class="card-body p-2" style="overflow:hidden;">
                     <div class="d-flex align-items-center mb-1" style="min-width:0;">
-                        <span class="flex-shrink-0" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${localPaused ? 'var(--warning-color, #ffc107)' : 'var(--success-color, #28a745)'};margin-right:6px;"></span>
+                        <span class="flex-shrink-0" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${masterStatusColor};margin-right:6px;"></span>
                         <strong style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(this.clusterNodeName || 'Master')}</strong>
                     </div>
                     <div class="text-muted small">
-                        <div>master${localPaused ? ' &bull; Local encoding paused' : ''}</div>
+                        <div>master</div>
+                        <div style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(masterStatus)}</div>
                         <div class="d-flex gap-1 mt-1">
                             <button class="btn btn-sm ${localPaused ? 'btn-outline-success' : 'btn-outline-warning'} flex-grow-1" id="masterLocalPause">
                                 <i class="fas fa-${localPaused ? 'play' : 'pause'} me-1"></i>${localPaused ? 'Resume' : 'Pause'}
