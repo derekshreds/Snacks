@@ -1852,9 +1852,11 @@ class TranscodingManager {
     /** Fetches the current list of connected worker nodes and refreshes the local `workers` map. */
     async loadWorkers() {
         try {
-            const response = await fetch('/Home/GetWorkers');
+            const response = await fetch('/Home/GetClusterStatus');
             if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            const nodes = await response.json();
+            const status = await response.json();
+            this.localEncodingEnabled = status.localEncodingEnabled !== false;
+            const nodes = status.nodes || [];
             this.workers.clear();
             for (const node of nodes) {
                 this.workers.set(node.nodeId, node);
@@ -1942,9 +1944,10 @@ class TranscodingManager {
                 } else {
                     showToast('Cluster settings saved', 'success');
                 }
+                this.localEncodingEnabled = config.localEncodingEnabled;
+                if (config.enabled) await this.loadWorkers();
                 this.renderClusterPanel();
                 this.updateNodeBanner();
-                if (config.enabled) await this.loadWorkers();
             } else {
                 showToast('Error saving cluster settings: ' + (result.error || 'Unknown error'), 'danger');
             }
@@ -2044,20 +2047,23 @@ class TranscodingManager {
             'Paused': 'var(--warning-color, #ffc107)'
         };
 
-        // Show master node card with settings gear when in master mode
+        // Show master node card with pause + settings when in master mode
+        const localPaused = !this.localEncodingEnabled;
         const masterCard = this.clusterRole === 'master' && this.clusterNodeId ? `
             <div class="card hover-lift" style="min-width: 180px; max-width: 240px; flex: 1 1 200px; border-color: var(--primary, #8b5cf6);">
                 <div class="card-body p-2" style="overflow:hidden;">
                     <div class="d-flex align-items-center mb-1" style="min-width:0;">
-                        <span class="flex-shrink-0" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--success-color, #28a745);margin-right:6px;"></span>
+                        <span class="flex-shrink-0" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${localPaused ? 'var(--warning-color, #ffc107)' : 'var(--success-color, #28a745)'};margin-right:6px;"></span>
                         <strong style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(this.clusterNodeName || 'Master')}</strong>
-                        <small class="ms-1 text-muted">(this machine)</small>
                     </div>
                     <div class="text-muted small">
-                        <div>master</div>
+                        <div>master${localPaused ? ' &bull; Local encoding paused' : ''}</div>
                         <div class="d-flex gap-1 mt-1">
-                            <button class="btn btn-sm btn-outline-secondary w-100 cluster-node-settings" data-node-id="${this.clusterNodeId}" data-hostname="${escapeHtml(this.clusterNodeName || 'Master')}">
-                                <i class="fas fa-cog me-1"></i>Configure
+                            <button class="btn btn-sm ${localPaused ? 'btn-outline-success' : 'btn-outline-warning'} flex-grow-1" id="masterLocalPause">
+                                <i class="fas fa-${localPaused ? 'play' : 'pause'} me-1"></i>${localPaused ? 'Resume' : 'Pause'}
+                            </button>
+                            <button class="btn btn-sm btn-outline-secondary cluster-node-settings" data-node-id="${this.clusterNodeId}" data-hostname="${escapeHtml(this.clusterNodeName || 'Master')}">
+                                <i class="fas fa-cog"></i>
                             </button>
                         </div>
                     </div>
@@ -2125,6 +2131,21 @@ class TranscodingManager {
             btn.addEventListener('click', () => {
                 this.openNodeSettings(btn.dataset.nodeId, btn.dataset.hostname);
             });
+        });
+
+        // Bind master local encoding pause button
+        document.getElementById('masterLocalPause')?.addEventListener('click', async () => {
+            try {
+                await fetch('/Home/SetLocalEncodingPaused', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ paused: !localPaused })
+                });
+                this.localEncodingEnabled = localPaused; // flip state
+                this.renderClusterPanel();
+            } catch (error) {
+                showToast('Error: ' + error.message, 'danger');
+            }
         });
     }
 

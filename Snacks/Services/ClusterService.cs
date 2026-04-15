@@ -309,6 +309,15 @@ public sealed class ClusterService : IHostedService, IDisposable
     /// <summary> Returns the current cluster configuration. </summary>
     public ClusterConfig GetConfig() => _config;
 
+    /// <summary> Toggles local encoding on the master without affecting remote dispatch. </summary>
+    public void SetLocalEncodingEnabled(bool enabled)
+    {
+        _config.LocalEncodingEnabled = enabled;
+        SaveConfig();
+        _transcodingService.SetLocalEncodingPaused(!enabled);
+        Console.WriteLine($"Cluster: Local encoding {(enabled ? "resumed" : "paused")}");
+    }
+
     /// <summary>
     ///     Persists a new configuration and restarts cluster operations immediately.
     ///     Handles role transitions such as switching from master to node mode.

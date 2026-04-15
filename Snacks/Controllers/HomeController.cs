@@ -811,6 +811,21 @@ namespace Snacks.Controllers
             }
         }
 
+        /// <summary> Pauses or resumes local encoding on the master (remote dispatch continues). </summary>
+        [HttpPost]
+        public IActionResult SetLocalEncodingPaused([FromBody] PauseRequest request)
+        {
+            try
+            {
+                _clusterService.SetLocalEncodingEnabled(!request.Paused);
+                return Json(new { success = true });
+            }
+            catch (Exception ex)
+            {
+                return Json(new { success = false, error = ex.Message });
+            }
+        }
+
         /// <summary> Returns a summary of cluster status: role, node count, and the full node list. </summary>
         [HttpGet]
         public IActionResult GetClusterStatus()
@@ -821,6 +836,7 @@ namespace Snacks.Controllers
                 enabled = config.Enabled,
                 role = config.Role,
                 nodeName = config.NodeName,
+                localEncodingEnabled = config.LocalEncodingEnabled,
                 nodeCount = _clusterService.GetNodes().Count,
                 nodes = _clusterService.GetNodes()
             });
