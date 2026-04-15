@@ -538,6 +538,7 @@ public sealed class ClusterService : IHostedService, IDisposable
             _transcodingService.SetLocalEncodingPaused(!_config.LocalEncodingEnabled);
             _transcodingService.SetRemoteJobCanceller(CancelRemoteJobOnNodeAsync);
             _transcodingService.SetRemoteJobChecker(IsRemoteJobAsync);
+            UpdateLocalSkipPredicate();
 
             _dispatchTimer = new Timer(async _ =>
             {
@@ -2305,6 +2306,7 @@ public sealed class ClusterService : IHostedService, IDisposable
     {
         _nodeSettingsConfig.Nodes[settings.NodeId] = settings;
         PersistNodeSettings();
+        UpdateLocalSkipPredicate();
     }
 
     /// <summary> Removes settings for a node and persists to disk. </summary>
@@ -2312,6 +2314,38 @@ public sealed class ClusterService : IHostedService, IDisposable
     {
         _nodeSettingsConfig.Nodes.Remove(nodeId);
         PersistNodeSettings();
+        UpdateLocalSkipPredicate();
+    }
+
+    /// <summary>
+    ///     Updates the local skip predicate on TranscodingService based on the master's own node settings.
+    ///     When the master has Exclude4K=true, 4K items are left in the queue for remote dispatch.
+    ///     When the master has Only4K=true, non-4K items are left for remote dispatch.
+    /// </summary>
+    private void UpdateLocalSkipPredicate()
+    {
+        var masterSettings = GetNodeSettings(_config.NodeId);
+        if (masterSettings == null)
+        {
+            _transcodingService.SetLocalSkipPredicate(null);
+            return;
+        }
+
+        bool only4K = masterSettings.Only4K == true;
+        bool exclude4K = masterSettings.Exclude4K == true;
+        if (!only4K && !exclude4K)
+        {
+            _transcodingService.SetLocalSkipPredicate(null);
+            return;
+        }
+
+        _transcodingService.SetLocalSkipPredicate(item =>
+        {
+            bool is4K = item.Probe?.Streams?.Any(s => s.CodecType == "video" && s.Width > 1920) == true;
+            if (exclude4K && is4K) return true;
+            if (only4K && !is4K) return true;
+            return false;
+        });
     }
 
     /// <summary>

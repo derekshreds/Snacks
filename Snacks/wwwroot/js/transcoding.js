@@ -1814,6 +1814,8 @@ class TranscodingManager {
             const config = await response.json();
             this.clusterEnabled = config.enabled;
             this.clusterRole = config.role;
+            this.clusterNodeId = config.nodeId;
+            this.clusterNodeName = config.nodeName;
 
             if (updateUI) {
                 // Populate settings form
@@ -2023,7 +2025,7 @@ class TranscodingManager {
         const nodes = Array.from(this.workers.values());
         if (countBadge) countBadge.textContent = `${nodes.length} node${nodes.length !== 1 ? 's' : ''}`;
 
-        if (nodes.length === 0) {
+        if (nodes.length === 0 && this.clusterRole !== 'master') {
             container.innerHTML = '<div class="text-muted"><i class="fas fa-search me-1"></i>Discovering nodes...</div>';
             return;
         }
@@ -2042,7 +2044,27 @@ class TranscodingManager {
             'Paused': 'var(--warning-color, #ffc107)'
         };
 
-        container.innerHTML = nodes.map(node => {
+        // Show master node card with settings gear when in master mode
+        const masterCard = this.clusterRole === 'master' && this.clusterNodeId ? `
+            <div class="card hover-lift" style="min-width: 180px; max-width: 240px; flex: 1 1 200px; border-color: var(--primary, #8b5cf6);">
+                <div class="card-body p-2" style="overflow:hidden;">
+                    <div class="d-flex align-items-center mb-1" style="min-width:0;">
+                        <span class="flex-shrink-0" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--success-color, #28a745);margin-right:6px;"></span>
+                        <strong style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(this.clusterNodeName || 'Master')}</strong>
+                        <small class="ms-1 text-muted">(this machine)</small>
+                    </div>
+                    <div class="text-muted small">
+                        <div>master</div>
+                        <div class="d-flex gap-1 mt-1">
+                            <button class="btn btn-sm btn-outline-secondary w-100 cluster-node-settings" data-node-id="${this.clusterNodeId}" data-hostname="${escapeHtml(this.clusterNodeName || 'Master')}">
+                                <i class="fas fa-cog me-1"></i>Configure
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>` : '';
+
+        container.innerHTML = masterCard + nodes.map(node => {
             const statusName = statusNames[node.status] || 'Unknown';
             const statusColor = statusColors[statusName] || 'gray';
 

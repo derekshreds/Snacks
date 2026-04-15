@@ -66,6 +66,9 @@ public class TranscodingService
         /// <summary>Optional async callback for the cluster to check whether a file is already assigned remotely.</summary>
         private Func<string, Task<bool>>? _isRemoteJobChecker;
 
+        /// <summary>Optional predicate to skip items for local processing (e.g. master excludes 4K).</summary>
+        private Func<WorkItem, bool>? _shouldSkipLocal;
+
         /// <summary>Whether the encoding queue is paused by user request.</summary>
         public bool IsPaused => _isPaused;
 
@@ -664,12 +667,29 @@ public class TranscodingService
                     lock (_queueLock)
                     {
                         if (_workQueue.Count == 0) break;
-                        workItem = _workQueue[0];
-                        _workQueue.RemoveAt(0);
-                    }
 
-                    if (workItem.Status is WorkItemStatus.Cancelled or WorkItemStatus.Stopped)
-                        continue;
+                        // Find the first item eligible for local processing
+                        int idx = 0;
+                        while (idx < _workQueue.Count)
+                        {
+                            var candidate = _workQueue[idx];
+                            if (candidate.Status is WorkItemStatus.Cancelled or WorkItemStatus.Stopped)
+                            {
+                                _workQueue.RemoveAt(idx);
+                                continue;
+                            }
+                            if (_shouldSkipLocal != null && _shouldSkipLocal(candidate))
+                            {
+                                idx++; // leave it for remote dispatch
+                                continue;
+                            }
+                            workItem = candidate;
+                            _workQueue.RemoveAt(idx);
+                            break;
+                        }
+
+                        if (workItem == null) break;
+                    }
 
                     // Clone from _lastOptions so settings changes take effect on the next item.
                     // _lastOptions gets updated when the user saves new settings.
@@ -2145,6 +2165,12 @@ public class TranscodingService
         public void SetRemoteJobChecker(Func<string, Task<bool>>? checker)
         {
             _isRemoteJobChecker = checker;
+        }
+
+        /// <summary>Sets a predicate that decides whether a work item should be skipped for local processing (left for remote dispatch).</summary>
+        public void SetLocalSkipPredicate(Func<WorkItem, bool>? predicate)
+        {
+            _shouldSkipLocal = predicate;
         }
 
         /// <summary>
