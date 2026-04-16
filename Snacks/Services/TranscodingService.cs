@@ -273,6 +273,7 @@ public class TranscodingService
                 bool isAv1 = sourceCodec == "av1";
                 bool alreadyTargetCodec = targetIsAv1 ? isAv1 : (targetIsHevc ? isHevc : !isHevc);
                 bool isHighDef = probe.Streams.Any(s => s.CodecType == "video" && s.Width > 1920);
+                workItem.Is4K = isHighDef;
 
                 var videoStream = probe.Streams.FirstOrDefault(s => s.CodecType == "video");
                 var normalizedPath = Path.GetFullPath(filePath);
@@ -680,29 +681,16 @@ public class TranscodingService
                     WorkItem? workItem = null;
                     lock (_queueLock)
                     {
-                        if (_workQueue.Count == 0) break;
+                        // Remove cancelled/stopped items
+                        _workQueue.RemoveAll(w => w.Status is WorkItemStatus.Cancelled or WorkItemStatus.Stopped);
 
-                        // Find the first item eligible for local processing
-                        int idx = 0;
-                        while (idx < _workQueue.Count)
-                        {
-                            var candidate = _workQueue[idx];
-                            if (candidate.Status is WorkItemStatus.Cancelled or WorkItemStatus.Stopped)
-                            {
-                                _workQueue.RemoveAt(idx);
-                                continue;
-                            }
-                            if (_shouldSkipLocal != null && _shouldSkipLocal(candidate))
-                            {
-                                idx++; // leave it for remote dispatch
-                                continue;
-                            }
-                            workItem = candidate;
-                            _workQueue.RemoveAt(idx);
-                            break;
-                        }
+                        // LINQ: first pending item that passes the local skip predicate
+                        workItem = _workQueue.FirstOrDefault(w =>
+                            w.Status == WorkItemStatus.Pending &&
+                            (_shouldSkipLocal == null || !_shouldSkipLocal(w)));
 
                         if (workItem == null) break;
+                        _workQueue.Remove(workItem);
                     }
 
                     // Clone from _lastOptions so settings changes take effect on the next item.
@@ -2187,6 +2175,16 @@ public class TranscodingService
         public void SetLocalSkipPredicate(Func<WorkItem, bool>? predicate)
         {
             _shouldSkipLocal = predicate;
+
+            // Re-trigger the processing loop so previously-skipped items get re-evaluated
+            if (_lastOptions != null && !_isPaused && !_localEncodingPaused)
+            {
+                _ = Task.Run(async () =>
+                {
+                    try { await ProcessQueueAsync(_lastOptions); }
+                    catch { }
+                });
+            }
         }
 
         /// <summary>
@@ -2268,6 +2266,8 @@ public class TranscodingService
         /// </summary>
         public async Task<string?> RestoreToQueueAsync(MediaFile dbFile, EncoderOptions options)
         {
+            _lastOptions ??= options;
+
             if (!File.Exists(dbFile.FilePath))
                 return null;
 
@@ -2293,6 +2293,7 @@ public class TranscodingService
                 Bitrate  = dbFile.Bitrate,
                 Length   = dbFile.Duration,
                 IsHevc   = dbFile.IsHevc,
+                Is4K     = dbFile.Is4K,
                 Probe    = null // Lazily probed when processing starts
             };
 
@@ -2354,11 +2355,12 @@ public class TranscodingService
         ///     making it available for dispatch to a cluster node.
         /// </summary>
         /// <returns> The next pending <see cref="WorkItem"/>, or <see langword="null"/> if the queue is empty. </returns>
-        public WorkItem? DequeueForRemoteProcessing()
+        public WorkItem? DequeueForRemoteProcessing(Func<WorkItem, bool>? filter = null)
         {
             lock (_queueLock)
             {
-                var item = _workQueue.FirstOrDefault(w => w.Status == WorkItemStatus.Pending);
+                var item = _workQueue.FirstOrDefault(w =>
+                    w.Status == WorkItemStatus.Pending && (filter == null || filter(w)));
                 if (item != null)
                 {
                     item.Status = WorkItemStatus.Processing;
@@ -2493,6 +2495,7 @@ public class TranscodingService
                     Bitrate = bitrate,
                     Length = length,
                     IsHevc = isHevc,
+                    Is4K = probe.Streams.Any(s => s.CodecType == "video" && s.Width > 1920),
                     Probe = probe,
                     Status = WorkItemStatus.Processing,
                     StartedAt = DateTime.UtcNow

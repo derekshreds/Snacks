@@ -880,7 +880,31 @@ public sealed class ClusterService : IHostedService, IDisposable
 
             while (true)
             {
-                var workItem = _transcodingService.DequeueForRemoteProcessing();
+                // Recompute available workers each iteration (nodes become busy after dispatch)
+                var availableNow = _nodes.Values
+                    .Where(n => n.Role == "node" && n.Status == NodeStatus.Online
+                        && !n.IsPaused && n.ActiveWorkItemId == null
+                        && (!_activeDispatchTasks.TryGetValue(n.NodeId, out var dt) || dt.IsCompleted)
+                        && (!_nodeDispatchCooldowns.TryGetValue(n.NodeId, out var cd) || DateTime.UtcNow >= cd))
+                    .ToList();
+                if (availableNow.Count == 0) break;
+
+                bool any4KWorker    = availableNow.Any(n => GetNodeSettings(n.NodeId)?.Exclude4K != true);
+                bool anyNon4KWorker = availableNow.Any(n => GetNodeSettings(n.NodeId)?.Only4K != true);
+
+                // When master has local encoding with 4K routing, only dispatch items the master won't handle
+                var masterNs = _config.LocalEncodingEnabled ? GetNodeSettings(_config.NodeId) : null;
+                bool masterExcludes4K = masterNs?.Exclude4K == true;
+                bool masterOnly4K     = masterNs?.Only4K == true;
+
+                var workItem = _transcodingService.DequeueForRemoteProcessing(item =>
+                {
+                    // If master has a 4K preference, only dispatch items it doesn't want
+                    if (masterExcludes4K && !item.Is4K) return false; // master handles non-4K locally
+                    if (masterOnly4K && item.Is4K) return false;      // master handles 4K locally
+
+                    return item.Is4K ? any4KWorker : anyNon4KWorker;
+                });
                 if (workItem == null) break;
 
                 // Resolve folder-level overrides for worker selection (GPU/encoder matching)
@@ -915,6 +939,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                 var dispatchTask = Task.Run(() => DispatchToNodeAsync(bestNode, workItem, finalOptions, nodeLock));
                 _activeDispatchTasks[bestNode.NodeId] = dispatchTask;
             }
+
         }
         finally
         {
@@ -1690,9 +1715,8 @@ public sealed class ClusterService : IHostedService, IDisposable
         var ns = GetNodeSettings(node.NodeId);
         if (ns != null)
         {
-            bool is4K = workItem.Probe?.Streams?.Any(s => s.CodecType == "video" && s.Width > 1920) == true;
-            if (ns.Only4K == true && !is4K) return -100;
-            if (ns.Exclude4K == true && is4K) return -100;
+            if (ns.Only4K == true && !workItem.Is4K) return -100;
+            if (ns.Exclude4K == true && workItem.Is4K) return -100;
         }
 
         int score = 1;
@@ -2350,9 +2374,8 @@ public sealed class ClusterService : IHostedService, IDisposable
 
         _transcodingService.SetLocalSkipPredicate(item =>
         {
-            bool is4K = item.Probe?.Streams?.Any(s => s.CodecType == "video" && s.Width > 1920) == true;
-            if (exclude4K && is4K) return true;
-            if (only4K && !is4K) return true;
+            if (exclude4K && item.Is4K) return true;
+            if (only4K && !item.Is4K) return true;
             return false;
         });
     }

@@ -41,6 +41,9 @@ public sealed class WorkItem
     /// </summary>
     public bool IsHevc { get; set; } = false;
 
+    /// <summary> Whether the source video is 4K (any video stream wider than 1920px). </summary>
+    public bool Is4K { get; set; } = false;
+
     /// <summary>
     ///     Full ffprobe analysis of the source file, including stream details.
     ///     Used to build FFmpeg command lines and validate output.
