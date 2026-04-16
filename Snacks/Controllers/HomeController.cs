@@ -837,6 +837,7 @@ namespace Snacks.Controllers
                 role = config.Role,
                 nodeName = config.NodeName,
                 localEncodingEnabled = config.LocalEncodingEnabled,
+                masterCapabilities = _clusterService.GetCapabilities(),
                 nodeCount = _clusterService.GetNodes().Count,
                 nodes = _clusterService.GetNodes()
             });

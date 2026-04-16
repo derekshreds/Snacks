@@ -106,7 +106,11 @@ public class TranscodingService
 
             _ = Task.Run(async () =>
             {
-                try { await DetectHardwareAccelerationAsync(); }
+                try
+                {
+                    await DetectHardwareAccelerationAsync();
+                    await _hubContext.Clients.All.SendAsync("HardwareDetected", _detectedHardware);
+                }
                 catch { }
             });
         }

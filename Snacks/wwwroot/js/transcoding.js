@@ -104,6 +104,10 @@ class TranscodingManager {
                 this.renderClusterPanel();
             });
 
+            this.connection.on("HardwareDetected", () => {
+                this.loadWorkers().then(() => this.renderClusterPanel());
+            });
+
             this.connection.on("WorkerDisconnected", (nodeId) => {
                 const node = this.workers.get(nodeId);
                 this.workers.delete(nodeId);
@@ -1856,6 +1860,7 @@ class TranscodingManager {
             if (!response.ok) throw new Error(`HTTP ${response.status}`);
             const status = await response.json();
             this.localEncodingEnabled = status.localEncodingEnabled !== false;
+            this.masterCapabilities = status.masterCapabilities || null;
             const nodes = status.nodes || [];
             this.workers.clear();
             for (const node of nodes) {
@@ -2051,6 +2056,10 @@ class TranscodingManager {
         const localPaused = !this.localEncodingEnabled;
         const masterStatus = localPaused ? 'Paused' : 'Online';
         const masterStatusColor = statusColors[masterStatus] || 'gray';
+        const masterGpu = this.masterCapabilities?.gpuVendor && this.masterCapabilities.gpuVendor !== 'none'
+            ? this.masterCapabilities.gpuVendor.charAt(0).toUpperCase() + this.masterCapabilities.gpuVendor.slice(1)
+            : 'CPU only';
+        const masterOs = this.masterCapabilities?.osPlatform || '';
         const masterCard = this.clusterRole === 'master' && this.clusterNodeId ? `
             <div class="card hover-lift" style="min-width: 180px; max-width: 240px; flex: 1 1 200px;">
                 <div class="card-body p-2" style="overflow:hidden;">
@@ -2059,7 +2068,7 @@ class TranscodingManager {
                         <strong style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(this.clusterNodeName || 'Master')}</strong>
                     </div>
                     <div class="text-muted small">
-                        <div>master</div>
+                        <div>master &bull; ${escapeHtml(masterOs)}${masterGpu ? ' / ' + escapeHtml(masterGpu) : ''}</div>
                         <div style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(masterStatus)}</div>
                         <div class="d-flex gap-1 mt-1">
                             <button class="btn btn-sm ${localPaused ? 'btn-outline-success' : 'btn-outline-warning'} flex-grow-1" id="masterLocalPause">
