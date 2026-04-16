@@ -44,6 +44,7 @@ public sealed class ClusterNodeJobService
     private volatile string?                  _receivingJobId;
     private          DateTime                 _lastReceiveActivity;
     private volatile bool                     _nodePaused;
+    private readonly object                   _jobStartLock = new();
 
     private readonly ConcurrentDictionary<string, SemaphoreSlim>           _receiveLocks = new();
     private readonly ConcurrentDictionary<string, CancellationTokenSource> _receiveCts   = new();
@@ -238,17 +239,37 @@ public sealed class ClusterNodeJobService
         if (_nodePaused)
             return (false, "Node is paused");
 
-        if (_currentRemoteJob != null)
-            return (false, $"Already processing job {_currentRemoteJob.Id} ({_currentRemoteJob.FileName})");
+        // Lock the check-and-set to prevent concurrent uploads from racing past
+        // the _currentRemoteJob guard — without this, two ReceiveFile completions
+        // arriving back-to-back can both see null and start encoding simultaneously,
+        // overwhelming the hardware encoder.
+        lock (_jobStartLock)
+        {
+            if (_currentRemoteJob != null)
+                return (false, $"Already processing job {_currentRemoteJob.Id} ({_currentRemoteJob.FileName})");
 
+            // Claim the slot immediately so no other caller can race past
+            _currentRemoteJob = new WorkItem
+            {
+                Id       = jobId,
+                FileName = metadata.FileName,
+                Status   = WorkItemStatus.Processing
+            };
+        }
+
+        // Validation — if any check fails, release the slot
         if (!File.Exists(filePath))
+        {
+            _currentRemoteJob = null;
             return (false, $"File not found at {filePath}");
+        }
 
         // Check if we already have the encoded output — skip encoding
         var existingOutput = GetOutputFileForJob(jobId);
         if (existingOutput != null)
         {
             Console.WriteLine($"Cluster: Output already exists for {metadata.FileName} — skipping encode, ready for download");
+            _currentRemoteJob = null;
             _completedJobId = jobId;
             _receivingJobId = null;
             return (true, null);
@@ -258,7 +279,10 @@ public sealed class ClusterNodeJobService
         // guaranteed per-chunk integrity, so a size check is sufficient here.
         var actualSize = new FileInfo(filePath).Length;
         if (actualSize != metadata.FileSize)
+        {
+            _currentRemoteJob = null;
             return (false, $"File size mismatch — expected {metadata.FileSize}, got {actualSize}");
+        }
 
         // Verify the file isn't corrupt at byte 0 — the most common failure mode
         // from interrupted chunk writes is null bytes at the start of the file.
@@ -268,11 +292,15 @@ public sealed class ClusterNodeJobService
             using var checkStream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read);
             var headerRead = await checkStream.ReadAsync(header);
             if (headerRead >= 4 && header[0] == 0x00 && header[1] == 0x00 && header[2] == 0x00 && header[3] == 0x00)
+            {
+                _currentRemoteJob = null;
                 return (false, $"File corrupt — first 4 bytes are 0x00000000 (expected container header). " +
                     $"Size on disk: {actualSize}, expected: {metadata.FileSize}");
+            }
         }
         catch { }
 
+        // Replace the placeholder with the full work item
         var workItem = new WorkItem
         {
             Id        = jobId,
@@ -383,6 +411,19 @@ public sealed class ClusterNodeJobService
         catch (Exception ex)
         {
             Console.WriteLine($"Cluster: Remote job encoding failed: {ex.Message}");
+
+            // Clean up node state BEFORE reporting failure to master — the master
+            // reacts immediately by marking the node online and dispatching new work.
+            // If we report first and clean up after, the new job's upload can arrive
+            // while _currentRemoteJob is still set, or worse, complete and start
+            // encoding concurrently with leftover retry processes.
+            _completedJobId = null;
+            _currentRemoteJob = null;
+            _remoteJobCts?.Dispose();
+            _remoteJobCts = null;
+            _transcodingService.SetProgressCallback(null);
+            _transcodingService.SetLogCallback(null);
+
             if (masterUrl != null)
             {
                 try

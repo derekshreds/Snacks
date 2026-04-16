@@ -178,7 +178,7 @@ if (!document.getElementById('toast-animations')) {
                 opacity: 1;
             }
         }
-        
+
         @keyframes slideOutRight {
             from {
                 transform: translateX(0);

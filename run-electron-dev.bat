@@ -9,6 +9,8 @@ echo.
 REM Step 1: Publish ASP.NET Core backend
 echo [1/3] Publishing ASP.NET Core backend...
 if exist "electron-app\backend" rmdir /s /q "electron-app\backend"
+if exist "Snacks\bin\Release" rmdir /s /q "Snacks\bin\Release"
+if exist "Snacks\obj\Release" rmdir /s /q "Snacks\obj\Release"
 dotnet publish Snacks/Snacks.csproj -c Release -r win-x64 --self-contained
 if %errorlevel% neq 0 (
     echo ERROR: dotnet publish failed.

@@ -14,15 +14,15 @@ using System.Text.Json.Serialization;
 /// </summary>
 public sealed class AutoScanService : IHostedService, IDisposable
 {
-    private readonly FileService         _fileService;
-    private readonly FfprobeService      _ffprobeService;
-    private readonly TranscodingService  _transcodingService;
-    private readonly MediaFileRepository _mediaFileRepo;
+    private readonly FileService                 _fileService;
+    private readonly FfprobeService              _ffprobeService;
+    private readonly TranscodingService          _transcodingService;
+    private readonly MediaFileRepository         _mediaFileRepo;
     private readonly IHubContext<TranscodingHub> _hubContext;
-    private readonly ClusterService      _clusterService;
-    private readonly SemaphoreSlim       _scanLock = new(1, 1);
-    private readonly string              _configPath;
-    private readonly string              _settingsPath;
+    private readonly ClusterService              _clusterService;
+    private readonly SemaphoreSlim               _scanLock = new(1, 1);
+    private readonly string                      _configPath;
+    private readonly string                      _settingsPath;
 
     private readonly JsonSerializerOptions _jsonOptions = new()
     {
@@ -81,6 +81,9 @@ public sealed class AutoScanService : IHostedService, IDisposable
         await MigrateSeenFilesIfNeededAsync();
         ScheduleTimer();
 
+        // Wire up folder override resolver for cluster dispatch (avoids circular DI)
+        _clusterService.FolderOverrideResolver = FindFolderOverride;
+
         if (_config.QueuePaused)
         {
             _transcodingService.SetPaused(true);
@@ -131,9 +134,9 @@ public sealed class AutoScanService : IHostedService, IDisposable
         var normalized = Path.GetFullPath(path);
         lock (_configLock)
         {
-            if (!_config.Directories.Contains(normalized, StringComparer.OrdinalIgnoreCase))
+            if (!_config.Directories.Any(d => string.Equals(d.Path, normalized, StringComparison.OrdinalIgnoreCase)))
             {
-                _config.Directories.Add(normalized);
+                _config.Directories.Add(new WatchedFolder { Path = normalized });
                 SaveConfig();
             }
         }
@@ -148,9 +151,51 @@ public sealed class AutoScanService : IHostedService, IDisposable
         var normalized = Path.GetFullPath(path);
         lock (_configLock)
         {
-            _config.Directories.RemoveAll(d => string.Equals(d, normalized, StringComparison.OrdinalIgnoreCase));
+            _config.Directories.RemoveAll(d => string.Equals(d.Path, normalized, StringComparison.OrdinalIgnoreCase));
             SaveConfig();
         }
+    }
+
+    /// <summary>
+    ///     Updates the encoding overrides for an existing watched folder.
+    ///     Pass null to clear overrides (revert to global defaults).
+    /// </summary>
+    public void SaveFolderSettings(string path, EncoderOptionsOverride? overrides)
+    {
+        var normalized = Path.GetFullPath(path);
+        lock (_configLock)
+        {
+            var folder = _config.Directories
+                .FirstOrDefault(d => string.Equals(d.Path, normalized, StringComparison.OrdinalIgnoreCase));
+            if (folder != null)
+            {
+                folder.EncodingOverrides = overrides;
+                SaveConfig();
+            }
+        }
+    }
+
+    /// <summary>
+    ///     Returns the folder-level encoding override for a file path, or null if none.
+    ///     Uses longest-prefix matching when a file is under multiple watched folders.
+    /// </summary>
+    public EncoderOptionsOverride? FindFolderOverride(string filePath)
+    {
+        var fullPath = Path.GetFullPath(filePath);
+        WatchedFolder? best = null;
+        int bestLen = -1;
+
+        foreach (var folder in _config.Directories)
+        {
+            var folderPath = folder.Path.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            if (fullPath.StartsWith(folderPath, StringComparison.OrdinalIgnoreCase) && folderPath.Length > bestLen)
+            {
+                best    = folder;
+                bestLen = folderPath.Length;
+            }
+        }
+
+        return best?.EncodingOverrides;
     }
 
     /// <summary> Enables or disables automatic scanning and reschedules the timer accordingly. </summary>
@@ -403,12 +448,12 @@ public sealed class AutoScanService : IHostedService, IDisposable
             if (!_config.Enabled || _config.Directories.Count == 0)
                 return;
 
-            var options = LoadEncoderOptions();
+            var globalOptions = LoadEncoderOptions();
 
             var allVideoFiles = new List<string>();
             foreach (var dir in _config.Directories)
             {
-                var directories = _fileService.RecursivelyFindDirectories(dir);
+                var directories = _fileService.RecursivelyFindDirectories(dir.Path);
                 var files       = _fileService.GetAllVideoFiles(directories);
                 allVideoFiles.AddRange(files);
             }
@@ -520,7 +565,9 @@ public sealed class AutoScanService : IHostedService, IDisposable
 
                 try
                 {
-                    await _transcodingService.AddFileAsync(file, options, cancellationToken: ct);
+                    var folderOverride = FindFolderOverride(file);
+                    var fileOptions    = EncoderOptionsOverride.ApplyOverrides(globalOptions, folderOverride, null);
+                    await _transcodingService.AddFileAsync(file, fileOptions, cancellationToken: ct);
                     newFileCount++;
                 }
                 catch (Exception ex)

@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Menu, dialog, shell } = require("electron");
+const { app, BrowserWindow, Menu, dialog, shell, session } = require("electron");
 const { spawn } = require("child_process");
 const path = require("path");
 const net = require("net");
@@ -225,6 +225,12 @@ function createWindow(port) {
 
 app.on("ready", async () => {
   try {
+    // Clear cached JS/CSS so the renderer always loads fresh files from the backend
+    await session.defaultSession.clearCache();
+    await session.defaultSession.clearStorageData({
+      storages: ["cachestorage", "serviceworkers"],
+    });
+
     backendPort = await findFreePort();
     startBackend(backendPort);
     await pollHealth(backendPort);

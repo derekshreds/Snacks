@@ -12,7 +12,8 @@ RUN apt-get update && apt-get install -y curl gnupg && \
 
 # Install jellyfin-ffmpeg7 (latest available for Noble), Intel VAAPI drivers, and supporting libraries
 RUN apt-get update && apt-get install -y \
-    jellyfin-ffmpeg7 \
+    coreutils \
+    jellyfin-ffmpeg7=7.1.3-5* \
     intel-media-va-driver-non-free \
     i965-va-driver \
     mesa-va-drivers \

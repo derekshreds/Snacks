@@ -66,6 +66,19 @@ public class TranscodingService
         /// <summary>Optional async callback for the cluster to check whether a file is already assigned remotely.</summary>
         private Func<string, Task<bool>>? _isRemoteJobChecker;
 
+        /// <summary>Optional predicate to skip items for local processing (e.g. master excludes 4K).</summary>
+        private Func<WorkItem, bool>? _shouldSkipLocal;
+
+        /// <summary>Local encoding job counters.</summary>
+        private int _localCompletedJobs;
+        private int _localFailedJobs;
+
+        /// <summary>Number of jobs completed by local encoding.</summary>
+        public int LocalCompletedJobs => _localCompletedJobs;
+
+        /// <summary>Number of jobs failed during local encoding.</summary>
+        public int LocalFailedJobs => _localFailedJobs;
+
         /// <summary>Whether the encoding queue is paused by user request.</summary>
         public bool IsPaused => _isPaused;
 
@@ -103,7 +116,11 @@ public class TranscodingService
 
             _ = Task.Run(async () =>
             {
-                try { await DetectHardwareAccelerationAsync(); }
+                try
+                {
+                    await DetectHardwareAccelerationAsync();
+                    await _hubContext.Clients.All.SendAsync("HardwareDetected", _detectedHardware);
+                }
                 catch { }
             });
         }
@@ -256,6 +273,7 @@ public class TranscodingService
                 bool isAv1 = sourceCodec == "av1";
                 bool alreadyTargetCodec = targetIsAv1 ? isAv1 : (targetIsHevc ? isHevc : !isHevc);
                 bool isHighDef = probe.Streams.Any(s => s.CodecType == "video" && s.Width > 1920);
+                workItem.Is4K = isHighDef;
 
                 var videoStream = probe.Streams.FirstOrDefault(s => s.CodecType == "video");
                 var normalizedPath = Path.GetFullPath(filePath);
@@ -663,13 +681,17 @@ public class TranscodingService
                     WorkItem? workItem = null;
                     lock (_queueLock)
                     {
-                        if (_workQueue.Count == 0) break;
-                        workItem = _workQueue[0];
-                        _workQueue.RemoveAt(0);
-                    }
+                        // Remove cancelled/stopped items
+                        _workQueue.RemoveAll(w => w.Status is WorkItemStatus.Cancelled or WorkItemStatus.Stopped);
 
-                    if (workItem.Status is WorkItemStatus.Cancelled or WorkItemStatus.Stopped)
-                        continue;
+                        // LINQ: first pending item that passes the local skip predicate
+                        workItem = _workQueue.FirstOrDefault(w =>
+                            w.Status == WorkItemStatus.Pending &&
+                            (_shouldSkipLocal == null || !_shouldSkipLocal(w)));
+
+                        if (workItem == null) break;
+                        _workQueue.Remove(workItem);
+                    }
 
                     // Clone from _lastOptions so settings changes take effect on the next item.
                     // _lastOptions gets updated when the user saves new settings.
@@ -722,6 +744,8 @@ public class TranscodingService
                 if (workItem.Probe == null)
                 {
                     workItem.Probe = await _ffprobeService.ProbeAsync(workItem.Path);
+                    if (workItem.Length <= 0 && workItem.Probe?.Format?.Duration != null)
+                        workItem.Length = _ffprobeService.DurationStringToSeconds(workItem.Probe.Format.Duration);
                 }
 
                 await ConvertVideoAsync(workItem, options);
@@ -729,6 +753,7 @@ public class TranscodingService
                 workItem.Status = WorkItemStatus.Completed;
                 workItem.CompletedAt = DateTime.UtcNow;
                 workItem.Progress = 100;
+                Interlocked.Increment(ref _localCompletedJobs);
                 await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Completed);
             }
             catch (OperationCanceledException)
@@ -739,6 +764,7 @@ public class TranscodingService
             }
             catch (Exception ex)
             {
+                Interlocked.Increment(ref _localFailedJobs);
                 workItem.Status = WorkItemStatus.Failed;
                 workItem.ErrorMessage = ex.Message;
                 workItem.CompletedAt = DateTime.UtcNow;
@@ -1866,9 +1892,13 @@ public class TranscodingService
 
         private async Task RunFfmpegAsync(string command, WorkItem workItem, CancellationToken cancellationToken = default)
         {
-            var processStartInfo = new ProcessStartInfo(_ffmpegPath)
+            // On Linux, FFmpeg's stderr switches to block-buffered when piped, which delays
+            // progress reporting for minutes. Wrap with stdbuf to force line buffering.
+            var usesStdbuf = !RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+                && File.Exists("/usr/bin/stdbuf");
+            var processStartInfo = new ProcessStartInfo(usesStdbuf ? "/usr/bin/stdbuf" : _ffmpegPath)
             {
-                Arguments = command,
+                Arguments = usesStdbuf ? $"-eL {_ffmpegPath} {command}" : command,
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
@@ -1887,7 +1917,7 @@ public class TranscodingService
 
             // Read stderr manually — FFmpeg uses \r for progress lines which
             // BeginErrorReadLine() doesn't split on Linux .NET
-            _ = Task.Run(async () =>
+            var stderrTask = Task.Run(async () =>
             {
                 try
                 {
@@ -1956,7 +1986,7 @@ public class TranscodingService
             });
 
             // Drain stdout to prevent the process from blocking on a full pipe buffer.
-            _ = Task.Run(async () =>
+            var stdoutTask = Task.Run(async () =>
             {
                 try { await process.StandardOutput.ReadToEndAsync(); } catch { }
             });
@@ -1995,6 +2025,10 @@ public class TranscodingService
                     }
                 }
             }
+
+            // Wait for stream readers to finish before disposing the process
+            try { await stderrTask; } catch { }
+            try { await stdoutTask; } catch { }
 
             lock (_activeLock) { _activeProcess = null; }
 
@@ -2147,6 +2181,22 @@ public class TranscodingService
             _isRemoteJobChecker = checker;
         }
 
+        /// <summary>Sets a predicate that decides whether a work item should be skipped for local processing (left for remote dispatch).</summary>
+        public void SetLocalSkipPredicate(Func<WorkItem, bool>? predicate)
+        {
+            _shouldSkipLocal = predicate;
+
+            // Re-trigger the processing loop so previously-skipped items get re-evaluated
+            if (_lastOptions != null && !_isPaused && !_localEncodingPaused)
+            {
+                _ = Task.Run(async () =>
+                {
+                    try { await ProcessQueueAsync(_lastOptions); }
+                    catch { }
+                });
+            }
+        }
+
         /// <summary>
         ///     Kills any active FFmpeg process, clears the pending queue, and resets all in-memory
         ///     state. Called when the master switches to node mode and must hand off processing.
@@ -2226,6 +2276,8 @@ public class TranscodingService
         /// </summary>
         public async Task<string?> RestoreToQueueAsync(MediaFile dbFile, EncoderOptions options)
         {
+            _lastOptions ??= options;
+
             if (!File.Exists(dbFile.FilePath))
                 return null;
 
@@ -2251,6 +2303,7 @@ public class TranscodingService
                 Bitrate  = dbFile.Bitrate,
                 Length   = dbFile.Duration,
                 IsHevc   = dbFile.IsHevc,
+                Is4K     = dbFile.Is4K,
                 Probe    = null // Lazily probed when processing starts
             };
 
@@ -2312,11 +2365,12 @@ public class TranscodingService
         ///     making it available for dispatch to a cluster node.
         /// </summary>
         /// <returns> The next pending <see cref="WorkItem"/>, or <see langword="null"/> if the queue is empty. </returns>
-        public WorkItem? DequeueForRemoteProcessing()
+        public WorkItem? DequeueForRemoteProcessing(Func<WorkItem, bool>? filter = null)
         {
             lock (_queueLock)
             {
-                var item = _workQueue.FirstOrDefault(w => w.Status == WorkItemStatus.Pending);
+                var item = _workQueue.FirstOrDefault(w =>
+                    w.Status == WorkItemStatus.Pending && (filter == null || filter(w)));
                 if (item != null)
                 {
                     item.Status = WorkItemStatus.Processing;
@@ -2451,6 +2505,7 @@ public class TranscodingService
                     Bitrate = bitrate,
                     Length = length,
                     IsHevc = isHevc,
+                    Is4K = probe.Streams.Any(s => s.CodecType == "video" && s.Width > 1920),
                     Probe = probe,
                     Status = WorkItemStatus.Processing,
                     StartedAt = DateTime.UtcNow

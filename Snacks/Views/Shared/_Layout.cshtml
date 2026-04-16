@@ -23,8 +23,8 @@
                 <ul class="navbar-nav ms-auto align-items-sm-center">
                     <li class="nav-item d-flex align-items-center py-2 py-sm-0">
                         <button class="btn btn-outline-secondary btn-sm me-2" id="pauseResumeBtn" title="Pause/Resume Queue"><i class="fas fa-pause" id="pauseResumeIcon"></i></button>
-                        <button class="btn btn-outline-secondary btn-sm me-2" data-bs-toggle="modal" data-bs-target="#settingsModal"><i class="fas fa-cog"></i></button>
-                        <button class="btn btn-primary btn-sm" data-bs-toggle="modal" data-bs-target="#libraryModal"><i class="fas fa-folder-plus me-1"></i><span class="d-none d-sm-inline">Browse Library</span><span class="d-sm-none">Library</span></button>
+                        <button class="btn btn-outline-secondary btn-sm me-2" id="openSettingsBtn"><i class="fas fa-cog"></i></button>
+                        <button class="btn btn-primary btn-sm" id="openLibraryBtn"><i class="fas fa-folder-plus me-1"></i><span class="d-none d-sm-inline">Browse Library</span><span class="d-sm-none">Library</span></button>
                     </li>
                     <li class="nav-item d-flex align-items-center py-1 py-sm-0 ms-sm-3">
                         <span class="nav-link d-flex align-items-center py-0" id="connectionStatus">
@@ -37,7 +37,7 @@
         </div>
     </nav>
 
-    <main class="container" style="margin-top: 80px; margin-bottom: 60px;">
+    <main class="container main-content">
         @RenderBody()
     </main>
 
@@ -45,7 +45,7 @@
         <div class="container text-center">
             <span class="text-muted">
                 <img src="~/images/snacks.ico" alt="Snacks" style="height: 18px; width: 18px;" class="me-2">
-                <a href="https://snacksvideo.com" target="_blank" class="text-muted text-decoration-none"><strong>Snacks</strong></a> - v2.2.4 &copy; @DateTime.Now.Year - <a href="https://technobitch.com" target="_blank" class="text-muted text-decoration-none">Derek Morris</a>
+                <a href="https://snacksvideo.com" target="_blank" class="text-muted text-decoration-none"><strong>Snacks</strong></a> - v2.3.0 &copy; @DateTime.Now.Year - <a href="https://technobitch.com" target="_blank" class="text-muted text-decoration-none">Derek Morris</a>
             </span>
         </div>
     </footer>

@@ -82,6 +82,8 @@ public sealed class ClusterService : IHostedService, IDisposable
      ******************************************************************/
 
     private ClusterConfig            _config = new();
+    private NodeSettingsConfig       _nodeSettingsConfig = new();
+    private readonly string          _nodeSettingsPath;
     private Timer?                   _heartbeatTimer;
     private Timer?                   _dispatchTimer;
     private CancellationTokenSource? _cts;
@@ -119,7 +121,8 @@ public sealed class ClusterService : IHostedService, IDisposable
         _workDir = _fileService.GetWorkingDirectory();
         var configDir = Path.Combine(_workDir, "config");
         Directory.CreateDirectory(configDir);
-        _configPath = Path.Combine(configDir, "cluster.json");
+        _configPath       = Path.Combine(configDir, "cluster.json");
+        _nodeSettingsPath = Path.Combine(configDir, "node-settings.json");
 
         // Sub-services share the node registry and are configured after config load
         _discovery = new ClusterDiscoveryService(
@@ -142,6 +145,7 @@ public sealed class ClusterService : IHostedService, IDisposable
     public Task StartAsync(CancellationToken cancellationToken)
     {
         LoadConfig();
+        LoadNodeSettings();
         Console.WriteLine($"Cluster: Config loaded — enabled={_config.Enabled}, role={_config.Role}, nodeId={_config.NodeId}");
 
         if (_config.Enabled && _config.Role != "standalone")
@@ -304,6 +308,15 @@ public sealed class ClusterService : IHostedService, IDisposable
 
     /// <summary> Returns the current cluster configuration. </summary>
     public ClusterConfig GetConfig() => _config;
+
+    /// <summary> Toggles local encoding on the master without affecting remote dispatch. </summary>
+    public void SetLocalEncodingEnabled(bool enabled)
+    {
+        _config.LocalEncodingEnabled = enabled;
+        SaveConfig();
+        _transcodingService.SetLocalEncodingPaused(!enabled);
+        Console.WriteLine($"Cluster: Local encoding {(enabled ? "resumed" : "paused")}");
+    }
 
     /// <summary>
     ///     Persists a new configuration and restarts cluster operations immediately.
@@ -534,6 +547,7 @@ public sealed class ClusterService : IHostedService, IDisposable
             _transcodingService.SetLocalEncodingPaused(!_config.LocalEncodingEnabled);
             _transcodingService.SetRemoteJobCanceller(CancelRemoteJobOnNodeAsync);
             _transcodingService.SetRemoteJobChecker(IsRemoteJobAsync);
+            UpdateLocalSkipPredicate();
 
             _dispatchTimer = new Timer(async _ =>
             {
@@ -749,7 +763,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                                 // for multiple consecutive heartbeats to avoid racing with encoding startup.
                                 var graceKey = $"_idle_grace_{node.ActiveWorkItemId}";
                                 var graceCount = _downloadRetryCounts.AddOrUpdate(graceKey, 1, (_, c) => c + 1);
-                                if (graceCount >= 3)
+                                if (graceCount >= 10)
                                 {
                                     Console.WriteLine($"Cluster: Node {node.Hostname} idle for {graceCount} heartbeats for job {node.ActiveWorkItemId} — re-queuing");
                                     _downloadRetryCounts.TryRemove(graceKey, out _);
@@ -862,14 +876,42 @@ public sealed class ClusterService : IHostedService, IDisposable
                 && !_activeDispatchTasks.ContainsKey(n.NodeId));
             if (!hasAvailableNodes) return;
 
-            var options = LoadEncoderOptions();
+            var globalOptions = LoadEncoderOptions();
 
             while (true)
             {
-                var workItem = _transcodingService.DequeueForRemoteProcessing();
+                // Recompute available workers each iteration (nodes become busy after dispatch)
+                var availableNow = _nodes.Values
+                    .Where(n => n.Role == "node" && n.Status == NodeStatus.Online
+                        && !n.IsPaused && n.ActiveWorkItemId == null
+                        && (!_activeDispatchTasks.TryGetValue(n.NodeId, out var dt) || dt.IsCompleted)
+                        && (!_nodeDispatchCooldowns.TryGetValue(n.NodeId, out var cd) || DateTime.UtcNow >= cd))
+                    .ToList();
+                if (availableNow.Count == 0) break;
+
+                bool any4KWorker    = availableNow.Any(n => GetNodeSettings(n.NodeId)?.Exclude4K != true);
+                bool anyNon4KWorker = availableNow.Any(n => GetNodeSettings(n.NodeId)?.Only4K != true);
+
+                // When master has local encoding with 4K routing, only dispatch items the master won't handle
+                var masterNs = _config.LocalEncodingEnabled ? GetNodeSettings(_config.NodeId) : null;
+                bool masterExcludes4K = masterNs?.Exclude4K == true;
+                bool masterOnly4K     = masterNs?.Only4K == true;
+
+                var workItem = _transcodingService.DequeueForRemoteProcessing(item =>
+                {
+                    // If master has a 4K preference, only dispatch items it doesn't want
+                    if (masterExcludes4K && !item.Is4K) return false; // master handles non-4K locally
+                    if (masterOnly4K && item.Is4K) return false;      // master handles 4K locally
+
+                    return item.Is4K ? any4KWorker : anyNon4KWorker;
+                });
                 if (workItem == null) break;
 
-                var bestNode = FindBestWorker(workItem, options);
+                // Resolve folder-level overrides for worker selection (GPU/encoder matching)
+                var folderOverride = FolderOverrideResolver?.Invoke(workItem.Path);
+                var folderOptions  = EncoderOptionsOverride.ApplyOverrides(globalOptions, folderOverride, null);
+
+                var bestNode = FindBestWorker(workItem, folderOptions);
                 if (bestNode == null)
                 {
                     _transcodingService.RequeueWorkItem(workItem, silent: true);
@@ -885,14 +927,19 @@ public sealed class ClusterService : IHostedService, IDisposable
                     break;
                 }
 
+                // Final options: global → folder → node overrides
+                var nodeOverride  = GetNodeSettings(bestNode.NodeId)?.EncodingOverrides;
+                var finalOptions  = EncoderOptionsOverride.ApplyOverrides(globalOptions, folderOverride, nodeOverride);
+
                 // Mark as uploading immediately to prevent double-dispatch
                 bestNode.ActiveWorkItemId = workItem.Id;
                 bestNode.Status           = NodeStatus.Uploading;
 
                 // Track the dispatch task instead of fire-and-forget
-                var dispatchTask = Task.Run(() => DispatchToNodeAsync(bestNode, workItem, options, nodeLock));
+                var dispatchTask = Task.Run(() => DispatchToNodeAsync(bestNode, workItem, finalOptions, nodeLock));
                 _activeDispatchTasks[bestNode.NodeId] = dispatchTask;
             }
+
         }
         finally
         {
@@ -913,6 +960,43 @@ public sealed class ClusterService : IHostedService, IDisposable
             _transcodingService.RequeueWorkItem(workItem, silent: true);
             nodeLock.Release();
             return;
+        }
+
+        // Pre-dispatch check: ask the node what it's doing before committing.
+        // The master's in-memory state can drift from reality (e.g., node is still
+        // retrying a failed encode that the master already re-queued). The node is
+        // the source of truth — if it says it's busy, don't dispatch.
+        var preCheckUrl = NodeBaseUrl(node);
+        try
+        {
+            var hbResponse = await _discovery.CreateAuthenticatedClient()
+                .GetAsync($"{preCheckUrl}/api/cluster/heartbeat");
+            if (hbResponse.IsSuccessStatusCode)
+            {
+                var hbBody = await hbResponse.Content.ReadAsStringAsync();
+                var hbData = JsonSerializer.Deserialize<JsonElement>(hbBody);
+
+                bool nodeIsBusy = false;
+                if (hbData.TryGetProperty("currentJobId", out var curJob) && curJob.ValueKind != JsonValueKind.Null)
+                    nodeIsBusy = true;
+                else if (hbData.TryGetProperty("status", out var statusProp) && statusProp.GetString() == "busy")
+                    nodeIsBusy = true;
+
+                if (nodeIsBusy)
+                {
+                    var busyJobId = curJob.ValueKind != JsonValueKind.Null ? curJob.GetString() : "unknown";
+                    Console.WriteLine($"Cluster: Node {node.Hostname} is busy (job {busyJobId}) — re-queuing {workItem.FileName}");
+                    _activeUploads.TryRemove(workItem.Id, out _);
+                    UpdateNodeStatus(node.NodeId, NodeStatus.Busy);
+                    _transcodingService.RequeueWorkItem(workItem, silent: true);
+                    nodeLock.Release();
+                    return;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Cluster: Pre-dispatch check failed for {node.Hostname}: {ex.Message} — proceeding with dispatch");
         }
 
         // Node lock acquired in RunDispatchAsync — release it now that _activeUploads guards us
@@ -1625,8 +1709,16 @@ public sealed class ClusterService : IHostedService, IDisposable
     }
 
     /// <summary> Assigns a numeric score to a candidate worker node for the given job. </summary>
-    private static int ScoreNode(ClusterNode node, WorkItem workItem, EncoderOptions options)
+    private int ScoreNode(ClusterNode node, WorkItem workItem, EncoderOptions options)
     {
+        // Check node-level 4K routing constraints
+        var ns = GetNodeSettings(node.NodeId);
+        if (ns != null)
+        {
+            if (ns.Only4K == true && !workItem.Is4K) return -100;
+            if (ns.Exclude4K == true && workItem.Is4K) return -100;
+        }
+
         int score = 1;
         var caps  = node.Capabilities;
         if (caps == null) return score; // Capabilities not yet received — allow dispatch with base score
@@ -1838,7 +1930,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                     // work is done and we just need to clear the assignment.
                     if (mediaFile.AssignedNodeId != null)
                     {
-                        var options = LoadEncoderOptions();
+                        var options = ResolveOptionsForJob(mediaFile.FilePath, mediaFile.AssignedNodeId);
                         var ext = options.Format == "mp4" ? ".mp4" : ".mkv";
                         var baseName = Path.GetFileNameWithoutExtension(mediaFile.FileName);
                         var outputFileName = $"{baseName} [snacks]{ext}";
@@ -2083,7 +2175,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                         _remoteJobs[workItem.Id]  = workItem;
                         await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
 
-                        var options = LoadEncoderOptions();
+                        var options = ResolveOptionsForJob(mediaFile.FilePath, mediaFile.AssignedNodeId);
                         var nodeForDispatch = _nodes.Values.FirstOrDefault(n => n.NodeId == mediaFile.AssignedNodeId)
                             ?? new ClusterNode
                             {
@@ -2223,6 +2315,112 @@ public sealed class ClusterService : IHostedService, IDisposable
     {
         var json = JsonSerializer.Serialize(options, _jsonOptions);
         return JsonSerializer.Deserialize<EncoderOptions>(json, _jsonOptions) ?? new EncoderOptions();
+    }
+
+    /******************************************************************
+     *  Node Settings Persistence
+     ******************************************************************/
+
+    /// <summary>
+    ///     Delegate set by <see cref="AutoScanService"/> at startup to resolve
+    ///     per-folder encoding overrides without a circular dependency.
+    /// </summary>
+    public Func<string, EncoderOptionsOverride?>? FolderOverrideResolver { get; set; }
+
+    /// <summary> Returns the full node settings config. </summary>
+    public NodeSettingsConfig GetNodeSettingsConfig() => _nodeSettingsConfig;
+
+    /// <summary> Returns settings for a specific node, or null if none configured. </summary>
+    public NodeSettings? GetNodeSettings(string nodeId) =>
+        _nodeSettingsConfig.Nodes.TryGetValue(nodeId, out var s) ? s : null;
+
+    /// <summary> Saves settings for a single node and persists to disk. </summary>
+    public void SaveNodeSettings(NodeSettings settings)
+    {
+        _nodeSettingsConfig.Nodes[settings.NodeId] = settings;
+        PersistNodeSettings();
+        UpdateLocalSkipPredicate();
+    }
+
+    /// <summary> Removes settings for a node and persists to disk. </summary>
+    public void DeleteNodeSettings(string nodeId)
+    {
+        _nodeSettingsConfig.Nodes.Remove(nodeId);
+        PersistNodeSettings();
+        UpdateLocalSkipPredicate();
+    }
+
+    /// <summary>
+    ///     Updates the local skip predicate on TranscodingService based on the master's own node settings.
+    ///     When the master has Exclude4K=true, 4K items are left in the queue for remote dispatch.
+    ///     When the master has Only4K=true, non-4K items are left for remote dispatch.
+    /// </summary>
+    private void UpdateLocalSkipPredicate()
+    {
+        var masterSettings = GetNodeSettings(_config.NodeId);
+        if (masterSettings == null)
+        {
+            _transcodingService.SetLocalSkipPredicate(null);
+            return;
+        }
+
+        bool only4K = masterSettings.Only4K == true;
+        bool exclude4K = masterSettings.Exclude4K == true;
+        if (!only4K && !exclude4K)
+        {
+            _transcodingService.SetLocalSkipPredicate(null);
+            return;
+        }
+
+        _transcodingService.SetLocalSkipPredicate(item =>
+        {
+            if (exclude4K && item.Is4K) return true;
+            if (only4K && !item.Is4K) return true;
+            return false;
+        });
+    }
+
+    /// <summary>
+    ///     Builds a final <see cref="EncoderOptions"/> for a specific job and target node,
+    ///     merging global → folder → node overrides.
+    /// </summary>
+    public EncoderOptions ResolveOptionsForJob(string? filePath, string? nodeId)
+    {
+        var global = LoadEncoderOptions();
+        var folderOverride = filePath != null ? FolderOverrideResolver?.Invoke(filePath) : null;
+        var nodeOverride   = nodeId != null ? GetNodeSettings(nodeId)?.EncodingOverrides : null;
+        return EncoderOptionsOverride.ApplyOverrides(global, folderOverride, nodeOverride);
+    }
+
+    private void LoadNodeSettings()
+    {
+        if (File.Exists(_nodeSettingsPath))
+        {
+            try
+            {
+                var json = File.ReadAllText(_nodeSettingsPath);
+                _nodeSettingsConfig = JsonSerializer.Deserialize<NodeSettingsConfig>(json, _jsonOptions)
+                    ?? new NodeSettingsConfig();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Cluster: Failed to load node settings: {ex.Message}");
+                _nodeSettingsConfig = new NodeSettingsConfig();
+            }
+        }
+    }
+
+    private void PersistNodeSettings()
+    {
+        try
+        {
+            var json = JsonSerializer.Serialize(_nodeSettingsConfig, _jsonOptions);
+            File.WriteAllText(_nodeSettingsPath, json);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Cluster: Failed to save node settings: {ex.Message}");
+        }
     }
 
     /// <summary> Loads cluster configuration from disk. </summary>

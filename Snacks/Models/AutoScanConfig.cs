@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace Snacks.Models;
 
 /// <summary>
@@ -12,8 +14,12 @@ public sealed class AutoScanConfig
     /// <summary> How often to run a scan, in minutes. Default: 60. </summary>
     public int IntervalMinutes { get; set; } = 60;
 
-    /// <summary> Absolute paths of directories to include in each scan. </summary>
-    public List<string> Directories { get; set; } = new();
+    /// <summary>
+    ///     Watched directories with optional per-folder encoding overrides.
+    ///     Backward-compatible: legacy string arrays are auto-promoted to <see cref="WatchedFolder"/> on load.
+    /// </summary>
+    [JsonConverter(typeof(WatchedFolderListConverter))]
+    public List<WatchedFolder> Directories { get; set; } = new();
 
     /// <summary> UTC timestamp of the most recent completed scan. Null if never scanned. </summary>
     public DateTime? LastScanTime { get; set; }

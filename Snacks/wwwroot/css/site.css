@@ -79,6 +79,17 @@ body {
     color: var(--text-primary);
 }
 
+.main-content {
+    margin-top: 64px;
+    margin-bottom: 60px;
+}
+
+@media (min-width: 768px) {
+    .main-content {
+        margin-top: 76px;
+    }
+}
+
 /* ===========================
    Typography
    =========================== */
@@ -617,8 +628,8 @@ footer a.text-muted:hover {
 }
 
 /* ===========================
-   Modals
-   =========================== */
+    Modals
+    =========================== */
 .modal-content {
     border: 1px solid var(--border-color);
     border-radius: var(--border-radius);
@@ -645,6 +656,66 @@ footer a.text-muted:hover {
 .modal-body {
     background: var(--bg-elevated);
     color: var(--text-primary);
+}
+
+/* Enhanced tab styling for better UX */
+.nav-tabs .nav-link {
+    transition: all 0.2s ease;
+    border-radius: var(--border-radius);
+    margin-bottom: -1px;
+}
+
+.nav-tabs .nav-link:hover,
+.nav-tabs .nav-link:focus {
+    color: var(--primary);
+    background-color: var(--bg-surface-hover);
+    border-color: transparent;
+}
+
+.nav-tabs .nav-link.active {
+    color: var(--primary) !important;
+    background-color: var(--bg-surface);
+    border-color: var(--border-color) var(--border-color) var(--bg-surface);
+    font-weight: 600;
+    box-shadow: inset 0 -2px 0 var(--primary);
+}
+
+/* Improved form elements */
+.form-control,
+.form-select {
+    transition: all 0.2s ease;
+}
+
+.form-control:focus,
+.form-select:focus {
+    border-color: var(--primary);
+    box-shadow: 0 0 0 0.25rem var(--primary-glow);
+    transform: translateY(-1px);
+}
+
+/* Enhanced button hover effects */
+.btn {
+    transition: all 0.2s ease;
+}
+
+.btn:hover {
+    transform: translateY(-2px);
+    box-shadow: var(--shadow-md);
+}
+
+.btn:active {
+    transform: translateY(0);
+}
+
+/* Enhanced encoder panel hover */
+.encoder-panel {
+    transition: all 0.3s ease;
+    border: 1px solid var(--border-color) !important;
+}
+
+.encoder-panel:hover {
+    border-color: var(--primary);
+    box-shadow: 0 0 0 0.2rem var(--primary-glow);
 }
 
 /* ===========================
@@ -771,8 +842,8 @@ footer a.text-muted:hover {
 
 .nav-tabs .nav-link.active {
     color: var(--primary) !important;
-    background-color: var(--bg-card);
-    border-color: var(--border-color) var(--border-color) var(--bg-card);
+    background-color: var(--bg-surface);
+    border-color: var(--border-color) var(--border-color) var(--bg-surface);
 }
 
 .nav-tabs {
@@ -1104,3 +1175,103 @@ footer a.text-muted:hover {
 .border-bottom {
     border-bottom-color: var(--border-color) !important;
 }
+
+/* ===========================
+   SnacksModal — custom modal system
+   =========================== */
+.snacks-modal-backdrop {
+    display: none;
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    z-index: var(--snacks-modal-z, 9000);
+    background: rgba(0, 0, 0, 0.55);
+    overflow: auto;
+}
+
+.snacks-modal-backdrop.open {
+    display: block;
+    animation: snacksBackdropIn 0.15s linear;
+}
+
+.snacks-modal-wrapper {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100%;
+    padding: 1.75rem;
+}
+
+.snacks-modal-dialog {
+    position: relative;
+    width: 100%;
+    max-width: 900px;
+    max-height: 85vh;
+    background: var(--bg-surface, #1a1a1e);
+    color: var(--text-primary, #e4e4e7);
+    border: 1px solid var(--border-color, #2a2a2e);
+    border-radius: 0.5rem;
+    box-shadow: 0 0.5rem 2rem rgba(0, 0, 0, 0.6);
+    display: flex;
+    flex-direction: column;
+    margin: 0 auto;
+}
+
+.snacks-modal-backdrop.open .snacks-modal-dialog {
+    animation: snacksDialogIn 0.3s ease-out;
+}
+
+@keyframes snacksBackdropIn {
+    from { opacity: 0; }
+    to   { opacity: 1; }
+}
+
+@keyframes snacksDialogIn {
+    from { transform: translateY(-50px); opacity: 0; }
+    to   { transform: translateY(0); opacity: 1; }
+}
+
+/* Explicit padding overrides for Bootstrap modal-header/body/footer inside our custom dialog.
+   Bootstrap 5 expects these to live under a .modal parent that sets CSS variables;
+   since .snacks-modal-dialog is not .modal, we apply the padding directly. */
+.snacks-modal-dialog > .modal-header {
+    padding: 1rem 1rem;
+    border-bottom: 1px solid var(--border-color, #2a2a2e);
+    border-top-left-radius: 0.5rem;
+    border-top-right-radius: 0.5rem;
+    background-color: var(--bg-surface, #1a1a1e);
+}
+
+.snacks-modal-dialog > .modal-body {
+    padding: 1rem;
+    overflow-y: auto;
+    flex-grow: 1;
+    background-color: var(--bg-elevated, #202024);
+}
+
+.snacks-modal-dialog > .modal-footer {
+    padding: 1rem 1rem;
+    border-top: 1px solid var(--border-color, #2a2a2e);
+    border-bottom-left-radius: 0.5rem;
+    border-bottom-right-radius: 0.5rem;
+    background-color: var(--bg-surface, #1a1a1e);
+    gap: 0.5rem;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: flex-end;
+}
+
+/* Ensure first/last children get proper border-radius even if the order varies */
+.snacks-modal-dialog > :first-child {
+    border-top-left-radius: 0.5rem;
+    border-top-right-radius: 0.5rem;
+}
+
+.snacks-modal-dialog > :last-child {
+    border-bottom-left-radius: 0.5rem;
+    border-bottom-right-radius: 0.5rem;
+}
+
