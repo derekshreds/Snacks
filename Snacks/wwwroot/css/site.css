@@ -79,6 +79,17 @@ body {
     color: var(--text-primary);
 }
 
+.main-content {
+    margin-top: 64px;
+    margin-bottom: 60px;
+}
+
+@media (min-width: 768px) {
+    .main-content {
+        margin-top: 76px;
+    }
+}
+
 /* ===========================
    Typography
    =========================== */

@@ -1860,7 +1860,11 @@ class TranscodingManager {
             if (!response.ok) throw new Error(`HTTP ${response.status}`);
             const status = await response.json();
             this.localEncodingEnabled = status.localEncodingEnabled !== false;
-            this.masterCapabilities = status.masterCapabilities || null;
+            this.selfCapabilities = status.selfCapabilities || null;
+            this.localCompletedJobs = status.localCompletedJobs || 0;
+            this.localFailedJobs = status.localFailedJobs || 0;
+            if (status.nodeId) this.clusterNodeId = status.nodeId;
+            if (status.nodeName) this.clusterNodeName = status.nodeName;
             const nodes = status.nodes || [];
             this.workers.clear();
             for (const node of nodes) {
@@ -2030,10 +2034,15 @@ class TranscodingManager {
         panel.style.display = showPanel ? '' : 'none';
         if (!showPanel) return;
 
-        const nodes = Array.from(this.workers.values());
-        if (countBadge) countBadge.textContent = `${nodes.length} node${nodes.length !== 1 ? 's' : ''}`;
+        // Filter out self from remote nodes (rendered separately as the self-card),
+        // then sort so master nodes appear before worker nodes
+        const nodes = Array.from(this.workers.values())
+            .filter(n => n.nodeId !== this.clusterNodeId)
+            .sort((a, b) => (a.role === 'master' ? -1 : 1) - (b.role === 'master' ? -1 : 1));
+        const totalNodes = nodes.length + (this.clusterNodeId ? 1 : 0);
+        if (countBadge) countBadge.textContent = `${totalNodes} node${totalNodes !== 1 ? 's' : ''}`;
 
-        if (nodes.length === 0 && this.clusterRole !== 'master') {
+        if (nodes.length === 0 && !this.clusterNodeId) {
             container.innerHTML = '<div class="text-muted"><i class="fas fa-search me-1"></i>Discovering nodes...</div>';
             return;
         }
@@ -2052,29 +2061,31 @@ class TranscodingManager {
             'Paused': 'var(--warning-color, #ffc107)'
         };
 
-        // Show master node card matching the same layout as worker cards
-        const localPaused = !this.localEncodingEnabled;
-        const masterStatus = localPaused ? 'Paused' : 'Online';
-        const masterStatusColor = statusColors[masterStatus] || 'gray';
-        const masterGpu = this.masterCapabilities?.gpuVendor && this.masterCapabilities.gpuVendor !== 'none'
-            ? this.masterCapabilities.gpuVendor.charAt(0).toUpperCase() + this.masterCapabilities.gpuVendor.slice(1)
+        // Self-card: this machine shown first, works for both master and worker roles
+        const selfGpu = this.selfCapabilities?.gpuVendor && this.selfCapabilities.gpuVendor !== 'none'
+            ? this.selfCapabilities.gpuVendor.charAt(0).toUpperCase() + this.selfCapabilities.gpuVendor.slice(1)
             : 'CPU only';
-        const masterOs = this.masterCapabilities?.osPlatform || '';
-        const masterCard = this.clusterRole === 'master' && this.clusterNodeId ? `
+        const selfOs = this.selfCapabilities?.osPlatform || '';
+        const localPaused = this.clusterRole === 'master' && !this.localEncodingEnabled;
+        const selfStatus = localPaused ? 'Paused' : 'Online';
+        const selfStatusColor = statusColors[selfStatus] || 'gray';
+        const selfCard = this.clusterNodeId ? `
             <div class="card hover-lift" style="min-width: 180px; max-width: 240px; flex: 1 1 200px;">
                 <div class="card-body p-2" style="overflow:hidden;">
                     <div class="d-flex align-items-center mb-1" style="min-width:0;">
-                        <span class="flex-shrink-0" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${masterStatusColor};margin-right:6px;"></span>
-                        <strong style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(this.clusterNodeName || 'Master')}</strong>
+                        <span class="flex-shrink-0" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${selfStatusColor};margin-right:6px;"></span>
+                        <strong style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(this.clusterNodeName || 'This Machine')}</strong>
                     </div>
                     <div class="text-muted small">
-                        <div>master &bull; ${escapeHtml(masterOs)}${masterGpu ? ' / ' + escapeHtml(masterGpu) : ''}</div>
-                        <div style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(masterStatus)}</div>
+                        <div>${escapeHtml(this.clusterRole)} &bull; ${escapeHtml(selfOs)}${selfGpu ? ' / ' + escapeHtml(selfGpu) : ''}</div>
+                        <div style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(selfStatus)}</div>
+                        <div class="mt-1">Jobs: ${this.localCompletedJobs || 0} done, ${this.localFailedJobs || 0} failed</div>
                         <div class="d-flex gap-1 mt-1">
-                            <button class="btn btn-sm ${localPaused ? 'btn-outline-success' : 'btn-outline-warning'} flex-grow-1" id="masterLocalPause">
-                                <i class="fas fa-${localPaused ? 'play' : 'pause'} me-1"></i>${localPaused ? 'Resume' : 'Pause'}
-                            </button>
-                            <button class="btn btn-sm btn-outline-secondary cluster-node-settings" data-node-id="${this.clusterNodeId}" data-hostname="${escapeHtml(this.clusterNodeName || 'Master')}">
+                            ${this.clusterRole === 'master' ? `
+                                <button class="btn btn-sm ${localPaused ? 'btn-outline-success' : 'btn-outline-warning'} flex-grow-1" id="masterLocalPause">
+                                    <i class="fas fa-${localPaused ? 'play' : 'pause'} me-1"></i>${localPaused ? 'Resume' : 'Pause'}
+                                </button>` : ''}
+                            <button class="btn btn-sm btn-outline-secondary cluster-node-settings" data-node-id="${this.clusterNodeId}" data-hostname="${escapeHtml(this.clusterNodeName || 'This Machine')}">
                                 <i class="fas fa-cog"></i>
                             </button>
                         </div>
@@ -2082,7 +2093,7 @@ class TranscodingManager {
                 </div>
             </div>` : '';
 
-        container.innerHTML = masterCard + nodes.map(node => {
+        container.innerHTML = selfCard + nodes.map(node => {
             const statusName = statusNames[node.status] || 'Unknown';
             const statusColor = statusColors[statusName] || 'gray';
 

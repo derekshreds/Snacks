@@ -836,9 +836,12 @@ namespace Snacks.Controllers
                 enabled = config.Enabled,
                 role = config.Role,
                 nodeName = config.NodeName,
+                nodeId = config.NodeId,
                 localEncodingEnabled = config.LocalEncodingEnabled,
-                masterCapabilities = _clusterService.GetCapabilities(),
-                nodeCount = _clusterService.GetNodes().Count,
+                selfCapabilities = _clusterService.GetCapabilities(),
+                localCompletedJobs = _transcodingService.LocalCompletedJobs,
+                localFailedJobs = _transcodingService.LocalFailedJobs,
+                nodeCount = _clusterService.GetNodes().Count + 1, // include self
                 nodes = _clusterService.GetNodes()
             });
         }

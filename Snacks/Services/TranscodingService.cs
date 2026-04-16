@@ -69,6 +69,16 @@ public class TranscodingService
         /// <summary>Optional predicate to skip items for local processing (e.g. master excludes 4K).</summary>
         private Func<WorkItem, bool>? _shouldSkipLocal;
 
+        /// <summary>Local encoding job counters.</summary>
+        private int _localCompletedJobs;
+        private int _localFailedJobs;
+
+        /// <summary>Number of jobs completed by local encoding.</summary>
+        public int LocalCompletedJobs => _localCompletedJobs;
+
+        /// <summary>Number of jobs failed during local encoding.</summary>
+        public int LocalFailedJobs => _localFailedJobs;
+
         /// <summary>Whether the encoding queue is paused by user request.</summary>
         public bool IsPaused => _isPaused;
 
@@ -753,6 +763,7 @@ public class TranscodingService
                 workItem.Status = WorkItemStatus.Completed;
                 workItem.CompletedAt = DateTime.UtcNow;
                 workItem.Progress = 100;
+                Interlocked.Increment(ref _localCompletedJobs);
                 await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Completed);
             }
             catch (OperationCanceledException)
@@ -763,6 +774,7 @@ public class TranscodingService
             }
             catch (Exception ex)
             {
+                Interlocked.Increment(ref _localFailedJobs);
                 workItem.Status = WorkItemStatus.Failed;
                 workItem.ErrorMessage = ex.Message;
                 workItem.CompletedAt = DateTime.UtcNow;
