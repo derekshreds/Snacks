@@ -2080,15 +2080,15 @@ class TranscodingManager {
                         <div>${escapeHtml(this.clusterRole)} &bull; ${escapeHtml(selfOs)}${selfGpu ? ' / ' + escapeHtml(selfGpu) : ''}</div>
                         <div style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(selfStatus)}</div>
                         <div class="mt-1">Jobs: ${this.localCompletedJobs || 0} done, ${this.localFailedJobs || 0} failed</div>
+                        ${this.clusterRole === 'master' ? `
                         <div class="d-flex gap-1 mt-1">
-                            ${this.clusterRole === 'master' ? `
-                                <button class="btn btn-sm ${localPaused ? 'btn-outline-success' : 'btn-outline-warning'} flex-grow-1" id="masterLocalPause">
-                                    <i class="fas fa-${localPaused ? 'play' : 'pause'} me-1"></i>${localPaused ? 'Resume' : 'Pause'}
-                                </button>` : ''}
+                            <button class="btn btn-sm ${localPaused ? 'btn-outline-success' : 'btn-outline-warning'} flex-grow-1" id="masterLocalPause">
+                                <i class="fas fa-${localPaused ? 'play' : 'pause'} me-1"></i>${localPaused ? 'Resume' : 'Pause'}
+                            </button>
                             <button class="btn btn-sm btn-outline-secondary cluster-node-settings" data-node-id="${this.clusterNodeId}" data-hostname="${escapeHtml(this.clusterNodeName || 'This Machine')}">
                                 <i class="fas fa-cog"></i>
                             </button>
-                        </div>
+                        </div>` : ''}
                     </div>
                 </div>
             </div>` : '';
