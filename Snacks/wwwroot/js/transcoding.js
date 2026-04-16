@@ -1471,7 +1471,7 @@ class TranscodingManager {
 
             const entry = document.createElement('div');
             entry.className = 'log-entry';
-            entry.innerHTML = `<span class="text-muted">[${new Date().toLocaleTimeString('en-GB')}]</span> ${escapeHtml(message)}`;
+            entry.innerHTML = `<div class="log-entry">${escapeHtml(message)}</div>`;
             logContent.appendChild(entry);
 
             if (wasAtBottom) {
@@ -1535,7 +1535,7 @@ class TranscodingManager {
         logContent.innerHTML = logs.map(log =>
             log.fromServer
                 ? `<div class="log-entry">${escapeHtml(log.message)}</div>`
-                : `<div class="log-entry"><span class="text-muted">[${log.timestamp.toLocaleTimeString('en-GB')}]</span> ${escapeHtml(log.message)}</div>`
+                : `<div class="log-entry">${escapeHtml(log.message)}</div>`
         ).join('');
 
         // Scroll to bottom on initial load

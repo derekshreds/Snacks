@@ -744,6 +744,8 @@ public class TranscodingService
                 if (workItem.Probe == null)
                 {
                     workItem.Probe = await _ffprobeService.ProbeAsync(workItem.Path);
+                    if (workItem.Length <= 0 && workItem.Probe?.Format?.Duration != null)
+                        workItem.Length = _ffprobeService.DurationStringToSeconds(workItem.Probe.Format.Duration);
                 }
 
                 await ConvertVideoAsync(workItem, options);
@@ -1890,9 +1892,13 @@ public class TranscodingService
 
         private async Task RunFfmpegAsync(string command, WorkItem workItem, CancellationToken cancellationToken = default)
         {
-            var processStartInfo = new ProcessStartInfo(_ffmpegPath)
+            // On Linux, FFmpeg's stderr switches to block-buffered when piped, which delays
+            // progress reporting for minutes. Wrap with stdbuf to force line buffering.
+            var usesStdbuf = !RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+                && File.Exists("/usr/bin/stdbuf");
+            var processStartInfo = new ProcessStartInfo(usesStdbuf ? "/usr/bin/stdbuf" : _ffmpegPath)
             {
-                Arguments = command,
+                Arguments = usesStdbuf ? $"-eL {_ffmpegPath} {command}" : command,
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
@@ -1911,7 +1917,7 @@ public class TranscodingService
 
             // Read stderr manually — FFmpeg uses \r for progress lines which
             // BeginErrorReadLine() doesn't split on Linux .NET
-            _ = Task.Run(async () =>
+            var stderrTask = Task.Run(async () =>
             {
                 try
                 {
@@ -1980,7 +1986,7 @@ public class TranscodingService
             });
 
             // Drain stdout to prevent the process from blocking on a full pipe buffer.
-            _ = Task.Run(async () =>
+            var stdoutTask = Task.Run(async () =>
             {
                 try { await process.StandardOutput.ReadToEndAsync(); } catch { }
             });
@@ -2019,6 +2025,10 @@ public class TranscodingService
                     }
                 }
             }
+
+            // Wait for stream readers to finish before disposing the process
+            try { await stderrTask; } catch { }
+            try { await stdoutTask; } catch { }
 
             lock (_activeLock) { _activeProcess = null; }
 
