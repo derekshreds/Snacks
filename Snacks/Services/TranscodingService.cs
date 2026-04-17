@@ -898,7 +898,8 @@ public class TranscodingService
 
             string initFlags = useVaapi ? GetInitFlags(hwAccel, canHwDecode) : GetInitFlags(hwAccel);
             string vaapiFormat = is10Bit ? "p010" : "nv12";
-            string hwFilter = useVaapi ? $"-vf format={vaapiFormat}|vaapi,hwupload " : "";
+            // hwupload only needed for sw decode → hw encode; hw-decoded frames are already on the GPU
+            string hwFilter = useVaapi && !canHwDecode ? $"-vf format={vaapiFormat}|vaapi,hwupload " : "";
             bool isSvtAv1 = encoder == "libsvtav1";
             string presetFlag = useVaapi
                 ? (useLowPower ? "-low_power 1 " : "")
@@ -1490,10 +1491,12 @@ public class TranscodingService
             bool is10Bit = workItem.Probe?.Streams?.Any(s =>
                 s.CodecType == "video" && (s.PixFmt?.Contains("10") == true || s.Profile?.Contains("10") == true)) == true;
             string vaapiFormat = is10Bit ? "p010" : "nv12";
-            string hwFilter = $"-vf format={vaapiFormat}|vaapi,hwupload";
+            // hwupload only needed for sw decode → hw encode; hw-decoded frames are already on the GPU
+            string hwFilter = canHwDecode ? "" : $"-vf format={vaapiFormat}|vaapi,hwupload";
 
-            // Try LP mode first, then fall back to normal mode if it fails
-            bool[] lowPowerModes = [true, false];
+            // LP mode is Intel-specific (VAEntrypointEncSliceLP); AMD only supports VAEntrypointEncSlice
+            bool isIntel = options.HardwareAcceleration.Equals("intel", StringComparison.OrdinalIgnoreCase);
+            bool[] lowPowerModes = isIntel ? [true, false] : [false];
             foreach (bool lowPower in lowPowerModes)
             {
                 string lpFlag = lowPower ? "-low_power 1 " : "";
