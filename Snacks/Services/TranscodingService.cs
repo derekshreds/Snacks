@@ -1264,7 +1264,7 @@ public class TranscodingService
                 if (encoder.Contains("vaapi"))
                 {
                     vf = "-vf format=nv12|vaapi,hwupload";
-                    extra = "-low_power 1 -rc_mode CQP -global_quality 25";
+                    extra = "-rc_mode CQP -global_quality 25";
                 }
                 else
                 {
