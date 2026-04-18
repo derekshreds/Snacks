@@ -9,18 +9,11 @@
 
             <div class="mb-3">
                 <label class="form-label">Subtitle Languages to Keep</label>
-                <div class="chip-input" id="@(formPrefix)SubtitleLanguagesToKeepChips" data-field="SubtitleLanguagesToKeep">
+                <div class="chip-input" id="@(formPrefix)SubtitleLanguagesToKeepChips" data-field="SubtitleLanguagesToKeep" data-source="iso-languages">
                     <div class="chip-list"></div>
-                    <input type="text" class="chip-new" placeholder="Add ISO code (e.g. en, es)">
+                    <input type="text" class="chip-new" placeholder="Type a language (e.g. en, eng, English)">
                 </div>
-                <div class="form-text">Empty list keeps all subtitle tracks.</div>
-            </div>
-
-            <div class="form-check mb-2">
-                <input class="form-check-input" type="checkbox" id="@(formPrefix)EnglishOnlySubtitles" name="EnglishOnlySubtitles">
-                <label class="form-check-label text-muted" for="@(formPrefix)EnglishOnlySubtitles">
-                    <small>Legacy: English Subtitles Only (superseded by list above)</small>
-                </label>
+                <div class="form-text">Empty list keeps all subtitle tracks. Codes are stored as 2-letter ISO (e.g. <code>en</code>).</div>
             </div>
         </div>
     </div>

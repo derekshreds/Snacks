@@ -48,9 +48,6 @@ public sealed class EncoderOptionsOverride
     /// <summary> Overrides <see cref="EncoderOptions.TwoChannelAudio"/> when non-<see langword="null"/>. </summary>
     public bool? TwoChannelAudio { get; set; }
 
-    /// <summary> Overrides <see cref="EncoderOptions.EnglishOnlyAudio"/> when non-<see langword="null"/>. </summary>
-    public bool? EnglishOnlyAudio { get; set; }
-
     /// <summary> Overrides <see cref="EncoderOptions.AudioLanguagesToKeep"/> when non-<see langword="null"/>. </summary>
     public List<string>? AudioLanguagesToKeep { get; set; }
 
@@ -72,9 +69,6 @@ public sealed class EncoderOptionsOverride
     /******************************************************************
      *  Subtitles
      ******************************************************************/
-
-    /// <summary> Overrides <see cref="EncoderOptions.EnglishOnlySubtitles"/> when non-<see langword="null"/>. </summary>
-    public bool? EnglishOnlySubtitles { get; set; }
 
     /// <summary> Overrides <see cref="EncoderOptions.SubtitleLanguagesToKeep"/> when non-<see langword="null"/>. </summary>
     public List<string>? SubtitleLanguagesToKeep { get; set; }
@@ -120,15 +114,12 @@ public sealed class EncoderOptionsOverride
     /// <summary> Overrides <see cref="EncoderOptions.EncodeDirectory"/> when non-<see langword="null"/>. </summary>
     public string? EncodeDirectory { get; set; }
 
-    /// <summary> Overrides <see cref="EncoderOptions.LocalTranscodeScratchDirectory"/> when non-<see langword="null"/>. </summary>
-    public string? LocalTranscodeScratchDirectory { get; set; }
-
     /******************************************************************
      *  Override Application
      ******************************************************************/
 
     /// <summary>
-    ///     Produces a new <see cref="EncoderOptions"/> instance by copying
+    ///     Produces a new <see cref="EncoderOptions"/> instance by cloning
     ///     <paramref name="baseOptions"/> then layering <paramref name="folderOverride"/>
     ///     and <paramref name="nodeOverride"/> in order.
     /// </summary>
@@ -140,42 +131,7 @@ public sealed class EncoderOptionsOverride
         EncoderOptionsOverride? folderOverride,
         EncoderOptionsOverride? nodeOverride)
     {
-        var result = new EncoderOptions
-        {
-            Format                         = baseOptions.Format,
-            Codec                          = baseOptions.Codec,
-            Encoder                        = baseOptions.Encoder,
-            TargetBitrate                  = baseOptions.TargetBitrate,
-            StrictBitrate                  = baseOptions.StrictBitrate,
-            FourKBitrateMultiplier         = baseOptions.FourKBitrateMultiplier,
-            Skip4K                         = baseOptions.Skip4K,
-            TwoChannelAudio                = baseOptions.TwoChannelAudio,
-            EnglishOnlyAudio               = baseOptions.EnglishOnlyAudio,
-            EnglishOnlySubtitles           = baseOptions.EnglishOnlySubtitles,
-            DeleteOriginalFile             = baseOptions.DeleteOriginalFile,
-            RemoveBlackBorders             = baseOptions.RemoveBlackBorders,
-            RetryOnFail                    = baseOptions.RetryOnFail,
-            OutputDirectory                = baseOptions.OutputDirectory,
-            EncodeDirectory                = baseOptions.EncodeDirectory,
-            HardwareAcceleration           = baseOptions.HardwareAcceleration,
-            SkipPercentAboveTarget         = baseOptions.SkipPercentAboveTarget,
-            AudioLanguagesToKeep           = new List<string>(baseOptions.AudioLanguagesToKeep),
-            KeepOriginalLanguage           = baseOptions.KeepOriginalLanguage,
-            OriginalLanguageProvider       = baseOptions.OriginalLanguageProvider,
-            AudioOnlyMode                  = baseOptions.AudioOnlyMode,
-            AudioCodec                     = baseOptions.AudioCodec,
-            AudioBitrateKbps               = baseOptions.AudioBitrateKbps,
-            SubtitleLanguagesToKeep        = new List<string>(baseOptions.SubtitleLanguagesToKeep),
-            ExtractSubtitlesToSidecar      = baseOptions.ExtractSubtitlesToSidecar,
-            SidecarSubtitleFormat          = baseOptions.SidecarSubtitleFormat,
-            ConvertImageSubtitlesToSrt     = baseOptions.ConvertImageSubtitlesToSrt,
-            DownscalePolicy                = baseOptions.DownscalePolicy,
-            DownscaleTarget                = baseOptions.DownscaleTarget,
-            TonemapHdrToSdr                = baseOptions.TonemapHdrToSdr,
-            FfmpegQualityPreset            = baseOptions.FfmpegQualityPreset,
-            LocalTranscodeScratchDirectory = baseOptions.LocalTranscodeScratchDirectory,
-        };
-
+        var result = baseOptions.Clone();
         Apply(result, folderOverride);
         Apply(result, nodeOverride);
         return result;
@@ -185,37 +141,34 @@ public sealed class EncoderOptionsOverride
     {
         if (over == null) return;
 
-        if (over.Format != null)                         target.Format                         = over.Format;
-        if (over.Codec != null)                          target.Codec                          = over.Codec;
-        if (over.Encoder != null)                        target.Encoder                        = over.Encoder;
-        if (over.TargetBitrate.HasValue)                 target.TargetBitrate                  = over.TargetBitrate.Value;
-        if (over.StrictBitrate.HasValue)                 target.StrictBitrate                  = over.StrictBitrate.Value;
-        if (over.FourKBitrateMultiplier.HasValue)        target.FourKBitrateMultiplier         = over.FourKBitrateMultiplier.Value;
-        if (over.Skip4K.HasValue)                        target.Skip4K                         = over.Skip4K.Value;
-        if (over.TwoChannelAudio.HasValue)               target.TwoChannelAudio                = over.TwoChannelAudio.Value;
-        if (over.EnglishOnlyAudio.HasValue)              target.EnglishOnlyAudio               = over.EnglishOnlyAudio.Value;
-        if (over.EnglishOnlySubtitles.HasValue)          target.EnglishOnlySubtitles           = over.EnglishOnlySubtitles.Value;
-        if (over.DeleteOriginalFile.HasValue)            target.DeleteOriginalFile             = over.DeleteOriginalFile.Value;
-        if (over.RemoveBlackBorders.HasValue)            target.RemoveBlackBorders             = over.RemoveBlackBorders.Value;
-        if (over.RetryOnFail.HasValue)                   target.RetryOnFail                    = over.RetryOnFail.Value;
-        if (over.OutputDirectory != null)                target.OutputDirectory                = over.OutputDirectory;
-        if (over.EncodeDirectory != null)                target.EncodeDirectory                = over.EncodeDirectory;
-        if (over.HardwareAcceleration != null)           target.HardwareAcceleration           = over.HardwareAcceleration;
-        if (over.SkipPercentAboveTarget.HasValue)        target.SkipPercentAboveTarget         = over.SkipPercentAboveTarget.Value;
-        if (over.AudioLanguagesToKeep != null)           target.AudioLanguagesToKeep           = over.AudioLanguagesToKeep;
-        if (over.KeepOriginalLanguage.HasValue)          target.KeepOriginalLanguage           = over.KeepOriginalLanguage.Value;
-        if (over.OriginalLanguageProvider != null)       target.OriginalLanguageProvider       = over.OriginalLanguageProvider;
-        if (over.AudioOnlyMode.HasValue)                 target.AudioOnlyMode                  = over.AudioOnlyMode.Value;
-        if (over.AudioCodec != null)                     target.AudioCodec                     = over.AudioCodec;
-        if (over.AudioBitrateKbps.HasValue)              target.AudioBitrateKbps               = over.AudioBitrateKbps.Value;
-        if (over.SubtitleLanguagesToKeep != null)        target.SubtitleLanguagesToKeep        = over.SubtitleLanguagesToKeep;
-        if (over.ExtractSubtitlesToSidecar.HasValue)     target.ExtractSubtitlesToSidecar      = over.ExtractSubtitlesToSidecar.Value;
-        if (over.SidecarSubtitleFormat != null)          target.SidecarSubtitleFormat          = over.SidecarSubtitleFormat;
-        if (over.ConvertImageSubtitlesToSrt.HasValue)    target.ConvertImageSubtitlesToSrt     = over.ConvertImageSubtitlesToSrt.Value;
-        if (over.DownscalePolicy != null)                target.DownscalePolicy                = over.DownscalePolicy;
-        if (over.DownscaleTarget != null)                target.DownscaleTarget                = over.DownscaleTarget;
-        if (over.TonemapHdrToSdr.HasValue)               target.TonemapHdrToSdr                = over.TonemapHdrToSdr.Value;
-        if (over.FfmpegQualityPreset != null)            target.FfmpegQualityPreset            = over.FfmpegQualityPreset;
-        if (over.LocalTranscodeScratchDirectory != null) target.LocalTranscodeScratchDirectory = over.LocalTranscodeScratchDirectory;
+        if (over.Format != null)                      target.Format                     = over.Format;
+        if (over.Codec != null)                       target.Codec                      = over.Codec;
+        if (over.Encoder != null)                     target.Encoder                    = over.Encoder;
+        if (over.TargetBitrate.HasValue)              target.TargetBitrate              = over.TargetBitrate.Value;
+        if (over.StrictBitrate.HasValue)              target.StrictBitrate              = over.StrictBitrate.Value;
+        if (over.FourKBitrateMultiplier.HasValue)     target.FourKBitrateMultiplier     = over.FourKBitrateMultiplier.Value;
+        if (over.Skip4K.HasValue)                     target.Skip4K                     = over.Skip4K.Value;
+        if (over.TwoChannelAudio.HasValue)            target.TwoChannelAudio            = over.TwoChannelAudio.Value;
+        if (over.DeleteOriginalFile.HasValue)         target.DeleteOriginalFile         = over.DeleteOriginalFile.Value;
+        if (over.RemoveBlackBorders.HasValue)         target.RemoveBlackBorders         = over.RemoveBlackBorders.Value;
+        if (over.RetryOnFail.HasValue)                target.RetryOnFail                = over.RetryOnFail.Value;
+        if (over.OutputDirectory != null)             target.OutputDirectory            = over.OutputDirectory;
+        if (over.EncodeDirectory != null)             target.EncodeDirectory            = over.EncodeDirectory;
+        if (over.HardwareAcceleration != null)        target.HardwareAcceleration       = over.HardwareAcceleration;
+        if (over.SkipPercentAboveTarget.HasValue)     target.SkipPercentAboveTarget     = over.SkipPercentAboveTarget.Value;
+        if (over.AudioLanguagesToKeep != null)        target.AudioLanguagesToKeep       = over.AudioLanguagesToKeep;
+        if (over.KeepOriginalLanguage.HasValue)       target.KeepOriginalLanguage       = over.KeepOriginalLanguage.Value;
+        if (over.OriginalLanguageProvider != null)    target.OriginalLanguageProvider   = over.OriginalLanguageProvider;
+        if (over.AudioOnlyMode.HasValue)              target.AudioOnlyMode              = over.AudioOnlyMode.Value;
+        if (over.AudioCodec != null)                  target.AudioCodec                 = over.AudioCodec;
+        if (over.AudioBitrateKbps.HasValue)           target.AudioBitrateKbps           = over.AudioBitrateKbps.Value;
+        if (over.SubtitleLanguagesToKeep != null)     target.SubtitleLanguagesToKeep    = over.SubtitleLanguagesToKeep;
+        if (over.ExtractSubtitlesToSidecar.HasValue)  target.ExtractSubtitlesToSidecar  = over.ExtractSubtitlesToSidecar.Value;
+        if (over.SidecarSubtitleFormat != null)       target.SidecarSubtitleFormat      = over.SidecarSubtitleFormat;
+        if (over.ConvertImageSubtitlesToSrt.HasValue) target.ConvertImageSubtitlesToSrt = over.ConvertImageSubtitlesToSrt.Value;
+        if (over.DownscalePolicy != null)             target.DownscalePolicy            = over.DownscalePolicy;
+        if (over.DownscaleTarget != null)             target.DownscaleTarget            = over.DownscaleTarget;
+        if (over.TonemapHdrToSdr.HasValue)            target.TonemapHdrToSdr            = over.TonemapHdrToSdr.Value;
+        if (over.FfmpegQualityPreset != null)         target.FfmpegQualityPreset        = over.FfmpegQualityPreset;
     }
 }

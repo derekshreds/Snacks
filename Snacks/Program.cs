@@ -130,9 +130,6 @@ var app = builder.Build();
 var mediaFileRepo = app.Services.GetRequiredService<MediaFileRepository>();
 await mediaFileRepo.InitializeAsync();
 
-// Upgrade settings.json to the new multi-language / codec schema if needed.
-SettingsMigration.RunStartupMigration(Path.Combine(configDir, "settings.json"));
-
 if (!app.Environment.IsDevelopment())
 {
     app.UseExceptionHandler("/Home/Error");

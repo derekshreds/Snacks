@@ -108,16 +108,19 @@ public class FfprobeService
 
     /// <summary>
     ///     Returns the FFmpeg <c>-map</c> and audio codec arguments for the selected audio streams.
-    ///     Filters commentary tracks when English-only mode is active.
+    ///     Filters commentary tracks when a language keep-list is active.
     /// </summary>
     /// <param name="probe">The ffprobe analysis of the source file.</param>
-    /// <param name="englishOnly">When <c>true</c>, only English audio tracks are kept.</param>
+    /// <param name="languagesToKeep">
+    ///     2-letter ISO codes to retain. Empty or null keeps every audio stream. Matching accepts
+    ///     the track's tag in any of its common forms (2-letter, 3-letter, or English name).
+    /// </param>
     /// <param name="twoChannels">When <c>true</c>, audio is downmixed to 2-channel stereo AAC.</param>
     /// <param name="isMatroska">
     ///     When <c>true</c>, non-AAC audio is copied; otherwise all tracks are re-encoded to AAC.
     /// </param>
     /// <returns>FFmpeg stream mapping and codec arguments for audio, or an empty string if no audio streams exist.</returns>
-    public string MapAudio(ProbeResult probe, bool englishOnly, bool twoChannels, bool isMatroska)
+    public string MapAudio(ProbeResult probe, IReadOnlyList<string>? languagesToKeep, bool twoChannels, bool isMatroska)
     {
         ArgumentNullException.ThrowIfNull(probe);
 
@@ -125,16 +128,16 @@ public class FfprobeService
         if (!audioStreams.Any())
             return "";
 
-        if (englishOnly)
+        if (languagesToKeep != null && languagesToKeep.Count > 0)
         {
-            var englishAudioStreams = audioStreams
-                .Where(s => s.Tags?.Language == "eng"
+            var filtered = audioStreams
+                .Where(s => LanguageMatcher.Matches(s.Tags?.Language, languagesToKeep)
                     && (s.Tags?.Title == null || !s.Tags.Title.ToLower().Contains("comm")))
                 .ToList();
 
-            if (englishAudioStreams.Any())
+            if (filtered.Any())
             {
-                var maps = string.Join(" ", englishAudioStreams.Select(s => $"-map 0:{s.Index}"));
+                var maps = string.Join(" ", filtered.Select(s => $"-map 0:{s.Index}"));
 
                 if (twoChannels)
                     return $"{maps} -c:a aac -ac 2 -vbr 5";
@@ -161,10 +164,13 @@ public class FfprobeService
     ///     Returns <c>-sn</c> (no subtitles) for MP4 containers, which don't support text subtitle passthrough.
     /// </summary>
     /// <param name="probe">The ffprobe analysis of the source file.</param>
-    /// <param name="englishOnly">When <c>true</c>, only English subtitle tracks are kept.</param>
+    /// <param name="languagesToKeep">
+    ///     2-letter ISO codes to retain. Empty or null keeps every (non-bitmap) subtitle stream. Matching
+    ///     accepts the track's tag in any of its common forms (2-letter, 3-letter, or English name).
+    /// </param>
     /// <param name="isMatroska">When <c>false</c>, subtitles are always stripped (<c>-sn</c>).</param>
     /// <returns>FFmpeg subtitle mapping arguments, or <c>-sn</c> to strip all subtitles.</returns>
-    public string MapSub(ProbeResult probe, bool englishOnly, bool isMatroska)
+    public string MapSub(ProbeResult probe, IReadOnlyList<string>? languagesToKeep, bool isMatroska)
     {
         ArgumentNullException.ThrowIfNull(probe);
 
@@ -178,11 +184,13 @@ public class FfprobeService
             .Where(s => !_bitmapSubCodecs.Contains(s.CodecName ?? ""))
             .ToList();
 
-        if (englishOnly)
+        if (languagesToKeep != null && languagesToKeep.Count > 0)
         {
-            var englishSubs = keepSubs.Where(s => s.Tags?.Language == "eng").ToList();
-            if (englishSubs.Any())
-                keepSubs = englishSubs;
+            var filtered = keepSubs
+                .Where(s => LanguageMatcher.Matches(s.Tags?.Language, languagesToKeep))
+                .ToList();
+            if (filtered.Any())
+                keepSubs = filtered;
         }
 
         if (keepSubs.Any())

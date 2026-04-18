@@ -32,8 +32,6 @@ const OVERRIDE_FIELDS = Object.freeze({
     Skip4K:                 'bool',
     StrictBitrate:          'bool',
     TwoChannelAudio:        'bool',
-    EnglishOnlyAudio:       'bool',
-    EnglishOnlySubtitles:   'bool',
     DeleteOriginalFile:     'bool',
     SkipPercentAboveTarget: 'number',
 });

@@ -42,10 +42,7 @@ public sealed class EncoderOptions
     /// <summary> When <see langword="true"/>, all audio is downmixed to two channels. </summary>
     public bool TwoChannelAudio { get; set; } = false;
 
-    /// <summary> Legacy: kept English audio only. Superseded by <see cref="AudioLanguagesToKeep"/>. </summary>
-    public bool EnglishOnlyAudio { get; set; } = false;
-
-    /// <summary> ISO 639-2 language codes for audio tracks to retain (e.g. ["en", "ja"]). </summary>
+    /// <summary> ISO 639-1 2-letter codes for audio tracks to retain (e.g. ["en", "ja"]). Empty keeps all tracks. </summary>
     public List<string> AudioLanguagesToKeep { get; set; } = new() { "en" };
 
     /// <summary> When <see langword="true"/>, always keeps the original-language audio track. </summary>
@@ -57,8 +54,8 @@ public sealed class EncoderOptions
     /// <summary> When <see langword="true"/>, processes audio tracks only and skips video re-encoding. </summary>
     public bool AudioOnlyMode { get; set; } = false;
 
-    /// <summary> FFmpeg audio codec name (e.g. "aac", "ac3"). </summary>
-    public string AudioCodec { get; set; } = "aac";
+    /// <summary> FFmpeg audio codec name (e.g. "copy", "aac", "ac3"). </summary>
+    public string AudioCodec { get; set; } = "copy";
 
     /// <summary> Target audio bitrate in kilobits per second. </summary>
     public int AudioBitrateKbps { get; set; } = 192;
@@ -67,10 +64,7 @@ public sealed class EncoderOptions
      *  Subtitles
      ******************************************************************/
 
-    /// <summary> Legacy: kept English subtitles only. Superseded by <see cref="SubtitleLanguagesToKeep"/>. </summary>
-    public bool EnglishOnlySubtitles { get; set; } = false;
-
-    /// <summary> ISO 639-2 language codes for subtitle tracks to retain. </summary>
+    /// <summary> ISO 639-1 2-letter codes for subtitle tracks to retain. Empty keeps all tracks. </summary>
     public List<string> SubtitleLanguagesToKeep { get; set; } = new() { "en" };
 
     /// <summary> When <see langword="true"/>, text subtitles are written to sidecar files instead of muxed. </summary>
@@ -120,6 +114,44 @@ public sealed class EncoderOptions
     /// <summary> Hardware acceleration mode (e.g. "auto", "nvenc", "vaapi", "none"). </summary>
     public string HardwareAcceleration { get; set; } = "auto";
 
-    /// <summary> Optional local scratch directory for cluster node temporary files. </summary>
-    public string? LocalTranscodeScratchDirectory { get; set; }
+    /******************************************************************
+     *  Cloning
+     ******************************************************************/
+
+    /// <summary>
+    ///     Deep copy of this options instance. The two language lists are
+    ///     cloned so per-item mutation can't bleed back into shared state.
+    /// </summary>
+    public EncoderOptions Clone() => new()
+    {
+        Format                     = Format,
+        Codec                      = Codec,
+        Encoder                    = Encoder,
+        TargetBitrate              = TargetBitrate,
+        StrictBitrate              = StrictBitrate,
+        FourKBitrateMultiplier     = FourKBitrateMultiplier,
+        Skip4K                     = Skip4K,
+        FfmpegQualityPreset        = FfmpegQualityPreset,
+        TwoChannelAudio            = TwoChannelAudio,
+        AudioLanguagesToKeep       = new List<string>(AudioLanguagesToKeep),
+        KeepOriginalLanguage       = KeepOriginalLanguage,
+        OriginalLanguageProvider   = OriginalLanguageProvider,
+        AudioOnlyMode              = AudioOnlyMode,
+        AudioCodec                 = AudioCodec,
+        AudioBitrateKbps           = AudioBitrateKbps,
+        SubtitleLanguagesToKeep    = new List<string>(SubtitleLanguagesToKeep),
+        ExtractSubtitlesToSidecar  = ExtractSubtitlesToSidecar,
+        SidecarSubtitleFormat      = SidecarSubtitleFormat,
+        ConvertImageSubtitlesToSrt = ConvertImageSubtitlesToSrt,
+        DownscalePolicy            = DownscalePolicy,
+        DownscaleTarget            = DownscaleTarget,
+        TonemapHdrToSdr            = TonemapHdrToSdr,
+        RemoveBlackBorders         = RemoveBlackBorders,
+        DeleteOriginalFile         = DeleteOriginalFile,
+        RetryOnFail                = RetryOnFail,
+        SkipPercentAboveTarget     = SkipPercentAboveTarget,
+        OutputDirectory            = OutputDirectory,
+        EncodeDirectory            = EncodeDirectory,
+        HardwareAcceleration       = HardwareAcceleration,
+    };
 }

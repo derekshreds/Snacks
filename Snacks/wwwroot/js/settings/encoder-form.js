@@ -96,8 +96,6 @@ export function getEncoderOptions(prefix = 'settings') {
         // Bitrate + skip policy.
         TargetBitrate:          num('TargetBitrate', 3500),
         TwoChannelAudio:        bool('TwoChannelAudio'),
-        EnglishOnlyAudio:       bool('EnglishOnlyAudio'),
-        EnglishOnlySubtitles:   bool('EnglishOnlySubtitles'),
         RemoveBlackBorders:     bool('RemoveBlackBorders'),
         DeleteOriginalFile:     bool('DeleteOriginalFile'),
         RetryOnFail:            bool('RetryOnFail', true),
@@ -107,15 +105,15 @@ export function getEncoderOptions(prefix = 'settings') {
         SkipPercentAboveTarget: Math.max(0, num('SkipPercentAboveTarget', 20)),
 
         // Paths.
-        OutputDirectory:                str('OutputDirectory'),
-        LocalTranscodeScratchDirectory: str('LocalTranscodeScratchDirectory'),
+        OutputDirectory: str('OutputDirectory'),
+        EncodeDirectory: str('EncodeDirectory'),
 
         // Audio.
         AudioLanguagesToKeep:     chips('AudioLanguagesToKeep') ?? ['en'],
         KeepOriginalLanguage:     bool('KeepOriginalLanguage'),
         OriginalLanguageProvider: str('OriginalLanguageProvider', 'None'),
         AudioOnlyMode:            bool('AudioOnlyMode'),
-        AudioCodec:               str('AudioCodec', 'aac'),
+        AudioCodec:               str('AudioCodec', 'copy'),
         AudioBitrateKbps:         num('AudioBitrateKbps', 192),
 
         // Subtitles.
@@ -191,8 +189,6 @@ export async function restoreEncoderOptions(prefix = 'settings') {
         // Bitrate + skip policy.
         set('TargetBitrate',          pick('TargetBitrate'));
         set('TwoChannelAudio',        pick('TwoChannelAudio'));
-        set('EnglishOnlyAudio',       pick('EnglishOnlyAudio'));
-        set('EnglishOnlySubtitles',   pick('EnglishOnlySubtitles'));
         set('RemoveBlackBorders',     pick('RemoveBlackBorders'));
         set('DeleteOriginalFile',     pick('DeleteOriginalFile'));
         set('RetryOnFail',            pick('RetryOnFail'));
@@ -202,14 +198,14 @@ export async function restoreEncoderOptions(prefix = 'settings') {
         set('SkipPercentAboveTarget', Math.max(0, pick('SkipPercentAboveTarget') ?? 20));
 
         // Paths.
-        set('OutputDirectory',                pick('OutputDirectory') || '');
-        set('LocalTranscodeScratchDirectory', pick('LocalTranscodeScratchDirectory') || '');
+        set('OutputDirectory', pick('OutputDirectory') || '');
+        set('EncodeDirectory', pick('EncodeDirectory') || '');
 
         // Audio.
         set('KeepOriginalLanguage',     pick('KeepOriginalLanguage'));
         set('OriginalLanguageProvider', pick('OriginalLanguageProvider') || 'None');
         set('AudioOnlyMode',            pick('AudioOnlyMode'));
-        set('AudioCodec',               pick('AudioCodec')               || 'aac');
+        set('AudioCodec',               pick('AudioCodec')               || 'copy');
         set('AudioBitrateKbps',         pick('AudioBitrateKbps')          ?? 192);
 
         // Subtitles.

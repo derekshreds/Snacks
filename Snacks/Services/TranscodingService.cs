@@ -716,27 +716,7 @@ public class TranscodingService
                     // Clone from _lastOptions so settings changes take effect on the next item.
                     // _lastOptions gets updated when the user saves new settings.
                     var current = _lastOptions ?? options;
-                    var itemOptions = new EncoderOptions
-                    {
-                        Format = current.Format,
-                        Codec = current.Codec,
-                        Encoder = current.Encoder,
-                        TargetBitrate = current.TargetBitrate,
-                        TwoChannelAudio = current.TwoChannelAudio,
-                        DeleteOriginalFile = current.DeleteOriginalFile,
-                        EnglishOnlyAudio = current.EnglishOnlyAudio,
-                        EnglishOnlySubtitles = current.EnglishOnlySubtitles,
-                        RemoveBlackBorders = current.RemoveBlackBorders,
-                        RetryOnFail = current.RetryOnFail,
-                        OutputDirectory = current.OutputDirectory,
-                        EncodeDirectory = current.EncodeDirectory,
-                        StrictBitrate = current.StrictBitrate,
-                        HardwareAcceleration = current.HardwareAcceleration,
-                        FourKBitrateMultiplier = current.FourKBitrateMultiplier,
-                        Skip4K = current.Skip4K,
-                        SkipPercentAboveTarget = current.SkipPercentAboveTarget
-                    };
-                    await ProcessWorkItemAsync(workItem, itemOptions);
+                    await ProcessWorkItemAsync(workItem, current.Clone());
                 }
             }
             finally
@@ -779,7 +759,7 @@ public class TranscodingService
                 if (_notificationService != null)
                     _ = _notificationService.NotifyEncodeCompletedAsync(Path.GetFileName(workItem.Path), workItem.Size);
                 if (_integrationService != null)
-                    _ = _integrationService.TriggerRescansAsync();
+                    _ = _integrationService.TriggerRescansAsync(workItem.Path);
             }
             catch (OperationCanceledException)
             {
@@ -936,12 +916,12 @@ public class TranscodingService
                 $"{_ffprobeService.MapVideo(workItem.Probe!)} -c:v copy " :
                 $"{_ffprobeService.MapVideo(workItem.Probe!)} -c:v {encoder} {presetFlag}{hwFilter}";
 
-            string audioFlags = _ffprobeService.MapAudio(workItem.Probe!, options.EnglishOnlyAudio,
+            string audioFlags = _ffprobeService.MapAudio(workItem.Probe!, options.AudioLanguagesToKeep,
                 options.TwoChannelAudio, options.Format == "mkv") + " ";
 
             string subtitleFlags = stripSubtitles
                 ? "-sn "
-                : _ffprobeService.MapSub(workItem.Probe!, options.EnglishOnlySubtitles, options.Format == "mkv") + " ";
+                : _ffprobeService.MapSub(workItem.Probe!, options.SubtitleLanguagesToKeep, options.Format == "mkv") + " ";
 
             string varFlags = options.Format == "mkv" ? "-max_muxing_queue_size 9999 " : "-movflags +faststart -max_muxing_queue_size 9999 ";
 

@@ -36,8 +36,8 @@ public sealed class SettingsController : ControllerBase
      ******************************************************************/
 
     /// <summary>
-    ///     Loads the current encoder settings from disk, applying schema migrations if needed.
-    ///     Falls back to the <c>.bak</c> file on corruption, then to defaults.
+    ///     Loads the current encoder settings from disk. Falls back to the
+    ///     <c>.bak</c> file on corruption, then to defaults.
     /// </summary>
     [HttpGet]
     public IActionResult Get()
@@ -50,22 +50,7 @@ public sealed class SettingsController : ControllerBase
             if (!System.IO.File.Exists(candidate)) continue;
             try
             {
-                var json    = System.IO.File.ReadAllText(candidate);
-                var options = JsonSerializer.Deserialize<EncoderOptions>(json, _jsonOptions);
-                if (options != null && SettingsMigration.Apply(options))
-                {
-                    var upgraded = JsonSerializer.Serialize(options, _jsonOptions);
-                    try
-                    {
-                        System.IO.File.Copy(candidate, candidate + ".bak", overwrite: true);
-                        System.IO.File.WriteAllText(candidate, upgraded);
-                    }
-                    catch
-                    {
-                        /* best-effort — if the .bak write fails the upgraded content is still returned */
-                    }
-                    return Content(upgraded, "application/json");
-                }
+                var json = System.IO.File.ReadAllText(candidate);
                 return Content(json, "application/json");
             }
             catch

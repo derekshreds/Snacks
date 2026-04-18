@@ -9,11 +9,11 @@
 
             <div class="mb-3">
                 <label class="form-label"><i class="fas fa-language me-1"></i> Audio Languages to Keep</label>
-                <div class="chip-input" id="@(formPrefix)AudioLanguagesToKeepChips" data-field="AudioLanguagesToKeep">
+                <div class="chip-input" id="@(formPrefix)AudioLanguagesToKeepChips" data-field="AudioLanguagesToKeep" data-source="iso-languages">
                     <div class="chip-list"></div>
-                    <input type="text" class="chip-new" placeholder="Add ISO code (e.g. en, es, ja)">
+                    <input type="text" class="chip-new" placeholder="Type a language (e.g. en, eng, English)">
                 </div>
-                <div class="form-text">Empty list keeps all audio tracks.</div>
+                <div class="form-text">Empty list keeps all audio tracks. Codes are stored as 2-letter ISO (e.g. <code>en</code>).</div>
             </div>
 
             <div class="form-check mb-3">
@@ -30,13 +30,6 @@
                     <option value="Radarr">Radarr</option>
                     <option value="TVDB">TVDB</option>
                 </select>
-            </div>
-
-            <div class="form-check mb-2">
-                <input class="form-check-input" type="checkbox" id="@(formPrefix)EnglishOnlyAudio" name="EnglishOnlyAudio">
-                <label class="form-check-label text-muted" for="@(formPrefix)EnglishOnlyAudio">
-                    <small>Legacy: English Audio Only (superseded by list above)</small>
-                </label>
             </div>
         </div>
     </div>
@@ -60,12 +53,12 @@
             <div class="mb-3">
                 <label for="@(formPrefix)AudioCodec" class="form-label">Audio Codec</label>
                 <select class="form-select" id="@(formPrefix)AudioCodec" name="AudioCodec">
-                    <option value="copy">Copy (no re-encode)</option>
-                    <option value="aac" selected>AAC</option>
+                    <option value="copy" selected>Copy (no re-encode)</option>
+                    <option value="aac">AAC</option>
                     <option value="eac3">E-AC3</option>
                     <option value="opus">Opus</option>
                 </select>
-                <div class="form-text">"Copy" preserves the original audio bit-for-bit; AAC is the safest cross-device default.</div>
+                <div class="form-text">"Copy" preserves the original audio bit-for-bit; AAC is the safest cross-device fallback.</div>
             </div>
 
             <div class="mb-3">
