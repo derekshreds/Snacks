@@ -83,4 +83,22 @@ public sealed class IntegrationsController : ControllerBase
         var (ok, msg) = await _integrations.TestArrAsync(req?.BaseUrl ?? "", req?.ApiKey ?? "", "Radarr");
         return new JsonResult(new { success = ok, message = msg });
     }
+
+    /// <summary> Tests authentication against TheTVDB v4 with the supplied credentials. </summary>
+    /// <param name="req"> API key (and optional subscriber PIN) for TVDB. </param>
+    [HttpPost("test/tvdb")]
+    public async Task<IActionResult> TestTvdb([FromBody] TvdbIntegration req)
+    {
+        var (ok, msg) = await _integrations.TestTvdbAsync(req?.ApiKey ?? "", req?.Pin);
+        return new JsonResult(new { success = ok, message = msg });
+    }
+
+    /// <summary> Tests connectivity to TMDb with the supplied API key. </summary>
+    /// <param name="req"> API key for TMDb. </param>
+    [HttpPost("test/tmdb")]
+    public async Task<IActionResult> TestTmdb([FromBody] TmdbIntegration req)
+    {
+        var (ok, msg) = await _integrations.TestTmdbAsync(req?.ApiKey ?? "");
+        return new JsonResult(new { success = ok, message = msg });
+    }
 }

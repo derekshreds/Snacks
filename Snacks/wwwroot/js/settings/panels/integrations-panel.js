@@ -65,6 +65,15 @@ function buildConfig() {
             baseUrl: val('radarrBaseUrl'),
             apiKey:  val('radarrApiKey'),
         },
+        tvdb: {
+            enabled: chk('tvdbEnabled'),
+            apiKey:  val('tvdbApiKey'),
+            pin:     val('tvdbPin'),
+        },
+        tmdb: {
+            enabled: chk('tmdbEnabled'),
+            apiKey:  val('tmdbApiKey'),
+        },
     };
 }
 
@@ -94,6 +103,13 @@ async function load() {
         setVal('radarrEnabled',   cfg.radarr?.enabled);
         setVal('radarrBaseUrl',   cfg.radarr?.baseUrl);
         setVal('radarrApiKey',    cfg.radarr?.apiKey);
+
+        setVal('tvdbEnabled',     cfg.tvdb?.enabled);
+        setVal('tvdbApiKey',      cfg.tvdb?.apiKey);
+        setVal('tvdbPin',         cfg.tvdb?.pin);
+
+        setVal('tmdbEnabled',     cfg.tmdb?.enabled);
+        setVal('tmdbApiKey',      cfg.tmdb?.apiKey);
     } catch { /* endpoint may be gated by auth */ }
 }
 
@@ -118,7 +134,7 @@ async function save() {
  * Issues a test-connection call against the named provider and paints the
  * result into its per-row `<span class="small">` element.
  *
- * @param {'plex'|'jellyfin'|'sonarr'|'radarr'} service
+ * @param {'plex'|'jellyfin'|'sonarr'|'radarr'|'tvdb'|'tmdb'} service
  */
 async function test(service) {
     const result = document.getElementById(`${service}TestResult`);
@@ -137,8 +153,14 @@ async function test(service) {
             case 'sonarr':
                 data = await integrationsApi.testSonarr(  val('sonarrBaseUrl'),   val('sonarrApiKey'));
                 break;
-            default: // radarr
+            case 'radarr':
                 data = await integrationsApi.testRadarr(  val('radarrBaseUrl'),   val('radarrApiKey'));
+                break;
+            case 'tvdb':
+                data = await integrationsApi.testTvdb(    val('tvdbApiKey'),      val('tvdbPin'));
+                break;
+            default: // tmdb
+                data = await integrationsApi.testTmdb(    val('tmdbApiKey'));
                 break;
         }
 
@@ -164,6 +186,8 @@ export function initIntegrationsPanel() {
     document.getElementById('testJellyfin')?.addEventListener('click', () => test('jellyfin'));
     document.getElementById('testSonarr')  ?.addEventListener('click', () => test('sonarr'));
     document.getElementById('testRadarr')  ?.addEventListener('click', () => test('radarr'));
+    document.getElementById('testTvdb')    ?.addEventListener('click', () => test('tvdb'));
+    document.getElementById('testTmdb')    ?.addEventListener('click', () => test('tmdb'));
 }
 
 /** Lazy data load, invoked when the settings modal is first opened. */

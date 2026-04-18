@@ -115,6 +115,8 @@ builder.Services.AddSingleton<ConfigFileService>();
 builder.Services.AddHttpClient();
 builder.Services.AddSingleton<NotificationService>();
 builder.Services.AddSingleton<IntegrationService>();
+builder.Services.AddSingleton<SubtitleEditService>();
+builder.Services.AddSingleton<SubtitleExtractionService>();
 builder.Services.AddSingleton<AuthService>();
 builder.Services.AddSingleton<TranscodingService>();
 builder.Services.AddSingleton<StateTransitionService>();

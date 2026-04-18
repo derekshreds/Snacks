@@ -549,4 +549,260 @@ public sealed class IntegrationService
         }
         return list;
     }
+
+    /******************************************************************
+     *  Original-Language Lookups
+     ******************************************************************/
+
+    // Cache prefix-map from integration (provider, baseUrl+key) to {series/movie path, originalLanguage}.
+    private readonly Dictionary<string, (DateTime expires, IReadOnlyList<(string path, string lang)> map)> _arrLangCache = new();
+    private (string token, DateTime expires)? _tvdbToken;
+    private readonly object _tvdbLock = new();
+
+    /// <summary>
+    ///     Resolves the original language of a media file (ISO 639-1, 2-letter).
+    ///     Provider can be <c>"None"</c>, <c>"Auto"</c>, <c>"Sonarr"</c>, <c>"Radarr"</c>,
+    ///     <c>"TVDB"</c>, or <c>"TMDb"</c>. Returns <c>null</c> on any failure; callers
+    ///     are expected to proceed with the configured keep-list unchanged in that case.
+    /// </summary>
+    public async Task<string?> LookupOriginalLanguageAsync(string filePath, string provider, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(filePath)) return null;
+        if (string.IsNullOrWhiteSpace(provider) || provider.Equals("None", StringComparison.OrdinalIgnoreCase)) return null;
+
+        var kind = MediaTypeDetector.Classify(filePath);
+
+        IntegrationConfig cfg;
+        lock (_lock) cfg = _config;
+
+        // "Auto": prefer a configured Arr instance for the media kind, then TVDB (TV) or TMDb.
+        if (provider.Equals("Auto", StringComparison.OrdinalIgnoreCase))
+        {
+            provider = kind == MediaTypeDetector.MediaKind.Tv
+                ? (cfg.Sonarr.Enabled ? "Sonarr"
+                    : cfg.Tvdb.Enabled  ? "TVDB"
+                    : cfg.Tmdb.Enabled  ? "TMDb" : "None")
+                : (cfg.Radarr.Enabled ? "Radarr"
+                    : cfg.Tmdb.Enabled  ? "TMDb" : "None");
+            if (provider == "None") return null;
+        }
+
+        try
+        {
+            return provider.ToLowerInvariant() switch
+            {
+                "sonarr" when kind == MediaTypeDetector.MediaKind.Tv    => await LookupArrLangAsync(filePath, cfg.Sonarr, isSeries: true,  ct),
+                "radarr" when kind == MediaTypeDetector.MediaKind.Movie => await LookupArrLangAsync(filePath, cfg.Radarr, isSeries: false, ct),
+                "tvdb"   when kind == MediaTypeDetector.MediaKind.Tv    => await LookupTvdbLangAsync(filePath, cfg.Tvdb, ct),
+                "tmdb"                                                  => await LookupTmdbLangAsync(filePath, cfg.Tmdb, kind, ct),
+                _                                                       => null,
+            };
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Original-language lookup error ({provider}): {ex.Message}");
+            return null;
+        }
+    }
+
+    private async Task<string?> LookupArrLangAsync(string filePath, ArrIntegration arr, bool isSeries, CancellationToken ct)
+    {
+        if (!arr.Enabled || string.IsNullOrWhiteSpace(arr.BaseUrl) || string.IsNullOrWhiteSpace(arr.ApiKey))
+            return null;
+
+        var cacheKey = (isSeries ? "sonarr|" : "radarr|") + arr.BaseUrl + "|" + arr.ApiKey;
+        IReadOnlyList<(string path, string lang)>? cached = null;
+        lock (_rootsLock)
+        {
+            if (_arrLangCache.TryGetValue(cacheKey, out var entry) && entry.expires > DateTime.UtcNow)
+                cached = entry.map;
+        }
+
+        if (cached == null)
+        {
+            var http     = _httpClientFactory.CreateClient();
+            http.Timeout = TimeSpan.FromSeconds(15);
+            var baseUrl  = arr.BaseUrl.TrimEnd('/');
+            var url      = baseUrl + (isSeries ? "/api/v3/series" : "/api/v3/movie");
+            var req      = new HttpRequestMessage(HttpMethod.Get, url);
+            req.Headers.TryAddWithoutValidation("X-Api-Key", arr.ApiKey);
+            using var resp = await http.SendAsync(req, ct);
+            if (!resp.IsSuccessStatusCode) return null;
+            var json = await resp.Content.ReadAsStringAsync(ct);
+
+            var list = new List<(string path, string lang)>();
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var item in doc.RootElement.EnumerateArray())
+                {
+                    var path = item.TryGetProperty("path", out var pEl) ? pEl.GetString() : null;
+                    if (string.IsNullOrEmpty(path)) continue;
+
+                    string? lang = null;
+                    if (item.TryGetProperty("originalLanguage", out var ol))
+                    {
+                        if (ol.ValueKind == JsonValueKind.Object && ol.TryGetProperty("name", out var nEl))
+                            lang = nEl.GetString();
+                        else if (ol.ValueKind == JsonValueKind.String)
+                            lang = ol.GetString();
+                    }
+                    if (!string.IsNullOrEmpty(lang))
+                        list.Add((path!, lang));
+                }
+            }
+            cached = list;
+            lock (_rootsLock)
+            {
+                _arrLangCache[cacheKey] = (DateTime.UtcNow + _rootCacheTtl, cached);
+            }
+        }
+
+        // Longest-prefix match so nested series roots pick the deepest entry.
+        var norm  = filePath.Replace('\\', '/');
+        var hit   = cached
+            .Where(e => norm.StartsWith(e.path.Replace('\\', '/'), StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(e => e.path.Length)
+            .FirstOrDefault();
+
+        return string.IsNullOrEmpty(hit.lang) ? null : LanguageMatcher.ToTwoLetter(hit.lang);
+    }
+
+    private async Task<string?> LookupTmdbLangAsync(string filePath, TmdbIntegration tmdb, MediaTypeDetector.MediaKind kind, CancellationToken ct)
+    {
+        if (!tmdb.Enabled || string.IsNullOrWhiteSpace(tmdb.ApiKey)) return null;
+
+        string query, searchPath;
+        int? year;
+        if (kind == MediaTypeDetector.MediaKind.Movie)
+        {
+            (query, year) = MediaTypeDetector.ExtractMovieTitle(filePath);
+            searchPath = "/3/search/movie";
+        }
+        else
+        {
+            query = MediaTypeDetector.ExtractSeriesTitle(filePath);
+            year  = null;
+            searchPath = "/3/search/tv";
+        }
+        if (string.IsNullOrWhiteSpace(query)) return null;
+
+        var http     = _httpClientFactory.CreateClient();
+        http.Timeout = TimeSpan.FromSeconds(10);
+        var url = $"https://api.themoviedb.org{searchPath}?api_key={Uri.EscapeDataString(tmdb.ApiKey)}&query={Uri.EscapeDataString(query)}"
+                + (year.HasValue ? $"&year={year.Value}" : "");
+        using var resp = await http.GetAsync(url, ct);
+        if (!resp.IsSuccessStatusCode) return null;
+        var json = await resp.Content.ReadAsStringAsync(ct);
+        using var doc = JsonDocument.Parse(json);
+        if (!doc.RootElement.TryGetProperty("results", out var results)
+         || results.ValueKind != JsonValueKind.Array) return null;
+
+        var first = results.EnumerateArray().FirstOrDefault();
+        if (first.ValueKind != JsonValueKind.Object) return null;
+        if (!first.TryGetProperty("original_language", out var olEl)) return null;
+        return LanguageMatcher.ToTwoLetter(olEl.GetString());
+    }
+
+    private async Task<string?> LookupTvdbLangAsync(string filePath, TvdbIntegration cfg, CancellationToken ct)
+    {
+        if (!cfg.Enabled || string.IsNullOrWhiteSpace(cfg.ApiKey)) return null;
+
+        var token = await GetTvdbTokenAsync(cfg, ct);
+        if (string.IsNullOrEmpty(token)) return null;
+
+        var query = MediaTypeDetector.ExtractSeriesTitle(filePath);
+        if (string.IsNullOrWhiteSpace(query)) return null;
+
+        var http     = _httpClientFactory.CreateClient();
+        http.Timeout = TimeSpan.FromSeconds(10);
+        var url = $"https://api4.thetvdb.com/v4/search?query={Uri.EscapeDataString(query)}&type=series";
+        var req = new HttpRequestMessage(HttpMethod.Get, url);
+        req.Headers.TryAddWithoutValidation("Authorization", "Bearer " + token);
+        using var resp = await http.SendAsync(req, ct);
+        if (resp.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+        {
+            lock (_tvdbLock) _tvdbToken = null;
+            return null;
+        }
+        if (!resp.IsSuccessStatusCode) return null;
+        var json = await resp.Content.ReadAsStringAsync(ct);
+        using var doc = JsonDocument.Parse(json);
+        if (!doc.RootElement.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Array)
+            return null;
+
+        var first = data.EnumerateArray().FirstOrDefault();
+        if (first.ValueKind != JsonValueKind.Object) return null;
+        string? lang = first.TryGetProperty("primary_language", out var plEl) ? plEl.GetString() : null;
+        if (string.IsNullOrEmpty(lang) && first.TryGetProperty("originalLanguage", out var olEl))
+            lang = olEl.GetString();
+        return LanguageMatcher.ToTwoLetter(lang);
+    }
+
+    private async Task<string?> GetTvdbTokenAsync(TvdbIntegration cfg, CancellationToken ct)
+    {
+        lock (_tvdbLock)
+        {
+            if (_tvdbToken is { } t && t.expires > DateTime.UtcNow.AddMinutes(5))
+                return t.token;
+        }
+
+        var http     = _httpClientFactory.CreateClient();
+        http.Timeout = TimeSpan.FromSeconds(10);
+        var body = System.Text.Json.JsonSerializer.Serialize(new
+        {
+            apikey = cfg.ApiKey,
+            pin    = cfg.Pin ?? "",
+        });
+        using var req = new HttpRequestMessage(HttpMethod.Post, "https://api4.thetvdb.com/v4/login")
+        {
+            Content = new StringContent(body, Encoding.UTF8, "application/json"),
+        };
+        using var resp = await http.SendAsync(req, ct);
+        if (!resp.IsSuccessStatusCode) return null;
+        var json = await resp.Content.ReadAsStringAsync(ct);
+        using var doc = JsonDocument.Parse(json);
+        if (!doc.RootElement.TryGetProperty("data", out var data)
+         || !data.TryGetProperty("token", out var tokEl)) return null;
+
+        var token = tokEl.GetString();
+        if (string.IsNullOrEmpty(token)) return null;
+        lock (_tvdbLock) _tvdbToken = (token, DateTime.UtcNow.AddDays(30));
+        return token;
+    }
+
+    /// <summary> Probes TMDb with the configured key. </summary>
+    public async Task<(bool ok, string message)> TestTmdbAsync(string apiKey)
+    {
+        if (string.IsNullOrWhiteSpace(apiKey)) return (false, "API key required");
+        try
+        {
+            var http = _httpClientFactory.CreateClient();
+            http.Timeout = TimeSpan.FromSeconds(10);
+            var url = $"https://api.themoviedb.org/3/configuration?api_key={Uri.EscapeDataString(apiKey)}";
+            using var resp = await http.GetAsync(url);
+            return resp.IsSuccessStatusCode ? (true, "TMDb connection OK") : (false, $"HTTP {(int)resp.StatusCode}");
+        }
+        catch (Exception ex) { return (false, ex.Message); }
+    }
+
+    /// <summary> Probes TVDB login with the configured key (and optional PIN). </summary>
+    public async Task<(bool ok, string message)> TestTvdbAsync(string apiKey, string? pin)
+    {
+        if (string.IsNullOrWhiteSpace(apiKey)) return (false, "API key required");
+        try
+        {
+            var http = _httpClientFactory.CreateClient();
+            http.Timeout = TimeSpan.FromSeconds(10);
+            var body = System.Text.Json.JsonSerializer.Serialize(new { apikey = apiKey, pin = pin ?? "" });
+            using var req = new HttpRequestMessage(HttpMethod.Post, "https://api4.thetvdb.com/v4/login")
+            {
+                Content = new StringContent(body, Encoding.UTF8, "application/json"),
+            };
+            using var resp = await http.SendAsync(req);
+            return resp.IsSuccessStatusCode ? (true, "TVDB connection OK") : (false, $"HTTP {(int)resp.StatusCode}");
+        }
+        catch (Exception ex) { return (false, ex.Message); }
+    }
 }

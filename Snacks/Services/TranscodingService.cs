@@ -108,8 +108,9 @@ public class TranscodingService
             }
         }
 
-        private readonly NotificationService? _notificationService;
-        private readonly IntegrationService?  _integrationService;
+        private readonly NotificationService?        _notificationService;
+        private readonly IntegrationService?         _integrationService;
+        private readonly SubtitleExtractionService?  _subtitleExtractionService;
 
         /// <summary>
         ///     Initializes the service and eagerly starts hardware acceleration detection in the
@@ -121,14 +122,16 @@ public class TranscodingService
             IHubContext<TranscodingHub> hubContext,
             MediaFileRepository mediaFileRepo,
             NotificationService? notificationService = null,
-            IntegrationService? integrationService = null)
+            IntegrationService? integrationService = null,
+            SubtitleExtractionService? subtitleExtractionService = null)
         {
-            _fileService         = fileService;
-            _ffprobeService      = ffprobeService;
-            _hubContext          = hubContext;
-            _mediaFileRepo       = mediaFileRepo;
-            _notificationService = notificationService;
-            _integrationService  = integrationService;
+            _fileService               = fileService;
+            _ffprobeService            = ffprobeService;
+            _hubContext                = hubContext;
+            _mediaFileRepo             = mediaFileRepo;
+            _notificationService       = notificationService;
+            _integrationService        = integrationService;
+            _subtitleExtractionService = subtitleExtractionService;
             _ffmpegPath          = Environment.GetEnvironmentVariable("FFMPEG_PATH") ?? "ffmpeg";
 
             _ = Task.Run(async () =>
@@ -811,6 +814,27 @@ public class TranscodingService
             await LogAsync(workItem.Id, $"Hardware acceleration: {options.HardwareAcceleration}");
             await LogAsync(workItem.Id, $"Video Bitrate: {workItem.Bitrate}kbps");
 
+            // Original-language lookup: merge the source's original language into the keep-lists
+            // for THIS job only (options is already a per-job clone from EncoderOptionsOverride).
+            if (options.KeepOriginalLanguage && _integrationService != null)
+            {
+                var orig = await _integrationService.LookupOriginalLanguageAsync(
+                    workItem.Path, options.OriginalLanguageProvider, cancellationToken);
+                if (!string.IsNullOrEmpty(orig))
+                {
+                    await LogAsync(workItem.Id, $"Original language resolved: {orig}");
+                    if (!options.AudioLanguagesToKeep.Contains(orig))
+                        options.AudioLanguagesToKeep.Add(orig);
+                    if (!options.SubtitleLanguagesToKeep.Contains(orig))
+                        options.SubtitleLanguagesToKeep.Add(orig);
+                }
+                else
+                {
+                    await LogAsync(workItem.Id,
+                        $"Original-language lookup ({options.OriginalLanguageProvider}) returned nothing; keeping configured languages.");
+                }
+            }
+
             var (targetBitrate, minBitrate, maxBitrate, videoCopy) = CalculateBitrates(workItem, options);
 
             // Audio-only mode: copy the video stream regardless of codec match.
@@ -903,19 +927,59 @@ public class TranscodingService
             bool is10Bit = workItem.Probe?.Streams?.Any(s =>
                 s.CodecType == "video" && (s.PixFmt?.Contains("10") == true || s.Profile?.Contains("10") == true)) == true;
 
-            // forceSwDecode overrides hardware decode — used as a retry when VAAPI hwaccel
-            // fails mid-stream due to format changes (keeps VAAPI encoder, uses software decoder)
-            bool canHwDecode = forceSwDecode ? false : CanVaapiDecode(workItem.Probe);
-            if (forceSwDecode && useVaapi)
+            // Filter decisions: crop / downscale / tonemap. All three produce SW filter expressions
+            // that feed VideoFilterBuilder. Audio-only mode disables every video filter.
+            string? cropExpr = null;
+            if (options.RemoveBlackBorders && !options.AudioOnlyMode)
+            {
+                var detected = await GetCropParametersAsync(workItem, options, workItem.Path);
+                if (!string.IsNullOrEmpty(detected)) cropExpr = detected;
+            }
+            string? scaleExpr = options.AudioOnlyMode ? null : ComputeScaleExpr(workItem, options);
+            bool tonemap = options.TonemapHdrToSdr && !options.AudioOnlyMode && FfprobeService.IsHdr(workItem.Probe!);
+            bool hasFilter = cropExpr != null || scaleExpr != null || tonemap;
+
+            // Any active filter forces a re-encode even if bitrate logic chose videoCopy.
+            if (videoCopy && hasFilter)
+            {
+                await LogAsync(workItem.Id,
+                    "Active filter (crop/downscale/tonemap) — re-encoding despite videoCopy eligibility.");
+                videoCopy = false;
+                encoder = GetEncoder(options);
+                if (!encoder.StartsWith("lib") && encoder != "copy")
+                {
+                    string testHwFlags = GetInitFlags(hwAccel);
+                    if (!await TestEncoderAsync(testHwFlags, encoder))
+                    {
+                        string swEncoder = GetSoftwareFallbackEncoder(options);
+                        await LogAsync(workItem.Id, $"{encoder} not available — falling back to {swEncoder}");
+                        encoder = swEncoder;
+                        hwAccel = "none";
+                    }
+                }
+                useVaapi = encoder.Contains("vaapi");
+                compressionFlags = GetForcedReencodeCompressionFlags(
+                    encoder, useVaapi, encoder == "libsvtav1",
+                    targetBitrate, minBitrate, maxBitrate);
+            }
+
+            // forceSwDecode: external retry path when VAAPI hwaccel fails mid-stream.
+            // User's chosen strategy is "SW filters + hwupload", so any active filter on a
+            // VAAPI path also forces SW decode — SW filter ops can't run on GPU frames.
+            bool canHwDecode = !forceSwDecode && CanVaapiDecode(workItem.Probe);
+            if (useVaapi && hasFilter) canHwDecode = false;
+            if (useVaapi && !canHwDecode && (forceSwDecode || hasFilter))
             {
                 await LogAsync(workItem.Id,
                     "Using software decode + VAAPI encode (hwaccel decode disabled)");
             }
 
             string initFlags = useVaapi ? GetInitFlags(hwAccel, canHwDecode) : GetInitFlags(hwAccel);
-            string vaapiFormat = is10Bit ? "p010" : "nv12";
-            // hwupload only needed for sw decode → hw encode; hw-decoded frames are already on the GPU
-            string hwFilter = useVaapi && !canHwDecode ? $"-vf format={vaapiFormat}|vaapi,hwupload " : "";
+            // After tonemap the frame is 8-bit SDR; p010 would waste bandwidth on the hwupload.
+            string vaapiFormat = (is10Bit && !tonemap) ? "p010" : "nv12";
+            string vfFlag = VideoFilterBuilder.Emit(
+                cropExpr: cropExpr, tonemap: tonemap, scaleExpr: scaleExpr,
+                useVaapi: useVaapi, canHwDecode: canHwDecode, vaapiFormat: vaapiFormat);
             bool isSvtAv1 = encoder == "libsvtav1";
             string presetFlag = useVaapi
                 ? (useLowPower ? "-low_power 1 " : "")
@@ -923,7 +987,7 @@ public class TranscodingService
                            : $"-preset {options.FfmpegQualityPreset} ";
             string videoFlags = videoCopy ?
                 $"{_ffprobeService.MapVideo(workItem.Probe!)} -c:v copy " :
-                $"{_ffprobeService.MapVideo(workItem.Probe!)} -c:v {encoder} {presetFlag}{hwFilter}";
+                $"{_ffprobeService.MapVideo(workItem.Probe!)} -c:v {encoder} {presetFlag}{vfFlag}";
 
             string audioFlags = _ffprobeService.MapAudio(
                 workItem.Probe!,
@@ -932,10 +996,6 @@ public class TranscodingService
                 options.AudioBitrateKbps,
                 options.TwoChannelAudio,
                 options.Format == "mkv") + " ";
-
-            string subtitleFlags = stripSubtitles
-                ? "-sn "
-                : _ffprobeService.MapSub(workItem.Probe!, options.SubtitleLanguagesToKeep, options.Format == "mkv") + " ";
 
             string varFlags = options.Format == "mkv" ? "-max_muxing_queue_size 9999 " : "-movflags +faststart -max_muxing_queue_size 9999 ";
 
@@ -965,31 +1025,27 @@ public class TranscodingService
             await LogAsync(workItem.Id,
                 $"Output to: {outputPath}");
 
-            if (options.RemoveBlackBorders)
+            // Pre-pass sidecar subtitle extraction — runs BEFORE the main encode so the
+            // encoded output never carries tracks that are being extracted. The main encode
+            // then strips all subs via stripSubtitles=true.
+            if (options.ExtractSubtitlesToSidecar && !stripSubtitles && _subtitleExtractionService != null)
             {
-                var cropFilter = await GetCropParametersAsync(workItem, options, inputPath);
-                if (!string.IsNullOrEmpty(cropFilter))
-                {
-                    if (videoCopy)
-                    {
-                        // Can't crop with copy, need to re-encode
-                        videoCopy = false;
-                        string cropHwFilter = useVaapi
-                            ? $"-vf {cropFilter.Replace("-vf ", "")},format=nv12|vaapi,hwupload "
-                            : $"{cropFilter} ";
-                        videoFlags = $"{_ffprobeService.MapVideo(workItem.Probe!)} -c:v {encoder} {presetFlag}{cropHwFilter}";
-                        compressionFlags = GetCropCompressionFlags(encoder, useVaapi, isSvtAv1,
-                            targetBitrate, minBitrate, maxBitrate);
-                    }
-                    else
-                    {
-                        string cropHwFilter = useVaapi
-                            ? $"-vf {cropFilter.Replace("-vf ", "")},format=nv12|vaapi,hwupload "
-                            : $"{cropFilter} ";
-                        videoFlags = $"{_ffprobeService.MapVideo(workItem.Probe!)} -c:v {encoder} {presetFlag}{cropHwFilter}";
-                    }
-                }
+                string sidecarBase = Path.Combine(
+                    Path.GetDirectoryName(outputPath)!,
+                    Path.GetFileNameWithoutExtension(outputPath));
+                await _subtitleExtractionService.ExtractAsync(
+                    workItem, inputPath, sidecarBase,
+                    options.SubtitleLanguagesToKeep,
+                    options.SidecarSubtitleFormat,
+                    options.ConvertImageSubtitlesToSrt,
+                    msg => LogAsync(workItem.Id, msg),
+                    cancellationToken);
+                stripSubtitles = true;
             }
+
+            string subtitleFlags = stripSubtitles
+                ? "-sn "
+                : _ffprobeService.MapSub(workItem.Probe!, options.SubtitleLanguagesToKeep, options.Format == "mkv") + " ";
 
             // -analyzeduration and -probesize handle files with many streams (e.g. 30+ PGS subtitle tracks)
             string analyzeFlags = "-analyzeduration 10M -probesize 50M ";
@@ -1075,7 +1131,7 @@ public class TranscodingService
                 minBitrate = targetBitrate;
                 maxBitrate = targetBitrate;
             }
-            else if (workItem.Probe!.Streams.Any(x => x.Width > 1920)) // 4k
+            else if (workItem.Probe!.Streams.Any(x => x.Width > 1920) && !WillDownscaleBelow4K(options)) // 4k
             {
                 int multiplier = Math.Clamp(options.FourKBitrateMultiplier, 2, 8);
                 int hdBitrate = options.TargetBitrate * multiplier;
@@ -1121,10 +1177,68 @@ public class TranscodingService
         }
 
         /// <summary>
-        ///     Returns compression flags for crop-triggered re-encodes, matching the same
-        ///     per-encoder rate control logic used by the main encoding path.
+        ///     Returns <c>true</c> when downscale is configured to a target height that
+        ///     no longer qualifies as 4K (≤ 1440p). Used to skip the 4K bitrate multiplier
+        ///     so a 4K→1080p downscale doesn't get allocated a 4K-sized bitrate budget.
         /// </summary>
-        private static string GetCropCompressionFlags(string encoder, bool useVaapi, bool isSvtAv1,
+        private static bool WillDownscaleBelow4K(EncoderOptions options)
+        {
+            var policy = options.DownscalePolicy;
+            if (!string.Equals(policy, "Always",   StringComparison.OrdinalIgnoreCase)
+             && !string.Equals(policy, "IfLarger", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            int targetH = options.DownscaleTarget switch
+            {
+                "2160p" => 2160,
+                "1440p" => 1440,
+                "1080p" => 1080,
+                "720p"  => 720,
+                "480p"  => 480,
+                _       => 1080,
+            };
+            return targetH <= 1440;
+        }
+
+        /// <summary>
+        ///     Resolves the downscale target height for an active policy, or <c>null</c>
+        ///     when no scaling should occur. Returns the SW <c>scale=</c> expression;
+        ///     <see cref="VideoFilterBuilder"/> keeps this form verbatim for the SW
+        ///     hwupload path the user has chosen for all HW encoders.
+        /// </summary>
+        private static string? ComputeScaleExpr(WorkItem workItem, EncoderOptions options)
+        {
+            var policy = options.DownscalePolicy;
+            bool always    = string.Equals(policy, "Always",   StringComparison.OrdinalIgnoreCase);
+            bool ifLarger  = string.Equals(policy, "IfLarger", StringComparison.OrdinalIgnoreCase);
+            if (!always && !ifLarger) return null;
+
+            int targetH = options.DownscaleTarget switch
+            {
+                "2160p" => 2160,
+                "1440p" => 1440,
+                "1080p" => 1080,
+                "720p"  => 720,
+                "480p"  => 480,
+                _       => 1080,
+            };
+
+            var v = workItem.Probe?.Streams?.FirstOrDefault(s => s.CodecType == "video");
+            int sourceH = v?.Height ?? 0;
+            if (sourceH <= 0) return null;
+            if (ifLarger && sourceH <= targetH) return null;
+
+            // -2 preserves aspect ratio and rounds to an even width (required by most encoders).
+            return $"scale=w=-2:h={targetH}:flags=lanczos";
+        }
+
+        /// <summary>
+        ///     Returns compression flags for filter-triggered re-encodes (crop, downscale,
+        ///     tonemap). Matches the per-encoder rate-control logic of the main path but
+        ///     skips VAAPI calibration — uses a fixed CQP since filter activation typically
+        ///     already implies bitrate guesswork is acceptable for an exceptional case.
+        /// </summary>
+        private static string GetForcedReencodeCompressionFlags(string encoder, bool useVaapi, bool isSvtAv1,
             string targetBitrate, string minBitrate, string maxBitrate)
         {
             int maxBitrateVal = int.Parse(maxBitrate.TrimEnd('k'));
@@ -1929,7 +2043,7 @@ public class TranscodingService
 
             string mostCommonCrop = cropValues.Aggregate((x, y) => x.Value > y.Value ? x : y).Key;
             await LogAsync(workItem.Id, $"Detected crop: {mostCommonCrop}");
-            return $"-vf crop={mostCommonCrop}";
+            return $"crop={mostCommonCrop}";
         }
 
         private async Task RunFfmpegAsync(string command, WorkItem workItem, CancellationToken cancellationToken = default)
@@ -2603,6 +2717,7 @@ public class TranscodingService
                         string finalSnacksPath = Path.Combine(options.OutputDirectory, Path.GetFileName(outputPath));
                         await LogAsync(workItem.Id, $"Moving to output directory: {finalSnacksPath}");
                         await _fileService.FileMoveAsync(outputPath, finalSnacksPath);
+                        await MoveSidecarsAlongsideAsync(outputPath, finalSnacksPath, workItem);
                         outputPath = finalSnacksPath;
                     }
 
@@ -2617,6 +2732,7 @@ public class TranscodingService
                         string cleanName = Path.GetFileNameWithoutExtension(outputPath).Replace(" [snacks]", "") + Path.GetExtension(outputPath);
                         string finalPath = Path.Combine(originalDir, cleanName);
                         await _fileService.FileMoveAsync(outputPath, finalPath);
+                        await MoveSidecarsAlongsideAsync(outputPath, finalPath, workItem);
                         await LogAsync(workItem.Id, $"Final output: {finalPath}");
                     }
                     else
@@ -2638,6 +2754,7 @@ public class TranscodingService
 
                         string cleanPath = GetCleanOutputName(outputPath);
                         await _fileService.FileMoveAsync(outputPath, cleanPath);
+                        await MoveSidecarsAlongsideAsync(outputPath, cleanPath, workItem);
                         await LogAsync(workItem.Id, $"Final output: {cleanPath}");
                     }
                     else
@@ -2654,6 +2771,46 @@ public class TranscodingService
             {
                 await LogAsync(workItem.Id, $"Error handling output placement: {ex.Message}");
                 throw;
+            }
+        }
+
+        /// <summary>
+        ///     Moves any sidecar subtitle files that were written next to <paramref name="oldMainPath"/>
+        ///     so they stay colocated with the main output when it's renamed/relocated. Matches
+        ///     <c>{oldBasename}.*.{srt|ass|vtt}</c>; each matched file is relocated to the same
+        ///     directory as <paramref name="newMainPath"/> with its language suffix preserved and
+        ///     the base name updated to the new basename.
+        /// </summary>
+        private async Task MoveSidecarsAlongsideAsync(string oldMainPath, string newMainPath, WorkItem workItem)
+        {
+            try
+            {
+                string? oldDir = Path.GetDirectoryName(oldMainPath);
+                if (string.IsNullOrEmpty(oldDir)) return;
+                string oldBase = Path.GetFileNameWithoutExtension(oldMainPath);
+                string newDir  = Path.GetDirectoryName(newMainPath) ?? oldDir;
+                string newBase = Path.GetFileNameWithoutExtension(newMainPath);
+
+                string[] exts  = { ".srt", ".ass", ".vtt" };
+                var matches = Directory
+                    .EnumerateFiles(oldDir, oldBase + ".*")
+                    .Where(p => exts.Contains(Path.GetExtension(p), StringComparer.OrdinalIgnoreCase))
+                    .ToList();
+
+                foreach (var src in matches)
+                {
+                    // Preserve everything after the base name (e.g. ".en.srt", ".en.2.srt").
+                    string tail = Path.GetFileName(src).Substring(oldBase.Length);
+                    string dst  = Path.Combine(newDir, newBase + tail);
+                    await _fileService.FileMoveAsync(src, dst);
+                }
+                if (matches.Count > 0)
+                    await LogAsync(workItem.Id, $"Moved {matches.Count} sidecar file(s) alongside main output.");
+            }
+            catch (Exception ex)
+            {
+                // Sidecar move is best-effort — never fail the job over it.
+                await LogAsync(workItem.Id, $"Sidecar relocation error (non-fatal): {ex.Message}");
             }
         }
     }

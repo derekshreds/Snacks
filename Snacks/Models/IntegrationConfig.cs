@@ -16,6 +16,12 @@ public sealed class IntegrationConfig
 
     /// <summary> Radarr integration settings. </summary>
     public ArrIntegration Radarr { get; set; } = new();
+
+    /// <summary> TheTVDB v4 integration (project API key + optional user PIN). </summary>
+    public TvdbIntegration Tvdb { get; set; } = new();
+
+    /// <summary> TMDb v3 integration (read-only API key). </summary>
+    public TmdbIntegration Tmdb { get; set; } = new();
 }
 
 /// <summary> Connection settings for a Plex or Jellyfin media server. </summary>
@@ -41,6 +47,29 @@ public sealed class ArrIntegration
     public string BaseUrl { get; set; } = "";
 
     /// <summary> API key for authenticating with the Arr instance. </summary>
+    public string ApiKey { get; set; } = "";
+
+    /// <summary> Whether this integration is active. </summary>
+    public bool Enabled { get; set; } = false;
+}
+
+/// <summary> TheTVDB v4 connection settings. </summary>
+public sealed class TvdbIntegration
+{
+    /// <summary> Project API key issued by TVDB. </summary>
+    public string ApiKey { get; set; } = "";
+
+    /// <summary> Optional subscriber PIN attached during <c>/v4/login</c>. </summary>
+    public string? Pin { get; set; }
+
+    /// <summary> Whether this integration is active. </summary>
+    public bool Enabled { get; set; } = false;
+}
+
+/// <summary> TMDb connection settings. </summary>
+public sealed class TmdbIntegration
+{
+    /// <summary> TMDb v3 read-access API key (preferred) or v4 bearer token. </summary>
     public string ApiKey { get; set; } = "";
 
     /// <summary> Whether this integration is active. </summary>

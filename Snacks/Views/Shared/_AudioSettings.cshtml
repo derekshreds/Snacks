@@ -26,9 +26,11 @@
                 <label for="@(formPrefix)OriginalLanguageProvider" class="form-label">Original-Language Lookup Provider</label>
                 <select class="form-select" id="@(formPrefix)OriginalLanguageProvider" name="OriginalLanguageProvider">
                     <option value="None">None</option>
-                    <option value="Sonarr">Sonarr</option>
-                    <option value="Radarr">Radarr</option>
-                    <option value="TVDB">TVDB</option>
+                    <option value="Auto">Auto (pick best available)</option>
+                    <option value="Sonarr">Sonarr (TV)</option>
+                    <option value="Radarr">Radarr (Movies)</option>
+                    <option value="TVDB">TVDB (TV)</option>
+                    <option value="TMDb">TMDb</option>
                 </select>
             </div>
         </div>

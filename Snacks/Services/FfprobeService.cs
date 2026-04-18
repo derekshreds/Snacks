@@ -195,10 +195,23 @@ public class FfprobeService
     }
 
     /// <summary> Bitmap subtitle codecs that can cause FFmpeg to hang — always excluded. </summary>
-    private static readonly HashSet<string> _bitmapSubCodecs = new(StringComparer.OrdinalIgnoreCase)
+    internal static readonly HashSet<string> _bitmapSubCodecs = new(StringComparer.OrdinalIgnoreCase)
     {
         "hdmv_pgs_subtitle", "pgssub", "dvd_subtitle", "dvdsub", "dvb_subtitle", "dvbsub", "xsub"
     };
+
+    /// <summary>
+    ///     Returns <see langword="true"/> when the probed video's color-transfer function
+    ///     indicates an HDR source — either PQ (smpte2084, HDR10/HDR10+/Dolby Vision) or
+    ///     HLG (arib-std-b67). Used to gate tone-map filter insertion.
+    /// </summary>
+    public static bool IsHdr(ProbeResult probe)
+    {
+        ArgumentNullException.ThrowIfNull(probe);
+        var v = probe.Streams.FirstOrDefault(s => s.CodecType == "video");
+        var t = v?.ColorTransfer?.ToLowerInvariant();
+        return t == "smpte2084" || t == "arib-std-b67";
+    }
 
     /// <summary>
     ///     Returns the FFmpeg <c>-map</c> and subtitle codec arguments for the selected subtitle streams.
@@ -242,6 +255,48 @@ public class FfprobeService
         }
 
         return "-sn";
+    }
+
+    /// <summary>
+    ///     A single subtitle stream selected for sidecar extraction.
+    /// </summary>
+    /// <param name="StreamIndex"> FFmpeg stream index (e.g. <c>0:3</c> — the <c>3</c> here). </param>
+    /// <param name="Lang">        Canonical 2-letter ISO code, or <c>"und"</c> if unresolvable. </param>
+    /// <param name="CodecName">   The source codec (e.g. <c>"subrip"</c>, <c>"hdmv_pgs_subtitle"</c>). </param>
+    /// <param name="IsBitmap">    When <c>true</c>, the stream is image-based and needs OCR to become text. </param>
+    public sealed record SidecarSpec(int StreamIndex, string Lang, string CodecName, bool IsBitmap);
+
+    /// <summary>
+    ///     Returns the subtitle streams that should be written as sidecar files, honoring
+    ///     the language keep-list and optionally including bitmap streams (for the OCR path).
+    /// </summary>
+    /// <param name="probe">            Probe of the source file. </param>
+    /// <param name="languagesToKeep">  2-letter ISO codes to retain; null/empty keeps all. </param>
+    /// <param name="includeBitmaps">   When <c>true</c>, bitmap subs (PGS/VobSub/DVB) are returned for OCR. </param>
+    public IReadOnlyList<SidecarSpec> SelectSidecarStreams(
+        ProbeResult            probe,
+        IReadOnlyList<string>? languagesToKeep,
+        bool                   includeBitmaps)
+    {
+        ArgumentNullException.ThrowIfNull(probe);
+
+        var subs = probe.Streams.Where(s => s.CodecType == "subtitle").ToList();
+        var keepByLang = languagesToKeep == null || languagesToKeep.Count == 0
+            ? subs
+            : subs.Where(s => LanguageMatcher.Matches(s.Tags?.Language, languagesToKeep)).ToList();
+
+        var result = new List<SidecarSpec>();
+        foreach (var s in keepByLang)
+        {
+            bool isBitmap = _bitmapSubCodecs.Contains(s.CodecName ?? "");
+            if (isBitmap && !includeBitmaps) continue;
+            result.Add(new SidecarSpec(
+                StreamIndex: s.Index,
+                Lang:        LanguageMatcher.ToTwoLetter(s.Tags?.Language) ?? "und",
+                CodecName:   s.CodecName ?? "",
+                IsBitmap:    isBitmap));
+        }
+        return result;
     }
 
     /// <summary>

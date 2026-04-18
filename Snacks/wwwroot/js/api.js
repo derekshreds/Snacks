@@ -253,6 +253,12 @@ export const integrationsApi = {
 
     /** Verifies a Radarr base URL + API key reach the server. */
     testRadarr:   (baseUrl, apiKey)  => postJson('/api/integrations/test/radarr',   { baseUrl, apiKey }),
+
+    /** Verifies a TVDB API key (and optional PIN) can authenticate. */
+    testTvdb:     (apiKey, pin)      => postJson('/api/integrations/test/tvdb',     { apiKey, pin }),
+
+    /** Verifies a TMDb API key reaches the service. */
+    testTmdb:     (apiKey)           => postJson('/api/integrations/test/tmdb',     { apiKey }),
 };
 
 
