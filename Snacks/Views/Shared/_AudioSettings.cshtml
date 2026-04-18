@@ -1,0 +1,78 @@
+@{
+    string formPrefix = ViewData["FormPrefix"]?.ToString() ?? "";
+}
+
+<div class="row g-4">
+    <div class="col-md-6">
+        <div class="encoder-panel rounded">
+            <h6 class="fw-bold mb-3"><i class="fas fa-volume-high me-2 text-primary"></i>Languages</h6>
+
+            <div class="mb-3">
+                <label class="form-label"><i class="fas fa-language me-1"></i> Audio Languages to Keep</label>
+                <div class="chip-input" id="@(formPrefix)AudioLanguagesToKeepChips" data-field="AudioLanguagesToKeep">
+                    <div class="chip-list"></div>
+                    <input type="text" class="chip-new" placeholder="Add ISO code (e.g. en, es, ja)">
+                </div>
+                <div class="form-text">Empty list keeps all audio tracks.</div>
+            </div>
+
+            <div class="form-check mb-3">
+                <input class="form-check-input" type="checkbox" id="@(formPrefix)KeepOriginalLanguage" name="KeepOriginalLanguage">
+                <label class="form-check-label" for="@(formPrefix)KeepOriginalLanguage">Auto-keep original performed language</label>
+                <div class="form-text ms-4">Requires Sonarr/Radarr/TVDB credentials in Integrations tab.</div>
+            </div>
+
+            <div class="mb-3">
+                <label for="@(formPrefix)OriginalLanguageProvider" class="form-label">Original-Language Lookup Provider</label>
+                <select class="form-select" id="@(formPrefix)OriginalLanguageProvider" name="OriginalLanguageProvider">
+                    <option value="None">None</option>
+                    <option value="Sonarr">Sonarr</option>
+                    <option value="Radarr">Radarr</option>
+                    <option value="TVDB">TVDB</option>
+                </select>
+            </div>
+
+            <div class="form-check mb-2">
+                <input class="form-check-input" type="checkbox" id="@(formPrefix)EnglishOnlyAudio" name="EnglishOnlyAudio">
+                <label class="form-check-label text-muted" for="@(formPrefix)EnglishOnlyAudio">
+                    <small>Legacy: English Audio Only (superseded by list above)</small>
+                </label>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-md-6">
+        <div class="encoder-panel rounded">
+            <h6 class="fw-bold mb-3"><i class="fas fa-sliders-h me-2 text-info"></i>Codec &amp; Mix</h6>
+
+            <div class="form-check mb-3">
+                <input class="form-check-input" type="checkbox" id="@(formPrefix)TwoChannelAudio" name="TwoChannelAudio">
+                <label class="form-check-label" for="@(formPrefix)TwoChannelAudio"><i class="fas fa-volume-up me-1"></i> Downmix to Stereo</label>
+                <div class="form-text">Replace surround tracks (5.1/7.1) with a 2-channel stereo mix.</div>
+            </div>
+
+            <div class="form-check mb-3">
+                <input class="form-check-input" type="checkbox" id="@(formPrefix)AudioOnlyMode" name="AudioOnlyMode">
+                <label class="form-check-label" for="@(formPrefix)AudioOnlyMode"><i class="fas fa-music me-1"></i> Audio-Only Transcode Mode</label>
+                <div class="form-text ms-4">Copies video stream; re-encodes audio only.</div>
+            </div>
+
+            <div class="mb-3">
+                <label for="@(formPrefix)AudioCodec" class="form-label">Audio Codec</label>
+                <select class="form-select" id="@(formPrefix)AudioCodec" name="AudioCodec">
+                    <option value="copy">Copy (no re-encode)</option>
+                    <option value="aac" selected>AAC</option>
+                    <option value="eac3">E-AC3</option>
+                    <option value="opus">Opus</option>
+                </select>
+                <div class="form-text">"Copy" preserves the original audio bit-for-bit; AAC is the safest cross-device default.</div>
+            </div>
+
+            <div class="mb-3">
+                <label for="@(formPrefix)AudioBitrateKbps" class="form-label">Audio Bitrate (kbps)</label>
+                <input type="number" class="form-control" id="@(formPrefix)AudioBitrateKbps" name="AudioBitrateKbps" min="32" max="1536" step="16" value="192">
+                <div class="form-text">Target bitrate for re-encoded audio (ignored when the codec is set to Copy).</div>
+            </div>
+        </div>
+    </div>
+</div>

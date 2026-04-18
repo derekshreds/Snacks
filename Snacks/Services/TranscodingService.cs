@@ -83,10 +83,10 @@ public class TranscodingService
         public bool IsPaused => _isPaused;
 
         /// <summary>
-        /// Pauses or resumes the encoding queue. When resuming, restarts the processing loop
-        /// if <see cref="_lastOptions"/> is available.
+        ///     Pauses or resumes the encoding queue. When resuming, restarts the processing loop
+        ///     if <see cref="_lastOptions"/> is available.
         /// </summary>
-        /// <param name="paused">Whether to pause processing.</param>
+        /// <param name="paused"> Whether to pause processing. </param>
         public void SetPaused(bool paused)
         {
             _isPaused = paused;
@@ -96,23 +96,40 @@ public class TranscodingService
             {
                 _ = Task.Run(async () =>
                 {
-                    try { await ProcessQueueAsync(_lastOptions); }
-                    catch (Exception ex) { Console.WriteLine($"Error in ProcessQueueAsync: {ex.Message}"); }
+                    try
+                    {
+                        await ProcessQueueAsync(_lastOptions);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Error in ProcessQueueAsync: {ex.Message}");
+                    }
                 });
             }
         }
 
+        private readonly NotificationService? _notificationService;
+        private readonly IntegrationService?  _integrationService;
+
         /// <summary>
-        /// Initializes the service and eagerly starts hardware acceleration detection in the background
-        /// so that the first queue item doesn't pay the detection cost.
+        ///     Initializes the service and eagerly starts hardware acceleration detection in the
+        ///     background so that the first queue item does not pay the detection cost.
         /// </summary>
-        public TranscodingService(FileService fileService, FfprobeService ffprobeService, IHubContext<TranscodingHub> hubContext, MediaFileRepository mediaFileRepo)
+        public TranscodingService(
+            FileService fileService,
+            FfprobeService ffprobeService,
+            IHubContext<TranscodingHub> hubContext,
+            MediaFileRepository mediaFileRepo,
+            NotificationService? notificationService = null,
+            IntegrationService? integrationService = null)
         {
-            _fileService = fileService;
-            _ffprobeService = ffprobeService;
-            _hubContext = hubContext;
-            _mediaFileRepo = mediaFileRepo;
-            _ffmpegPath = Environment.GetEnvironmentVariable("FFMPEG_PATH") ?? "ffmpeg";
+            _fileService         = fileService;
+            _ffprobeService      = ffprobeService;
+            _hubContext          = hubContext;
+            _mediaFileRepo       = mediaFileRepo;
+            _notificationService = notificationService;
+            _integrationService  = integrationService;
+            _ffmpegPath          = Environment.GetEnvironmentVariable("FFMPEG_PATH") ?? "ffmpeg";
 
             _ = Task.Run(async () =>
             {
@@ -121,13 +138,16 @@ public class TranscodingService
                     await DetectHardwareAccelerationAsync();
                     await _hubContext.Clients.All.SendAsync("HardwareDetected", _detectedHardware);
                 }
-                catch { }
+                catch
+                {
+                    // Detection is best-effort; failure here does not block encoding.
+                }
             });
         }
 
         /// <summary>
-        /// Sends a log line to all SignalR clients, forwards it to the master node if this is
-        /// a remote job, and appends it to the per-item log file on disk.
+        ///     Sends a log line to all SignalR clients, forwards it to the master node if this is
+        ///     a remote job, and appends it to the per-item log file on disk.
         /// </summary>
         private async Task LogAsync(string workItemId, string message)
         {
@@ -179,8 +199,8 @@ public class TranscodingService
         }
 
         /// <summary>
-        /// Returns the log file path for a work item, named after the video file for easy browsing.
-        /// Returns <c>null</c> if the work item ID is not found in the dictionary.
+        ///     Returns the log file path for a work item, named after the video file for easy browsing.
+        ///     Returns <c>null</c> if the work item ID is not found in the dictionary.
         /// </summary>
         private string? GetLogFilePath(string workItemId)
         {
@@ -190,8 +210,8 @@ public class TranscodingService
         }
 
         /// <summary>
-        /// Builds the log file path from a work item ID and file name. Public so that
-        /// ClusterService can write remote job logs to the same location.
+        ///     Builds the log file path from a work item ID and file name. Public so that
+        ///     ClusterService can write remote job logs to the same location.
         /// </summary>
         public string BuildLogFilePath(string workItemId, string fileName)
         {
@@ -202,9 +222,9 @@ public class TranscodingService
         }
 
         /// <summary>
-        /// Probes a file, checks skip conditions (already target codec, 4K skip, VAAPI limits),
-        /// performs DB change detection, and enqueues the file for encoding if eligible.
-        /// Starts the processing loop in the background.
+        ///     Probes a file, checks skip conditions (already target codec, 4K skip, VAAPI limits),
+        ///     performs DB change detection, and enqueues the file for encoding if eligible.
+        ///     Starts the processing loop in the background.
         /// </summary>
         /// <param name="filePath">Absolute path to the video file.</param>
         /// <param name="options">Encoder options for this job.</param>
@@ -435,9 +455,9 @@ public class TranscodingService
         }
 
         /// <summary>
-        /// Adds all video files in a directory to the encoding queue.
-        /// Files are probed sequentially to avoid overwhelming NAS storage.
-        /// Encoding starts as soon as the first file is scanned — no waiting for the full batch.
+        ///     Adds all video files in a directory to the encoding queue.
+        ///     Files are probed sequentially to avoid overwhelming NAS storage.
+        ///     Encoding starts as soon as the first file is scanned — no waiting for the full batch.
         /// </summary>
         /// <param name="directoryPath">The directory to scan for video files.</param>
         /// <param name="options">Encoder options to apply to all files.</param>
@@ -652,9 +672,9 @@ public class TranscodingService
         }
 
         /// <summary>
-        /// Main queue processing loop. Dequeues items one at a time and encodes them locally.
-        /// Stops if the queue is paused or local encoding is suspended for cluster dispatch.
-        /// The <see cref="_processingLock"/> semaphore guarantees only one instance runs at a time.
+        ///     Main queue processing loop. Dequeues items one at a time and encodes them locally.
+        ///     Stops if the queue is paused or local encoding is suspended for cluster dispatch.
+        ///     The <see cref="_processingLock"/> semaphore guarantees only one instance runs at a time.
         /// </summary>
         private async Task ProcessQueueAsync(EncoderOptions options)
         {
@@ -726,8 +746,8 @@ public class TranscodingService
         }
 
         /// <summary>
-        /// Transitions a work item to Processing, runs the conversion, and handles success/failure outcomes.
-        /// On cancellation, cleans up the partial output file. On failure, increments the DB failure count.
+        ///     Transitions a work item to Processing, runs the conversion, and handles success/failure outcomes.
+        ///     On cancellation, cleans up the partial output file. On failure, increments the DB failure count.
         /// </summary>
         private async Task ProcessWorkItemAsync(WorkItem workItem, EncoderOptions options)
         {
@@ -755,6 +775,11 @@ public class TranscodingService
                 workItem.Progress = 100;
                 Interlocked.Increment(ref _localCompletedJobs);
                 await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Completed);
+
+                if (_notificationService != null)
+                    _ = _notificationService.NotifyEncodeCompletedAsync(Path.GetFileName(workItem.Path), workItem.Size);
+                if (_integrationService != null)
+                    _ = _integrationService.TriggerRescansAsync();
             }
             catch (OperationCanceledException)
             {
@@ -769,6 +794,9 @@ public class TranscodingService
                 workItem.ErrorMessage = ex.Message;
                 workItem.CompletedAt = DateTime.UtcNow;
                 await _mediaFileRepo.IncrementFailureCountAsync(Path.GetFullPath(workItem.Path), ex.Message);
+
+                if (_notificationService != null)
+                    _ = _notificationService.NotifyEncodeFailedAsync(Path.GetFileName(workItem.Path), ex.Message);
             }
             finally
             {
@@ -783,10 +811,10 @@ public class TranscodingService
         }
 
         /// <summary>
-        /// Builds and executes an FFmpeg command for the given work item.
-        /// Handles hardware acceleration setup, VAAPI quality calibration, bitrate calculation,
-        /// stream mapping, and post-conversion validation and file placement.
-        /// On failure, invokes the retry chain (no subs → sw decode → sw encode).
+        ///     Builds and executes an FFmpeg command for the given work item.
+        ///     Handles hardware acceleration setup, VAAPI quality calibration, bitrate calculation,
+        ///     stream mapping, and post-conversion validation and file placement.
+        ///     On failure, invokes the retry chain (no subs → sw decode → sw encode).
         /// </summary>
         /// <param name="workItem">The item to encode.</param>
         /// <param name="options">Encoding options (may be mutated by retry logic).</param>
@@ -1037,9 +1065,9 @@ public class TranscodingService
         }
 
         /// <summary>
-        /// Calculates target, min, and max bitrate strings for FFmpeg's VBR mode, and determines
-        /// whether to copy the video stream instead of re-encoding (when source is already HEVC at low bitrate).
-        /// 4K content uses the configured multiplier; source bitrate is always respected as an upper cap.
+        ///     Calculates target, min, and max bitrate strings for FFmpeg's VBR mode, and determines
+        ///     whether to copy the video stream instead of re-encoding (when source is already HEVC at low bitrate).
+        ///     4K content uses the configured multiplier; source bitrate is always respected as an upper cap.
         /// </summary>
         /// <returns>A tuple of (targetBitrate, minBitrate, maxBitrate, videoCopy).</returns>
         private (string target, string min, string max, bool copy) CalculateBitrates(WorkItem workItem, EncoderOptions options)
@@ -1099,8 +1127,8 @@ public class TranscodingService
         }
 
         /// <summary>
-        /// Returns compression flags for crop-triggered re-encodes, matching the same
-        /// per-encoder rate control logic used by the main encoding path.
+        ///     Returns compression flags for crop-triggered re-encodes, matching the same
+        ///     per-encoder rate control logic used by the main encoding path.
         /// </summary>
         private static string GetCropCompressionFlags(string encoder, bool useVaapi, bool isSvtAv1,
             string targetBitrate, string minBitrate, string maxBitrate)
@@ -1125,8 +1153,8 @@ public class TranscodingService
         private string? _detectedHardware = null;
 
         /// <summary>
-        /// Detects available hardware acceleration by testing encoders.
-        /// Result is cached after first detection.
+        ///     Detects available hardware acceleration by testing encoders.
+        ///     Result is cached after first detection.
         /// </summary>
         private async Task<string> DetectHardwareAccelerationAsync()
         {
@@ -1203,7 +1231,7 @@ public class TranscodingService
         }
 
         /// <summary>
-        /// Logs VAAPI diagnostic info (vainfo output) for troubleshooting.
+        ///     Logs VAAPI diagnostic info (vainfo output) for troubleshooting.
         /// </summary>
         private async Task LogVaapiInfoAsync()
         {
@@ -1254,7 +1282,7 @@ public class TranscodingService
         }
 
         /// <summary>
-        /// Tests whether a hardware encoder is functional by running a minimal encode.
+        ///     Tests whether a hardware encoder is functional by running a minimal encode.
         /// </summary>
         private async Task<bool> TestEncoderAsync(string hwFlags, string encoder)
         {
@@ -1312,8 +1340,8 @@ public class TranscodingService
         }
 
         /// <summary>
-        /// Resolves "auto" to a concrete hardware acceleration type.
-        /// For explicit selections, returns as-is.
+        ///     Resolves "auto" to a concrete hardware acceleration type.
+        ///     For explicit selections, returns as-is.
         /// </summary>
         private async Task ResolveHardwareAccelerationAsync(EncoderOptions options)
         {
@@ -1324,8 +1352,8 @@ public class TranscodingService
         }
 
         /// <summary>
-        /// Returns <c>true</c> if the specified hardware acceleration mode maps to VAAPI (Intel/AMD on Linux).
-        /// Always returns <c>false</c> on Windows since VAAPI is Linux-only.
+        ///     Returns <c>true</c> if the specified hardware acceleration mode maps to VAAPI (Intel/AMD on Linux).
+        ///     Always returns <c>false</c> on Windows since VAAPI is Linux-only.
         /// </summary>
         private bool IsVaapiAcceleration(string hardwareAcceleration)
         {
@@ -1337,8 +1365,8 @@ public class TranscodingService
         }
 
         /// <summary>
-        /// Returns <c>true</c> if the source video codec is supported by VAAPI hardware decoding
-        /// on Elkhart Lake (J6412) hardware (h264, hevc, mpeg2, vp8, vp9, mjpeg).
+        ///     Returns <c>true</c> if the source video codec is supported by VAAPI hardware decoding
+        ///     on Elkhart Lake (J6412) hardware (h264, hevc, mpeg2, vp8, vp9, mjpeg).
         /// </summary>
         private static bool CanVaapiDecode(ProbeResult? probe)
         {
@@ -1348,10 +1376,10 @@ public class TranscodingService
         }
 
         /// <summary>
-        /// Returns the FFmpeg initialization flags for the specified hardware acceleration mode.
-        /// On Windows, maps Intel → QSV and AMD → AMF. On Linux, maps Intel/AMD → VAAPI.
-        /// When <paramref name="hwDecode"/> is <c>false</c>, initializes the VAAPI device but skips
-        /// forcing hardware decode (software decode + VAAPI encode mode).
+        ///     Returns the FFmpeg initialization flags for the specified hardware acceleration mode.
+        ///     On Windows, maps Intel → QSV and AMD → AMF. On Linux, maps Intel/AMD → VAAPI.
+        ///     When <paramref name="hwDecode"/> is <c>false</c>, initializes the VAAPI device but skips
+        ///     forcing hardware decode (software decode + VAAPI encode mode).
         /// </summary>
         private string GetInitFlags(string hardwareAcceleration, bool hwDecode = true)
         {
@@ -1372,8 +1400,8 @@ public class TranscodingService
         }
 
         /// <summary>
-        /// Maps the user's encoder preference and hardware acceleration setting to the
-        /// concrete FFmpeg encoder name (e.g., <c>"hevc_vaapi"</c>, <c>"hevc_nvenc"</c>, <c>"libx265"</c>).
+        ///     Maps the user's encoder preference and hardware acceleration setting to the
+        ///     concrete FFmpeg encoder name (e.g., <c>"hevc_vaapi"</c>, <c>"hevc_nvenc"</c>, <c>"libx265"</c>).
         /// </summary>
         private string GetEncoder(EncoderOptions options)
         {
@@ -1390,24 +1418,25 @@ public class TranscodingService
                 "intel" when isAv1 => "av1_vaapi",
                 "amd" when isAv1 => "av1_vaapi",
                 "nvidia" when isAv1 => "av1_nvenc",
+                // H.264 encoders
+                "intel" when isWindows && isH264 => "h264_qsv",
+                "amd" when isWindows && isH264 => "h264_amf",
+                "intel" when isH264 => "h264_vaapi",
+                "amd" when isH264 => "h264_vaapi",
+                "nvidia" when isH264 => "h264_nvenc",
                 // H.265 encoders
                 "intel" when isWindows && isH265 => "hevc_qsv",
-                "intel" when isWindows && isH264 => "h264_qsv",
                 "amd" when isWindows && isH265 => "hevc_amf",
-                "amd" when isWindows && isH264 => "h264_amf",
                 "intel" when isH265 => "hevc_vaapi",
-                "intel" when isH264 => "h264_vaapi",
                 "amd" when isH265 => "hevc_vaapi",
-                "amd" when isH264 => "h264_vaapi",
                 "nvidia" when isH265 => "hevc_nvenc",
-                "nvidia" when isH264 => "h264_nvenc",
                 _ => options.Encoder
             };
         }
 
         /// <summary>
-        /// Returns the software fallback encoder for the user's codec preference.
-        /// Used when the requested hardware encoder isn't available on the system.
+        ///     Returns the software fallback encoder for the user's codec preference.
+        ///     Used when the requested hardware encoder isn't available on the system.
         /// </summary>
         private static string GetSoftwareFallbackEncoder(EncoderOptions options)
         {
@@ -1419,9 +1448,9 @@ public class TranscodingService
         }
 
         /// <summary>
-        /// Computes the output file path for a work item.
-        /// Prefers <c>EncodeDirectory</c>, then <c>OutputDirectory</c>, then the source file's directory.
-        /// Output file is named <c>"{basename} [snacks].{ext}"</c>.
+        ///     Computes the output file path for a work item.
+        ///     Prefers <c>EncodeDirectory</c>, then <c>OutputDirectory</c>, then the source file's directory.
+        ///     Output file is named <c>"{basename} [snacks].{ext}"</c>.
         /// </summary>
         private string GetOutputPath(WorkItem workItem, EncoderOptions options)
         {
@@ -1445,7 +1474,7 @@ public class TranscodingService
         }
 
         /// <summary>
-        /// Returns the final "clean" path (without [snacks] tag) for output placement.
+        ///     Returns the final "clean" path (without [snacks] tag) for output placement.
         /// </summary>
         private string GetCleanOutputName(string snacksPath)
         {
@@ -1456,10 +1485,10 @@ public class TranscodingService
         }
 
         /// <summary>
-        /// Does iterative test encodes at two file locations to find the right QP for the
-        /// target bitrate. Samples at ~25% and ~60% of the file (30s each) and averages the
-        /// results. For short files (<90s) falls back to a single sample. Starts at QP 24,
-        /// adjusts per iteration, and stops when within 15% of target or after 6 iterations.
+        ///     Does iterative test encodes at two file locations to find the right QP for the
+        ///     target bitrate. Samples at ~25% and ~60% of the file (30s each) and averages the
+        ///     results. For short files (<90s) falls back to a single sample. Starts at QP 24,
+        ///     adjusts per iteration, and stops when within 15% of target or after 6 iterations.
         /// </summary>
         private async Task<(int qp, bool useLowPower)> CalibrateVaapiQualityAsync(WorkItem workItem, EncoderOptions options, string inputPath, long targetKbps)
         {
@@ -1774,8 +1803,8 @@ public class TranscodingService
         }
 
         /// <summary>
-        /// Runs a short test encode to measure the actual output bitrate for a given VAAPI QP value.
-        /// Returns the measured bitrate in kbps, or 0 if the encode produced no output.
+        ///     Runs a short test encode to measure the actual output bitrate for a given VAAPI QP value.
+        ///     Returns the measured bitrate in kbps, or 0 if the encode produced no output.
         /// </summary>
         private async Task<long> RunTestEncodeAsync(string inputPath, string initFlags, string encoder, string hwFilter, string lpFlag, int qp, string seekTime, int duration)
         {
@@ -2127,8 +2156,8 @@ public class TranscodingService
         public EncoderOptions? GetLastOptions() => _lastOptions;
 
         /// <summary>
-        /// Updates the cached encoder options so that queued items pick up
-        /// settings changes without needing a new scan.
+        ///     Updates the cached encoder options so that queued items pick up
+        ///     settings changes without needing a new scan.
         /// </summary>
         public void UpdateOptions(EncoderOptions options) => _lastOptions = options;
 
@@ -2525,9 +2554,9 @@ public class TranscodingService
         }
 
         /// <summary>
-        /// Runs the encoding pipeline for a job received from a master node.
-        /// Registers the work item so logging works, then delegates to <see cref="ConvertVideoAsync"/>.
-        /// The work item is kept in the dictionary after completion so the output remains accessible for download.
+        ///     Runs the encoding pipeline for a job received from a master node.
+        ///     Registers the work item so logging works, then delegates to <see cref="ConvertVideoAsync"/>.
+        ///     The work item is kept in the dictionary after completion so the output remains accessible for download.
         /// </summary>
         /// <param name="workItem">The work item to encode.</param>
         /// <param name="options">Encoding options from the master's job assignment.</param>
@@ -2547,9 +2576,9 @@ public class TranscodingService
         }
 
         /// <summary>
-        /// Moves the encoded output to its final destination, optionally deletes the original,
-        /// and renames the file from the <c>[snacks]</c> staging name to the clean final name.
-        /// No-op if the output file produced no size savings (already handled by the caller).
+        ///     Moves the encoded output to its final destination, optionally deletes the original,
+        ///     and renames the file from the <c>[snacks]</c> staging name to the clean final name.
+        ///     No-op if the output file produced no size savings (already handled by the caller).
         /// </summary>
         private async Task HandleOutputPlacement(string outputPath, WorkItem workItem, EncoderOptions options)
         {

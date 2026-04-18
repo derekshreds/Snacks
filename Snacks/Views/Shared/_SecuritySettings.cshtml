@@ -1,0 +1,41 @@
+<div class="row g-4">
+    <div class="col-md-6">
+        <div class="encoder-panel rounded">
+            <h6 class="fw-bold mb-3"><i class="fas fa-user-lock me-2 text-primary"></i>Control Panel Login</h6>
+
+            <div class="form-check form-switch mb-3">
+                <input class="form-check-input" type="checkbox" id="authEnabled">
+                <label class="form-check-label" for="authEnabled">Require sign-in to access control panel</label>
+                <div class="form-text ms-4" id="authEnabledHint"></div>
+            </div>
+
+            <div class="mb-3">
+                <label for="authUsername" class="form-label">Username</label>
+                <input type="text" class="form-control" id="authUsername" autocomplete="off">
+            </div>
+
+            <div class="mb-3">
+                <label for="authPassword" class="form-label">Password</label>
+                <input type="password" class="form-control" id="authPassword" placeholder="Leave blank to keep current" autocomplete="new-password">
+                <div class="form-text">Stored as a PBKDF2 hash; never displayed back.</div>
+            </div>
+
+            <div class="d-flex gap-2 align-items-center">
+                <button class="btn btn-primary" id="saveAuthConfig"><i class="fas fa-save me-1"></i>Save</button>
+                <button class="btn btn-outline-secondary" id="signOutBtn" type="button"><i class="fas fa-sign-out-alt me-1"></i>Sign out</button>
+                <span class="small text-success ms-2" id="authSaveStatus" style="display:none;"><i class="fas fa-check me-1"></i>Saved</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-md-6">
+        <div class="encoder-panel rounded">
+            <h6 class="fw-bold mb-3"><i class="fas fa-shield-alt me-2 text-warning"></i>Notes</h6>
+            <ul class="small text-muted mb-0">
+                <li>When enabled, every browser request must present a valid session cookie.</li>
+                <li>Cluster traffic between master and nodes uses the shared secret configured in the Cluster tab — it is independent of this login.</li>
+                <li>Disabling auth rotates the session secret, invalidating all existing cookies.</li>
+            </ul>
+        </div>
+    </div>
+</div>

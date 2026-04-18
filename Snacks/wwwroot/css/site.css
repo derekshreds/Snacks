@@ -573,6 +573,43 @@ footer a.text-muted:hover {
     color: var(--text-primary);
 }
 
+/* -----------------------------------------------------------------------
+   Encoder-panel form-check alignment.
+   Bootstrap's default .form-check / .form-switch apply padding-left: 1.5em
+   / 2.5em on the container to make room for the input, then negative-margin
+   the input back to position 0. Inside our encoder panels that leaves the
+   label text visually indented from the section heading. We want the whole
+   row (input + label) to sit flush with the heading, so we strip the
+   padding, lay out as a flex row, and let form-text descriptions wrap to a
+   new line aligned with the label.
+   ----------------------------------------------------------------------- */
+.encoder-panel .form-check {
+    padding-left: 0;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    column-gap: 0.5rem;
+    row-gap: 0.25rem;
+}
+
+.encoder-panel .form-check .form-check-input {
+    margin-left: 0;
+    margin-top: 0;
+    flex-shrink: 0;
+}
+
+.encoder-panel .form-check .form-check-label {
+    margin-bottom: 0;
+}
+
+/* Descriptions under a form-check row wrap to a new line aligned with the
+   container's left edge — no need for the explicit ms-4 spacing used
+   before these overrides existed. */
+.encoder-panel .form-check .form-text {
+    flex-basis: 100%;
+    margin-left: 0 !important;
+}
+
 /* ===========================
    Lists
    =========================== */
@@ -1275,3 +1312,152 @@ footer a.text-muted:hover {
     border-bottom-right-radius: 0.5rem;
 }
 
+
+/* ===========================
+   Settings: Horizontal Swipeable Tabs
+   =========================== */
+.settings-tabs-wrapper {
+    position: relative;
+    display: flex;
+    align-items: stretch;
+}
+
+.settings-tabs-wrapper .settings-tabs {
+    flex: 1 1 auto;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    scroll-behavior: smooth;
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+    -webkit-overflow-scrolling: touch;
+    border-bottom: 1px solid var(--border-color);
+    margin: 0;
+    padding: 0;
+    scroll-snap-type: x proximity;
+}
+.settings-tabs-wrapper .settings-tabs::-webkit-scrollbar { display: none; }
+
+.settings-tabs-wrapper .settings-tabs .nav-item {
+    flex: 0 0 auto;
+    scroll-snap-align: start;
+}
+.settings-tabs-wrapper .settings-tabs .nav-link {
+    white-space: nowrap;
+    border: 1px solid transparent;
+    border-bottom: none;
+    transition: color 0.15s ease, background 0.15s ease;
+}
+
+.settings-tab-arrow {
+    flex: 0 0 auto;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    width: 34px;
+    background: linear-gradient(90deg, var(--bg-surface, #fff), transparent);
+    border: none;
+    color: var(--text-secondary);
+    cursor: pointer;
+    padding: 0 0.25rem;
+    z-index: 2;
+    transition: opacity 0.2s ease, color 0.15s ease;
+}
+.settings-tab-arrow:hover { color: var(--primary); }
+.settings-tab-arrow.visible { display: inline-flex; }
+.settings-tab-arrow.disabled { opacity: 0.25; pointer-events: none; }
+.settings-tab-arrow-right {
+    background: linear-gradient(270deg, var(--bg-surface, #fff), transparent);
+}
+
+/* ===========================
+   Chip input (language / pattern lists)
+   =========================== */
+.chip-input {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.375rem 0.5rem;
+    border: 1px solid var(--border-color, #ced4da);
+    border-radius: 0.375rem;
+    background: var(--bg-surface, #fff);
+    min-height: 38px;
+}
+.chip-input .chip-list {
+    display: contents;
+}
+.chip-input .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.15rem 0.55rem;
+    background: rgba(13, 110, 253, 0.12);
+    color: var(--primary, #0d6efd);
+    border-radius: 999px;
+    font-size: 0.85rem;
+    font-weight: 500;
+}
+.chip-input .chip .chip-remove {
+    background: none;
+    border: none;
+    color: inherit;
+    opacity: 0.6;
+    cursor: pointer;
+    padding: 0;
+    line-height: 1;
+    font-size: 0.8rem;
+}
+.chip-input .chip .chip-remove:hover { opacity: 1; }
+.chip-input .chip-new {
+    flex: 1 1 140px;
+    min-width: 80px;
+    border: none;
+    outline: none;
+    padding: 0.25rem;
+    background: transparent;
+    font-size: 0.9rem;
+}
+
+/* ===========================
+   Folder picker rows
+   =========================== */
+.folder-picker-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.35rem 0.5rem;
+    border-radius: 0.25rem;
+    cursor: pointer;
+    transition: background 0.12s ease;
+}
+.folder-picker-row:hover { background: rgba(13, 110, 253, 0.08); }
+.folder-picker-row.active { background: rgba(13, 110, 253, 0.18); }
+.folder-picker-row .fa-folder { color: #e0b95b; }
+.folder-picker-row .folder-picker-name { flex: 1 1 auto; }
+.folder-picker-row .folder-picker-expand {
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    padding: 0 0.25rem;
+}
+
+.notification-dest-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.35rem 0.5rem;
+    border: 1px solid var(--border-color);
+    border-radius: 0.375rem;
+    margin-bottom: 0.35rem;
+    background: rgba(0,0,0,0.02);
+}
+.notification-dest-row .badge { flex: 0 0 auto; }
+.notification-dest-row .dest-url { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.85rem; }
+
+@media (max-width: 768px) {
+    .settings-tab-arrow { width: 28px; }
+    .settings-tabs-wrapper .settings-tabs .nav-link {
+        padding: 0.5rem 0.75rem;
+        font-size: 0.9rem;
+    }
+}

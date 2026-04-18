@@ -111,9 +111,13 @@ builder.Services.AddSingleton<MediaFileRepository>();
 
 builder.Services.AddSingleton<FfprobeService>();
 builder.Services.AddSingleton<FileService>();
+builder.Services.AddSingleton<ConfigFileService>();
+builder.Services.AddHttpClient();
+builder.Services.AddSingleton<NotificationService>();
+builder.Services.AddSingleton<IntegrationService>();
+builder.Services.AddSingleton<AuthService>();
 builder.Services.AddSingleton<TranscodingService>();
 builder.Services.AddSingleton<StateTransitionService>();
-builder.Services.AddHttpClient();
 builder.Services.AddSingleton<ClusterService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<ClusterService>());
 builder.Services.AddScoped<ClusterAuthFilter>();
@@ -125,6 +129,9 @@ var app = builder.Build();
 // Initialize database — apply migrations and set pragmas.
 var mediaFileRepo = app.Services.GetRequiredService<MediaFileRepository>();
 await mediaFileRepo.InitializeAsync();
+
+// Upgrade settings.json to the new multi-language / codec schema if needed.
+SettingsMigration.RunStartupMigration(Path.Combine(configDir, "settings.json"));
 
 if (!app.Environment.IsDevelopment())
 {
@@ -148,6 +155,8 @@ app.UseStaticFiles(new StaticFileOptions
 });
 
 app.UseRouting();
+
+app.UseMiddleware<AuthMiddleware>();
 
 app.UseAuthorization();
 

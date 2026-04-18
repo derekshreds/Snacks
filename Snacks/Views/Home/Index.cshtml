@@ -199,25 +199,31 @@
                 <button type="button" class="btn-close" onclick="document.getElementById('settingsModal').classList.remove('open')"></button>
             </div>
             <div class="modal-body">
-                <ul class="nav nav-tabs mb-3" role="tablist">
-                    <li class="nav-item">
-                        <button class="nav-link active" data-bs-toggle="tab" data-bs-target="#encodingTab" type="button" role="tab">
-                            <i class="fas fa-film me-1"></i> Encoding
-                        </button>
-                    </li>
-                    <li class="nav-item">
-                        <button class="nav-link" data-bs-toggle="tab" data-bs-target="#clusterTab" type="button" role="tab">
-                            <i class="fas fa-network-wired me-1"></i> Cluster
-                        </button>
-                    </li>
-                </ul>
-                <div class="tab-content">
-                    <div class="tab-pane fade show active" id="encodingTab" role="tabpanel">
-                        @await Html.PartialAsync("_EncoderOptions", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })
-                    </div>
-                    <div class="tab-pane fade" id="clusterTab" role="tabpanel">
-                        @await Html.PartialAsync("_ClusterSettings")
-                    </div>
+                <div class="settings-tabs-wrapper">
+                    <button type="button" class="settings-tab-arrow settings-tab-arrow-left" aria-label="Scroll tabs left"><i class="fas fa-chevron-left"></i></button>
+                    <ul class="nav nav-tabs settings-tabs" role="tablist">
+                        <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#generalTab" type="button" role="tab"><i class="fas fa-sliders me-1"></i> General</button></li>
+                        <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#audioTab" type="button" role="tab"><i class="fas fa-volume-high me-1"></i> Audio</button></li>
+                        <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#subtitleTab" type="button" role="tab"><i class="fas fa-closed-captioning me-1"></i> Subtitles</button></li>
+                        <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#videoTab" type="button" role="tab"><i class="fas fa-film me-1"></i> Video</button></li>
+                        <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#libraryTab" type="button" role="tab"><i class="fas fa-folder-tree me-1"></i> Library</button></li>
+                        <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#integrationsTab" type="button" role="tab"><i class="fas fa-plug me-1"></i> Integrations</button></li>
+                        <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#clusterTab" type="button" role="tab"><i class="fas fa-network-wired me-1"></i> Cluster</button></li>
+                        <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#securityTab" type="button" role="tab"><i class="fas fa-lock me-1"></i> Security</button></li>
+                        <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#advancedTab" type="button" role="tab"><i class="fas fa-screwdriver-wrench me-1"></i> Advanced</button></li>
+                    </ul>
+                    <button type="button" class="settings-tab-arrow settings-tab-arrow-right" aria-label="Scroll tabs right"><i class="fas fa-chevron-right"></i></button>
+                </div>
+                <div class="tab-content mt-3">
+                    <div class="tab-pane fade show active" id="generalTab" role="tabpanel">@await Html.PartialAsync("_GeneralSettings", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })</div>
+                    <div class="tab-pane fade" id="audioTab" role="tabpanel">@await Html.PartialAsync("_AudioSettings", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })</div>
+                    <div class="tab-pane fade" id="subtitleTab" role="tabpanel">@await Html.PartialAsync("_SubtitleSettings", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })</div>
+                    <div class="tab-pane fade" id="videoTab" role="tabpanel">@await Html.PartialAsync("_VideoSettings", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })</div>
+                    <div class="tab-pane fade" id="libraryTab" role="tabpanel">@await Html.PartialAsync("_LibrarySettings")</div>
+                    <div class="tab-pane fade" id="integrationsTab" role="tabpanel">@await Html.PartialAsync("_IntegrationSettings")</div>
+                    <div class="tab-pane fade" id="clusterTab" role="tabpanel">@await Html.PartialAsync("_ClusterSettings")</div>
+                    <div class="tab-pane fade" id="securityTab" role="tabpanel">@await Html.PartialAsync("_SecuritySettings")</div>
+                    <div class="tab-pane fade" id="advancedTab" role="tabpanel">@await Html.PartialAsync("_AdvancedSettings")</div>
                 </div>
             </div>
             <div class="modal-footer">
@@ -350,76 +356,91 @@
     </div>
 </div>
 
-<!-- Stop/Cancel Modal -->
-<div class="modal fade" id="stopCancelModal" tabindex="-1">
-    <div class="modal-dialog modal-dialog-centered">
-        <div class="modal-content">
+<!-- Folder Picker Modal (folders only — attached to directory inputs via .folder-picker-btn) -->
+<div class="snacks-modal-backdrop" id="folderPickerModal" style="--snacks-modal-z: 9200">
+    <div class="snacks-modal-wrapper">
+        <div class="snacks-modal-dialog" style="max-width: 640px;">
             <div class="modal-header">
-                <h5 class="modal-title">
-                    <i class="fas fa-question-circle me-2"></i>
-                    Remove from Queue
-                </h5>
-                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                <h5 class="modal-title"><i class="fas fa-folder-tree me-2"></i>Select Folder</h5>
+                <button type="button" class="btn-close" onclick="document.getElementById('folderPickerModal').classList.remove('open')"></button>
+            </div>
+            <div class="modal-body">
+                <div class="folder-picker-breadcrumb mb-2 small text-muted" id="folderPickerBreadcrumb">/</div>
+                <div class="input-group input-group-sm mb-2">
+                    <span class="input-group-text"><i class="fas fa-keyboard"></i></span>
+                    <input type="text" class="form-control" id="folderPickerManualPath" placeholder="Or type a path directly and press Enter">
+                </div>
+                <div id="folderPickerList" class="border rounded p-2" style="height: 360px; overflow-y: auto;">
+                    <div class="text-center text-muted py-4">
+                        <div class="spinner-border spinner-border-sm" role="status"></div>
+                        <div class="mt-2 small">Loading folders…</div>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <div class="me-auto small text-muted" id="folderPickerSelection">No folder selected</div>
+                <button type="button" class="btn btn-secondary" onclick="document.getElementById('folderPickerModal').classList.remove('open')">Cancel</button>
+                <button type="button" class="btn btn-primary" id="folderPickerConfirm" disabled><i class="fas fa-check me-1"></i> Select</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Stop/Cancel Modal -->
+<div class="snacks-modal-backdrop" id="stopCancelModal" style="--snacks-modal-z: 9050">
+    <div class="snacks-modal-wrapper">
+        <div class="snacks-modal-dialog" style="max-width: 520px;">
+            <div class="modal-header">
+                <h5 class="modal-title"><i class="fas fa-question-circle me-2"></i>Remove from Queue</h5>
+                <button type="button" class="btn-close" data-snacks-dismiss="stopCancelModal"></button>
             </div>
             <div class="modal-body">
                 <p class="mb-0">What would you like to do with this item?</p>
             </div>
             <div class="modal-footer">
-                <button type="button" class="btn btn-warning" id="stopCancelStop">
-                    <i class="fas fa-pause me-1"></i>Stop (Encode Later)
-                </button>
-                <button type="button" class="btn btn-danger" id="stopCancelCancel">
-                    <i class="fas fa-ban me-1"></i>Cancel (Don't Reprocess)
-                </button>
+                <button type="button" class="btn btn-secondary" data-snacks-dismiss="stopCancelModal">Close</button>
+                <button type="button" class="btn btn-warning" id="stopCancelStop"><i class="fas fa-pause me-1"></i>Stop (Encode Later)</button>
+                <button type="button" class="btn btn-danger"  id="stopCancelCancel"><i class="fas fa-ban me-1"></i>Cancel (Don't Reprocess)</button>
             </div>
         </div>
     </div>
 </div>
 
 <!-- Log Modal -->
-<div class="modal fade modal-fullscreen-mobile" id="logModal" tabindex="-1">
-    <div class="modal-dialog modal-xl modal-dialog-centered">
-        <div class="modal-content">
+<div class="snacks-modal-backdrop" id="logModal" style="--snacks-modal-z: 9050">
+    <div class="snacks-modal-wrapper">
+        <div class="snacks-modal-dialog" style="max-width: 1140px;">
             <div class="modal-header">
-                <h5 class="modal-title">
-                    <i class="fas fa-terminal me-2"></i>
-                    Transcoding Log
-                </h5>
-                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                <h5 class="modal-title"><i class="fas fa-terminal me-2"></i>Transcoding Log</h5>
+                <button type="button" class="btn-close" data-snacks-dismiss="logModal"></button>
             </div>
             <div class="modal-body">
-                <div id="logContent">
-                    <!-- Log content will be loaded here -->
-                </div>
+                <div id="logContent"></div>
             </div>
             <div class="modal-footer">
-                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                <button type="button" class="btn btn-secondary" data-snacks-dismiss="logModal">Close</button>
             </div>
         </div>
     </div>
 </div>
 
 <!-- Confirm Modal -->
-<div class="modal fade" id="confirmModal" tabindex="-1">
-    <div class="modal-dialog modal-dialog-centered">
-        <div class="modal-content">
+<div class="snacks-modal-backdrop" id="confirmModal" style="--snacks-modal-z: 9300">
+    <div class="snacks-modal-wrapper">
+        <div class="snacks-modal-dialog" style="max-width: 520px;">
             <div class="modal-header">
-                <h5 class="modal-title" id="confirmModalTitle">
-                    <i class="fas fa-exclamation-triangle me-2"></i>
-                    Confirm
-                </h5>
-                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                <h5 class="modal-title" id="confirmModalTitle"><i class="fas fa-exclamation-triangle me-2"></i>Confirm</h5>
+                <button type="button" class="btn-close" data-snacks-dismiss="confirmModal"></button>
             </div>
-            <div class="modal-body" id="confirmModalBody">
-            </div>
+            <div class="modal-body" id="confirmModalBody"></div>
             <div class="modal-footer">
-                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
-                <button type="button" class="btn btn-danger" id="confirmModalConfirm">Confirm</button>
+                <button type="button" class="btn btn-secondary" data-snacks-dismiss="confirmModal">Cancel</button>
+                <button type="button" class="btn btn-danger"    id="confirmModalConfirm">Confirm</button>
             </div>
         </div>
     </div>
 </div>
 
 @section Scripts {
-    <script src="~/js/transcoding.js"></script>
+    <script type="module" src="~/js/main.js"></script>
 }

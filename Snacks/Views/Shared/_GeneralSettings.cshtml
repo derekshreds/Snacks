@@ -1,0 +1,122 @@
+@{
+    string formPrefix = ViewData["FormPrefix"]?.ToString() ?? "";
+}
+
+<div class="row g-4">
+    <div class="col-md-6">
+        <div class="encoder-panel rounded">
+            <h6 class="fw-bold mb-3"><i class="fas fa-cogs me-2 text-primary"></i>Output</h6>
+
+            <div class="mb-3">
+                <label for="@(formPrefix)Format" class="form-label"><i class="fas fa-file-video me-1"></i> Output Format</label>
+                <select class="form-select" id="@(formPrefix)Format" name="Format">
+                    <option value="mkv" selected>MKV (Matroska)</option>
+                    <option value="mp4">MP4</option>
+                </select>
+                <div class="form-text">MKV preserves every stream; MP4 is more broadly compatible but drops some subtitle types.</div>
+            </div>
+
+            <div class="mb-3">
+                <label for="@(formPrefix)Codec" class="form-label"><i class="fas fa-microchip me-1"></i> Video Codec</label>
+                <select class="form-select" id="@(formPrefix)Codec" name="Codec">
+                    <option value="h265" selected>H.265/HEVC (Better Quality)</option>
+                    <option value="h264">H.264/AVC (Faster)</option>
+                    <option value="av1">AV1 (Best Compression)</option>
+                </select>
+                <div class="form-text">H.265 is a good default; AV1 gives the smallest files but encodes more slowly.</div>
+            </div>
+
+            <div class="mb-3">
+                <label for="@(formPrefix)HardwareAcceleration" class="form-label"><i class="fas fa-bolt me-1"></i> Hardware Acceleration</label>
+                <select class="form-select" id="@(formPrefix)HardwareAcceleration" name="HardwareAcceleration">
+                    <option value="auto" selected>Auto Detect</option>
+                    <option value="intel">Intel Quick Sync (QSV)</option>
+                    <option value="amd">AMD VAAPI</option>
+                    <option value="nvidia">NVIDIA NVENC</option>
+                    <option value="none">Software Only</option>
+                </select>
+                <div class="form-text">Use the GPU when available for faster encodes. Auto-detect tries each vendor at startup.</div>
+            </div>
+
+            <div class="mb-3">
+                <label for="@(formPrefix)TargetBitrate" class="form-label"><i class="fas fa-tachometer-alt me-1"></i> Target Bitrate (kbps)</label>
+                <input type="number" class="form-control" id="@(formPrefix)TargetBitrate" name="TargetBitrate" value="3500" min="500" max="50000" step="100">
+                <div class="form-text">Average video bitrate for 1080p content; higher resolutions scale via the 4K multiplier below.</div>
+            </div>
+
+            <div class="form-check mb-2">
+                <input class="form-check-input" type="checkbox" id="@(formPrefix)StrictBitrate" name="StrictBitrate">
+                <label class="form-check-label" for="@(formPrefix)StrictBitrate"><i class="fas fa-lock me-1"></i> Strict Bitrate Control</label>
+                <div class="form-text">Caps peak bitrate close to the target (CBR-like) instead of allowing variable peaks.</div>
+            </div>
+
+            <div class="mb-3 mt-3">
+                <label for="@(formPrefix)FourKBitrateMultiplier" class="form-label"><i class="fas fa-expand me-1"></i> 4K Bitrate Multiplier</label>
+                <select class="form-select" id="@(formPrefix)FourKBitrateMultiplier" name="FourKBitrateMultiplier">
+                    <option value="2">2x</option>
+                    <option value="3">3x</option>
+                    <option value="4" selected>4x (Default)</option>
+                    <option value="5">5x</option>
+                    <option value="6">6x</option>
+                    <option value="8">8x</option>
+                </select>
+                <div class="form-text">4K sources get Target Bitrate × this value. Only applied when Skip 4K is off.</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-md-6">
+        <div class="encoder-panel rounded">
+            <h6 class="fw-bold mb-3"><i class="fas fa-folder-open me-2 text-success"></i>File Handling</h6>
+
+            <div class="form-check mb-2">
+                <input class="form-check-input" type="checkbox" id="@(formPrefix)Skip4K" name="Skip4K">
+                <label class="form-check-label" for="@(formPrefix)Skip4K"><i class="fas fa-ban me-1"></i> Skip 4K Videos</label>
+                <div class="form-text">Leave 3840×2160 and larger files untouched.</div>
+            </div>
+
+            <div class="mb-3 mt-3">
+                <label for="@(formPrefix)SkipPercentAboveTarget" class="form-label"><i class="fas fa-forward me-1"></i> Skip Threshold</label>
+                <div class="input-group input-group-sm">
+                    <input type="number" class="form-control" id="@(formPrefix)SkipPercentAboveTarget" name="SkipPercentAboveTarget" min="0" max="100" value="20">
+                    <span class="input-group-text">% above target</span>
+                </div>
+                <div class="form-text">Skip files already in target codec within this margin</div>
+            </div>
+
+            <div class="form-check mb-3">
+                <input class="form-check-input" type="checkbox" id="@(formPrefix)DeleteOriginalFile" name="DeleteOriginalFile">
+                <label class="form-check-label" for="@(formPrefix)DeleteOriginalFile"><i class="fas fa-exchange-alt me-1 text-danger"></i> Replace Original Files</label>
+                <div class="form-text ms-4 text-danger"><strong>Warning:</strong> Deletes original and moves encoded file to its location.</div>
+            </div>
+
+            <div class="form-check mb-3">
+                <input class="form-check-input" type="checkbox" id="@(formPrefix)RetryOnFail" name="RetryOnFail" checked>
+                <label class="form-check-label" for="@(formPrefix)RetryOnFail"><i class="fas fa-redo me-1"></i> Retry on Failure</label>
+                <div class="form-text">Re-queue failed files so the next auto-scan picks them up again.</div>
+            </div>
+
+            <div class="mb-3">
+                <label for="@(formPrefix)OutputDirectory" class="form-label"><i class="fas fa-folder me-1"></i> Output Directory</label>
+                <div class="input-group">
+                    <input type="text" class="form-control" id="@(formPrefix)OutputDirectory" name="OutputDirectory" placeholder="Leave blank to output next to originals">
+                    <button class="btn btn-outline-secondary folder-picker-btn" type="button" data-target="@(formPrefix)OutputDirectory" title="Browse folders">
+                        <i class="fas fa-folder-open"></i>
+                    </button>
+                </div>
+                <div class="form-text">Where encoded files are saved.</div>
+            </div>
+
+            <div class="mb-3">
+                <label for="@(formPrefix)LocalTranscodeScratchDirectory" class="form-label"><i class="fas fa-hdd me-1"></i> Local Transcode Scratch Directory</label>
+                <div class="input-group">
+                    <input type="text" class="form-control" id="@(formPrefix)LocalTranscodeScratchDirectory" name="LocalTranscodeScratchDirectory" placeholder="Leave blank to encode in place">
+                    <button class="btn btn-outline-secondary folder-picker-btn" type="button" data-target="@(formPrefix)LocalTranscodeScratchDirectory" title="Browse folders">
+                        <i class="fas fa-folder-open"></i>
+                    </button>
+                </div>
+                <div class="form-text">Optional: encode to a fast local disk, then copy result back.</div>
+            </div>
+        </div>
+    </div>
+</div>

@@ -1,0 +1,32 @@
+<div class="row g-4">
+    <div class="col-md-6">
+        <div class="encoder-panel rounded">
+            <h6 class="fw-bold mb-3"><i class="fas fa-screwdriver-wrench me-2 text-primary"></i>Advanced</h6>
+
+            <div class="mb-3">
+                <label for="advHeartbeatInterval" class="form-label">Heartbeat Interval (seconds)</label>
+                <input type="number" class="form-control" id="advHeartbeatInterval" min="5" max="300" step="1">
+                <div class="form-text">How often cluster nodes ping the master.</div>
+            </div>
+
+            <div class="mb-3">
+                <label for="advNodeTimeout" class="form-label">Node Timeout (seconds)</label>
+                <input type="number" class="form-control" id="advNodeTimeout" min="10" max="600" step="1">
+                <div class="form-text">How long before a silent node is marked offline.</div>
+            </div>
+
+            <button class="btn btn-primary btn-sm" id="saveAdvancedCluster"><i class="fas fa-save me-1"></i>Save Timings</button>
+        </div>
+    </div>
+
+    <div class="col-md-6">
+        <div class="encoder-panel rounded">
+            <h6 class="fw-bold mb-3"><i class="fas fa-tools me-2 text-warning"></i>Maintenance</h6>
+
+            <div class="d-flex flex-column gap-2">
+                <button class="btn btn-outline-warning" id="clearScanHistory"><i class="fas fa-eraser me-1"></i> Clear Auto-Scan History</button>
+                <button class="btn btn-outline-danger" id="restartAppBtn"><i class="fas fa-redo me-1"></i> Restart Application</button>
+            </div>
+        </div>
+    </div>
+</div>

@@ -1,0 +1,101 @@
+<div class="row g-4">
+    <div class="col-12">
+        <div class="encoder-panel rounded">
+            <h6 class="fw-bold mb-3"><i class="fas fa-bell me-2 text-primary"></i>Notifications</h6>
+
+            <div id="notificationDestinations" class="mb-3">
+                <div class="text-muted text-center py-2"><small>No destinations configured</small></div>
+            </div>
+
+            <div class="row g-2 mb-3">
+                <div class="col-md-3">
+                    <input type="text" class="form-control form-control-sm" id="newNotifName" placeholder="Name">
+                </div>
+                <div class="col-md-3">
+                    <select class="form-select form-select-sm" id="newNotifType">
+                        <option value="webhook">Webhook</option>
+                        <option value="ntfy">ntfy</option>
+                        <option value="apprise">Apprise</option>
+                    </select>
+                </div>
+                <div class="col-md-4">
+                    <input type="text" class="form-control form-control-sm" id="newNotifUrl" placeholder="https://…">
+                </div>
+                <div class="col-md-2">
+                    <button class="btn btn-sm btn-outline-primary w-100" id="addNotifDestination">
+                        <i class="fas fa-plus"></i> Add
+                    </button>
+                </div>
+            </div>
+
+            <h6 class="fw-semibold mt-3">Events</h6>
+            <div class="row g-2">
+                <div class="col-md-3 form-check"><input type="checkbox" class="form-check-input" id="notifEventEncodeStarted"><label class="form-check-label" for="notifEventEncodeStarted">Encode Started</label></div>
+                <div class="col-md-3 form-check"><input type="checkbox" class="form-check-input" id="notifEventEncodeCompleted" checked><label class="form-check-label" for="notifEventEncodeCompleted">Encode Completed</label></div>
+                <div class="col-md-3 form-check"><input type="checkbox" class="form-check-input" id="notifEventEncodeFailed" checked><label class="form-check-label" for="notifEventEncodeFailed">Encode Failed</label></div>
+                <div class="col-md-3 form-check"><input type="checkbox" class="form-check-input" id="notifEventScanCompleted"><label class="form-check-label" for="notifEventScanCompleted">Scan Completed</label></div>
+                <div class="col-md-3 form-check"><input type="checkbox" class="form-check-input" id="notifEventNodeOffline" checked><label class="form-check-label" for="notifEventNodeOffline">Node Offline</label></div>
+            </div>
+
+            <button class="btn btn-primary btn-sm mt-3" id="saveNotificationConfig"><i class="fas fa-save me-1"></i> Save Notifications</button>
+        </div>
+    </div>
+
+    <div class="col-md-6">
+        <div class="encoder-panel rounded">
+            <h6 class="fw-bold mb-3"><i class="fas fa-play-circle me-2" style="color:#e5a00d"></i>Plex</h6>
+            <div class="form-check form-switch mb-3">
+                <input class="form-check-input" type="checkbox" id="plexEnabled">
+                <label class="form-check-label" for="plexEnabled">Enable Plex integration</label>
+            </div>
+            <div class="mb-2"><label class="form-label">Base URL</label><input type="text" class="form-control form-control-sm" id="plexBaseUrl" placeholder="http://192.168.1.10:32400"></div>
+            <div class="mb-2"><label class="form-label">X-Plex-Token</label><input type="password" class="form-control form-control-sm" id="plexToken"></div>
+            <div class="form-check mb-2"><input class="form-check-input" type="checkbox" id="plexRescan"><label class="form-check-label" for="plexRescan">Trigger library rescan on encode complete</label></div>
+            <div class="d-flex gap-2"><button class="btn btn-sm btn-outline-primary" id="testPlex"><i class="fas fa-vial me-1"></i>Test</button><span class="small align-self-center" id="plexTestResult"></span></div>
+        </div>
+    </div>
+
+    <div class="col-md-6">
+        <div class="encoder-panel rounded">
+            <h6 class="fw-bold mb-3"><i class="fas fa-circle-play me-2" style="color:#aa5cc3"></i>Jellyfin</h6>
+            <div class="form-check form-switch mb-3">
+                <input class="form-check-input" type="checkbox" id="jellyfinEnabled">
+                <label class="form-check-label" for="jellyfinEnabled">Enable Jellyfin integration</label>
+            </div>
+            <div class="mb-2"><label class="form-label">Base URL</label><input type="text" class="form-control form-control-sm" id="jellyfinBaseUrl" placeholder="http://192.168.1.10:8096"></div>
+            <div class="mb-2"><label class="form-label">API Key</label><input type="password" class="form-control form-control-sm" id="jellyfinToken"></div>
+            <div class="form-check mb-2"><input class="form-check-input" type="checkbox" id="jellyfinRescan"><label class="form-check-label" for="jellyfinRescan">Trigger library rescan on encode complete</label></div>
+            <div class="d-flex gap-2"><button class="btn btn-sm btn-outline-primary" id="testJellyfin"><i class="fas fa-vial me-1"></i>Test</button><span class="small align-self-center" id="jellyfinTestResult"></span></div>
+        </div>
+    </div>
+
+    <div class="col-md-6">
+        <div class="encoder-panel rounded">
+            <h6 class="fw-bold mb-3"><i class="fas fa-tv me-2 text-info"></i>Sonarr</h6>
+            <div class="form-check form-switch mb-3">
+                <input class="form-check-input" type="checkbox" id="sonarrEnabled">
+                <label class="form-check-label" for="sonarrEnabled">Enable Sonarr integration</label>
+            </div>
+            <div class="mb-2"><label class="form-label">Base URL</label><input type="text" class="form-control form-control-sm" id="sonarrBaseUrl" placeholder="http://192.168.1.10:8989"></div>
+            <div class="mb-2"><label class="form-label">API Key</label><input type="password" class="form-control form-control-sm" id="sonarrApiKey"></div>
+            <div class="d-flex gap-2"><button class="btn btn-sm btn-outline-primary" id="testSonarr"><i class="fas fa-vial me-1"></i>Test</button><span class="small align-self-center" id="sonarrTestResult"></span></div>
+        </div>
+    </div>
+
+    <div class="col-md-6">
+        <div class="encoder-panel rounded">
+            <h6 class="fw-bold mb-3"><i class="fas fa-film me-2 text-warning"></i>Radarr</h6>
+            <div class="form-check form-switch mb-3">
+                <input class="form-check-input" type="checkbox" id="radarrEnabled">
+                <label class="form-check-label" for="radarrEnabled">Enable Radarr integration</label>
+            </div>
+            <div class="mb-2"><label class="form-label">Base URL</label><input type="text" class="form-control form-control-sm" id="radarrBaseUrl" placeholder="http://192.168.1.10:7878"></div>
+            <div class="mb-2"><label class="form-label">API Key</label><input type="password" class="form-control form-control-sm" id="radarrApiKey"></div>
+            <div class="d-flex gap-2"><button class="btn btn-sm btn-outline-primary" id="testRadarr"><i class="fas fa-vial me-1"></i>Test</button><span class="small align-self-center" id="radarrTestResult"></span></div>
+        </div>
+    </div>
+
+    <div class="col-12">
+        <button class="btn btn-primary" id="saveIntegrationConfig"><i class="fas fa-save me-1"></i> Save Integrations</button>
+    </div>
+</div>

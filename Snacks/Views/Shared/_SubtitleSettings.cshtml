@@ -1,0 +1,54 @@
+@{
+    string formPrefix = ViewData["FormPrefix"]?.ToString() ?? "";
+}
+
+<div class="row g-4">
+    <div class="col-md-6">
+        <div class="encoder-panel rounded">
+            <h6 class="fw-bold mb-3"><i class="fas fa-closed-captioning me-2 text-primary"></i>Keep List</h6>
+
+            <div class="mb-3">
+                <label class="form-label">Subtitle Languages to Keep</label>
+                <div class="chip-input" id="@(formPrefix)SubtitleLanguagesToKeepChips" data-field="SubtitleLanguagesToKeep">
+                    <div class="chip-list"></div>
+                    <input type="text" class="chip-new" placeholder="Add ISO code (e.g. en, es)">
+                </div>
+                <div class="form-text">Empty list keeps all subtitle tracks.</div>
+            </div>
+
+            <div class="form-check mb-2">
+                <input class="form-check-input" type="checkbox" id="@(formPrefix)EnglishOnlySubtitles" name="EnglishOnlySubtitles">
+                <label class="form-check-label text-muted" for="@(formPrefix)EnglishOnlySubtitles">
+                    <small>Legacy: English Subtitles Only (superseded by list above)</small>
+                </label>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-md-6">
+        <div class="encoder-panel rounded">
+            <h6 class="fw-bold mb-3"><i class="fas fa-file-export me-2 text-info"></i>Extraction &amp; Conversion</h6>
+
+            <div class="form-check mb-3">
+                <input class="form-check-input" type="checkbox" id="@(formPrefix)ExtractSubtitlesToSidecar" name="ExtractSubtitlesToSidecar">
+                <label class="form-check-label" for="@(formPrefix)ExtractSubtitlesToSidecar">Extract subtitles to sidecar files</label>
+                <div class="form-text">Write subtitle tracks as separate files next to the video instead of embedding them.</div>
+            </div>
+
+            <div class="mb-3" id="@(formPrefix)SidecarFormatWrapper">
+                <label for="@(formPrefix)SidecarSubtitleFormat" class="form-label">Sidecar Subtitle Format</label>
+                <select class="form-select" id="@(formPrefix)SidecarSubtitleFormat" name="SidecarSubtitleFormat">
+                    <option value="srt" selected>SRT (text)</option>
+                    <option value="ass">ASS (styled text)</option>
+                </select>
+                <div class="form-text">Container format for extracted subtitle files.</div>
+            </div>
+
+            <div class="form-check mb-3">
+                <input class="form-check-input" type="checkbox" id="@(formPrefix)ConvertImageSubtitlesToSrt" name="ConvertImageSubtitlesToSrt">
+                <label class="form-check-label" for="@(formPrefix)ConvertImageSubtitlesToSrt">Convert image-based subtitles to SRT (OCR)</label>
+                <div class="form-text">Run OCR on image-based subtitles (PGS/VOBSUB) to produce searchable text.</div>
+            </div>
+        </div>
+    </div>
+</div>
