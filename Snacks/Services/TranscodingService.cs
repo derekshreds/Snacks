@@ -813,6 +813,14 @@ public class TranscodingService
 
             var (targetBitrate, minBitrate, maxBitrate, videoCopy) = CalculateBitrates(workItem, options);
 
+            // Audio-only mode: copy the video stream regardless of codec match.
+            // The audio side still honors AudioCodec / AudioBitrateKbps below.
+            if (options.AudioOnlyMode)
+            {
+                videoCopy = true;
+                await LogAsync(workItem.Id, "Audio-only mode: copying video stream, re-encoding audio.");
+            }
+
             // Resolve the actual encoder — verify it works, fall back to software if not
             string encoder = videoCopy ? "copy" : GetEncoder(options);
             string hwAccel = options.HardwareAcceleration;
@@ -911,13 +919,19 @@ public class TranscodingService
             bool isSvtAv1 = encoder == "libsvtav1";
             string presetFlag = useVaapi
                 ? (useLowPower ? "-low_power 1 " : "")
-                : isSvtAv1 ? "-preset 6 " : "-preset medium ";
+                : isSvtAv1 ? $"-preset {MapSvtAv1Preset(options.FfmpegQualityPreset)} "
+                           : $"-preset {options.FfmpegQualityPreset} ";
             string videoFlags = videoCopy ?
                 $"{_ffprobeService.MapVideo(workItem.Probe!)} -c:v copy " :
                 $"{_ffprobeService.MapVideo(workItem.Probe!)} -c:v {encoder} {presetFlag}{hwFilter}";
 
-            string audioFlags = _ffprobeService.MapAudio(workItem.Probe!, options.AudioLanguagesToKeep,
-                options.TwoChannelAudio, options.Format == "mkv") + " ";
+            string audioFlags = _ffprobeService.MapAudio(
+                workItem.Probe!,
+                options.AudioLanguagesToKeep,
+                options.AudioCodec,
+                options.AudioBitrateKbps,
+                options.TwoChannelAudio,
+                options.Format == "mkv") + " ";
 
             string subtitleFlags = stripSubtitles
                 ? "-sn "
@@ -1426,6 +1440,22 @@ public class TranscodingService
             if (isH264) return "libx264";
             return "libx265";
         }
+
+        /// <summary>
+        ///     SVT-AV1 takes a numeric preset (0 = slowest/best, 13 = fastest/worst) instead
+        ///     of the libx264/libx265 preset names. Maps the shared UI preset string into
+        ///     SVT-AV1's range so a user who picks "slow" in the UI actually gets slower
+        ///     encodes on AV1 too. Unknown values fall back to 6 (matches the prior hardcode).
+        /// </summary>
+        private static int MapSvtAv1Preset(string preset) => (preset ?? "").ToLowerInvariant() switch
+        {
+            "veryslow" => 2,
+            "slow"     => 4,
+            "medium"   => 6,
+            "fast"     => 8,
+            "veryfast" => 10,
+            _          => 6,
+        };
 
         /// <summary>
         ///     Computes the output file path for a work item.

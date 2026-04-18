@@ -115,18 +115,33 @@ public class FfprobeService
     ///     2-letter ISO codes to retain. Empty or null keeps every audio stream. Matching accepts
     ///     the track's tag in any of its common forms (2-letter, 3-letter, or English name).
     /// </param>
-    /// <param name="twoChannels">When <c>true</c>, audio is downmixed to 2-channel stereo AAC.</param>
-    /// <param name="isMatroska">
-    ///     When <c>true</c>, non-AAC audio is copied; otherwise all tracks are re-encoded to AAC.
+    /// <param name="audioCodec">
+    ///     User-selected codec: <c>"copy"</c>, <c>"aac"</c>, <c>"eac3"</c>, or <c>"opus"</c>.
+    ///     "copy" is silently upgraded to AAC re-encode when <paramref name="twoChannels"/> is set
+    ///     (you can't downmix a copied stream) or when the container is MP4 (which doesn't carry
+    ///     every source format).
     /// </param>
+    /// <param name="audioBitrateKbps">Target bitrate for re-encoded audio. Ignored when the effective codec is copy.</param>
+    /// <param name="twoChannels">When <c>true</c>, audio is downmixed to 2-channel stereo.</param>
+    /// <param name="isMatroska">When <c>false</c> (MP4), copy is disallowed — falls back to AAC re-encode.</param>
     /// <returns>FFmpeg stream mapping and codec arguments for audio, or an empty string if no audio streams exist.</returns>
-    public string MapAudio(ProbeResult probe, IReadOnlyList<string>? languagesToKeep, bool twoChannels, bool isMatroska)
+    public string MapAudio(
+        ProbeResult               probe,
+        IReadOnlyList<string>?    languagesToKeep,
+        string                    audioCodec,
+        int                       audioBitrateKbps,
+        bool                      twoChannels,
+        bool                      isMatroska)
     {
         ArgumentNullException.ThrowIfNull(probe);
 
         var audioStreams = probe.Streams.Where(s => s.CodecType == "audio").ToList();
-        if (!audioStreams.Any())
-            return "";
+        if (!audioStreams.Any()) return "";
+
+        // Resolve the effective codec. "copy" is degraded to AAC when the config
+        // asks for something copy can't satisfy (downmix, MP4 container).
+        var effectiveCodec = ResolveAudioCodec(audioCodec, twoChannels, isMatroska);
+        var codecArgs      = BuildAudioCodecArgs(effectiveCodec, audioBitrateKbps, twoChannels);
 
         if (languagesToKeep != null && languagesToKeep.Count > 0)
         {
@@ -138,18 +153,45 @@ public class FfprobeService
             if (filtered.Any())
             {
                 var maps = string.Join(" ", filtered.Select(s => $"-map 0:{s.Index}"));
-
-                if (twoChannels)
-                    return $"{maps} -c:a aac -ac 2 -vbr 5";
-
-                return isMatroska ? $"{maps} -c:a copy" : $"{maps} -c:a aac -vbr 5";
+                return $"{maps} {codecArgs}";
             }
         }
 
-        if (twoChannels)
-            return "-map 0:a -c:a aac -ac 2 -vbr 5";
+        return $"-map 0:a {codecArgs}";
+    }
 
-        return isMatroska ? "-map 0:a -c:a copy" : "-map 0:a -c:a aac -vbr 5";
+    /// <summary>
+    ///     Resolves the user-selected audio codec to what FFmpeg will actually run.
+    ///     Downgrades <c>"copy"</c> to AAC when the rest of the config can't satisfy copy
+    ///     (a downmix request or an MP4 container with unsupported source codecs).
+    /// </summary>
+    private static string ResolveAudioCodec(string requested, bool twoChannels, bool isMatroska)
+    {
+        var codec = (requested ?? "").Trim().ToLowerInvariant();
+        if (codec is not ("copy" or "aac" or "eac3" or "opus")) codec = "aac";
+
+        // Copy can't downmix, and MP4 can't carry every codec — fall back to AAC.
+        if (codec == "copy" && (twoChannels || !isMatroska)) codec = "aac";
+        return codec;
+    }
+
+    /// <summary>
+    ///     Builds the <c>-c:a ...</c> flag set for the resolved codec, including
+    ///     bitrate/VBR flags and the downmix flag when <paramref name="twoChannels"/>.
+    /// </summary>
+    private static string BuildAudioCodecArgs(string codec, int bitrateKbps, bool twoChannels)
+    {
+        var downmix = twoChannels ? " -ac 2" : "";
+        var br      = bitrateKbps > 0 ? bitrateKbps : 192;
+
+        return codec switch
+        {
+            "copy" => "-c:a copy",
+            "aac"  => $"-c:a aac  -b:a {br}k{downmix}",
+            "eac3" => $"-c:a eac3 -b:a {br}k{downmix}",
+            "opus" => $"-c:a libopus -b:a {br}k -vbr on{downmix}",
+            _      => $"-c:a aac -b:a {br}k{downmix}",
+        };
     }
 
     /// <summary> Bitmap subtitle codecs that can cause FFmpeg to hang — always excluded. </summary>
