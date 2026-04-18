@@ -47,7 +47,14 @@ public sealed class AuthApiController : ControllerBase
                 return new JsonResult(new { success = false, error = "Password required to enable auth" });
 
             _auth.UpdateConfig(req.Enabled, req.Username, req.Password);
-            return new JsonResult(new { success = true });
+
+            // Force a fresh login whenever the config changes: drop whatever session
+            // cookie the caller had so they have to re-authenticate under the new
+            // settings. Disabling already rotates the server-side secret; clearing the
+            // cookie as well keeps the client and server in sync.
+            Response.Cookies.Delete(AuthService.CookieName);
+
+            return new JsonResult(new { success = true, authRequired = _auth.IsAuthRequired() });
         }
         catch (Exception ex)
         {

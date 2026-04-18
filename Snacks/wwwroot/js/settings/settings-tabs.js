@@ -50,6 +50,14 @@ export function initSettingsTabs() {
     nav.addEventListener('scroll', update, { passive: true });
     window.addEventListener('resize', update);
 
+    // The tab strip lives inside a modal that's `display: none` until the
+    // user opens Settings. On first init the nav's clientWidth is 0, so the
+    // overflow check can't know whether arrows are needed. Observe size
+    // changes on the nav so `update` fires as soon as layout becomes real.
+    if (typeof ResizeObserver !== 'undefined') {
+        new ResizeObserver(update).observe(nav);
+    }
+
     // Translate dominant vertical wheel movement into horizontal scroll
     // so a normal mouse wheel can scroll the tab strip.
     nav.addEventListener('wheel', (e) => {

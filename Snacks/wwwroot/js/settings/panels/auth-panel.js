@@ -47,6 +47,13 @@ async function save() {
             return;
         }
 
+        // Auth just became (or stayed) required — force a login round-trip so
+        // the user actually exercises the credentials they just configured.
+        if (data.authRequired) {
+            window.location.href = '/Auth/Login';
+            return;
+        }
+
         showToast('Auth settings saved', 'success');
 
         // Clear the password field and reload so the hint reflects the new state.

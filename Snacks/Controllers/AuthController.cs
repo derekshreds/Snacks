@@ -62,8 +62,7 @@ public sealed class AuthController : Controller
         {
             HttpOnly = true,
             SameSite = SameSiteMode.Lax,
-            Secure   = Request.IsHttps,
-            Expires  = DateTimeOffset.UtcNow.AddDays(14),
+            Secure   = Request.IsHttps
         });
 
         return Redirect(string.IsNullOrEmpty(returnUrl) ? "/" : returnUrl);
