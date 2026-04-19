@@ -194,4 +194,41 @@ public sealed class ClusterAdminController : ControllerBase
         _autoScanService.SaveFolderSettings(request.Path, request.EncodingOverrides);
         return new JsonResult(new { success = true });
     }
+
+    /******************************************************************
+     *  Integration Sync (worker-only UI)
+     ******************************************************************/
+
+    /// <summary>
+    ///     Returns the integration-pull sync status for this worker. Used by the
+    ///     "Integration Sync" tab that is only visible when the role is <c>node</c>.
+    /// </summary>
+    [HttpGet("integration-sync")]
+    public IActionResult GetIntegrationSyncStatus()
+    {
+        var cfg = _clusterService.GetConfig();
+        var lastAt = _clusterService.LastIntegrationSyncAt;
+        return new JsonResult(new
+        {
+            masterUrl  = cfg.MasterUrl,
+            lastSyncAt = lastAt?.ToString("o"),
+            status     = _clusterService.LastIntegrationSyncStatus,
+        });
+    }
+
+    /// <summary>
+    ///     Triggers an on-demand integration-credentials pull from the master. Surfaces
+    ///     the same code path the pre-encode hook uses; useful for verifying the
+    ///     master connection without waiting for a queued job.
+    /// </summary>
+    [HttpPost("integration-sync/refresh")]
+    public async Task<IActionResult> RefreshIntegrationSync()
+    {
+        await _clusterService.PullIntegrationsFromMasterAsync(HttpContext.RequestAborted);
+        return new JsonResult(new
+        {
+            lastSyncAt = _clusterService.LastIntegrationSyncAt?.ToString("o"),
+            status     = _clusterService.LastIntegrationSyncStatus,
+        });
+    }
 }

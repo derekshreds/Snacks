@@ -39,11 +39,11 @@ import { LibraryBrowser }       from './library/library-browser.js';
 
 import { ClusterDashboard }     from './cluster/cluster-dashboard.js';
 import { ClusterSettingsForm }  from './cluster/cluster-settings-form.js';
-import { NodeOverrideDialog }   from './cluster/node-override-dialog.js';
+import { OverrideDialog }       from './cluster/override-dialog.js';
 
 import { initAllChipInputs }    from './settings/chip-input.js';
 import { initFolderPicker }     from './settings/folder-picker.js';
-import { initSettingsTabs }     from './settings/settings-tabs.js';
+import { initSettingsTabs, applySettingsRoleVisibility } from './settings/settings-tabs.js';
 import { restoreEncoderOptions, getEncoderOptions } from './settings/encoder-form.js';
 
 import { AutoScanPanel }                                  from './settings/panels/auto-scan-panel.js';
@@ -52,6 +52,7 @@ import { initNotificationsPanel, loadNotificationsPanel } from './settings/panel
 import { initAuthPanel,          loadAuthPanel }          from './settings/panels/auth-panel.js';
 import { initExclusionPanel,     loadExclusionPanel }     from './settings/panels/exclusion-panel.js';
 import { initAdvancedPanel,      loadAdvancedPanel }      from './settings/panels/advanced-panel.js';
+import { initNodeSyncPanel,      loadNodeSyncPanel }      from './settings/panels/node-sync-panel.js';
 
 
 // ---------------------------------------------------------------------------
@@ -86,13 +87,13 @@ document.addEventListener('DOMContentLoaded', () => {
     const logViewer    = new LogViewer();
     const pauseControl = new PauseControl();
 
-    // AutoScanPanel and NodeOverrideDialog form a small cycle — the override
+    // AutoScanPanel and OverrideDialog form a small cycle — the override
     // dialog reads the panel's last-loaded config and calls back on save,
     // while the panel opens the dialog for per-folder overrides. We break
     // the cycle with an indirection box that the dialog reads lazily.
     const autoScanPanelRef = {};
 
-    const nodeOverride = new NodeOverrideDialog({
+    const nodeOverride = new OverrideDialog({
         getLastAutoScanConfig: () => autoScanPanelRef.current?._lastConfig ?? null,
         onFolderSaved:         () => autoScanPanelRef.current?.reload(),
     });
@@ -102,8 +103,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const clusterDashboard = new ClusterDashboard({
         nodeOverrideDialog:   nodeOverride,
-        onClusterModeChanged: (enabled, role) => queueManager.setClusterMode(enabled, role),
+        onClusterModeChanged: (enabled, role) => {
+            queueManager.setClusterMode(enabled, role);
+            applySettingsRoleVisibility(role);
+        },
     });
+    // Expose the dashboard so other scripts (e.g. Node Sync tab) can read the
+    // current role without round-tripping through the config API.
+    if (typeof window !== 'undefined') window.clusterDashboard = clusterDashboard;
     const clusterSettings = new ClusterSettingsForm({ dashboard: clusterDashboard });
 
     const stopCancelDialog = new StopCancelDialog(
@@ -130,6 +137,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initAuthPanel();
     initExclusionPanel();
     initAdvancedPanel();
+    initNodeSyncPanel();
 
 
     // 4. Initial data loads.
@@ -157,6 +165,7 @@ document.addEventListener('DOMContentLoaded', () => {
             loadAuthPanel();
             loadExclusionPanel();
             loadAdvancedPanel();
+            loadNodeSyncPanel();
         }
     });
 

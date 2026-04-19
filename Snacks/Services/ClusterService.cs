@@ -108,7 +108,8 @@ public sealed class ClusterService : IHostedService, IDisposable
         IHubContext<TranscodingHub> hubContext,
         IHttpClientFactory httpClientFactory,
         MediaFileRepository mediaFileRepo,
-        StateTransitionService stateTransitions)
+        StateTransitionService stateTransitions,
+        IntegrationService integrationService)
     {
         _transcodingService = transcodingService;
         _ffprobeService     = ffprobeService;
@@ -131,7 +132,7 @@ public sealed class ClusterService : IHostedService, IDisposable
         _fileTransfer = new ClusterFileTransferService(hubContext, httpClientFactory);
 
         _nodeJobs = new ClusterNodeJobService(
-            transcodingService, hubContext, httpClientFactory, _discovery, _nodes);
+            transcodingService, hubContext, httpClientFactory, _discovery, _nodes, integrationService);
     }
 
     /******************************************************************
@@ -428,6 +429,20 @@ public sealed class ClusterService : IHostedService, IDisposable
 
     /// <summary> Deletes all remote job temp directories unconditionally. </summary>
     public void CleanupAllRemoteJobs() => _nodeJobs.CleanupAllRemoteJobs();
+
+    /// <summary>
+    ///     Triggers an on-demand pull of the master's integration credentials into this
+    ///     worker's local <c>integrations.json</c>. Surfaces the same code path the
+    ///     pre-encode hook uses.
+    /// </summary>
+    public Task PullIntegrationsFromMasterAsync(CancellationToken ct) =>
+        _nodeJobs.PullIntegrationsFromMasterAsync(ct);
+
+    /// <summary> UTC timestamp of this worker's last successful integration pull, or <c>null</c>. </summary>
+    public DateTime? LastIntegrationSyncAt => _nodeJobs.LastIntegrationSyncAt;
+
+    /// <summary> Human-readable status of this worker's last integration pull attempt. </summary>
+    public string LastIntegrationSyncStatus => _nodeJobs.LastIntegrationSyncStatus;
 
     /******************************************************************
      *  Delegated Discovery API

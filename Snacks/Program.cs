@@ -123,6 +123,7 @@ builder.Services.AddSingleton<StateTransitionService>();
 builder.Services.AddSingleton<ClusterService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<ClusterService>());
 builder.Services.AddScoped<ClusterAuthFilter>();
+builder.Services.AddScoped<LocalNetworkOnlyFilter>();
 builder.Services.AddSingleton<AutoScanService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<AutoScanService>());
 

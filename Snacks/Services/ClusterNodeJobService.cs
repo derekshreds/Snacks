@@ -26,6 +26,7 @@ public sealed class ClusterNodeJobService
     private readonly IHttpClientFactory                        _httpClientFactory;
     private readonly ClusterDiscoveryService                   _discoveryService;
     private readonly ConcurrentDictionary<string, ClusterNode> _nodes;
+    private readonly IntegrationService                        _integrationService;
 
     private readonly JsonSerializerOptions _jsonOptions = new()
     {
@@ -83,13 +84,15 @@ public sealed class ClusterNodeJobService
         IHubContext<TranscodingHub>                hubContext,
         IHttpClientFactory                        httpClientFactory,
         ClusterDiscoveryService                   discoveryService,
-        ConcurrentDictionary<string, ClusterNode> nodes)
+        ConcurrentDictionary<string, ClusterNode> nodes,
+        IntegrationService                        integrationService)
     {
         _transcodingService = transcodingService;
-        _hubContext          = hubContext;
-        _httpClientFactory   = httpClientFactory;
-        _discoveryService    = discoveryService;
-        _nodes               = nodes;
+        _hubContext         = hubContext;
+        _httpClientFactory  = httpClientFactory;
+        _discoveryService   = discoveryService;
+        _nodes              = nodes;
+        _integrationService = integrationService;
 
         var workDir = Environment.GetEnvironmentVariable("SNACKS_WORK_DIR")
             ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Snacks", "work");
@@ -347,6 +350,11 @@ public sealed class ClusterNodeJobService
             options.OutputDirectory     = null;
             options.EncodeDirectory     = tempDir;
             options.DeleteOriginalFile  = false;
+
+            // Pull the master's integration credentials before every encode so
+            // KeepOriginalLanguage lookups and OCR on this worker use the master's
+            // Sonarr / Radarr / TVDB / TMDb config, not whatever is cached locally.
+            await PullIntegrationsFromMasterAsync(_remoteJobCts?.Token ?? CancellationToken.None);
 
             // Hook into log reporting to master — buffer and send every 2 seconds
             var logBuffer   = new ConcurrentQueue<string>();
@@ -869,4 +877,64 @@ public sealed class ClusterNodeJobService
         return client;
     }
 
+    /// <summary> UTC timestamp of the last successful integration pull, or <c>null</c> if never synced. </summary>
+    public DateTime? LastIntegrationSyncAt { get; private set; }
+
+    /// <summary> Human-readable status of the last pull attempt. </summary>
+    public string LastIntegrationSyncStatus { get; private set; } = "Never";
+
+    /// <summary>
+    ///     Pulls the master's current integration config and writes it to the local
+    ///     <c>integrations.json</c> so original-language lookups and OCR on this worker
+    ///     use the master's credentials instead of whatever is cached locally. Called
+    ///     immediately before every remote encode, and exposed publicly so the UI can
+    ///     trigger an on-demand refresh.
+    ///
+    ///     <para>On any failure (master unreachable, 403, parse error) the existing
+    ///     local config is preserved and the encode continues — a transient pull
+    ///     failure must never abort a queued job.</para>
+    /// </summary>
+    public async Task PullIntegrationsFromMasterAsync(CancellationToken ct)
+    {
+        var masterUrl = ResolveMasterUrl();
+        if (string.IsNullOrEmpty(masterUrl))
+        {
+            LastIntegrationSyncStatus = "Master URL unresolved";
+            return;
+        }
+
+        try
+        {
+            var client     = CreateAuthenticatedClient();
+            client.Timeout = TimeSpan.FromSeconds(10);
+
+            using var resp = await client.GetAsync($"{masterUrl}/api/cluster/integrations", ct);
+            if (!resp.IsSuccessStatusCode)
+            {
+                LastIntegrationSyncStatus = $"Failed: HTTP {(int)resp.StatusCode}";
+                Console.WriteLine($"Cluster: Integration pull failed (HTTP {(int)resp.StatusCode}); using cached config.");
+                return;
+            }
+
+            var json = await resp.Content.ReadAsStringAsync(ct);
+            var pulled = JsonSerializer.Deserialize<IntegrationConfig>(json, _jsonOptions);
+            if (pulled == null)
+            {
+                LastIntegrationSyncStatus = "Failed: empty payload";
+                Console.WriteLine("Cluster: Integration pull returned empty payload; using cached config.");
+                return;
+            }
+
+            _integrationService.SaveConfig(pulled);
+            LastIntegrationSyncAt     = DateTime.UtcNow;
+            LastIntegrationSyncStatus = "OK";
+            Console.WriteLine("Cluster: Integration config synced from master.");
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            LastIntegrationSyncStatus = $"Failed: {ex.Message}";
+            Console.WriteLine($"Cluster: Integration pull error ({ex.Message}); using cached config.");
+        }
+    }
 }

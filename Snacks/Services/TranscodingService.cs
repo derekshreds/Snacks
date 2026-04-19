@@ -1183,22 +1183,25 @@ public class TranscodingService
         /// </summary>
         private static bool WillDownscaleBelow4K(EncoderOptions options)
         {
-            var policy = options.DownscalePolicy;
-            if (!string.Equals(policy, "Always",   StringComparison.OrdinalIgnoreCase)
-             && !string.Equals(policy, "IfLarger", StringComparison.OrdinalIgnoreCase))
-                return false;
-
-            int targetH = options.DownscaleTarget switch
-            {
-                "2160p" => 2160,
-                "1440p" => 1440,
-                "1080p" => 1080,
-                "720p"  => 720,
-                "480p"  => 480,
-                _       => 1080,
-            };
-            return targetH <= 1440;
+            if (!IsDownscalePolicyActive(options.DownscalePolicy)) return false;
+            return ResolveDownscaleHeight(options.DownscaleTarget) <= 1440;
         }
+
+        private static bool IsDownscalePolicyActive(string policy) =>
+            string.Equals(policy, "Always",      StringComparison.OrdinalIgnoreCase)
+         || string.Equals(policy, "CapAtTarget", StringComparison.OrdinalIgnoreCase)
+         || string.Equals(policy, "IfLarger",    StringComparison.OrdinalIgnoreCase);
+
+        private static int ResolveDownscaleHeight(string target) => target switch
+        {
+            "4K"    => 2160,
+            "2160p" => 2160,
+            "1440p" => 1440,
+            "1080p" => 1080,
+            "720p"  => 720,
+            "480p"  => 480,
+            _       => 1080,
+        };
 
         /// <summary>
         ///     Resolves the downscale target height for an active policy, or <c>null</c>
@@ -1209,24 +1212,18 @@ public class TranscodingService
         private static string? ComputeScaleExpr(WorkItem workItem, EncoderOptions options)
         {
             var policy = options.DownscalePolicy;
-            bool always    = string.Equals(policy, "Always",   StringComparison.OrdinalIgnoreCase);
-            bool ifLarger  = string.Equals(policy, "IfLarger", StringComparison.OrdinalIgnoreCase);
-            if (!always && !ifLarger) return null;
+            if (!IsDownscalePolicyActive(policy)) return null;
 
-            int targetH = options.DownscaleTarget switch
-            {
-                "2160p" => 2160,
-                "1440p" => 1440,
-                "1080p" => 1080,
-                "720p"  => 720,
-                "480p"  => 480,
-                _       => 1080,
-            };
+            int targetH = ResolveDownscaleHeight(options.DownscaleTarget);
 
             var v = workItem.Probe?.Streams?.FirstOrDefault(s => s.CodecType == "video");
             int sourceH = v?.Height ?? 0;
             if (sourceH <= 0) return null;
-            if (ifLarger && sourceH <= targetH) return null;
+
+            // "Always" downscales unconditionally; "CapAtTarget"/"IfLarger" only downscale
+            // when the source is actually larger than the target.
+            bool always = string.Equals(policy, "Always", StringComparison.OrdinalIgnoreCase);
+            if (!always && sourceH <= targetH) return null;
 
             // -2 preserves aspect ratio and rounds to an even width (required by most encoders).
             return $"scale=w=-2:h={targetH}:flags=lanczos";

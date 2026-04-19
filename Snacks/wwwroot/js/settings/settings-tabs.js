@@ -85,3 +85,35 @@ export function initSettingsTabs() {
     requestAnimationFrame(update);
     setTimeout(update, 100);
 }
+
+/**
+ * Shows or hides tab items and content panes based on the current cluster
+ * role. Each element with a `data-role-visible="master standalone"` attribute
+ * lists the roles for which it should render. Applied whenever the role
+ * changes (cluster settings saved, initial page load, etc.).
+ *
+ * When the currently-active tab becomes hidden for the new role, activates
+ * the first visible tab instead so the user isn't left staring at an empty
+ * pane.
+ *
+ * @param {'master'|'node'|'standalone'} role
+ */
+export function applySettingsRoleVisibility(role) {
+    const effective = role || 'standalone';
+    document.querySelectorAll('[data-role-visible]').forEach(el => {
+        const allowed = (el.dataset.roleVisible || '').split(/\s+/).filter(Boolean);
+        el.style.display = allowed.includes(effective) ? '' : 'none';
+    });
+
+    // If the currently-active tab is no longer visible, switch to the first
+    // visible sibling so the settings modal always shows something.
+    const nav = document.querySelector('.settings-tabs');
+    if (!nav) return;
+
+    const activeBtn = nav.querySelector('.nav-link.active');
+    const activeLi  = activeBtn?.closest('.nav-item');
+    if (activeLi && activeLi.style.display === 'none') {
+        const firstVisible = nav.querySelector('.nav-item:not([style*="display: none"]) .nav-link');
+        firstVisible?.click();
+    }
+}

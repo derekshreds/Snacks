@@ -1,10 +1,18 @@
 /**
- * Unified encoding-override dialog used for both per-node and per-folder overrides.
+ * Encoding-override dialog shared between per-folder and per-node flows.
  *
- * The two invocations share a single DOM (ids prefixed with `ovr`) so a
- * single form drives both flows. The open call provides context-specific
- * title, save handler, reset handler, and an optional 4K node-dispatch
- * rules block (only visible for node-level opens).
+ * The two contexts share a single DOM (ids prefixed with `ovr`) but drive
+ * it from two different field lists:
+ *
+ *   - FOLDER_OVERRIDE_FIELDS: every field that takes effect when the
+ *     override is baked into a dispatched job (master-local or worker).
+ *   - NODE_OVERRIDE_FIELDS: strict subset — drops fields workers clobber
+ *     (OutputDirectory, EncodeDirectory, DeleteOriginalFile) and master-
+ *     scanner-only fields (Skip4K, SkipPercentAboveTarget).
+ *
+ * Fields with `data-context` attributes in Index.cshtml are hidden when
+ * the current context doesn't list them, so the user only sees knobs that
+ * will actually take effect.
  */
 
 import { clusterApi, autoScanApi }    from '../api.js';
@@ -19,21 +27,76 @@ import { openModal, closeModal }      from '../utils/modal-controller.js';
 const MODAL_ID = 'overrideDialog';
 
 /**
- * Override form fields and their input types (matches the DOM ids in
- * Index.cshtml — each field `Foo` is a toggle `#ovr_Foo` plus a value input
- * `#ovrFoo`).
+ * Folder-context fields. Mirrors what the main settings tabs expose, minus
+ * HardwareAcceleration (each node auto-detects its own hardware).
  */
-const OVERRIDE_FIELDS = Object.freeze({
-    Format:                 'select',
-    Codec:                  'select',
-    HardwareAcceleration:   'select',
-    TargetBitrate:          'number',
-    FourKBitrateMultiplier: 'select',
-    Skip4K:                 'bool',
-    StrictBitrate:          'bool',
-    TwoChannelAudio:        'bool',
-    DeleteOriginalFile:     'bool',
-    SkipPercentAboveTarget: 'number',
+const FOLDER_OVERRIDE_FIELDS = Object.freeze({
+    // General
+    Format:                     'select',
+    Codec:                      'select',
+    TargetBitrate:              'number',
+    StrictBitrate:              'bool',
+    FourKBitrateMultiplier:     'select',
+    Skip4K:                     'bool',
+    SkipPercentAboveTarget:     'number',
+    DeleteOriginalFile:         'bool',
+    RetryOnFail:                'bool',
+
+    // Video pipeline
+    DownscalePolicy:            'select',
+    DownscaleTarget:            'select',
+    FfmpegQualityPreset:        'select',
+    TonemapHdrToSdr:            'bool',
+    RemoveBlackBorders:         'bool',
+
+    // Audio
+    AudioCodec:                 'select',
+    AudioBitrateKbps:           'number',
+    TwoChannelAudio:            'bool',
+    AudioOnlyMode:              'bool',
+    KeepOriginalLanguage:       'bool',
+    OriginalLanguageProvider:   'select',
+
+    // Subtitles
+    ExtractSubtitlesToSidecar:  'bool',
+    SidecarSubtitleFormat:      'select',
+    ConvertImageSubtitlesToSrt: 'bool',
+});
+
+/**
+ * Node-context fields. Drops everything a worker overwrites on receipt
+ * (OutputDirectory, EncodeDirectory, DeleteOriginalFile — handled at
+ * ClusterNodeJobService.cs:347-349) and everything the master-side scanner
+ * alone consults (Skip4K, SkipPercentAboveTarget).
+ */
+const NODE_OVERRIDE_FIELDS = Object.freeze({
+    // General
+    Format:                     'select',
+    Codec:                      'select',
+    TargetBitrate:              'number',
+    StrictBitrate:              'bool',
+    FourKBitrateMultiplier:     'select',
+    RetryOnFail:                'bool',
+
+    // Video pipeline
+    DownscalePolicy:            'select',
+    DownscaleTarget:            'select',
+    FfmpegQualityPreset:        'select',
+    TonemapHdrToSdr:            'bool',
+    RemoveBlackBorders:         'bool',
+
+    // Audio
+    AudioCodec:                 'select',
+    AudioBitrateKbps:           'number',
+    TwoChannelAudio:            'bool',
+    AudioOnlyMode:              'bool',
+    KeepOriginalLanguage:       'bool',
+    OriginalLanguageProvider:   'select',
+
+    // Subtitles
+    ExtractSubtitlesToSidecar:  'bool',
+    SidecarSubtitleFormat:      'select',
+    ConvertImageSubtitlesToSrt: 'bool',
 });
 
 /** Default values restored when a numeric override is toggled off. */
@@ -41,14 +104,15 @@ const NUMBER_DEFAULTS = Object.freeze({
     TargetBitrate:          '3500',
     FourKBitrateMultiplier: '4',
     SkipPercentAboveTarget: '20',
+    AudioBitrateKbps:       '192',
 });
 
 
 // ---------------------------------------------------------------------------
-// NodeOverrideDialog
+// OverrideDialog
 // ---------------------------------------------------------------------------
 
-export class NodeOverrideDialog {
+export class OverrideDialog {
 
     /**
      * @param {object} deps
@@ -62,6 +126,7 @@ export class NodeOverrideDialog {
     constructor({ getLastAutoScanConfig, onFolderSaved }) {
         this._getLastAutoScan = getLastAutoScanConfig;
         this._onFolderSaved   = onFolderSaved ?? (() => {});
+        this._activeFields    = FOLDER_OVERRIDE_FIELDS;   // set per-open
     }
 
     /** Closes the dialog if it is currently open. */
@@ -79,6 +144,8 @@ export class NodeOverrideDialog {
      * @param {string} hostname Displayed in the title.
      */
     async openNode(nodeId, hostname) {
+        this._activeFields = NODE_OVERRIDE_FIELDS;
+        this._applyContextVisibility('node');
         this._resetForm();
 
         document.getElementById('nodeOnly4K').checked    = false;
@@ -166,6 +233,8 @@ export class NodeOverrideDialog {
      * @param {string} path
      */
     openFolder(path) {
+        this._activeFields = FOLDER_OVERRIDE_FIELDS;
+        this._applyContextVisibility('folder');
         this._resetForm();
 
         const config = this._getLastAutoScan?.();
@@ -231,6 +300,21 @@ export class NodeOverrideDialog {
     // ---- Shared form plumbing ----
 
     /**
+     * Toggles visibility of each field wrapper based on its `data-context`
+     * attribute. Wrappers marked for a context different from the active
+     * one are hidden so the user only sees knobs that will actually take
+     * effect.
+     *
+     * @param {'folder'|'node'} context
+     */
+    _applyContextVisibility(context) {
+        document.querySelectorAll('#overrideFields [data-context]').forEach(el => {
+            const contexts = (el.dataset.context || '').split(',').map(s => s.trim());
+            el.style.display = contexts.includes(context) ? '' : 'none';
+        });
+    }
+
+    /**
      * Mutates the modal chrome and opens it. Called by both `openNode` and
      * `openFolder` after they populate the form.
      *
@@ -260,14 +344,14 @@ export class NodeOverrideDialog {
 
     /**
      * Wires each field's toggle so unchecking it disables (and blanks) the
-     * corresponding value input.
+     * corresponding value input. Only wires fields in the active context.
      */
     _initToggles() {
-        document.querySelectorAll('#overrideFields .override-toggle').forEach(toggle => {
+        for (const [field, type] of Object.entries(this._activeFields)) {
+            const toggle = document.getElementById(`ovr_${field}`);
+            if (!toggle) continue;
             toggle.onchange = () => {
-                const field = toggle.dataset.field;
-                const type  = OVERRIDE_FIELDS[field];
-                const el    = document.getElementById(`ovr${field}`);
+                const el = document.getElementById(`ovr${field}`);
                 if (!el) return;
 
                 el.disabled = !toggle.checked;
@@ -278,14 +362,14 @@ export class NodeOverrideDialog {
                     else                        el.selectedIndex = 0;
                 }
             };
-        });
+        }
     }
 
     /**
      * Clears every field in the override form back to its default, disabled state.
      */
     _resetForm() {
-        for (const [field, type] of Object.entries(OVERRIDE_FIELDS)) {
+        for (const [field, type] of Object.entries(this._activeFields)) {
             const toggle = document.getElementById(`ovr_${field}`);
             if (toggle) toggle.checked = false;
 
@@ -306,7 +390,7 @@ export class NodeOverrideDialog {
      * @param {object} overrides
      */
     _populateForm(overrides) {
-        for (const [field, type] of Object.entries(OVERRIDE_FIELDS)) {
+        for (const [field, type] of Object.entries(this._activeFields)) {
             const key = field.charAt(0).toLowerCase() + field.slice(1);
             const val = overrides[key];
             if (val === null || val === undefined) continue;
@@ -333,7 +417,7 @@ export class NodeOverrideDialog {
     _readForm() {
         const result = {};
 
-        for (const [field, type] of Object.entries(OVERRIDE_FIELDS)) {
+        for (const [field, type] of Object.entries(this._activeFields)) {
             const key    = field.charAt(0).toLowerCase() + field.slice(1);
             const toggle = document.getElementById(`ovr_${field}`);
 
