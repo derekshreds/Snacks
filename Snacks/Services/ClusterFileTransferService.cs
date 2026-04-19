@@ -94,7 +94,7 @@ public sealed class ClusterFileTransferService
             signal.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
             var request = new HttpRequestMessage(HttpMethod.Put, $"{baseUrl}/api/cluster/files/{workItem.Id}");
             request.Content = signal;
-            request.Headers.Add("X-Original-FileName", workItem.FileName);
+            request.Headers.Add("X-Original-FileName", Uri.EscapeDataString(workItem.FileName ?? ""));
             request.Headers.Add("X-Total-Size",        totalSize.ToString());
             request.Headers.Add("X-Bitrate",           workItem.Bitrate.ToString());
             request.Headers.Add("X-Duration",          workItem.Length.ToString());
@@ -154,7 +154,7 @@ public sealed class ClusterFileTransferService
                     var request = new HttpRequestMessage(
                         HttpMethod.Put, $"{baseUrl}/api/cluster/files/{workItem.Id}");
                     request.Content = chunkContent;
-                    request.Headers.Add("X-Original-FileName", workItem.FileName);
+                    request.Headers.Add("X-Original-FileName", Uri.EscapeDataString(workItem.FileName ?? ""));
                     request.Headers.Add("X-Total-Size",        totalSize.ToString());
                     request.Headers.Add("X-Bitrate",           workItem.Bitrate.ToString());
                     request.Headers.Add("X-Duration",          workItem.Length.ToString());
@@ -253,12 +253,7 @@ public sealed class ClusterFileTransferService
             }
         }
 
-        var secret = client.DefaultRequestHeaders.TryGetValues("X-Snacks-Secret", out var secretValues)
-            ? secretValues.FirstOrDefault() ?? ""
-            : "";
-        var finalSize = await GetNodeReceivedBytesAsync(
-            CreateAuthenticatedClient(secret),
-            baseUrl, workItem.Id);
+        var finalSize = await GetNodeReceivedBytesAsync(client, baseUrl, workItem.Id);
 
         if (finalSize != totalSize)
             throw new Exception(
@@ -460,7 +455,7 @@ public sealed class ClusterFileTransferService
     {
         var client = _httpClientFactory.CreateClient();
         client.Timeout = TimeSpan.FromMinutes(30);
-        client.DefaultRequestHeaders.Add("X-Snacks-Secret", sharedSecret);
+        client.DefaultRequestHeaders.Add("X-Snacks-Secret", ClusterAuthFilter.EncodeSecretForHeader(sharedSecret));
         return client;
     }
 }
