@@ -13,6 +13,16 @@
       <IncludeAssets>runtime; build; buildtransitive; contentfiles; analyzers</IncludeAssets>
     </PackageReference>
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+    <PackageReference Include="TesseractOCR" Version="5.3.5" />
+    <PackageReference Include="SkiaSharp" Version="2.88.8" />
+    <PackageReference Include="SkiaSharp.NativeAssets.Linux" Version="2.88.8" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Bundled Tesseract language data. Any file placed under tools/tessdata ships
+         next to the DLL at runtime and is picked up by TessdataResolver before any
+         on-demand download. Apache 2.0 licensed (tessdata_fast upstream). -->
+    <None Include="tools\tessdata\*.traineddata" CopyToOutputDirectory="PreserveNewest" Link="tessdata\%(Filename)%(Extension)" />
   </ItemGroup>
 
 </Project>

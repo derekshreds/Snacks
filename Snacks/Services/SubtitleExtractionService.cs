@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using Snacks.Services.Ocr;
 
 namespace Snacks.Services;
 
@@ -7,7 +8,7 @@ namespace Snacks.Services;
 ///     passes the language keep-list, writes a sidecar file alongside the planned
 ///     main output (<c>{basename}.{lang}[.{n}].{srt|ass}</c>). Text streams are
 ///     transcoded by FFmpeg directly; bitmap streams are handed off to
-///     <see cref="SubtitleEditService"/> for OCR.
+///     <see cref="NativeOcrService"/> for OCR.
 /// </summary>
 /// <remarks>
 ///     The caller is expected to strip all subtitle streams from the main encode
@@ -16,17 +17,17 @@ namespace Snacks.Services;
 /// </remarks>
 public sealed class SubtitleExtractionService
 {
-    private readonly FfprobeService       _ffprobeService;
-    private readonly SubtitleEditService  _subtitleEditService;
-    private readonly string               _ffmpegPath;
+    private readonly FfprobeService    _ffprobeService;
+    private readonly NativeOcrService  _ocr;
+    private readonly string            _ffmpegPath;
 
-    public SubtitleExtractionService(FfprobeService ffprobeService, SubtitleEditService subtitleEditService)
+    public SubtitleExtractionService(FfprobeService ffprobeService, NativeOcrService ocr)
     {
         ArgumentNullException.ThrowIfNull(ffprobeService);
-        ArgumentNullException.ThrowIfNull(subtitleEditService);
-        _ffprobeService      = ffprobeService;
-        _subtitleEditService = subtitleEditService;
-        _ffmpegPath          = Environment.GetEnvironmentVariable("FFMPEG_PATH") ?? "ffmpeg";
+        ArgumentNullException.ThrowIfNull(ocr);
+        _ffprobeService = ffprobeService;
+        _ocr            = ocr;
+        _ffmpegPath     = Environment.GetEnvironmentVariable("FFMPEG_PATH") ?? "ffmpeg";
     }
 
     /// <summary>
@@ -79,7 +80,7 @@ public sealed class SubtitleExtractionService
             {
                 if (spec.IsBitmap)
                 {
-                    var produced = await _subtitleEditService.ConvertBitmapToSrtAsync(
+                    var produced = await _ocr.ConvertBitmapToSrtAsync(
                         inputPath, spec.StreamIndex, spec.Lang, spec.CodecName, outPath, log, ct);
                     if (!string.IsNullOrEmpty(produced))
                         written.Add(produced);

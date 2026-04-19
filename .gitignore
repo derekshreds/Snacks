@@ -366,6 +366,9 @@ FodyWeavers.xsd
 settings.ini
 *.config.user
 
+# Trained datasets for tesseract
+*.traineddata
+
 # FFmpeg binaries and related files (if included in project)
 ffmpeg.exe
 ffprobe.exe
