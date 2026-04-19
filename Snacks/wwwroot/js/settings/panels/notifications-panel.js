@@ -18,7 +18,11 @@ import { escapeHtml }       from '../../utils/dom.js';
 /**
  * Current list of notification destinations.
  *
- * @type {Array<{ name?: string, type?: string, url: string, enabled?: boolean }>}
+ * `hasSecret` is an indicator returned by GET; `secret` is only populated
+ * when the user types a new value in the row-level input. On save, an empty
+ * `secret` with `hasSecret: true` preserves the stored value server-side.
+ *
+ * @type {Array<{ name?: string, type?: string, url: string, enabled?: boolean, hasSecret?: boolean, secret?: string }>}
  */
 let destinations = [];
 
@@ -44,6 +48,8 @@ function render() {
     destinations.forEach((d, idx) => {
         const row = document.createElement('div');
         row.className = 'notification-dest-row';
+        const isWebhook = (d.type || 'webhook') === 'webhook';
+        const secretPlaceholder = d.hasSecret ? '(secret set — leave blank to keep)' : 'Secret (optional)';
         row.innerHTML = `
             <span class="badge bg-secondary">${escapeHtml(d.type || 'webhook')}</span>
             <div class="form-check form-switch m-0">
@@ -51,6 +57,7 @@ function render() {
             </div>
             <strong class="small">${escapeHtml(d.name || '')}</strong>
             <span class="dest-url text-muted">${escapeHtml(d.url)}</span>
+            ${isWebhook ? `<input class="form-control form-control-sm dest-secret" type="password" placeholder="${escapeHtml(secretPlaceholder)}" data-secret="${idx}" autocomplete="new-password">` : ''}
             <button class="btn btn-sm btn-outline-primary" data-test-dest="${idx}" title="Send test"><i class="fas fa-vial"></i></button>
             <button class="btn btn-sm btn-outline-danger"  data-remove-dest="${idx}" title="Remove"><i class="fas fa-trash"></i></button>`;
         container.appendChild(row);
@@ -60,6 +67,11 @@ function render() {
     container.querySelectorAll('[data-toggle-dest]').forEach(el =>
         el.addEventListener('change', (e) => {
             destinations[+e.target.dataset.idx].enabled = e.target.checked;
+        }));
+
+    container.querySelectorAll('[data-secret]').forEach(el =>
+        el.addEventListener('input', (e) => {
+            destinations[+e.target.dataset.secret].secret = e.target.value;
         }));
 
     container.querySelectorAll('[data-remove-dest]').forEach(el =>
@@ -100,6 +112,7 @@ async function load() {
         set('notifEventEncodeFailed',    ev.encodeFailed    ?? true);
         set('notifEventScanCompleted',   ev.scanCompleted);
         set('notifEventNodeOffline',     ev.nodeOffline     ?? true);
+        set('notifEventNodeOnline',      ev.nodeOnline      ?? true);
 
         render();
     } catch { /* auth-gated */ }
@@ -119,6 +132,7 @@ async function save() {
             encodeFailed:    chk('notifEventEncodeFailed'),
             scanCompleted:   chk('notifEventScanCompleted'),
             nodeOffline:     chk('notifEventNodeOffline'),
+            nodeOnline:      chk('notifEventNodeOnline'),
         },
     };
 
@@ -155,19 +169,22 @@ async function testDestination(dest) {
  * Appends a new destination from the "add new" form to the in-memory list.
  */
 function addDestination() {
-    const name = document.getElementById('newNotifName').value.trim();
-    const type = document.getElementById('newNotifType').value;
-    const url  = document.getElementById('newNotifUrl').value.trim();
+    const name   = document.getElementById('newNotifName').value.trim();
+    const type   = document.getElementById('newNotifType').value;
+    const url    = document.getElementById('newNotifUrl').value.trim();
+    const secret = document.getElementById('newNotifSecret')?.value ?? '';
 
     if (!url) {
         showToast('URL required', 'warning');
         return;
     }
 
-    destinations.push({ name, type, url, enabled: true });
+    destinations.push({ name, type, url, enabled: true, secret, hasSecret: !!secret });
 
     document.getElementById('newNotifName').value = '';
     document.getElementById('newNotifUrl').value  = '';
+    const secretEl = document.getElementById('newNotifSecret');
+    if (secretEl) secretEl.value = '';
 
     render();
 }

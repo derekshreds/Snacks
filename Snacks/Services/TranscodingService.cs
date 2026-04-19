@@ -111,6 +111,18 @@ public class TranscodingService
         private readonly NotificationService?        _notificationService;
         private readonly IntegrationService?         _integrationService;
         private readonly SubtitleExtractionService?  _subtitleExtractionService;
+        private Func<bool>?                          _externalDispatchGate;
+
+        /// <summary>
+        ///     Installs a predicate that returns <c>true</c> when this instance
+        ///     should originate external-facing side effects (webhooks, library rescans).
+        ///     Wired by <see cref="ClusterService"/> during its own construction to
+        ///     avoid the TranscodingService ↔ ClusterService DI cycle. When unset
+        ///     (standalone / tests), external dispatch defaults to enabled.
+        /// </summary>
+        public void SetExternalDispatchGate(Func<bool> gate) => _externalDispatchGate = gate;
+
+        private bool ShouldDispatchExternal => _externalDispatchGate?.Invoke() ?? true;
 
         /// <summary>
         ///     Initializes the service and eagerly starts hardware acceleration detection in the
@@ -743,6 +755,9 @@ public class TranscodingService
                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
                 await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Processing);
 
+                if (_notificationService != null && ShouldDispatchExternal)
+                    _ = _notificationService.NotifyEncodeStartedAsync(Path.GetFileName(workItem.Path));
+
                 // Lazy probe: items restored from DB on startup don't have probe data yet
                 if (workItem.Probe == null)
                 {
@@ -759,10 +774,13 @@ public class TranscodingService
                 Interlocked.Increment(ref _localCompletedJobs);
                 await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Completed);
 
-                if (_notificationService != null)
-                    _ = _notificationService.NotifyEncodeCompletedAsync(Path.GetFileName(workItem.Path), workItem.Size);
-                if (_integrationService != null)
-                    _ = _integrationService.TriggerRescansAsync(workItem.Path);
+                if (ShouldDispatchExternal)
+                {
+                    if (_notificationService != null)
+                        _ = _notificationService.NotifyEncodeCompletedAsync(Path.GetFileName(workItem.Path), workItem.Size);
+                    if (_integrationService != null)
+                        _ = _integrationService.TriggerRescansAsync(workItem.Path);
+                }
             }
             catch (OperationCanceledException)
             {
@@ -778,7 +796,7 @@ public class TranscodingService
                 workItem.CompletedAt = DateTime.UtcNow;
                 await _mediaFileRepo.IncrementFailureCountAsync(Path.GetFullPath(workItem.Path), ex.Message);
 
-                if (_notificationService != null)
+                if (_notificationService != null && ShouldDispatchExternal)
                     _ = _notificationService.NotifyEncodeFailedAsync(Path.GetFileName(workItem.Path), ex.Message);
             }
             finally
@@ -2645,6 +2663,14 @@ public class TranscodingService
             }
 
             await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
+
+            if (ShouldDispatchExternal)
+            {
+                if (_notificationService != null)
+                    _ = _notificationService.NotifyEncodeCompletedAsync(Path.GetFileName(workItem.Path), new FileInfo(workItem.Path).Length);
+                if (_integrationService != null && savings > 0)
+                    _ = _integrationService.TriggerRescansAsync(workItem.Path);
+            }
         }
 
         /// <summary>
@@ -2662,6 +2688,9 @@ public class TranscodingService
                 workItem.CompletedAt = DateTime.UtcNow;
                 await _mediaFileRepo.IncrementFailureCountAsync(Path.GetFullPath(workItem.Path), errorMessage);
                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
+
+                if (_notificationService != null && ShouldDispatchExternal)
+                    _ = _notificationService.NotifyEncodeFailedAsync(Path.GetFileName(workItem.Path), errorMessage);
             }
         }
 

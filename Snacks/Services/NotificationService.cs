@@ -1,4 +1,5 @@
 using System.Net.Http.Headers;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Snacks.Models;
@@ -97,6 +98,15 @@ public sealed class NotificationService
             $"Node offline: {nodeName}",
             new { node = nodeName });
 
+    /// <summary> Dispatches a node-online notification when a previously-unreachable node recovers. </summary>
+    /// <param name="nodeName"> The name of the cluster node that came back online. </param>
+    public Task NotifyNodeOnlineAsync(string nodeName) =>
+        DispatchIfEnabledAsync(
+            c => c.NodeOnline,
+            "NodeOnline",
+            $"Node online: {nodeName}",
+            new { node = nodeName });
+
     /******************************************************************
      *  Internals
      ******************************************************************/
@@ -177,6 +187,16 @@ public sealed class NotificationService
                     {
                         Content = new StringContent(body, Encoding.UTF8, "application/json"),
                     };
+                    if (!string.IsNullOrEmpty(dest.Secret))
+                    {
+                        var unix = DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString();
+                        var signingInput = Encoding.UTF8.GetBytes($"{unix}.{body}");
+                        var secretBytes  = Encoding.UTF8.GetBytes(dest.Secret);
+                        using var hmac   = new HMACSHA256(secretBytes);
+                        var hex          = Convert.ToHexString(hmac.ComputeHash(signingInput)).ToLowerInvariant();
+                        request.Headers.TryAddWithoutValidation("X-Snacks-Timestamp", unix);
+                        request.Headers.TryAddWithoutValidation("X-Snacks-Signature", $"sha256={hex}");
+                    }
                     break;
             }
 

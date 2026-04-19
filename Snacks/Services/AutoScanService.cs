@@ -20,6 +20,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
     private readonly MediaFileRepository         _mediaFileRepo;
     private readonly IHubContext<TranscodingHub> _hubContext;
     private readonly ClusterService              _clusterService;
+    private readonly NotificationService         _notificationService;
     private readonly SemaphoreSlim               _scanLock = new(1, 1);
     private readonly string                      _configPath;
     private readonly string                      _settingsPath;
@@ -49,14 +50,16 @@ public sealed class AutoScanService : IHostedService, IDisposable
         TranscodingService transcodingService,
         MediaFileRepository mediaFileRepo,
         IHubContext<TranscodingHub> hubContext,
-        ClusterService clusterService)
+        ClusterService clusterService,
+        NotificationService notificationService)
     {
-        _fileService        = fileService;
-        _ffprobeService     = ffprobeService;
-        _transcodingService = transcodingService;
-        _mediaFileRepo      = mediaFileRepo;
-        _hubContext         = hubContext;
-        _clusterService     = clusterService;
+        _fileService         = fileService;
+        _ffprobeService      = ffprobeService;
+        _transcodingService  = transcodingService;
+        _mediaFileRepo       = mediaFileRepo;
+        _hubContext          = hubContext;
+        _clusterService      = clusterService;
+        _notificationService = notificationService;
 
         var configDir = Path.Combine(_fileService.GetWorkingDirectory(), "config");
         if (!Directory.Exists(configDir))
@@ -594,6 +597,9 @@ public sealed class AutoScanService : IHostedService, IDisposable
             SaveConfig();
 
             await _hubContext.Clients.All.SendAsync("AutoScanCompleted", newFileCount, allVideoFiles.Count);
+
+            // Auto-scan only runs on the master, so this is naturally master-only.
+            _ = _notificationService.NotifyScanCompletedAsync(newFileCount);
         }
         catch (OperationCanceledException)
         {

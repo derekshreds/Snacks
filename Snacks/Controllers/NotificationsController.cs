@@ -23,18 +23,58 @@ public sealed class NotificationsController : ControllerBase
      *  Notification Config
      ******************************************************************/
 
-    /// <summary> Returns the current notification configuration. </summary>
+    /// <summary>
+    ///     Returns the current notification configuration. Secrets are never echoed
+    ///     to the client; each destination carries a <c>hasSecret</c> boolean instead
+    ///     so the UI can render a "secret set" indicator without exposing the value.
+    /// </summary>
     [HttpGet("config")]
-    public IActionResult Get() => new JsonResult(_notifications.GetConfig());
+    public IActionResult Get()
+    {
+        var cfg = _notifications.GetConfig();
+        var safeDestinations = cfg.Destinations.Select(d => new
+        {
+            d.Url,
+            d.Name,
+            d.Type,
+            d.Enabled,
+            HasSecret = !string.IsNullOrEmpty(d.Secret)
+        });
+        return new JsonResult(new
+        {
+            Destinations = safeDestinations,
+            cfg.Events
+        });
+    }
 
-    /// <summary> Saves updated notification configuration and persists it to disk. </summary>
+    /// <summary>
+    ///     Saves updated notification configuration and persists it to disk. When an
+    ///     incoming destination omits <c>Secret</c> (null or empty) but a stored
+    ///     secret exists on the matching existing destination, the stored value is
+    ///     preserved — otherwise a simple round-trip through the UI would wipe it.
+    ///     Matching is by <c>Url</c> (case-insensitive), which is the only stable key.
+    /// </summary>
     /// <param name="config"> The new notification configuration to apply. </param>
     [HttpPost("config")]
     public IActionResult Save([FromBody] NotificationConfig config)
     {
         try
         {
-            _notifications.SaveConfig(config ?? new NotificationConfig());
+            var incoming = config ?? new NotificationConfig();
+            var existing = _notifications.GetConfig();
+
+            foreach (var dest in incoming.Destinations)
+            {
+                if (string.IsNullOrEmpty(dest.Secret))
+                {
+                    var match = existing.Destinations
+                        .FirstOrDefault(e => string.Equals(e.Url, dest.Url, StringComparison.OrdinalIgnoreCase));
+                    if (match != null && !string.IsNullOrEmpty(match.Secret))
+                        dest.Secret = match.Secret;
+                }
+            }
+
+            _notifications.SaveConfig(incoming);
             return new JsonResult(new { success = true });
         }
         catch (Exception ex)
@@ -67,6 +107,7 @@ public sealed class NotificationsController : ControllerBase
                     EncodeFailed    = true,
                     ScanCompleted   = true,
                     NodeOffline     = true,
+                    NodeOnline      = true,
                 }
             });
             await _notifications.NotifyEncodeCompletedAsync("(test notification)", null);

@@ -27,6 +27,14 @@ public sealed class NotificationDestination
 
     /// <summary> Whether this destination is active. Disabled destinations are skipped during dispatch. </summary>
     public bool Enabled { get; set; } = true;
+
+    /// <summary>
+    ///     Optional shared secret. When set, webhook POSTs are signed with
+    ///     HMAC-SHA256 over "{timestamp}.{body}" and the signature is sent as
+    ///     X-Snacks-Signature: sha256=&lt;hex&gt;. Null/empty disables signing
+    ///     (backwards-compatible). Ignored for ntfy/apprise destinations.
+    /// </summary>
+    public string? Secret { get; set; }
 }
 
 /// <summary> Per-event toggles controlling which encoding and cluster events trigger notifications. </summary>
@@ -46,4 +54,7 @@ public sealed class NotificationEventToggles
 
     /// <summary> Send a notification when a cluster node goes offline. </summary>
     public bool NodeOffline { get; set; } = true;
+
+    /// <summary> Send a notification when a cluster node comes back online after being unreachable. </summary>
+    public bool NodeOnline { get; set; } = true;
 }
