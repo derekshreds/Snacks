@@ -41,10 +41,16 @@ public sealed class ClusterAuthFilter : IActionFilter
             return;
         }
 
-        var providedSecret = context.HttpContext.Request.Headers["X-Snacks-Secret"].FirstOrDefault();
-        if (string.IsNullOrEmpty(providedSecret))
+        var providedHeader = context.HttpContext.Request.Headers["X-Snacks-Secret"].FirstOrDefault();
+        if (string.IsNullOrEmpty(providedHeader))
         {
             context.Result = new UnauthorizedObjectResult("Missing X-Snacks-Secret header");
+            return;
+        }
+
+        if (!TryDecodeSecretHeader(providedHeader, out var providedSecret))
+        {
+            context.Result = new UnauthorizedObjectResult("Invalid cluster secret");
             return;
         }
 
@@ -52,6 +58,32 @@ public sealed class ClusterAuthFilter : IActionFilter
         {
             context.Result = new UnauthorizedObjectResult("Invalid cluster secret");
             return;
+        }
+    }
+
+    /// <summary>
+    ///     Encodes the shared secret as Base64(UTF-8) so it can be sent in an HTTP header.
+    ///     HTTP headers must be ASCII; secrets may contain any Unicode character.
+    /// </summary>
+    /// <param name="secret">The raw shared secret.</param>
+    /// <returns>An ASCII-safe Base64 representation of the secret's UTF-8 bytes.</returns>
+    public static string EncodeSecretForHeader(string secret)
+    {
+        if (string.IsNullOrEmpty(secret)) return "";
+        return Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(secret));
+    }
+
+    private static bool TryDecodeSecretHeader(string headerValue, out string decoded)
+    {
+        try
+        {
+            decoded = System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(headerValue));
+            return true;
+        }
+        catch (FormatException)
+        {
+            decoded = "";
+            return false;
         }
     }
 

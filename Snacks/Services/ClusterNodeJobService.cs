@@ -865,7 +865,7 @@ public sealed class ClusterNodeJobService
     {
         var client = _httpClientFactory.CreateClient();
         client.Timeout = TimeSpan.FromMinutes(30);
-        client.DefaultRequestHeaders.Add("X-Snacks-Secret", Config.SharedSecret);
+        client.DefaultRequestHeaders.Add("X-Snacks-Secret", ClusterAuthFilter.EncodeSecretForHeader(Config.SharedSecret));
         return client;
     }
 
