@@ -40,7 +40,7 @@
             <div class="form-check mb-3">
                 <input class="form-check-input" type="checkbox" id="@(formPrefix)ConvertImageSubtitlesToSrt" name="ConvertImageSubtitlesToSrt">
                 <label class="form-check-label" for="@(formPrefix)ConvertImageSubtitlesToSrt">Convert image-based subtitles to SRT (OCR)</label>
-                <div class="form-text">Run OCR on image-based subtitles (PGS/VOBSUB) to produce searchable text.</div>
+                <div class="form-text">Run OCR on image-based subtitles (PGS/VOBSUB) to produce searchable text. With sidecar extraction on, the result is written as a <code>.srt</code> file; without sidecar extraction, it's embedded in the output as a text subtitle track alongside any existing text subtitles.</div>
             </div>
         </div>
     </div>

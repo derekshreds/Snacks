@@ -59,14 +59,15 @@ public static class LanguageMatcher
 
     // Normalized (lowercase) alias -> 2-letter code. Built once from Entries.
     private static readonly Dictionary<string, string> _aliasToTwoLetter = BuildAliasMap();
+    private static readonly Dictionary<string, Entry>  _twoLetterToEntry = Entries.ToDictionary(e => e.TwoLetter, StringComparer.Ordinal);
 
     private static Dictionary<string, string> BuildAliasMap()
     {
         var map = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var e in Entries)
         {
-            map[e.TwoLetter]                   = e.TwoLetter;
-            map[e.ThreeLetterT]                = e.TwoLetter;
+            map[e.TwoLetter]    = e.TwoLetter;
+            map[e.ThreeLetterT] = e.TwoLetter;
             if (e.ThreeLetterB != null) map[e.ThreeLetterB] = e.TwoLetter;
             map[e.EnglishName.ToLowerInvariant()] = e.TwoLetter;
         }
@@ -84,6 +85,32 @@ public static class LanguageMatcher
         if (string.IsNullOrWhiteSpace(raw)) return null;
         var key = raw.Trim().ToLowerInvariant();
         return _aliasToTwoLetter.TryGetValue(key, out var two) ? two : null;
+    }
+
+    /// <summary>
+    ///     Returns the ISO 639-2/B (bibliographic) 3-letter code for <paramref name="raw"/>,
+    ///     falling back to the T (terminological) form when the language has no distinct B
+    ///     code, or <see langword="null"/> if the language is unknown. This is the form
+    ///     Matroska's <c>language</c> element expects and is what Plex documents for
+    ///     sidecar filenames (<c>.eng.srt</c>).
+    /// </summary>
+    public static string? ToThreeLetterB(string? raw)
+    {
+        var two = ToTwoLetter(raw);
+        if (two == null) return null;
+        var e = _twoLetterToEntry[two];
+        return e.ThreeLetterB ?? e.ThreeLetterT;
+    }
+
+    /// <summary>
+    ///     Returns the ISO 639-2/T (terminological) 3-letter code for <paramref name="raw"/>,
+    ///     or <see langword="null"/> if unknown. T is what most modern tools — and Tesseract's
+    ///     language packs — use.
+    /// </summary>
+    public static string? ToThreeLetterT(string? raw)
+    {
+        var two = ToTwoLetter(raw);
+        return two == null ? null : _twoLetterToEntry[two].ThreeLetterT;
     }
 
     /// <summary>

@@ -72,9 +72,13 @@ public sealed class SubtitleExtractionService
             langCounts[spec.Lang] = seen + 1;
             string suffix  = seen == 0 ? "" : $".{seen + 1}";
 
-            // OCR output is always .srt — Subtitle Edit can't produce styled ASS.
-            string outFmt  = spec.IsBitmap ? "srt" : fmt;
-            string outPath = $"{sidecarBase}.{spec.Lang}{suffix}.{outFmt}";
+            // OCR output is always .srt — the native OCR path can't produce styled ASS.
+            string outFmt   = spec.IsBitmap ? "srt" : fmt;
+            // Plex & Jellyfin prefer ISO 639-2/B 3-letter codes in sidecar filenames
+            // (Movie.eng.srt). Fall back to whatever tag the source carried when the
+            // language isn't in LanguageMatcher's table.
+            string langCode = LanguageMatcher.ToThreeLetterB(spec.Lang) ?? spec.Lang;
+            string outPath  = $"{sidecarBase}.{langCode}{suffix}.{outFmt}";
 
             try
             {
@@ -101,6 +105,68 @@ public sealed class SubtitleExtractionService
         await log($"Sidecar extraction: wrote {written.Count} file(s).");
         return written;
     }
+
+    /// <summary>
+    ///     Runs OCR on bitmap subtitle streams and returns the produced <c>.srt</c> files
+    ///     so the caller can mux them back into the main encode as text subtitle tracks
+    ///     — used when <c>ConvertImageSubtitlesToSrt</c> is on without sidecar extraction.
+    /// </summary>
+    /// <remarks>
+    ///     Text subtitle streams are intentionally ignored here: they stay muxed via
+    ///     <c>MapSub</c>'s existing stream-copy path. Only bitmap streams need conversion.
+    /// </remarks>
+    public async Task<IReadOnlyList<OcrMuxResult>> OcrBitmapsForMuxAsync(
+        Models.WorkItem        workItem,
+        string                 inputPath,
+        string                 tmpDir,
+        IReadOnlyList<string>? languagesToKeep,
+        Func<string, Task>     log,
+        CancellationToken      ct)
+    {
+        if (workItem.Probe == null) return Array.Empty<OcrMuxResult>();
+
+        var bitmapSpecs = _ffprobeService
+            .SelectSidecarStreams(workItem.Probe, languagesToKeep, includeBitmaps: true)
+            .Where(s => s.IsBitmap)
+            .ToList();
+
+        if (bitmapSpecs.Count == 0)
+        {
+            await log("OCR-for-mux: no image-based subtitle streams found — nothing to embed.");
+            return Array.Empty<OcrMuxResult>();
+        }
+
+        Directory.CreateDirectory(tmpDir);
+        var results    = new List<OcrMuxResult>();
+        var langCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var spec in bitmapSpecs)
+        {
+            langCounts.TryGetValue(spec.Lang, out int seen);
+            langCounts[spec.Lang] = seen + 1;
+            string suffix  = seen == 0 ? "" : $".{seen + 1}";
+            string outPath = Path.Combine(tmpDir, $"ocr.{spec.Lang}{suffix}.srt");
+
+            try
+            {
+                var produced = await _ocr.ConvertBitmapToSrtAsync(
+                    inputPath, spec.StreamIndex, spec.Lang, spec.CodecName, outPath, log, ct);
+                if (!string.IsNullOrEmpty(produced))
+                    results.Add(new OcrMuxResult(produced, spec.Lang));
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                await log($"OCR-for-mux failed for stream {spec.StreamIndex} ({spec.Lang}): {ex.Message}");
+            }
+        }
+
+        await log($"OCR-for-mux: produced {results.Count} track(s) ready to embed.");
+        return results;
+    }
+
+    /// <summary> One OCR'd SRT file ready to be added to the main encode as a text subtitle track. </summary>
+    public readonly record struct OcrMuxResult(string SrtPath, string Lang);
 
     private async Task ExtractTextStreamAsync(
         string            inputPath,

@@ -1046,6 +1046,9 @@ public class TranscodingService
             // Pre-pass sidecar subtitle extraction — runs BEFORE the main encode so the
             // encoded output never carries tracks that are being extracted. The main encode
             // then strips all subs via stripSubtitles=true.
+            var ocrMuxSrts  = new List<SubtitleExtractionService.OcrMuxResult>();
+            string? ocrMuxTmpDir = null;
+
             if (options.ExtractSubtitlesToSidecar && !stripSubtitles && _subtitleExtractionService != null)
             {
                 string sidecarBase = Path.Combine(
@@ -1060,14 +1063,82 @@ public class TranscodingService
                     cancellationToken);
                 stripSubtitles = true;
             }
+            else if (options.ConvertImageSubtitlesToSrt && !stripSubtitles && _subtitleExtractionService != null)
+            {
+                // OCR-without-sidecar: run OCR and mux the resulting SRTs back into the main output
+                // as text subtitle tracks, so the user gets a single file with searchable subtitles.
+                ocrMuxTmpDir = Path.Combine(
+                    Environment.GetEnvironmentVariable("SNACKS_WORK_DIR")
+                        ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Snacks", "work"),
+                    "tmp", "ocrmux-" + Guid.NewGuid().ToString("N"));
 
-            string subtitleFlags = stripSubtitles
-                ? "-sn "
-                : _ffprobeService.MapSub(workItem.Probe!, options.SubtitleLanguagesToKeep, options.Format == "mkv") + " ";
+                var results = await _subtitleExtractionService.OcrBitmapsForMuxAsync(
+                    workItem, inputPath, ocrMuxTmpDir,
+                    options.SubtitleLanguagesToKeep,
+                    msg => LogAsync(workItem.Id, msg),
+                    cancellationToken);
+                ocrMuxSrts.AddRange(results);
+            }
+
+            string subtitleFlags;
+            string extraInputs = "";
+
+            if (stripSubtitles)
+            {
+                subtitleFlags = "-sn ";
+            }
+            else if (ocrMuxSrts.Count > 0)
+            {
+                // Mux mode — build the subtitle args ourselves so we can interleave source text
+                // subs (passed through as-is via per-stream -c:s:N copy) with the OCR'd SRTs
+                // (encoded to the container's native text codec). Source bitmap subs are replaced
+                // by the OCR output and so are dropped from the map.
+                string ocrCodec = options.Format == "mkv" ? "srt" : "mov_text";
+
+                var textSubs = _ffprobeService
+                    .SelectSidecarStreams(workItem.Probe!, options.SubtitleLanguagesToKeep, includeBitmaps: false)
+                    .Where(s => !s.IsBitmap)
+                    .ToList();
+
+                string maps   = "";
+                string codecs = "";
+                string meta   = "";
+                int    outSubIndex = 0;
+
+                foreach (var s in textSubs)
+                {
+                    maps   += $"-map 0:{s.StreamIndex} ";
+                    codecs += $"-c:s:{outSubIndex} copy ";
+                    // Matroska's language element and Plex/Jellyfin auto-select both key on
+                    // ISO 639-2/B. Map the 2-letter tag if we can, otherwise pass through.
+                    var tag = LanguageMatcher.ToThreeLetterB(s.Lang) ?? s.Lang;
+                    if (!string.Equals(tag, "und", StringComparison.OrdinalIgnoreCase))
+                        meta += $"-metadata:s:s:{outSubIndex} language={tag} ";
+                    outSubIndex++;
+                }
+
+                for (int i = 0; i < ocrMuxSrts.Count; i++)
+                {
+                    extraInputs += $"-i \"{ocrMuxSrts[i].SrtPath}\" ";
+                    maps        += $"-map {i + 1}:0 ";
+                    codecs      += $"-c:s:{outSubIndex} {ocrCodec} ";
+                    var tag = LanguageMatcher.ToThreeLetterB(ocrMuxSrts[i].Lang) ?? ocrMuxSrts[i].Lang;
+                    if (!string.Equals(tag, "und", StringComparison.OrdinalIgnoreCase))
+                        meta += $"-metadata:s:s:{outSubIndex} language={tag} ";
+                    meta += $"-metadata:s:s:{outSubIndex} title=\"OCR ({tag})\" ";
+                    outSubIndex++;
+                }
+
+                subtitleFlags = maps + codecs + meta;
+            }
+            else
+            {
+                subtitleFlags = _ffprobeService.MapSub(workItem.Probe!, options.SubtitleLanguagesToKeep, options.Format == "mkv") + " ";
+            }
 
             // -analyzeduration and -probesize handle files with many streams (e.g. 30+ PGS subtitle tracks)
             string analyzeFlags = "-analyzeduration 10M -probesize 50M ";
-            string command = $"{initFlags} {analyzeFlags}-i \"{inputPath}\" {videoFlags}{compressionFlags}{audioFlags}{subtitleFlags}" +
+            string command = $"{initFlags} {analyzeFlags}-i \"{inputPath}\" {extraInputs}{videoFlags}{compressionFlags}{audioFlags}{subtitleFlags}" +
                            $"{varFlags}-f {(options.Format == "mkv" ? "matroska" : "mp4")} \"{outputPath}\"";
 
             await LogAsync(workItem.Id, $"Converting {workItem.FileName}");
@@ -1082,10 +1153,12 @@ public class TranscodingService
             }
             catch (OperationCanceledException)
             {
+                TryCleanupOcrMuxDir(ocrMuxTmpDir);
                 throw; // Don't retry on cancellation
             }
             catch (Exception ex)
             {
+                TryCleanupOcrMuxDir(ocrMuxTmpDir);
                 await HandleConversionFailure(workItem, options, outputPath, ex.Message, stripSubtitles, forceSwDecode, cancellationToken: cancellationToken);
                 return;
             }
@@ -1130,6 +1203,15 @@ public class TranscodingService
                     await LogAsync(workItem.Id, $"Error cleaning up output: {ex.Message}");
                 }
             }
+
+            TryCleanupOcrMuxDir(ocrMuxTmpDir);
+        }
+
+        private static void TryCleanupOcrMuxDir(string? dir)
+        {
+            if (dir == null) return;
+            try { if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true); }
+            catch { /* best-effort — dir is under SNACKS_WORK_DIR/tmp, not user-facing */ }
         }
 
         /// <summary>

@@ -1,3 +1,5 @@
+using Snacks.Services;
+
 namespace Snacks.Services.Ocr;
 
 /// <summary>
@@ -76,36 +78,17 @@ public sealed class TessdataResolver
         }
     }
 
-    /// <summary> Two-letter ISO → Tesseract 3-letter code for the languages Snacks exposes. </summary>
-    public static string MapToTesseractLang(string twoLetter) => twoLetter.ToLowerInvariant() switch
+    /// <summary>
+    ///     Two-letter ISO → Tesseract 3-letter code. Tesseract uses the ISO 639-2/T form
+    ///     for almost everything, with one wrinkle: Chinese is split into <c>chi_sim</c>
+    ///     (Simplified) and <c>chi_tra</c> (Traditional) rather than using a single ISO
+    ///     code. We default <c>zh</c> → Simplified since Simplified is the majority of
+    ///     subtitle content; users needing Traditional can override by setting
+    ///     <c>SNACKS_TESSDATA_PATH</c> and dropping <c>chi_tra.traineddata</c> there.
+    /// </summary>
+    public static string MapToTesseractLang(string twoLetter)
     {
-        "en" => "eng",
-        "es" => "spa",
-        "fr" => "fra",
-        "de" => "deu",
-        "it" => "ita",
-        "pt" => "por",
-        "ru" => "rus",
-        "ja" => "jpn",
-        "ko" => "kor",
-        "zh" => "chi_sim",
-        "ar" => "ara",
-        "hi" => "hin",
-        "nl" => "nld",
-        "sv" => "swe",
-        "no" => "nor",
-        "da" => "dan",
-        "fi" => "fin",
-        "pl" => "pol",
-        "tr" => "tur",
-        "cs" => "ces",
-        "hu" => "hun",
-        "el" => "ell",
-        "he" => "heb",
-        "th" => "tha",
-        "vi" => "vie",
-        "id" => "ind",
-        "uk" => "ukr",
-        _    => "eng",
-    };
+        if (twoLetter.Equals("zh", StringComparison.OrdinalIgnoreCase)) return "chi_sim";
+        return LanguageMatcher.ToThreeLetterT(twoLetter) ?? "eng";
+    }
 }
