@@ -335,6 +335,7 @@ public sealed class ClusterController : ControllerBase
                 _clusterService.SetReceivingJob(jobId);
 
                 var rawFileName = Request.Headers["X-Original-FileName"].FirstOrDefault() ?? "input.mkv";
+                try { rawFileName = Uri.UnescapeDataString(rawFileName); } catch (UriFormatException) { }
                 var fileName = Path.GetFileName(rawFileName);
                 if (string.IsNullOrWhiteSpace(fileName)) fileName = "input.mkv";
                 var tempDir = _clusterService.GetNodeTempDirectory(jobId);

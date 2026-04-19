@@ -2,13 +2,15 @@
 REM Snacks - Build and Push to Docker Hub
 REM Builds the Docker image and pushes to derekshreds/snacks-docker
 
-echo Snacks - Build and Push
+set VERSION=2.3.1
+
+echo Snacks - Build and Push (v%VERSION%)
 echo ==========================
 echo.
 
-REM Build the image
-echo [1/2] Building Docker image...
-docker buildx build --tag derekshreds/snacks-docker:latest --load --provenance=false --sbom=false -f Snacks/Dockerfile .
+REM Build the image with both :latest and pinned version tags
+echo [1/2] Building Docker image (tags: latest, %VERSION%)...
+docker buildx build --tag derekshreds/snacks-docker:latest --tag derekshreds/snacks-docker:%VERSION% --load --provenance=false --sbom=false -f Snacks/Dockerfile .
 if %errorlevel% neq 0 (
     echo ERROR: Docker build failed.
     pause
@@ -17,8 +19,8 @@ if %errorlevel% neq 0 (
 echo Build complete.
 echo.
 
-REM Push to Docker Hub (both image names)
-echo [2/3] Pushing derekshreds/snacks-docker:latest...
+REM Push to Docker Hub (both image names, both tags)
+echo [2/3] Pushing derekshreds/snacks-docker (latest, %VERSION%)...
 docker push derekshreds/snacks-docker:latest
 if %errorlevel% neq 0 (
     echo ERROR: Docker push failed. Make sure you are logged in:
@@ -26,14 +28,27 @@ if %errorlevel% neq 0 (
     pause
     exit /b 1
 )
+docker push derekshreds/snacks-docker:%VERSION%
+if %errorlevel% neq 0 (
+    echo ERROR: Push of snacks-docker:%VERSION% failed.
+    pause
+    exit /b 1
+)
 echo Push complete.
 echo.
 
-echo [3/3] Pushing derekshreds/snacksweb:latest...
+echo [3/3] Pushing derekshreds/snacksweb (latest, %VERSION%)...
 docker tag derekshreds/snacks-docker:latest derekshreds/snacksweb:latest
+docker tag derekshreds/snacks-docker:%VERSION% derekshreds/snacksweb:%VERSION%
 docker push derekshreds/snacksweb:latest
 if %errorlevel% neq 0 (
-    echo ERROR: Push of snacksweb tag failed.
+    echo ERROR: Push of snacksweb:latest failed.
+    pause
+    exit /b 1
+)
+docker push derekshreds/snacksweb:%VERSION%
+if %errorlevel% neq 0 (
+    echo ERROR: Push of snacksweb:%VERSION% failed.
     pause
     exit /b 1
 )
