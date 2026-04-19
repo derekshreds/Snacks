@@ -41,7 +41,7 @@ public sealed class ClusterDiscoveryService
     };
 
     /// <summary> Protocol version for cluster inter-node communication. </summary>
-    internal const string ClusterVersion = "2.3.0";
+    internal const string ClusterVersion = "2.3.1";
 
     private volatile ClusterConfig       _config;
     private UdpClient?                   _udpListener;
@@ -617,7 +617,7 @@ public sealed class ClusterDiscoveryService
     {
         var client = _httpClientFactory.CreateClient();
         client.Timeout = TimeSpan.FromMinutes(30);
-        client.DefaultRequestHeaders.Add("X-Snacks-Secret", _config.SharedSecret);
+        client.DefaultRequestHeaders.Add("X-Snacks-Secret", ClusterAuthFilter.EncodeSecretForHeader(_config.SharedSecret));
         return client;
     }
 

@@ -898,7 +898,8 @@ public class TranscodingService
 
             string initFlags = useVaapi ? GetInitFlags(hwAccel, canHwDecode) : GetInitFlags(hwAccel);
             string vaapiFormat = is10Bit ? "p010" : "nv12";
-            string hwFilter = useVaapi ? $"-vf format={vaapiFormat}|vaapi,hwupload " : "";
+            // hwupload only needed for sw decode → hw encode; hw-decoded frames are already on the GPU
+            string hwFilter = useVaapi && !canHwDecode ? $"-vf format={vaapiFormat}|vaapi,hwupload " : "";
             bool isSvtAv1 = encoder == "libsvtav1";
             string presetFlag = useVaapi
                 ? (useLowPower ? "-low_power 1 " : "")
@@ -1264,7 +1265,7 @@ public class TranscodingService
                 if (encoder.Contains("vaapi"))
                 {
                     vf = "-vf format=nv12|vaapi,hwupload";
-                    extra = "-low_power 1 -rc_mode CQP -global_quality 25";
+                    extra = "-rc_mode CQP -global_quality 25";
                 }
                 else
                 {
@@ -1490,15 +1491,20 @@ public class TranscodingService
             bool is10Bit = workItem.Probe?.Streams?.Any(s =>
                 s.CodecType == "video" && (s.PixFmt?.Contains("10") == true || s.Profile?.Contains("10") == true)) == true;
             string vaapiFormat = is10Bit ? "p010" : "nv12";
-            string hwFilter = $"-vf format={vaapiFormat}|vaapi,hwupload";
+            // hwupload only needed for sw decode → hw encode; hw-decoded frames are already on the GPU
+            string hwFilter = canHwDecode ? "" : $"-vf format={vaapiFormat}|vaapi,hwupload";
 
-            // Try LP mode first, then fall back to normal mode if it fails
-            bool[] lowPowerModes = [true, false];
+            // LP mode is Intel-specific (VAEntrypointEncSliceLP); AMD only supports VAEntrypointEncSlice
+            bool isIntel = options.HardwareAcceleration.Equals("intel", StringComparison.OrdinalIgnoreCase);
+            bool[] lowPowerModes = isIntel ? [true, false] : [false];
             foreach (bool lowPower in lowPowerModes)
             {
                 string lpFlag = lowPower ? "-low_power 1 " : "";
                 string modeLabel = lowPower ? "LP mode" : "normal mode";
                 int currentQp = 24;
+                // QP -> peak kbps from prior passes in this mode; used to detect oscillation
+                // and bisect between a bracketing pair rather than re-testing the same QP.
+                var tested = new Dictionary<int, long>();
 
                 for (int iteration = 1; iteration <= maxIterations; iteration++)
                 {
@@ -1540,6 +1546,7 @@ public class TranscodingService
                     // are what overshoot the target, so we tune QP to the worst case
                     long peakKbps = sampleResults.Max();
                     long avgKbps = sampleResults.Sum() / sampleResults.Count;
+                    tested[currentQp] = peakKbps;
 
                     double ratio = (double)peakKbps / targetKbps;
                     await LogAsync(workItem.Id,
@@ -1565,10 +1572,54 @@ public class TranscodingService
                     int adjustment = (int)Math.Round(qpDelta);
                     if (adjustment == 0) adjustment = peakKbps > targetKbps ? 1 : -1;
 
-                    currentQp = Math.Clamp(currentQp + adjustment, 18, 51);
+                    int nextQp = Math.Clamp(currentQp + adjustment, 18, 51);
+
+                    // Oscillation guard: the log-based predictor assumes a constant 0.72x
+                    // per +2QP, but real content breaks that — it can bounce between two
+                    // QPs that straddle the target forever. If we already tested the
+                    // predicted QP, bisect between the closest under- and over-target pair.
+                    if (tested.ContainsKey(nextQp))
+                    {
+                        int? lowQp  = tested.Where(kv => kv.Value >  targetKbps).Select(kv => (int?)kv.Key).DefaultIfEmpty(null).Max(); // higher bitrate = lower QP
+                        int? highQp = tested.Where(kv => kv.Value <= targetKbps).Select(kv => (int?)kv.Key).DefaultIfEmpty(null).Min(); // lower bitrate = higher QP
+
+                        if (lowQp.HasValue && highQp.HasValue && highQp.Value - lowQp.Value > 1)
+                        {
+                            nextQp = (lowQp.Value + highQp.Value) / 2;
+                            if (tested.ContainsKey(nextQp))
+                                nextQp = (lowQp.Value + highQp.Value + 1) / 2;
+                        }
+
+                        if (tested.ContainsKey(nextQp))
+                        {
+                            // Bracket is exhausted (adjacent QPs both tested, or no bracket
+                            // at all). Stop and pick the best observed QP below.
+                            await LogAsync(workItem.Id,
+                                $"Calibration converged — adjacent QPs exhausted. Selecting best observed.");
+                            break;
+                        }
+                    }
+
+                    currentQp = nextQp;
                 }
 
-                // Completed all iterations without early return — use final QP
+                // Pick the best tested QP: prefer highest-quality (lowest QP) whose peak
+                // is at or under the upper tolerance bound; otherwise fall back to the QP
+                // whose peak is closest to target so we don't return an untested last guess.
+                if (tested.Count > 0)
+                {
+                    long upperBound = (long)(targetKbps * (1 + tolerance));
+                    var underBound  = tested.Where(kv => kv.Value <= upperBound).ToList();
+                    int chosenQp = underBound.Count > 0
+                        ? underBound.OrderBy(kv => kv.Key).First().Key
+                        : tested.OrderBy(kv => Math.Abs(kv.Value - targetKbps)).First().Key;
+
+                    await LogAsync(workItem.Id,
+                        $"Calibration complete after {tested.Count} pass(es). Using QP {chosenQp} " +
+                        $"(peak {tested[chosenQp]}kbps vs target {targetKbps}kbps) ({modeLabel}).");
+                    return (chosenQp, lowPower);
+                }
+
                 await LogAsync(workItem.Id,
                     $"Calibration complete after {maxIterations} passes. Using QP {currentQp} ({modeLabel}).");
                 return (currentQp, lowPower);
