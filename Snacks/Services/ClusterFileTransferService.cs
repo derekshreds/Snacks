@@ -213,11 +213,15 @@ public sealed class ClusterFileTransferService
                     offset              += bytesRead;
                     consecutiveFailures  = 0;
 
+                    // Don't re-assert Status/Phase here. Dispatch already set them to
+                    // Uploading before this loop began; re-setting them on every chunk
+                    // creates a race with CancelWorkItemAsync — if cancel fires between
+                    // two chunks, the chunk that completes next would clobber Cancelled
+                    // and flip the item back to Uploading forever.
                     workItem.TransferProgress = (int)(offset * 100 / totalSize);
-                    workItem.Status           = WorkItemStatus.Uploading;
-                    workItem.RemoteJobPhase   = "Uploading";
                     workItem.ErrorMessage     = null;
-                    await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem, ct);
+                    if (workItem.Status == WorkItemStatus.Uploading)
+                        await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem, ct);
 
                     break;
                 }

@@ -41,7 +41,7 @@ internal static class VobSubParser
             var spu = ReadSpu(subData, (int)entry.FilePos);
             if (spu.Length < 4) continue;
 
-            if (!TryDecodeSpu(spu, idx.Width, idx.Height, idx.Palette, out var bmp, out var startDelay, out var endDelay))
+            if (!TryDecodeSpu(spu, idx.Width, idx.Height, idx.Palette, out var rgba, out var w, out var h, out var startDelay, out var endDelay))
                 continue;
 
             var start = entry.Timestamp + startDelay;
@@ -55,7 +55,7 @@ internal static class VobSubParser
                     : start + TimeSpan.FromSeconds(4);
             }
 
-            if (bmp is not null) yield return new BitmapEvent(start, end, bmp);
+            if (rgba is not null) yield return new BitmapEvent(start, end, rgba, w, h);
         }
     }
 
@@ -205,9 +205,12 @@ internal static class VobSubParser
 
     private static bool TryDecodeSpu(
         byte[] spu, int frameW, int frameH, uint[] palette,
-        out byte[]? png, out TimeSpan startDelay, out TimeSpan endDelay)
+        out byte[]? rgbaOut, out int widthOut, out int heightOut,
+        out TimeSpan startDelay, out TimeSpan endDelay)
     {
-        png = null;
+        rgbaOut    = null;
+        widthOut   = 0;
+        heightOut  = 0;
         startDelay = TimeSpan.Zero;
         endDelay   = TimeSpan.Zero;
         if (spu.Length < 4) return false;
@@ -313,8 +316,10 @@ internal static class VobSubParser
             rgba[o + 3] = a;
         }
 
-        // Aggressive 3× upscale helps Tesseract on 720×480 DVD subs.
-        png = ImagePreprocessor.Preprocess(rgba, w, h, upscale: 3);
+        // Emit raw RGBA; preprocessing happens in NativeOcrService
+        rgbaOut   = rgba;
+        widthOut  = w;
+        heightOut = h;
         return true;
     }
 

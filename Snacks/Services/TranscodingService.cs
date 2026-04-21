@@ -42,6 +42,15 @@ public class TranscodingService
         /// <summary>The currently running FFmpeg process, or <c>null</c> when idle.</summary>
         private Process? _activeProcess;
 
+        /// <summary>
+        ///     Cancellation source for the active local job. Cancelled by
+        ///     <see cref="CancelWorkItemAsync"/> to stop phases that run outside the ffmpeg
+        ///     process (OCR pre-pass, sidecar extraction, tessdata downloads) — killing
+        ///     <see cref="_activeProcess"/> isn't enough because those spawn their own
+        ///     child processes that aren't registered as the active one.
+        /// </summary>
+        private CancellationTokenSource? _activeJobCts;
+
         /// <summary>The work item currently being encoded locally, or <c>null</c> when idle.</summary>
         private WorkItem? _activeWorkItem;
 
@@ -336,6 +345,11 @@ public class TranscodingService
                     });
                 }
 
+                // Settings may require non-video work (audio re-encode, track removal, OCR,
+                // sidecar extraction) even when the video itself is already efficient. In that
+                // case the bitrate-based skip gates would silently swallow the job, so bypass them.
+                bool hasNonVideoWork = HasNonVideoWork(options, probe);
+
                 if (options.Skip4K && isHighDef)
                 {
                     Console.WriteLine($"Skipping {workItem.FileName}: 4K video (Skip 4K enabled)");
@@ -345,7 +359,7 @@ public class TranscodingService
 
                 string targetCodecLabel = targetIsAv1 ? "AV1" : (isHevc ? "HEVC" : "H.264");
                 double skipMultiplier = 1.0 + (Math.Clamp(options.SkipPercentAboveTarget, 0, 100) / 100.0);
-                if (alreadyTargetCodec && bitrate > 0 && bitrate <= options.TargetBitrate * skipMultiplier && !isHighDef)
+                if (alreadyTargetCodec && bitrate > 0 && bitrate <= options.TargetBitrate * skipMultiplier && !isHighDef && !hasNonVideoWork)
                 {
                     Console.WriteLine($"Skipping {workItem.FileName}: already {targetCodecLabel} at {bitrate}kbps (target {options.TargetBitrate}kbps, skip threshold {skipMultiplier:P0})");
                     await MarkSkippedInDb();
@@ -354,7 +368,7 @@ public class TranscodingService
 
                 int fourKMultiplier = Math.Clamp(options.FourKBitrateMultiplier, 2, 8);
                 int fourKTarget = options.TargetBitrate * fourKMultiplier;
-                if (alreadyTargetCodec && isHighDef && bitrate > 0 && bitrate <= fourKTarget * skipMultiplier)
+                if (alreadyTargetCodec && isHighDef && bitrate > 0 && bitrate <= fourKTarget * skipMultiplier && !hasNonVideoWork)
                 {
                     Console.WriteLine($"Skipping {workItem.FileName}: already {targetCodecLabel} 4K at {bitrate}kbps (4K target {fourKTarget}kbps)");
                     await MarkSkippedInDb();
@@ -366,7 +380,7 @@ public class TranscodingService
                 bool isVaapiMode = IsVaapiAcceleration(options.HardwareAcceleration) ||
                     (options.HardwareAcceleration.Equals("auto", StringComparison.OrdinalIgnoreCase) &&
                      _detectedHardware != null && IsVaapiAcceleration(_detectedHardware));
-                if (isVaapiMode && !isHevc && targetIsHevc && bitrate > 0 && bitrate <= options.TargetBitrate && !isHighDef)
+                if (isVaapiMode && !isHevc && targetIsHevc && bitrate > 0 && bitrate <= options.TargetBitrate && !isHighDef && !hasNonVideoWork)
                 {
                     Console.WriteLine($"Skipping {workItem.FileName}: VAAPI can't compress {bitrate}kbps H.264 below target");
                     await MarkSkippedInDb();
@@ -561,6 +575,10 @@ public class TranscodingService
             if (!_workItems.TryGetValue(id, out var workItem))
                 return;
 
+            // Diagnostic log — if cancel ever seems to "not work", this line tells us exactly
+            // which branch fired and what the item's state was going in.
+            Console.WriteLine($"Cancel: id={id} status={workItem.Status} assignedNode={workItem.AssignedNodeId ?? "<none>"} isActiveLocal={_activeWorkItem?.Id == id}");
+
             if (workItem.Status == WorkItemStatus.Pending)
             {
                 workItem.Status = WorkItemStatus.Cancelled;
@@ -582,6 +600,9 @@ public class TranscodingService
             }
             else if (workItem.Status == WorkItemStatus.Processing && _activeWorkItem?.Id == id)
             {
+                // Cancel the token first so phases that aren't backed by _activeProcess
+                // (OCR pre-pass, sidecar extraction, tessdata downloads) stop too.
+                CancelActiveJobCts();
                 await KillActiveProcess(workItem, "Encoding cancelled by user.");
                 workItem.Status = WorkItemStatus.Cancelled;
                 workItem.CompletedAt = DateTime.UtcNow;
@@ -599,6 +620,13 @@ public class TranscodingService
                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
                 await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Cancelled);
             }
+        }
+
+        private void CancelActiveJobCts()
+        {
+            CancellationTokenSource? cts;
+            lock (_activeLock) { cts = _activeJobCts; }
+            try { cts?.Cancel(); } catch { /* already disposed */ }
         }
 
         /// <summary>
@@ -632,6 +660,7 @@ public class TranscodingService
             }
             else if (workItem.Status == WorkItemStatus.Processing && _activeWorkItem?.Id == id)
             {
+                CancelActiveJobCts();
                 await KillActiveProcess(workItem, "Encoding stopped by user — will retry later.");
                 workItem.Status = WorkItemStatus.Stopped;
                 workItem.CompletedAt = DateTime.UtcNow;
@@ -746,7 +775,12 @@ public class TranscodingService
         /// </summary>
         private async Task ProcessWorkItemAsync(WorkItem workItem, EncoderOptions options)
         {
-            lock (_activeLock) { _activeWorkItem = workItem; }
+            var jobCts = new CancellationTokenSource();
+            lock (_activeLock)
+            {
+                _activeWorkItem = workItem;
+                _activeJobCts   = jobCts;
+            }
             try
             {
                 workItem.Status = WorkItemStatus.Processing;
@@ -766,7 +800,7 @@ public class TranscodingService
                         workItem.Length = _ffprobeService.DurationStringToSeconds(workItem.Probe.Format.Duration);
                 }
 
-                await ConvertVideoAsync(workItem, options);
+                await ConvertVideoAsync(workItem, options, cancellationToken: jobCts.Token);
 
                 workItem.Status = WorkItemStatus.Completed;
                 workItem.CompletedAt = DateTime.UtcNow;
@@ -805,7 +839,9 @@ public class TranscodingService
                 {
                     _activeWorkItem = null;
                     _activeProcess = null;
+                    _activeJobCts  = null;
                 }
+                jobCts.Dispose();
             }
 
             await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
@@ -1072,12 +1108,22 @@ public class TranscodingService
                         ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Snacks", "work"),
                     "tmp", "ocrmux-" + Guid.NewGuid().ToString("N"));
 
-                var results = await _subtitleExtractionService.OcrBitmapsForMuxAsync(
-                    workItem, inputPath, ocrMuxTmpDir,
-                    options.SubtitleLanguagesToKeep,
-                    msg => LogAsync(workItem.Id, msg),
-                    cancellationToken);
-                ocrMuxSrts.AddRange(results);
+                try
+                {
+                    var results = await _subtitleExtractionService.OcrBitmapsForMuxAsync(
+                        workItem, inputPath, ocrMuxTmpDir,
+                        options.SubtitleLanguagesToKeep,
+                        msg => LogAsync(workItem.Id, msg),
+                        cancellationToken);
+                    ocrMuxSrts.AddRange(results);
+                }
+                catch (OperationCanceledException)
+                {
+                    // Cancellation fires during OCR, before the main encode's try/catch. Clean
+                    // up the temp dir ourselves since the encode path never runs.
+                    TryCleanupOcrMuxDir(ocrMuxTmpDir);
+                    throw;
+                }
             }
 
             string subtitleFlags;
@@ -1187,8 +1233,10 @@ public class TranscodingService
 
             if (savings > 0 || videoCopy)
             {
+                // Show both sizes explicitly so users don't misread the savings number
+                // as the output size.
                 await LogAsync(workItem.Id,
-                    $"{savings:0,0}mb / {percent:P} saved.");
+                    $"Size: {FormatSize(workItem.Size)} → {FormatSize(outputSize)}  (saved {FormatSize((long)(savings * 1048576))}, {percent:P0})");
 
                 await HandleOutputPlacement(outputPath, workItem, options);
             }
@@ -1207,11 +1255,93 @@ public class TranscodingService
             TryCleanupOcrMuxDir(ocrMuxTmpDir);
         }
 
+        private static string FormatSize(long bytes)
+        {
+            // Matches formatFileSize() in wwwroot/js/site.js so log output is consistent
+            // with the queue UI's labels (KB/MB/GB using base-1024).
+            if (bytes <= 0) return "0 Bytes";
+            string[] units = { "Bytes", "KB", "MB", "GB", "TB" };
+            double value = bytes;
+            int i = 0;
+            while (value >= 1024 && i < units.Length - 1) { value /= 1024; i++; }
+            return $"{value:0.##} {units[i]}";
+        }
+
         private static void TryCleanupOcrMuxDir(string? dir)
         {
             if (dir == null) return;
             try { if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true); }
             catch { /* best-effort — dir is under SNACKS_WORK_DIR/tmp, not user-facing */ }
+        }
+
+        /// <summary>
+        ///     Returns <see langword="true"/> when the current settings would cause the output to
+        ///     differ from the source even if the video is already at-or-below target bitrate.
+        ///     Used to bypass the "already efficient" skip gates so workflows like audio-only
+        ///     re-encodes, OCR, sidecar extraction, and track-removal still process the file.
+        /// </summary>
+        private static bool HasNonVideoWork(EncoderOptions options, ProbeResult probe)
+        {
+            // --- Audio ---
+            if (options.AudioOnlyMode) return true;
+
+            var audioStreams = probe.Streams.Where(s => s.CodecType == "audio").ToList();
+            if (audioStreams.Count > 0)
+            {
+                // Language filter would drop at least one track?
+                if (options.AudioLanguagesToKeep is { Count: > 0 } audLangs)
+                {
+                    var kept = audioStreams
+                        .Where(s => LanguageMatcher.Matches(s.Tags?.Language, audLangs))
+                        .ToList();
+                    if (kept.Count < audioStreams.Count) return true;
+                    audioStreams = kept;
+                }
+
+                // Codec re-encode on any surviving track?
+                if (!string.IsNullOrEmpty(options.AudioCodec)
+                    && !options.AudioCodec.Equals("copy", StringComparison.OrdinalIgnoreCase))
+                {
+                    foreach (var s in audioStreams)
+                        if (!string.Equals(s.CodecName, options.AudioCodec, StringComparison.OrdinalIgnoreCase))
+                            return true;
+                }
+
+                // Downmix would reduce channels on any surviving track?
+                if (options.TwoChannelAudio)
+                {
+                    foreach (var s in audioStreams)
+                        if (s.Channels > 2) return true;
+                }
+            }
+
+            // --- Subtitles ---
+            var subStreams = probe.Streams.Where(s => s.CodecType == "subtitle").ToList();
+            if (subStreams.Count > 0)
+            {
+                // Language filter would drop at least one track?
+                if (options.SubtitleLanguagesToKeep is { Count: > 0 } subLangs)
+                {
+                    var kept = subStreams
+                        .Where(s => LanguageMatcher.Matches(s.Tags?.Language, subLangs))
+                        .ToList();
+                    if (kept.Count < subStreams.Count) return true;
+                    subStreams = kept;
+                }
+
+                // Sidecar extraction with any text (or OCR-able bitmap) track present?
+                if (options.ExtractSubtitlesToSidecar && subStreams.Count > 0) return true;
+
+                // OCR requested and a bitmap track is actually present to OCR?
+                if (options.ConvertImageSubtitlesToSrt)
+                {
+                    foreach (var s in subStreams)
+                        if (FfprobeService._bitmapSubCodecs.Contains(s.CodecName ?? ""))
+                            return true;
+                }
+            }
+
+            return false;
         }
 
         /// <summary>
@@ -2720,7 +2850,7 @@ public class TranscodingService
             float savings = (workItem.Size - outputSize) / 1048576f;
             float percent = 1 - ((float)outputSize / workItem.Size);
 
-            Console.WriteLine($"Cluster: Remote encode of {workItem.FileName}: {savings:0,0}MB / {percent:P} saved");
+            Console.WriteLine($"Cluster: Remote encode of {workItem.FileName}: {FormatSize(workItem.Size)} → {FormatSize(outputSize)} (saved {FormatSize((long)(savings * 1048576))}, {percent:P0})");
 
             if (savings > 0)
             {

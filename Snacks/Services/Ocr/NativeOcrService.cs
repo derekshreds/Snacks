@@ -27,8 +27,9 @@ public sealed class NativeOcrService
 
     // One cached engine per language — Tesseract engine construction is ~100ms and
     // allocates model memory, so keeping them around pays for itself within the first file.
-    private readonly Dictionary<string, Engine> _engineCache = new(StringComparer.Ordinal);
-    private readonly SemaphoreSlim              _engineLock  = new(1, 1);
+    private readonly Dictionary<string, Engine>                _engineCache       = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, SubtitleSpellChecker>  _spellCheckerCache = new(StringComparer.Ordinal);
+    private readonly SemaphoreSlim                             _engineLock        = new(1, 1);
 
     public NativeOcrService(TessdataResolver tessdataResolver)
     {
@@ -74,7 +75,9 @@ public sealed class NativeOcrService
                 return null;
             }
 
-            // Pick a parser and decode the raw stream into timestamped bitmaps.
+            // Buffer the whole parser output into memory so we can run a file-wide skew
+            // detection pass before OCR. Cue bitmaps are small (typically <50 KB each)
+            // and a feature-length film has <2000 cues, so a few dozen MB at peak.
             IAsyncEnumerable<BitmapEvent> events;
             try
             {
@@ -86,6 +89,20 @@ public sealed class NativeOcrService
                 return null;
             }
 
+            var buffered = new List<BitmapEvent>();
+            await foreach (var ev in events.WithCancellation(ct)) buffered.Add(ev);
+            if (buffered.Count == 0)
+            {
+                await log("OCR: parser produced no cues.");
+                return null;
+            }
+
+            // Skew detection runs per-cue. Real-world subtitle tracks often mix italic
+            // narration with upright dialogue, so a single file-wide angle breaks the
+            // upright lines. Per-cue detection sees fewer strokes but the threshold is
+            // tuned strict enough to only fire when a cue is clearly italic.
+            bool latinScript = IsLatinScript(TessdataResolver.MapToTesseractLang(lang));
+
             // Get a Tesseract engine for the target language.
             var engine = await GetEngineAsync(lang, log, ct);
             if (engine == null)
@@ -94,25 +111,61 @@ public sealed class NativeOcrService
                 return null;
             }
 
-            // Stream bitmaps through Tesseract and into the SRT writer.
+            // Spellcheck / bigram post-pass temporarily disabled to evaluate raw
+            // Tesseract output. Re-enable by uncommenting the GetSpellChecker call here
+            // and the spellChecker.Correct(text) line below.
+            // var spellChecker = GetSpellChecker(lang);
+
+            // OCR each cue, detecting slant per-cue so mixed italic/upright content is handled.
             var srt = new SrtWriter();
             int cueCount  = 0;
             int emptyRuns = 0;
+            int deshearedCount = 0;
 
-            await foreach (var ev in events.WithCancellation(ct))
+            for (int idx = 0; idx < buffered.Count; idx++)
             {
+                var ev = buffered[idx];
                 ct.ThrowIfCancellationRequested();
+
+                // Per-cue skew detection (only for Latin-script languages). Returns 0 for
+                // upright cues, which is the common case — upright lines don't get touched.
+                double cueSkewRad = latinScript
+                    ? ImagePreprocessor.DetectPerCueSkew(ev.Rgba, ev.Width, ev.Height)
+                    : 0;
+                if (cueSkewRad != 0) deshearedCount++;
+
+                byte[] png;
+                try
+                {
+                    // 6× brings 40-60px PGS glyphs to roughly 300 DPI, which is Tesseract's
+                    // trained input scale. Going lower costs accuracy; going higher adds cost
+                    // without a material quality gain.
+                    png = ImagePreprocessor.Preprocess(ev.Rgba, ev.Width, ev.Height, upscale: 6, skewRad: cueSkewRad);
+                }
+                catch (Exception ex)
+                {
+                    await log($"OCR: preprocessing failed on cue {idx} ({ex.Message}) — skipping.");
+                    continue;
+                }
 
                 string text;
                 try
                 {
-                    using var pix  = TesseractOCR.Pix.Image.LoadFromMemory(ev.PngBytes);
-                    using var page = engine.Process(pix);
+                    using var pix = TesseractOCR.Pix.Image.LoadFromMemory(png);
+                    // Tell Tesseract the preprocessed image is at ~300 DPI. Without this
+                    // its internal scaling heuristics use a 70 DPI default and systematically
+                    // misjudge font size, costing 10-20% word accuracy.
+                    pix.XRes = 300;
+                    pix.YRes = 300;
+                    using var page = engine.Process(pix, TesseractOCR.Enums.PageSegMode.SingleBlock);
                     text = page.Text ?? "";
+                    // Deterministic OCR character fixes only (pipe/bracket → I,
+                    // line-start = → -). Full dictionary spellcheck remains disabled.
+                    text = SubtitleSpellChecker.ApplyDeterministicSubs(text);
                 }
                 catch (Exception ex)
                 {
-                    await log($"OCR: Tesseract failed on a cue ({ex.Message}) — skipping cue.");
+                    await log($"OCR: Tesseract failed on cue {idx} ({ex.Message}) — skipping.");
                     continue;
                 }
 
@@ -131,7 +184,8 @@ public sealed class NativeOcrService
 
             await srt.WriteAsync(outputPath, ct);
             await log($"OCR: wrote {srt.CueCount} cue(s) to {Path.GetFileName(outputPath)}" +
-                      (emptyRuns > 0 ? $" ({emptyRuns} blank OCR result(s) dropped)" : ""));
+                      (emptyRuns      > 0 ? $" ({emptyRuns} blank OCR result(s) dropped)" : "") +
+                      (deshearedCount > 0 ? $"; {deshearedCount}/{buffered.Count} cues desheared" : ""));
 
             return File.Exists(outputPath) ? outputPath : null;
         }
@@ -162,6 +216,21 @@ public sealed class NativeOcrService
             _ => throw new NotSupportedException($"Native OCR does not support codec '{codecName}'."),
         };
     }
+
+    /// <summary>
+    ///     Tesseract language codes whose writing systems use the Latin alphabet (plus
+    ///     its diacritic variants). Only these langs opt in to italic-deshear preprocessing —
+    ///     italic typography is Latin-script convention and the detector gives false
+    ///     positives on cursive Arabic, stroke-varied CJK, etc.
+    /// </summary>
+    private static readonly HashSet<string> _latinScriptLangs = new(StringComparer.Ordinal)
+    {
+        "eng", "spa", "fra", "deu", "ita", "por", "nld",
+        "swe", "nor", "dan", "fin", "pol", "tur", "ces",
+        "hun", "vie", "ind",
+    };
+
+    private static bool IsLatinScript(string tessLang) => _latinScriptLangs.Contains(tessLang);
 
     /// <summary>
     ///     Produces the raw bitstream the parser needs. PGS streams are copied verbatim from
@@ -209,7 +278,17 @@ public sealed class NativeOcrService
         var stdErrTask = proc.StandardError.ReadToEndAsync(ct);
         _ = proc.StandardOutput.ReadToEndAsync(ct);
 
-        await proc.WaitForExitAsync(ct);
+        try
+        {
+            await proc.WaitForExitAsync(ct);
+        }
+        catch (OperationCanceledException)
+        {
+            // WaitForExitAsync(ct) only cancels the wait — the child process keeps running
+            // and holds file handles on the tmp output, which breaks our tmpDir cleanup. Kill it.
+            try { if (!proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
+            throw;
+        }
 
         if (proc.ExitCode != 0)
         {
@@ -247,9 +326,26 @@ public sealed class NativeOcrService
 
             try
             {
-                // 'Default' engine mode uses the LSTM model when available and falls back to
-                // the legacy engine otherwise — the safe choice across tessdata variants.
-                var engine = new Engine(tessdataDir, tessLang, EngineMode.Default);
+                // tessdata_best ships LSTM-only models; EngineMode.Default tries to load the
+                // legacy engine too and can yield worse results than pure LSTM. Match the
+                // tessdata variant we're actually using.
+                var engine = new Engine(tessdataDir, tessLang, EngineMode.LstmOnly);
+
+                // Bias the recogniser toward dictionary words. LSTM's default non-dict penalty
+                // (~0.1) lets plausible-but-wrong readings like "heiped" win over "helped";
+                // raising it to 0.25 flips the ranking without being so aggressive that rare
+                // but legitimate words get rewritten.
+                try
+                {
+                    engine.SetVariable("language_model_penalty_non_dict_word",      "0.25");
+                    engine.SetVariable("language_model_penalty_non_freq_dict_word", "0.25");
+                    engine.SetVariable("tessedit_enable_dict_correction",           "1");
+                }
+                catch (Exception ex)
+                {
+                    await log($"OCR: Tesseract variable tuning partially failed ({ex.Message}) — continuing with defaults.");
+                }
+
                 _engineCache[tessLang] = engine;
                 return engine;
             }
@@ -263,6 +359,17 @@ public sealed class NativeOcrService
         {
             _engineLock.Release();
         }
+    }
+
+    private SubtitleSpellChecker GetSpellChecker(string lang)
+    {
+        var tessLang = TessdataResolver.MapToTesseractLang(lang);
+        if (_spellCheckerCache.TryGetValue(tessLang, out var cached)) return cached;
+        // Load once per language and cache. LoadFor always returns an instance —
+        // an empty dictionary just means the deterministic pass runs and edit-1 is skipped.
+        var checker = SubtitleSpellChecker.LoadFor(tessLang);
+        _spellCheckerCache[tessLang] = checker;
+        return checker;
     }
 
     private static void TryDeleteDirectory(string path)

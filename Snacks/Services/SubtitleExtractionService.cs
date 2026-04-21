@@ -95,7 +95,15 @@ public sealed class SubtitleExtractionService
                     if (File.Exists(outPath)) written.Add(outPath);
                 }
             }
-            catch (OperationCanceledException) { throw; }
+            catch (OperationCanceledException)
+            {
+                // Partial sidecar sets are worse than none — delete the completed ones so a
+                // retry starts from a clean state instead of the user thinking they have the
+                // full set from a prior run.
+                foreach (var p in written)
+                    try { if (File.Exists(p)) File.Delete(p); } catch { }
+                throw;
+            }
             catch (Exception ex)
             {
                 await log($"Sidecar extraction failed for stream {spec.StreamIndex} ({spec.Lang}): {ex.Message}");
@@ -196,7 +204,19 @@ public sealed class SubtitleExtractionService
         var stdErrTask = proc.StandardError.ReadToEndAsync(ct);
         _ = proc.StandardOutput.ReadToEndAsync(ct);
 
-        await proc.WaitForExitAsync(ct);
+        try
+        {
+            await proc.WaitForExitAsync(ct);
+        }
+        catch (OperationCanceledException)
+        {
+            // WaitForExitAsync(ct) only cancels the wait — ffmpeg keeps writing to the sidecar
+            // and holds the file handle. Kill it and delete the partial output so we don't
+            // leave a half-written .srt next to the user's video.
+            try { if (!proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
+            try { if (File.Exists(outPath)) File.Delete(outPath); } catch { }
+            throw;
+        }
         if (proc.ExitCode != 0)
         {
             var err = await stdErrTask;

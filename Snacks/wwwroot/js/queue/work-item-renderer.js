@@ -24,15 +24,22 @@ import { escapeHtml } from '../utils/dom.js';
  */
 export const TRANSFER_STATUSES = Object.freeze(['Processing', 'Uploading', 'Downloading']);
 
-/** Numeric → canonical status name lookup (the hub emits numbers). */
+/**
+ * Numeric → canonical status name lookup (the hub emits numbers).
+ *
+ * MUST stay in sync with the C# `WorkItemStatus` enum (see
+ * `Snacks/Models/WorkItem.cs`). Order and indices matter — a mismatch here
+ * silently relabels statuses at the UI layer.
+ */
 const STATUS_NAMES_BY_CODE = Object.freeze({
     0: 'Pending',
     1: 'Processing',
     2: 'Completed',
     3: 'Failed',
     4: 'Cancelled',
-    5: 'Uploading',
-    6: 'Downloading',
+    5: 'Stopped',
+    6: 'Uploading',
+    7: 'Downloading',
 });
 
 

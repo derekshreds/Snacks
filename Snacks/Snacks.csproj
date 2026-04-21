@@ -23,6 +23,10 @@
          next to the DLL at runtime and is picked up by TessdataResolver before any
          on-demand download. Apache 2.0 licensed (tessdata_fast upstream). -->
     <None Include="tools\tessdata\*.traineddata" CopyToOutputDirectory="PreserveNewest" Link="tessdata\%(Filename)%(Extension)" />
+
+    <!-- OCR post-pass word lists. Each *.txt named by Tesseract lang code activates
+         the spellcheck corrector for that language — see SubtitleSpellChecker. -->
+    <None Include="tools\wordlists\*.txt" CopyToOutputDirectory="PreserveNewest" Link="wordlists\%(Filename)%(Extension)" />
   </ItemGroup>
 
 </Project>

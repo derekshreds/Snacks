@@ -109,9 +109,9 @@ internal static class PgsParser
                         if (cueStart is not null && cueObjects.Length > 0 && palettes.ContainsKey(cuePaletteId))
                         {
                             var end = Pts(pts90);
-                            var bmp = Render(cueObjects, objects, palettes[cuePaletteId]);
-                            if (bmp is not null)
-                                yield return new BitmapEvent(cueStart.Value, end, bmp);
+                            var ev = Render(cueObjects, objects, palettes[cuePaletteId], cueStart.Value, end);
+                            if (ev is not null)
+                                yield return ev;
                         }
                         cueStart   = null;
                         cueObjects = Array.Empty<CompositionObject>();
@@ -192,7 +192,7 @@ internal static class PgsParser
     ///     the tight bounding box. Returns <c>null</c> if nothing renders (no decoded objects,
     ///     all transparent, etc.).
     /// </summary>
-    private static byte[]? Render(CompositionObject[] comps, Dictionary<ushort, PgsObject> objects, Rgba[] palette)
+    private static BitmapEvent? Render(CompositionObject[] comps, Dictionary<ushort, PgsObject> objects, Rgba[] palette, TimeSpan start, TimeSpan end)
     {
         // First pass: determine the bounding box of all placed objects.
         int minX = int.MaxValue, minY = int.MaxValue, maxX = 0, maxY = 0;
@@ -237,8 +237,8 @@ internal static class PgsParser
             }
         }
 
-        // Preprocessing (upscale + binarize) lifts Tesseract accuracy noticeably on PGS.
-        return ImagePreprocessor.Preprocess(canvas, w, h, upscale: 2);
+        // Emit raw RGBA — the OCR service runs preprocessing
+        return new BitmapEvent(start, end, canvas, w, h);
     }
 
     private readonly record struct CompositionObject(ushort ObjectId, int X, int Y);

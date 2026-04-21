@@ -383,5 +383,12 @@ signing/
 # Snacks runtime data (SQLite databases, config)
 data/
 
+# OCR wordlists — downloaded at build/dev time via download-wordlists.bat,
+# not tracked (50k-word files per language, ~10MB total). English is the
+# exception: we commit it so the spellchecker always has something to work
+# with on fresh clones and in CI where the download batch hasn't run.
+Snacks/tools/wordlists/*.txt
+!Snacks/tools/wordlists/eng.txt
+
 # Claude Code
 .claude/
