@@ -59,6 +59,18 @@ public sealed class ClusterController : ControllerBase
         [HttpPost("handshake")]
         public IActionResult Handshake([FromBody] ClusterNode senderNode)
         {
+            // Override the sender's self-reported IP with the actual source address of
+            // the TCP connection. A peer running in a container (e.g. Docker Desktop on
+            // Windows) may advertise an internal VM IP that is unreachable from here;
+            // the address we actually received the request from is, by definition,
+            // routable back to it.
+            var remoteIp = HttpContext.Connection.RemoteIpAddress;
+            if (remoteIp != null)
+            {
+                var ipv4 = remoteIp.IsIPv4MappedToIPv6 ? remoteIp.MapToIPv4() : remoteIp;
+                senderNode.IpAddress = ipv4.ToString();
+            }
+
             var (accepted, rejectReason) = _clusterService.RegisterOrUpdateNode(senderNode, fromHandshake: true);
             if (!accepted)
                 return Conflict(new { error = rejectReason });
