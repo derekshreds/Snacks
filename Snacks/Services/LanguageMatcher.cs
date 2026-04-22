@@ -114,6 +114,16 @@ public static class LanguageMatcher
     }
 
     /// <summary>
+    ///     Returns the English name ("English", "French") for <paramref name="raw"/>, or
+    ///     <see langword="null"/> if unknown. Useful for human-readable track titles.
+    /// </summary>
+    public static string? ToEnglishName(string? raw)
+    {
+        var two = ToTwoLetter(raw);
+        return two == null ? null : _twoLetterToEntry[two].EnglishName;
+    }
+
+    /// <summary>
     ///     Returns <see langword="true"/> when <paramref name="trackLang"/>
     ///     should be kept given the user-selected languages
     ///     <paramref name="wantedTwoLetter"/>.

@@ -264,7 +264,8 @@ public class FfprobeService
     /// <param name="Lang">        Canonical 2-letter ISO code, or <c>"und"</c> if unresolvable. </param>
     /// <param name="CodecName">   The source codec (e.g. <c>"subrip"</c>, <c>"hdmv_pgs_subtitle"</c>). </param>
     /// <param name="IsBitmap">    When <c>true</c>, the stream is image-based and needs OCR to become text. </param>
-    public sealed record SidecarSpec(int StreamIndex, string Lang, string CodecName, bool IsBitmap);
+    /// <param name="Title">       Source track title (e.g. "English [SDH]"), or <c>null</c> if untitled. </param>
+    public sealed record SidecarSpec(int StreamIndex, string Lang, string CodecName, bool IsBitmap, string? Title);
 
     /// <summary>
     ///     Returns the subtitle streams that should be written as sidecar files, honoring
@@ -294,7 +295,8 @@ public class FfprobeService
                 StreamIndex: s.Index,
                 Lang:        LanguageMatcher.ToTwoLetter(s.Tags?.Language) ?? "und",
                 CodecName:   s.CodecName ?? "",
-                IsBitmap:    isBitmap));
+                IsBitmap:    isBitmap,
+                Title:       string.IsNullOrWhiteSpace(s.Tags?.Title) ? null : s.Tags.Title));
         }
         return result;
     }

@@ -1171,7 +1171,23 @@ public class TranscodingService
                     var tag = LanguageMatcher.ToThreeLetterB(ocrMuxSrts[i].Lang) ?? ocrMuxSrts[i].Lang;
                     if (!string.Equals(tag, "und", StringComparison.OrdinalIgnoreCase))
                         meta += $"-metadata:s:s:{outSubIndex} language={tag} ";
-                    meta += $"-metadata:s:s:{outSubIndex} title=\"OCR ({tag})\" ";
+
+                    // Preserve the original track's title when present so "English" and
+                    // "English [SDH]" remain distinguishable after OCR (was collapsing
+                    // both to "OCR (eng)"). Fall back to "{Language} (OCR)" for tracks
+                    // that were untitled in the source.
+                    string title;
+                    if (!string.IsNullOrWhiteSpace(ocrMuxSrts[i].Title))
+                    {
+                        title = $"{ocrMuxSrts[i].Title} (OCR)";
+                    }
+                    else
+                    {
+                        var name = LanguageMatcher.ToEnglishName(ocrMuxSrts[i].Lang) ?? ocrMuxSrts[i].Lang;
+                        title = $"{name} (OCR)";
+                    }
+                    // Quotes need escaping for FFmpeg's metadata arg — replace " with a single quote.
+                    meta += $"-metadata:s:s:{outSubIndex} title=\"{title.Replace("\"", "'")}\" ";
                     outSubIndex++;
                 }
 

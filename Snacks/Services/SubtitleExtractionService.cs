@@ -160,7 +160,7 @@ public sealed class SubtitleExtractionService
                 var produced = await _ocr.ConvertBitmapToSrtAsync(
                     inputPath, spec.StreamIndex, spec.Lang, spec.CodecName, outPath, log, ct);
                 if (!string.IsNullOrEmpty(produced))
-                    results.Add(new OcrMuxResult(produced, spec.Lang));
+                    results.Add(new OcrMuxResult(produced, spec.Lang, spec.Title));
             }
             catch (OperationCanceledException) { throw; }
             catch (Exception ex)
@@ -174,7 +174,13 @@ public sealed class SubtitleExtractionService
     }
 
     /// <summary> One OCR'd SRT file ready to be added to the main encode as a text subtitle track. </summary>
-    public readonly record struct OcrMuxResult(string SrtPath, string Lang);
+    /// <param name="SrtPath"> Path to the produced SRT file. </param>
+    /// <param name="Lang">    2-letter ISO language code. </param>
+    /// <param name="Title">   Source track title if the original had one (e.g. "English [SDH]"),
+    ///                        <c>null</c> for untitled tracks. The muxer uses this to label the
+    ///                        OCR'd output so "English" and "English [SDH]" tracks stay
+    ///                        distinguishable instead of both showing as "OCR (eng)". </param>
+    public readonly record struct OcrMuxResult(string SrtPath, string Lang, string? Title);
 
     private async Task ExtractTextStreamAsync(
         string            inputPath,
