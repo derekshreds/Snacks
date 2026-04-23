@@ -1,4 +1,36 @@
+using System.Text.Json.Serialization;
+
 namespace Snacks.Models;
+
+/// <summary>
+///     Top-level encoding strategy.
+///     <list type="bullet">
+///         <item><see cref="Transcode"/> — re-encode video per the video settings; audio and subtitles per their tabs.</item>
+///         <item><see cref="Hybrid"/> — files already at the bitrate target get a video-copy mux pass (audio/subs still processed); above-target files get a full re-encode.</item>
+///         <item><see cref="MuxOnly"/> — never re-encode video. Files with muxable audio/subtitle work get a mux pass; files without muxable work are skipped entirely.</item>
+///     </list>
+/// </summary>
+[JsonConverter(typeof(JsonStringEnumConverter))]
+public enum EncodingMode
+{
+    Transcode,
+    Hybrid,
+    MuxOnly,
+}
+
+/// <summary>
+///     Which non-video stream types a mux pass is allowed to touch. Streams outside
+///     the selected type are always stream-copied through untouched — their tab settings
+///     are ignored during the mux pass. Only consulted when <see cref="EncoderOptions.EncodingMode"/>
+///     is not <see cref="EncodingMode.Transcode"/>.
+/// </summary>
+[JsonConverter(typeof(JsonStringEnumConverter))]
+public enum MuxStreams
+{
+    Both,
+    Audio,
+    Subtitles,
+}
 
 /// <summary>
 ///     User-configurable encoding options for transcoding jobs.
@@ -7,105 +39,167 @@ namespace Snacks.Models;
 /// </summary>
 public sealed class EncoderOptions
 {
-    /// <summary>
-    ///     Output container format: "mkv" or "mp4".
-    ///     Default: "mkv" (better subtitle support, fewer muxing issues).
-    /// </summary>
+    /******************************************************************
+     *  Core Video
+     ******************************************************************/
+
+    /// <summary> Output container format (e.g. "mkv", "mp4"). </summary>
     public string Format { get; set; } = "mkv";
 
-    /// <summary>
-    ///     Target video codec family: "h265", "h264", or "av1".
-    ///     Used for skip detection (already target codec).
-    /// </summary>
+    /// <summary> Logical codec name (e.g. "h265", "h264"). </summary>
     public string Codec { get; set; } = "h265";
 
-    /// <summary>
-    ///     Specific FFmpeg encoder name (e.g., "libx265", "hevc_vaapi", "av1_nvenc").
-    ///     May be overridden at runtime by hardware acceleration detection.
-    /// </summary>
+    /// <summary> FFmpeg encoder identifier (e.g. "libx265", "h264_nvenc"). </summary>
     public string Encoder { get; set; } = "libx265";
 
-    /// <summary> Target video bitrate in kbps. Default: 3500 kbps (good quality for 1080p). </summary>
+    /// <summary> Target output bitrate in kilobits per second. </summary>
     public int TargetBitrate { get; set; } = 3500;
 
-    /// <summary>
-    ///     Whether to enforce exact target bitrate (no min/max range).
-    ///     When false, a bitrate range is used for better quality.
-    /// </summary>
+    /// <summary> When <see langword="true"/>, enforces the target bitrate strictly rather than using CRF/CQ mode. </summary>
     public bool StrictBitrate { get; set; } = false;
 
-    /// <summary>
-    ///     Multiplier applied to target bitrate for 4K content.
-    ///     Range: 2–8x. Default: 4x (14,000 kbps for 4K).
-    /// </summary>
+    /// <summary> Multiplier applied to <see cref="TargetBitrate"/> for 4K source material. </summary>
     public int FourKBitrateMultiplier { get; set; } = 4;
 
-    /// <summary>
-    ///     Whether to skip 4K videos entirely.
-    ///     Useful when the target hardware can't handle 4K encoding efficiently.
-    /// </summary>
+    /// <summary> When <see langword="true"/>, 4K files are skipped entirely. </summary>
     public bool Skip4K { get; set; } = false;
 
-    /// <summary>
-    ///     Whether to downmix audio to 2-channel stereo.
-    ///     When false, original channel layout is preserved.
-    /// </summary>
+    /// <summary> FFmpeg quality preset string (e.g. "medium", "slow"). </summary>
+    public string FfmpegQualityPreset { get; set; } = "medium";
+
+    /******************************************************************
+     *  Audio
+     ******************************************************************/
+
+    /// <summary> When <see langword="true"/>, all audio is downmixed to two channels. </summary>
     public bool TwoChannelAudio { get; set; } = false;
 
-    /// <summary>
-    ///     Whether to keep only English audio tracks.
-    ///     When false, all audio tracks are preserved.
-    /// </summary>
-    public bool EnglishOnlyAudio { get; set; } = false;
+    /// <summary> ISO 639-1 2-letter codes for audio tracks to retain (e.g. ["en", "ja"]). Empty keeps all tracks. </summary>
+    public List<string> AudioLanguagesToKeep { get; set; } = new() { "en" };
+
+    /// <summary> When <see langword="true"/>, always keeps the original-language audio track. </summary>
+    public bool KeepOriginalLanguage { get; set; } = false;
+
+    /// <summary> Provider used to look up the original language of a file (e.g. "None", "Sonarr"). </summary>
+    public string OriginalLanguageProvider { get; set; } = "None";
+
+    /// <summary> FFmpeg audio codec name (e.g. "copy", "aac", "ac3"). </summary>
+    public string AudioCodec { get; set; } = "copy";
+
+    /// <summary> Target audio bitrate in kilobits per second. </summary>
+    public int AudioBitrateKbps { get; set; } = 192;
+
+    /******************************************************************
+     *  Encoding Mode
+     ******************************************************************/
 
     /// <summary>
-    ///     Whether to keep only English subtitle tracks.
-    ///     When false, all subtitle tracks are preserved.
+    ///     Top-level strategy. <see cref="EncodingMode.Transcode"/> re-encodes video
+    ///     as usual. <see cref="EncodingMode.Hybrid"/> mux-passes at-target files and
+    ///     transcodes above-target files. <see cref="EncodingMode.MuxOnly"/> never
+    ///     re-encodes video; files with no muxable work are skipped.
     /// </summary>
-    public bool EnglishOnlySubtitles { get; set; } = false;
+    public EncodingMode EncodingMode { get; set; } = EncodingMode.Transcode;
 
     /// <summary>
-    ///     Whether to delete the original source file after successful encoding.
-    ///     When true, the transcoded file replaces the original.
-    ///     Default: false (keep both files).
+    ///     Which stream types a mux pass is allowed to touch. Ignored when
+    ///     <see cref="EncodingMode"/> is <see cref="EncodingMode.Transcode"/>.
     /// </summary>
-    public bool DeleteOriginalFile { get; set; } = false;
+    public MuxStreams MuxStreams { get; set; } = MuxStreams.Both;
 
-    /// <summary>
-    ///     Whether to detect and crop black borders.
-    ///     Adds a crop filter to the FFmpeg command.
-    /// </summary>
+    /******************************************************************
+     *  Subtitles
+     ******************************************************************/
+
+    /// <summary> ISO 639-1 2-letter codes for subtitle tracks to retain. Empty keeps all tracks. </summary>
+    public List<string> SubtitleLanguagesToKeep { get; set; } = new() { "en" };
+
+    /// <summary> When <see langword="true"/>, text subtitles are written to sidecar files instead of muxed. </summary>
+    public bool ExtractSubtitlesToSidecar { get; set; } = false;
+
+    /// <summary> Sidecar subtitle container format (e.g. "srt", "ass"). </summary>
+    public string SidecarSubtitleFormat { get; set; } = "srt";
+
+    /// <summary> When <see langword="true"/>, image-based subtitle tracks are OCR-converted to SRT. </summary>
+    public bool ConvertImageSubtitlesToSrt { get; set; } = false;
+
+    /******************************************************************
+     *  Video Pipeline
+     ******************************************************************/
+
+    /// <summary> Downscale policy: "Never", "Always", or "IfLarger". </summary>
+    public string DownscalePolicy { get; set; } = "Never";
+
+    /// <summary> Target resolution for downscaling (e.g. "1080p", "720p"). </summary>
+    public string DownscaleTarget { get; set; } = "1080p";
+
+    /// <summary> When <see langword="true"/>, HDR content is tone-mapped to SDR before encoding. </summary>
+    public bool TonemapHdrToSdr { get; set; } = false;
+
+    /// <summary> When <see langword="true"/>, black border crop detection is applied before encoding. </summary>
     public bool RemoveBlackBorders { get; set; } = false;
 
-    /// <summary>
-    ///     Whether to retry with software encoding if hardware encoding fails.
-    ///     Default: true (recommended for reliability).
-    /// </summary>
+    /******************************************************************
+     *  Output and Scratch
+     ******************************************************************/
+
+    /// <summary> When <see langword="true"/>, the source file is deleted after a successful encode. </summary>
+    public bool DeleteOriginalFile { get; set; } = false;
+
+    /// <summary> When <see langword="true"/>, failed items are automatically re-queued once. </summary>
     public bool RetryOnFail { get; set; } = true;
 
-    /// <summary>
-    ///     Directory to place output files.
-    ///     If set, transcoded files are moved here after encoding.
-    /// </summary>
+    /// <summary> Percentage above target bitrate at which an already-efficient file is skipped. </summary>
+    public int SkipPercentAboveTarget { get; set; } = 20;
+
+    /// <summary> Optional output directory override. When <see langword="null"/>, output is written beside the source. </summary>
     public string? OutputDirectory { get; set; }
 
-    /// <summary>
-    ///     Temporary directory for encoding work files.
-    ///     If set, encoding happens here and files are moved to OutputDirectory after.
-    /// </summary>
+    /// <summary> Optional intermediate encode directory. When <see langword="null"/>, the system temp directory is used. </summary>
     public string? EncodeDirectory { get; set; }
 
-    /// <summary>
-    ///     Hardware acceleration mode: "auto", "intel", "amd", "nvidia", or "none".
-    ///     "auto" detects available hardware at runtime.
-    /// </summary>
+    /// <summary> Hardware acceleration mode (e.g. "auto", "nvenc", "vaapi", "none"). </summary>
     public string HardwareAcceleration { get; set; } = "auto";
 
+    /******************************************************************
+     *  Cloning
+     ******************************************************************/
+
     /// <summary>
-    ///     Skip files already in the target codec if their bitrate is within this
-    ///     percentage above the target. Default: 20 (skip if within 20% above target).
-    ///     Set to 0 to only skip files at or below target. Set to 100 to skip files
-    ///     up to 2x target.
+    ///     Deep copy of this options instance. The two language lists are
+    ///     cloned so per-item mutation can't bleed back into shared state.
     /// </summary>
-    public int SkipPercentAboveTarget { get; set; } = 20;
+    public EncoderOptions Clone() => new()
+    {
+        Format                     = Format,
+        Codec                      = Codec,
+        Encoder                    = Encoder,
+        TargetBitrate              = TargetBitrate,
+        StrictBitrate              = StrictBitrate,
+        FourKBitrateMultiplier     = FourKBitrateMultiplier,
+        Skip4K                     = Skip4K,
+        FfmpegQualityPreset        = FfmpegQualityPreset,
+        TwoChannelAudio            = TwoChannelAudio,
+        AudioLanguagesToKeep       = new List<string>(AudioLanguagesToKeep),
+        KeepOriginalLanguage       = KeepOriginalLanguage,
+        OriginalLanguageProvider   = OriginalLanguageProvider,
+        AudioCodec                 = AudioCodec,
+        AudioBitrateKbps           = AudioBitrateKbps,
+        EncodingMode               = EncodingMode,
+        MuxStreams                 = MuxStreams,
+        SubtitleLanguagesToKeep    = new List<string>(SubtitleLanguagesToKeep),
+        ExtractSubtitlesToSidecar  = ExtractSubtitlesToSidecar,
+        SidecarSubtitleFormat      = SidecarSubtitleFormat,
+        ConvertImageSubtitlesToSrt = ConvertImageSubtitlesToSrt,
+        DownscalePolicy            = DownscalePolicy,
+        DownscaleTarget            = DownscaleTarget,
+        TonemapHdrToSdr            = TonemapHdrToSdr,
+        RemoveBlackBorders         = RemoveBlackBorders,
+        DeleteOriginalFile         = DeleteOriginalFile,
+        RetryOnFail                = RetryOnFail,
+        SkipPercentAboveTarget     = SkipPercentAboveTarget,
+        OutputDirectory            = OutputDirectory,
+        EncodeDirectory            = EncodeDirectory,
+        HardwareAcceleration       = HardwareAcceleration,
+    };
 }

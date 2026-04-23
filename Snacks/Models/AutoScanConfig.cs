@@ -32,4 +32,9 @@ public sealed class AutoScanConfig
     ///     survives application restarts.
     /// </summary>
     public bool QueuePaused { get; set; } = false;
+
+    /// <summary>
+    ///     Rules for skipping files during scans (filename patterns, size thresholds, resolutions).
+    /// </summary>
+    public ExclusionRules ExclusionRules { get; set; } = new();
 }

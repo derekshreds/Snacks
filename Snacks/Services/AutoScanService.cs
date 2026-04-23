@@ -20,6 +20,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
     private readonly MediaFileRepository         _mediaFileRepo;
     private readonly IHubContext<TranscodingHub> _hubContext;
     private readonly ClusterService              _clusterService;
+    private readonly NotificationService         _notificationService;
     private readonly SemaphoreSlim               _scanLock = new(1, 1);
     private readonly string                      _configPath;
     private readonly string                      _settingsPath;
@@ -49,14 +50,16 @@ public sealed class AutoScanService : IHostedService, IDisposable
         TranscodingService transcodingService,
         MediaFileRepository mediaFileRepo,
         IHubContext<TranscodingHub> hubContext,
-        ClusterService clusterService)
+        ClusterService clusterService,
+        NotificationService notificationService)
     {
-        _fileService        = fileService;
-        _ffprobeService     = ffprobeService;
-        _transcodingService = transcodingService;
-        _mediaFileRepo      = mediaFileRepo;
-        _hubContext         = hubContext;
-        _clusterService     = clusterService;
+        _fileService         = fileService;
+        _ffprobeService      = ffprobeService;
+        _transcodingService  = transcodingService;
+        _mediaFileRepo       = mediaFileRepo;
+        _hubContext          = hubContext;
+        _clusterService      = clusterService;
+        _notificationService = notificationService;
 
         var configDir = Path.Combine(_fileService.GetWorkingDirectory(), "config");
         if (!Directory.Exists(configDir))
@@ -74,7 +77,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
     ///     Starts the service: loads config, migrates legacy data, restores queue pause state,
     ///     resumes interrupted queue items from the database, and triggers an immediate scan if enabled.
     /// </summary>
-    /// <param name="cancellationToken">Triggered when the host is starting a shutdown.</param>
+    /// <param name="cancellationToken"> Triggered when the host is starting a shutdown. </param>
     public async Task StartAsync(CancellationToken cancellationToken)
     {
         LoadConfig();
@@ -83,6 +86,13 @@ public sealed class AutoScanService : IHostedService, IDisposable
 
         // Wire up folder override resolver for cluster dispatch (avoids circular DI)
         _clusterService.FolderOverrideResolver = FindFolderOverride;
+
+        // Feed library exclusion rules into the transcoding service so manual adds honor
+        // the same filename/size/resolution filters the auto-scanner applies.
+        _transcodingService.SetExclusionRulesProvider(() =>
+        {
+            lock (_configLock) { return _config.ExclusionRules; }
+        });
 
         if (_config.QueuePaused)
         {
@@ -104,7 +114,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
     }
 
     /// <summary> Stops the scan timer. Active scans finish naturally. </summary>
-    /// <param name="cancellationToken">Triggered when the host needs a forced shutdown.</param>
+    /// <param name="cancellationToken"> Triggered when the host needs a forced shutdown. </param>
     public Task StopAsync(CancellationToken cancellationToken)
     {
         _timer?.Change(Timeout.Infinite, 0);
@@ -128,7 +138,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
     ///     Adds a directory to the auto-scan list if it is not already present.
     ///     Normalizes the path before comparison and persists the change immediately.
     /// </summary>
-    /// <param name="path">The directory path to add.</param>
+    /// <param name="path"> The directory path to add. </param>
     public void AddDirectory(string path)
     {
         var normalized = Path.GetFullPath(path);
@@ -145,7 +155,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
     /// <summary>
     ///     Removes a directory from the auto-scan list (case-insensitive) and persists the change immediately.
     /// </summary>
-    /// <param name="path">The directory path to remove.</param>
+    /// <param name="path"> The directory path to remove. </param>
     public void RemoveDirectory(string path)
     {
         var normalized = Path.GetFullPath(path);
@@ -158,8 +168,10 @@ public sealed class AutoScanService : IHostedService, IDisposable
 
     /// <summary>
     ///     Updates the encoding overrides for an existing watched folder.
-    ///     Pass null to clear overrides (revert to global defaults).
+    ///     Pass <see langword="null"/> to clear overrides and revert to global defaults.
     /// </summary>
+    /// <param name="path"> The watched folder path to update. </param>
+    /// <param name="overrides"> The new encoding overrides, or <see langword="null"/> to clear them. </param>
     public void SaveFolderSettings(string path, EncoderOptionsOverride? overrides)
     {
         var normalized = Path.GetFullPath(path);
@@ -199,7 +211,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
     }
 
     /// <summary> Enables or disables automatic scanning and reschedules the timer accordingly. </summary>
-    /// <param name="enabled">Whether auto-scan should be active.</param>
+    /// <param name="enabled"> Whether auto-scan should be active. </param>
     public void SetEnabled(bool enabled)
     {
         lock (_configLock)
@@ -211,7 +223,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
     }
 
     /// <summary> Updates the scan interval (minimum 1 minute) and reschedules the timer. </summary>
-    /// <param name="minutes">The new scan interval in minutes.</param>
+    /// <param name="minutes"> The new scan interval in minutes. </param>
     public void SetInterval(int minutes)
     {
         if (minutes < 1) minutes = 1;
@@ -223,8 +235,29 @@ public sealed class AutoScanService : IHostedService, IDisposable
         ScheduleTimer();
     }
 
+    /// <summary> Replaces the exclusion rules sub-config and persists the change immediately. </summary>
+    /// <param name="rules"> The new exclusion rules to apply. </param>
+    public void UpdateExclusionRules(ExclusionRules rules)
+    {
+        lock (_configLock)
+        {
+            _config.ExclusionRules = rules;
+            SaveConfig();
+        }
+    }
+
+    /// <summary>
+    ///     Returns a snapshot of the current exclusion rules. Threaded services poll through this
+    ///     getter instead of holding a direct <see cref="AutoScanService"/> reference (avoids
+    ///     the TranscodingService &#8596; AutoScanService DI cycle).
+    /// </summary>
+    public ExclusionRules GetCurrentExclusionRules()
+    {
+        lock (_configLock) { return _config.ExclusionRules; }
+    }
+
     /// <summary> Persists the queue paused state to disk so it survives restarts. </summary>
-    /// <param name="paused">Whether the encoding queue should be paused.</param>
+    /// <param name="paused"> Whether the encoding queue should be paused. </param>
     public void SetQueuePaused(bool paused)
     {
         lock (_configLock)
@@ -251,32 +284,30 @@ public sealed class AutoScanService : IHostedService, IDisposable
     {
         Console.WriteLine("ClearHistory: Starting full state reset...");
 
-        // 1. Cancel any active scan (stops ffprobe operations and file enumeration)
+        // Cancel any in-flight scan before acquiring the lock to avoid deadlock.
         _scanCts?.Cancel();
 
-        // 2. Wait for scan to fully stop
         await _scanLock.WaitAsync();
         try
         {
-            // 3. Cancel all remote jobs and clear cluster state
             if (_clusterService.IsMasterMode)
                 await _clusterService.ClearAllRemoteStateAsync();
 
-            // 4. Clear in-memory queue and kill any active local FFmpeg process
+            // Kill any active local FFmpeg process and drain the in-memory queue.
             await _transcodingService.ClearAllInMemoryState();
 
-            // 5. Reset all database statuses
             await _mediaFileRepo.ResetAllStatusesAsync();
 
-            // 6. Clear WAL table
-            try { await _mediaFileRepo.ClearAllTransitionsAsync(); } catch { }
+            try
+            {
+                await _mediaFileRepo.ClearAllTransitionsAsync();
+            }
+            catch { }
 
-            // 7. Clear scan timestamps
             _config.LastScanTime     = null;
             _config.LastScanNewFiles = 0;
             SaveConfig();
 
-            // 8. Notify UI
             await _hubContext.Clients.All.SendAsync("HistoryCleared");
 
             Console.WriteLine("ClearHistory: Full state reset complete");
@@ -465,11 +496,26 @@ public sealed class AutoScanService : IHostedService, IDisposable
             var knownPaths     = await _mediaFileRepo.GetFileInfoBatchAsync(scannedDirs);
             var knownBaseNames = await _mediaFileRepo.GetBaseNameStatusBatchAsync(scannedDirs);
 
+            // Snapshot the exclusion rules once per scan — using the same rules for every file
+            // in a pass keeps behavior predictable even if the user edits exclusions mid-scan.
+            ExclusionRules exclusions;
+            lock (_configLock) { exclusions = _config.ExclusionRules; }
+
             var newFiles = new List<string>();
             foreach (var file in allVideoFiles)
             {
                 ct.ThrowIfCancellationRequested();
                 var normalizedPath = Path.GetFullPath(file);
+
+                // Cheap exclusion filter — filename and size are available without probing.
+                // Resolution-based exclusion is applied downstream in AddFileAsync (needs probe).
+                long? earlySize = null;
+                try { earlySize = new FileInfo(normalizedPath).Length; } catch { }
+                if (exclusions.IsExcluded(Path.GetFileName(normalizedPath), earlySize, resolutionLabel: null))
+                {
+                    Console.WriteLine($"AutoScan: Excluded by library rules: {Path.GetFileName(file)}");
+                    continue;
+                }
 
                 if (knownPaths.TryGetValue(normalizedPath, out var info) &&
                     info.Status is not MediaFileStatus.Unseen)
@@ -521,8 +567,8 @@ public sealed class AutoScanService : IHostedService, IDisposable
                 }
                 catch { continue; }
 
-                var dir        = Path.GetDirectoryName(file) ?? "";
-                var baseName   = Path.GetFileNameWithoutExtension(file);
+                var dir         = Path.GetDirectoryName(file) ?? "";
+                var baseName    = Path.GetFileNameWithoutExtension(file);
                 var snacksFiles = Directory.Exists(dir)
                     ? Directory.GetFiles(dir, $"{baseName} [snacks].*")
                         .Where(f => _fileService.IsVideoFile(f))
@@ -583,6 +629,9 @@ public sealed class AutoScanService : IHostedService, IDisposable
             SaveConfig();
 
             await _hubContext.Clients.All.SendAsync("AutoScanCompleted", newFileCount, allVideoFiles.Count);
+
+            // Auto-scan only runs on the master, so this is naturally master-only.
+            _ = _notificationService.NotifyScanCompletedAsync(newFileCount);
         }
         catch (OperationCanceledException)
         {

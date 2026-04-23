@@ -10,7 +10,10 @@ RUN apt-get update && apt-get install -y curl gnupg && \
     printf "Types: deb\nURIs: https://repo.jellyfin.org/ubuntu\nSuites: noble\nComponents: main\nArchitectures: amd64\nSigned-By: /etc/apt/keyrings/jellyfin.gpg\n" \
     > /etc/apt/sources.list.d/jellyfin.sources
 
-# Install jellyfin-ffmpeg7 (latest available for Noble), Intel VAAPI drivers, and supporting libraries
+# Install jellyfin-ffmpeg7 (latest available for Noble), Intel VAAPI drivers, supporting
+# libraries, and the runtime deps that SkiaSharp needs for its native bitmap decoder
+# (libfontconfig1, libfreetype6). Tesseract's native libs are carried by the TesseractOCR
+# NuGet so no apt package is needed for OCR itself.
 RUN apt-get update && apt-get install -y \
     coreutils \
     jellyfin-ffmpeg7=7.1.3-5* \
@@ -20,6 +23,8 @@ RUN apt-get update && apt-get install -y \
     va-driver-all \
     vainfo \
     libva-drm2 \
+    libfontconfig1 \
+    libfreetype6 \
     && rm -rf /var/lib/apt/lists/*
 
 # Verify FFmpeg has VAAPI support

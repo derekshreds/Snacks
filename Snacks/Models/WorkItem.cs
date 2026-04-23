@@ -26,6 +26,13 @@ public sealed class WorkItem
     public long Size { get; set; } = 0;
 
     /// <summary>
+    ///     File size in bytes of the encoded output. Populated when the job completes;
+    ///     <see langword="null"/> while pending/processing or when the output was discarded
+    ///     before a size could be read. Surfaced in the UI to show size reduction on completed cards.
+    /// </summary>
+    public long? OutputSize { get; set; }
+
+    /// <summary>
     ///     Video bitrate in kbps, calculated from file size and duration.
     ///     Used for queue prioritization — higher bitrate files are processed first
     ///     to maximize perceived throughput.
@@ -50,8 +57,38 @@ public sealed class WorkItem
     /// </summary>
     public ProbeResult? Probe { get; set; }
 
-    /// <summary> Current lifecycle state of this work item. </summary>
-    public WorkItemStatus Status { get; set; } = WorkItemStatus.Pending;
+    private WorkItemStatus _status = WorkItemStatus.Pending;
+
+    /// <summary>
+    ///     Current lifecycle state of this work item.
+    /// </summary>
+    /// <remarks>
+    ///     Terminal states (<see cref="WorkItemStatus.Cancelled"/>, <see cref="WorkItemStatus.Stopped"/>,
+    ///     <see cref="WorkItemStatus.Completed"/>, <see cref="WorkItemStatus.Failed"/>) are <b>sticky</b>
+    ///     against concurrent active-state assignments — once the user cancels (or the job completes),
+    ///     any in-flight async handler that tries to flip the status back to <c>Uploading</c>,
+    ///     <c>Downloading</c>, or <c>Processing</c> is ignored. This eliminates races between
+    ///     <c>CancelWorkItemAsync</c> and progress-update loops or WAL transitions that were
+    ///     already in flight when cancel fired. Legitimate retry/reset paths use <c>Pending</c>,
+    ///     which is always accepted.
+    /// </remarks>
+    public WorkItemStatus Status
+    {
+        get => _status;
+        set
+        {
+            if (IsTerminal(_status) && IsActive(value)) return;
+            _status = value;
+        }
+    }
+
+    private static bool IsTerminal(WorkItemStatus s) => s is WorkItemStatus.Cancelled
+                                                          or WorkItemStatus.Stopped
+                                                          or WorkItemStatus.Completed
+                                                          or WorkItemStatus.Failed;
+    private static bool IsActive(WorkItemStatus s)   => s is WorkItemStatus.Uploading
+                                                          or WorkItemStatus.Downloading
+                                                          or WorkItemStatus.Processing;
 
     /// <summary>
     ///     Encoding progress percentage (0–100).

@@ -130,6 +130,11 @@ public class MediaFileRepository
                 existing.Status = file.Status;
                 existing.LastScannedAt = file.LastScannedAt;
                 existing.FileMtime = file.FileMtime;
+                // Only overwrite stream summaries when the caller actually has them — a
+                // partial upsert without probe data shouldn't wipe previously-captured
+                // summaries that the Mux re-evaluation still needs.
+                if (file.AudioStreams    != null) existing.AudioStreams    = file.AudioStreams;
+                if (file.SubtitleStreams != null) existing.SubtitleStreams = file.SubtitleStreams;
             }
             else
             {
@@ -326,6 +331,38 @@ public class MediaFileRepository
         {
             using var context = await _contextFactory.CreateDbContextAsync();
             await context.StateTransitions.ExecuteDeleteAsync();
+        }
+
+        /// <summary>
+        ///     Re-evaluates every <see cref="MediaFileStatus.Skipped" /> row against the supplied
+        ///     predicate. Files for which <paramref name="shouldStaySkipped" /> returns
+        ///     <see langword="false" /> are flipped back to <see cref="MediaFileStatus.Unseen" />
+        ///     so the next scan picks them up. Used when encoder settings change to re-queue
+        ///     files whose skip decision would no longer hold.
+        /// </summary>
+        /// <param name="shouldStaySkipped">
+        ///     Pure predicate over the DB-stored fields (no probing). Return <see langword="true" />
+        ///     to keep the row skipped, <see langword="false" /> to flip it to Unseen.
+        /// </param>
+        /// <returns> The number of rows whose status was flipped. </returns>
+        public async Task<int> ReevaluateSkippedAsync(Func<MediaFile, bool> shouldStaySkipped)
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            var skipped = await context.MediaFiles
+                .Where(f => f.Status == MediaFileStatus.Skipped)
+                .ToListAsync();
+
+            int flipped = 0;
+            foreach (var mf in skipped)
+            {
+                if (shouldStaySkipped(mf)) continue;
+                mf.Status = MediaFileStatus.Unseen;
+                mf.LastScannedAt = null;
+                flipped++;
+            }
+
+            if (flipped > 0) await SaveChangesWithRetryAsync(context);
+            return flipped;
         }
 
         /// <summary>

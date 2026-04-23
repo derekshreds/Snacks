@@ -49,6 +49,7 @@ public sealed class ClusterService : IHostedService, IDisposable
     private readonly IHttpClientFactory                        _httpClientFactory;
     private readonly MediaFileRepository                       _mediaFileRepo;
     private readonly StateTransitionService                    _stateTransitions;
+    private readonly NotificationService                       _notificationService;
     private readonly ConcurrentDictionary<string, ClusterNode> _nodes = new();
     private readonly ConcurrentDictionary<string, WorkItem>    _remoteJobs         = new();
     private readonly ConcurrentDictionary<string, bool>        _activeDownloads    = new();
@@ -108,15 +109,20 @@ public sealed class ClusterService : IHostedService, IDisposable
         IHubContext<TranscodingHub> hubContext,
         IHttpClientFactory httpClientFactory,
         MediaFileRepository mediaFileRepo,
-        StateTransitionService stateTransitions)
+        StateTransitionService stateTransitions,
+        IntegrationService integrationService,
+        NotificationService notificationService)
     {
-        _transcodingService = transcodingService;
-        _ffprobeService     = ffprobeService;
-        _fileService        = fileService;
-        _hubContext         = hubContext;
-        _httpClientFactory  = httpClientFactory;
-        _mediaFileRepo      = mediaFileRepo;
-        _stateTransitions   = stateTransitions;
+        _transcodingService  = transcodingService;
+        _ffprobeService      = ffprobeService;
+        _fileService         = fileService;
+        _hubContext          = hubContext;
+        _httpClientFactory   = httpClientFactory;
+        _mediaFileRepo       = mediaFileRepo;
+        _stateTransitions    = stateTransitions;
+        _notificationService = notificationService;
+
+        transcodingService.SetExternalDispatchGate(() => ShouldDispatchExternal);
 
         _workDir = _fileService.GetWorkingDirectory();
         var configDir = Path.Combine(_workDir, "config");
@@ -131,7 +137,7 @@ public sealed class ClusterService : IHostedService, IDisposable
         _fileTransfer = new ClusterFileTransferService(hubContext, httpClientFactory);
 
         _nodeJobs = new ClusterNodeJobService(
-            transcodingService, hubContext, httpClientFactory, _discovery, _nodes);
+            transcodingService, hubContext, httpClientFactory, _discovery, _nodes, integrationService);
     }
 
     /******************************************************************
@@ -364,6 +370,13 @@ public sealed class ClusterService : IHostedService, IDisposable
     /// <summary> Whether this instance is running as the master coordinator. </summary>
     public bool IsMasterMode => _config.Enabled && _config.Role == "master";
 
+    /// <summary>
+    ///     Whether this instance should originate external-facing side effects
+    ///     (webhooks, Plex/Jellyfin rescans, etc.). True for standalone and master;
+    ///     false for dedicated worker nodes so each event fires exactly once cluster-wide.
+    /// </summary>
+    public bool ShouldDispatchExternal => !_config.Enabled || _config.Role != "node";
+
     /******************************************************************
      *  Delegated Node-Side API
      ******************************************************************/
@@ -428,6 +441,20 @@ public sealed class ClusterService : IHostedService, IDisposable
 
     /// <summary> Deletes all remote job temp directories unconditionally. </summary>
     public void CleanupAllRemoteJobs() => _nodeJobs.CleanupAllRemoteJobs();
+
+    /// <summary>
+    ///     Triggers an on-demand pull of the master's integration credentials into this
+    ///     worker's local <c>integrations.json</c>. Surfaces the same code path the
+    ///     pre-encode hook uses.
+    /// </summary>
+    public Task PullIntegrationsFromMasterAsync(CancellationToken ct) =>
+        _nodeJobs.PullIntegrationsFromMasterAsync(ct);
+
+    /// <summary> UTC timestamp of this worker's last successful integration pull, or <c>null</c>. </summary>
+    public DateTime? LastIntegrationSyncAt => _nodeJobs.LastIntegrationSyncAt;
+
+    /// <summary> Human-readable status of this worker's last integration pull attempt. </summary>
+    public string LastIntegrationSyncStatus => _nodeJobs.LastIntegrationSyncStatus;
 
     /******************************************************************
      *  Delegated Discovery API
@@ -625,6 +652,7 @@ public sealed class ClusterService : IHostedService, IDisposable
             {
                 Console.WriteLine($"Cluster: Node {node.Hostname} timed out (last heartbeat {timeSinceHeartbeat.TotalSeconds:0}s ago)");
                 node.Status = NodeStatus.Unreachable;
+                _ = _notificationService.NotifyNodeOfflineAsync(NodeDisplayName(node));
                 await _hubContext.Clients.All.SendAsync("WorkerUpdated", node);
 
                 if (node.ActiveWorkItemId != null)
@@ -668,6 +696,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                     {
                         node.Status = NodeStatus.Online;
                         Console.WriteLine($"Cluster: Node {node.Hostname} reconnected");
+                        _ = _notificationService.NotifyNodeOnlineAsync(NodeDisplayName(node));
                     }
 
                     if (heartbeat.TryGetProperty("isPaused", out var pausedProp))
@@ -1103,6 +1132,9 @@ public sealed class ClusterService : IHostedService, IDisposable
             workItem.TransferProgress = 0;
             await _mediaFileRepo.UpdateRemoteJobPhaseAsync(Path.GetFullPath(workItem.Path), "Encoding");
             await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
+
+            if (ShouldDispatchExternal)
+                _ = _notificationService.NotifyEncodeStartedAsync(Path.GetFileName(workItem.Path));
 
             await encodeScope.CompleteAsync();
             _activeTransitions.TryRemove(workItem.Id, out _);
@@ -2309,6 +2341,10 @@ public sealed class ClusterService : IHostedService, IDisposable
     /// <summary> Builds the base URL for inter-node HTTP communication. </summary>
     private string NodeBaseUrl(ClusterNode node) =>
         $"{(_config.UseHttps ? "https" : "http")}://{node.IpAddress}:{node.Port}";
+
+    /// <summary> Returns a human-readable node identifier for log messages and notifications. </summary>
+    private static string NodeDisplayName(ClusterNode node) =>
+        !string.IsNullOrWhiteSpace(node.Hostname) ? node.Hostname : node.NodeId;
 
     /// <summary> Creates a deep copy of encoder options via JSON round-trip serialization. </summary>
     private EncoderOptions CloneOptions(EncoderOptions options)

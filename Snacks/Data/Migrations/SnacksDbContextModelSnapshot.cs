@@ -38,6 +38,10 @@ namespace Snacks.Data.Migrations
                     b.Property<int?>("AssignedNodePort")
                         .HasColumnType("INTEGER");
 
+                    b.Property<string>("AudioStreams")
+                        .HasMaxLength(4096)
+                        .HasColumnType("TEXT");
+
                     b.Property<string>("BaseName")
                         .IsRequired()
                         .HasMaxLength(512)
@@ -117,6 +121,10 @@ namespace Snacks.Data.Migrations
 
                     b.Property<int>("Status")
                         .HasColumnType("INTEGER");
+
+                    b.Property<string>("SubtitleStreams")
+                        .HasMaxLength(4096)
+                        .HasColumnType("TEXT");
 
                     b.Property<int>("Width")
                         .HasColumnType("INTEGER");

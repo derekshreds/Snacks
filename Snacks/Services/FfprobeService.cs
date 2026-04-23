@@ -108,52 +108,110 @@ public class FfprobeService
 
     /// <summary>
     ///     Returns the FFmpeg <c>-map</c> and audio codec arguments for the selected audio streams.
-    ///     Filters commentary tracks when English-only mode is active.
+    ///     Filters commentary tracks when a language keep-list is active.
     /// </summary>
     /// <param name="probe">The ffprobe analysis of the source file.</param>
-    /// <param name="englishOnly">When <c>true</c>, only English audio tracks are kept.</param>
-    /// <param name="twoChannels">When <c>true</c>, audio is downmixed to 2-channel stereo AAC.</param>
-    /// <param name="isMatroska">
-    ///     When <c>true</c>, non-AAC audio is copied; otherwise all tracks are re-encoded to AAC.
+    /// <param name="languagesToKeep">
+    ///     2-letter ISO codes to retain. Empty or null keeps every audio stream. Matching accepts
+    ///     the track's tag in any of its common forms (2-letter, 3-letter, or English name).
     /// </param>
+    /// <param name="audioCodec">
+    ///     User-selected codec: <c>"copy"</c>, <c>"aac"</c>, <c>"eac3"</c>, or <c>"opus"</c>.
+    ///     "copy" is silently upgraded to AAC re-encode when <paramref name="twoChannels"/> is set
+    ///     (you can't downmix a copied stream) or when the container is MP4 (which doesn't carry
+    ///     every source format).
+    /// </param>
+    /// <param name="audioBitrateKbps">Target bitrate for re-encoded audio. Ignored when the effective codec is copy.</param>
+    /// <param name="twoChannels">When <c>true</c>, audio is downmixed to 2-channel stereo.</param>
+    /// <param name="isMatroska">When <c>false</c> (MP4), copy is disallowed — falls back to AAC re-encode.</param>
     /// <returns>FFmpeg stream mapping and codec arguments for audio, or an empty string if no audio streams exist.</returns>
-    public string MapAudio(ProbeResult probe, bool englishOnly, bool twoChannels, bool isMatroska)
+    public string MapAudio(
+        ProbeResult               probe,
+        IReadOnlyList<string>?    languagesToKeep,
+        string                    audioCodec,
+        int                       audioBitrateKbps,
+        bool                      twoChannels,
+        bool                      isMatroska)
     {
         ArgumentNullException.ThrowIfNull(probe);
 
         var audioStreams = probe.Streams.Where(s => s.CodecType == "audio").ToList();
-        if (!audioStreams.Any())
-            return "";
+        if (!audioStreams.Any()) return "";
 
-        if (englishOnly)
+        // Resolve the effective codec. "copy" is degraded to AAC when the config
+        // asks for something copy can't satisfy (downmix, MP4 container).
+        var effectiveCodec = ResolveAudioCodec(audioCodec, twoChannels, isMatroska);
+        var codecArgs      = BuildAudioCodecArgs(effectiveCodec, audioBitrateKbps, twoChannels);
+
+        if (languagesToKeep != null && languagesToKeep.Count > 0)
         {
-            var englishAudioStreams = audioStreams
-                .Where(s => s.Tags?.Language == "eng"
+            var filtered = audioStreams
+                .Where(s => LanguageMatcher.Matches(s.Tags?.Language, s.Tags?.Title, languagesToKeep)
                     && (s.Tags?.Title == null || !s.Tags.Title.ToLower().Contains("comm")))
                 .ToList();
 
-            if (englishAudioStreams.Any())
+            if (filtered.Any())
             {
-                var maps = string.Join(" ", englishAudioStreams.Select(s => $"-map 0:{s.Index}"));
-
-                if (twoChannels)
-                    return $"{maps} -c:a aac -ac 2 -vbr 5";
-
-                return isMatroska ? $"{maps} -c:a copy" : $"{maps} -c:a aac -vbr 5";
+                var maps = string.Join(" ", filtered.Select(s => $"-map 0:{s.Index}"));
+                return $"{maps} {codecArgs}";
             }
         }
 
-        if (twoChannels)
-            return "-map 0:a -c:a aac -ac 2 -vbr 5";
+        return $"-map 0:a {codecArgs}";
+    }
 
-        return isMatroska ? "-map 0:a -c:a copy" : "-map 0:a -c:a aac -vbr 5";
+    /// <summary>
+    ///     Resolves the user-selected audio codec to what FFmpeg will actually run.
+    ///     Downgrades <c>"copy"</c> to AAC when the rest of the config can't satisfy copy
+    ///     (a downmix request or an MP4 container with unsupported source codecs).
+    /// </summary>
+    private static string ResolveAudioCodec(string requested, bool twoChannels, bool isMatroska)
+    {
+        var codec = (requested ?? "").Trim().ToLowerInvariant();
+        if (codec is not ("copy" or "aac" or "eac3" or "opus")) codec = "aac";
+
+        // Copy can't downmix, and MP4 can't carry every codec — fall back to AAC.
+        if (codec == "copy" && (twoChannels || !isMatroska)) codec = "aac";
+        return codec;
+    }
+
+    /// <summary>
+    ///     Builds the <c>-c:a ...</c> flag set for the resolved codec, including
+    ///     bitrate/VBR flags and the downmix flag when <paramref name="twoChannels"/>.
+    /// </summary>
+    private static string BuildAudioCodecArgs(string codec, int bitrateKbps, bool twoChannels)
+    {
+        var downmix = twoChannels ? " -ac 2" : "";
+        var br      = bitrateKbps > 0 ? bitrateKbps : 192;
+
+        return codec switch
+        {
+            "copy" => "-c:a copy",
+            "aac"  => $"-c:a aac  -b:a {br}k{downmix}",
+            "eac3" => $"-c:a eac3 -b:a {br}k{downmix}",
+            "opus" => $"-c:a libopus -b:a {br}k -vbr on{downmix}",
+            _      => $"-c:a aac -b:a {br}k{downmix}",
+        };
     }
 
     /// <summary> Bitmap subtitle codecs that can cause FFmpeg to hang — always excluded. </summary>
-    private static readonly HashSet<string> _bitmapSubCodecs = new(StringComparer.OrdinalIgnoreCase)
+    internal static readonly HashSet<string> _bitmapSubCodecs = new(StringComparer.OrdinalIgnoreCase)
     {
         "hdmv_pgs_subtitle", "pgssub", "dvd_subtitle", "dvdsub", "dvb_subtitle", "dvbsub", "xsub"
     };
+
+    /// <summary>
+    ///     Returns <see langword="true"/> when the probed video's color-transfer function
+    ///     indicates an HDR source — either PQ (smpte2084, HDR10/HDR10+/Dolby Vision) or
+    ///     HLG (arib-std-b67). Used to gate tone-map filter insertion.
+    /// </summary>
+    public static bool IsHdr(ProbeResult probe)
+    {
+        ArgumentNullException.ThrowIfNull(probe);
+        var v = probe.Streams.FirstOrDefault(s => s.CodecType == "video");
+        var t = v?.ColorTransfer?.ToLowerInvariant();
+        return t == "smpte2084" || t == "arib-std-b67";
+    }
 
     /// <summary>
     ///     Returns the FFmpeg <c>-map</c> and subtitle codec arguments for the selected subtitle streams.
@@ -161,10 +219,13 @@ public class FfprobeService
     ///     Returns <c>-sn</c> (no subtitles) for MP4 containers, which don't support text subtitle passthrough.
     /// </summary>
     /// <param name="probe">The ffprobe analysis of the source file.</param>
-    /// <param name="englishOnly">When <c>true</c>, only English subtitle tracks are kept.</param>
+    /// <param name="languagesToKeep">
+    ///     2-letter ISO codes to retain. Empty or null keeps every (non-bitmap) subtitle stream. Matching
+    ///     accepts the track's tag in any of its common forms (2-letter, 3-letter, or English name).
+    /// </param>
     /// <param name="isMatroska">When <c>false</c>, subtitles are always stripped (<c>-sn</c>).</param>
     /// <returns>FFmpeg subtitle mapping arguments, or <c>-sn</c> to strip all subtitles.</returns>
-    public string MapSub(ProbeResult probe, bool englishOnly, bool isMatroska)
+    public string MapSub(ProbeResult probe, IReadOnlyList<string>? languagesToKeep, bool isMatroska)
     {
         ArgumentNullException.ThrowIfNull(probe);
 
@@ -178,11 +239,11 @@ public class FfprobeService
             .Where(s => !_bitmapSubCodecs.Contains(s.CodecName ?? ""))
             .ToList();
 
-        if (englishOnly)
+        if (languagesToKeep != null && languagesToKeep.Count > 0)
         {
-            var englishSubs = keepSubs.Where(s => s.Tags?.Language == "eng").ToList();
-            if (englishSubs.Any())
-                keepSubs = englishSubs;
+            keepSubs = keepSubs
+                .Where(s => LanguageMatcher.Matches(s.Tags?.Language, s.Tags?.Title, languagesToKeep))
+                .ToList();
         }
 
         if (keepSubs.Any())
@@ -192,6 +253,52 @@ public class FfprobeService
         }
 
         return "-sn";
+    }
+
+    /// <summary>
+    ///     A single subtitle stream selected for sidecar extraction.
+    /// </summary>
+    /// <param name="StreamIndex"> FFmpeg stream index (e.g. <c>0:3</c> — the <c>3</c> here). </param>
+    /// <param name="Lang">        Canonical 2-letter ISO code, or <c>"und"</c> if unresolvable. </param>
+    /// <param name="CodecName">   The source codec (e.g. <c>"subrip"</c>, <c>"hdmv_pgs_subtitle"</c>). </param>
+    /// <param name="IsBitmap">    When <c>true</c>, the stream is image-based and needs OCR to become text. </param>
+    /// <param name="Title">       Source track title (e.g. "English [SDH]"), or <c>null</c> if untitled. </param>
+    public sealed record SidecarSpec(int StreamIndex, string Lang, string CodecName, bool IsBitmap, string? Title);
+
+    /// <summary>
+    ///     Returns the subtitle streams that should be written as sidecar files, honoring
+    ///     the language keep-list and optionally including bitmap streams (for the OCR path).
+    /// </summary>
+    /// <param name="probe">            Probe of the source file. </param>
+    /// <param name="languagesToKeep">  2-letter ISO codes to retain; null/empty keeps all. </param>
+    /// <param name="includeBitmaps">   When <c>true</c>, bitmap subs (PGS/VobSub/DVB) are returned for OCR. </param>
+    public IReadOnlyList<SidecarSpec> SelectSidecarStreams(
+        ProbeResult            probe,
+        IReadOnlyList<string>? languagesToKeep,
+        bool                   includeBitmaps)
+    {
+        ArgumentNullException.ThrowIfNull(probe);
+
+        var subs = probe.Streams.Where(s => s.CodecType == "subtitle").ToList();
+        var keepByLang = languagesToKeep == null || languagesToKeep.Count == 0
+            ? subs
+            : subs.Where(s => LanguageMatcher.Matches(s.Tags?.Language, s.Tags?.Title, languagesToKeep)).ToList();
+
+        var result = new List<SidecarSpec>();
+        foreach (var s in keepByLang)
+        {
+            bool isBitmap = _bitmapSubCodecs.Contains(s.CodecName ?? "");
+            if (isBitmap && !includeBitmaps) continue;
+            result.Add(new SidecarSpec(
+                StreamIndex: s.Index,
+                Lang:        LanguageMatcher.ToTwoLetter(s.Tags?.Language)
+                          ?? LanguageMatcher.InferFromTitle(s.Tags?.Title)
+                          ?? "und",
+                CodecName:   s.CodecName ?? "",
+                IsBitmap:    isBitmap,
+                Title:       string.IsNullOrWhiteSpace(s.Tags?.Title) ? null : s.Tags.Title));
+        }
+        return result;
     }
 
     /// <summary>

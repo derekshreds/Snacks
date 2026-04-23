@@ -111,12 +111,20 @@ builder.Services.AddSingleton<MediaFileRepository>();
 
 builder.Services.AddSingleton<FfprobeService>();
 builder.Services.AddSingleton<FileService>();
+builder.Services.AddSingleton<ConfigFileService>();
+builder.Services.AddHttpClient();
+builder.Services.AddSingleton<NotificationService>();
+builder.Services.AddSingleton<IntegrationService>();
+builder.Services.AddSingleton<Snacks.Services.Ocr.TessdataResolver>();
+builder.Services.AddSingleton<Snacks.Services.Ocr.NativeOcrService>();
+builder.Services.AddSingleton<SubtitleExtractionService>();
+builder.Services.AddSingleton<AuthService>();
 builder.Services.AddSingleton<TranscodingService>();
 builder.Services.AddSingleton<StateTransitionService>();
-builder.Services.AddHttpClient();
 builder.Services.AddSingleton<ClusterService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<ClusterService>());
 builder.Services.AddScoped<ClusterAuthFilter>();
+builder.Services.AddScoped<LocalNetworkOnlyFilter>();
 builder.Services.AddSingleton<AutoScanService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<AutoScanService>());
 
@@ -148,6 +156,8 @@ app.UseStaticFiles(new StaticFileOptions
 });
 
 app.UseRouting();
+
+app.UseMiddleware<AuthMiddleware>();
 
 app.UseAuthorization();
 

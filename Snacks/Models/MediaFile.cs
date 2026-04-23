@@ -96,6 +96,22 @@ public sealed class MediaFile
     public long FileMtime { get; set; }
 
     /// <summary>
+    ///     Compact JSON array of per-track audio-stream data used to re-evaluate
+    ///     mux-pass eligibility without re-probing (<c>[{"l":"en","c":"ac3","ch":6},...]</c>).
+    ///     <see langword="null" /> for rows scanned before this column existed; those
+    ///     rows fall back to being reset to <see cref="MediaFileStatus.Unseen" /> on
+    ///     skip re-evaluation so they get re-probed on the next scan.
+    /// </summary>
+    public string? AudioStreams { get; set; }
+
+    /// <summary>
+    ///     Compact JSON array of per-track subtitle-stream data
+    ///     (<c>[{"l":"en","c":"srt"},...]</c>). Same null semantics as
+    ///     <see cref="AudioStreams" />.
+    /// </summary>
+    public string? SubtitleStreams { get; set; }
+
+    /// <summary>
     ///     The <see cref="WorkItem.Id"/> GUID used when this file was dispatched as a remote job.
     ///     Preserved across restarts so nodes can resume partial uploads under the same ID.
     ///     Only cleared on successful completion (not on failure) to enable retry resume.

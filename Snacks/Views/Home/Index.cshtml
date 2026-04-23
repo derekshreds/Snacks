@@ -199,24 +199,54 @@
                 <button type="button" class="btn-close" onclick="document.getElementById('settingsModal').classList.remove('open')"></button>
             </div>
             <div class="modal-body">
-                <ul class="nav nav-tabs mb-3" role="tablist">
-                    <li class="nav-item">
-                        <button class="nav-link active" data-bs-toggle="tab" data-bs-target="#encodingTab" type="button" role="tab">
-                            <i class="fas fa-film me-1"></i> Encoding
-                        </button>
-                    </li>
-                    <li class="nav-item">
-                        <button class="nav-link" data-bs-toggle="tab" data-bs-target="#clusterTab" type="button" role="tab">
-                            <i class="fas fa-network-wired me-1"></i> Cluster
-                        </button>
-                    </li>
-                </ul>
-                <div class="tab-content">
-                    <div class="tab-pane fade show active" id="encodingTab" role="tabpanel">
-                        @await Html.PartialAsync("_EncoderOptions", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })
-                    </div>
-                    <div class="tab-pane fade" id="clusterTab" role="tabpanel">
-                        @await Html.PartialAsync("_ClusterSettings")
+                <div class="settings-tabs-wrapper">
+                    <button type="button" class="settings-tab-arrow settings-tab-arrow-left" aria-label="Scroll tabs left"><i class="fas fa-chevron-left"></i></button>
+                    <ul class="nav nav-tabs settings-tabs" role="tablist">
+                        <li class="nav-item" data-role-visible="master standalone"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#generalTab" type="button" role="tab"><i class="fas fa-sliders me-1"></i> General</button></li>
+                        <li class="nav-item" data-role-visible="master standalone"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#audioTab" type="button" role="tab"><i class="fas fa-volume-high me-1"></i> Audio</button></li>
+                        <li class="nav-item" data-role-visible="master standalone"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#subtitleTab" type="button" role="tab"><i class="fas fa-closed-captioning me-1"></i> Subtitles</button></li>
+                        <li class="nav-item" data-role-visible="master standalone"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#muxTab" type="button" role="tab"><i class="fas fa-layer-group me-1"></i> Mux</button></li>
+                        <li class="nav-item" data-role-visible="master standalone"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#videoTab" type="button" role="tab"><i class="fas fa-film me-1"></i> Video</button></li>
+                        <li class="nav-item" data-role-visible="master standalone"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#libraryTab" type="button" role="tab"><i class="fas fa-folder-tree me-1"></i> Library</button></li>
+                        <li class="nav-item" data-role-visible="master standalone"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#integrationsTab" type="button" role="tab"><i class="fas fa-plug me-1"></i> Integrations</button></li>
+                        <li class="nav-item" data-role-visible="node"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#nodeSyncTab" type="button" role="tab"><i class="fas fa-sync me-1"></i> Integration Sync</button></li>
+                        <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#clusterTab" type="button" role="tab"><i class="fas fa-network-wired me-1"></i> Cluster</button></li>
+                        <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#securityTab" type="button" role="tab"><i class="fas fa-lock me-1"></i> Security</button></li>
+                        <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#advancedTab" type="button" role="tab"><i class="fas fa-screwdriver-wrench me-1"></i> Advanced</button></li>
+                    </ul>
+                    <button type="button" class="settings-tab-arrow settings-tab-arrow-right" aria-label="Scroll tabs right"><i class="fas fa-chevron-right"></i></button>
+                </div>
+                <div class="tab-content mt-3">
+                    <div class="tab-pane fade show active" id="generalTab"      role="tabpanel" data-role-visible="master standalone">@await Html.PartialAsync("_GeneralSettings", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })</div>
+                    <div class="tab-pane fade"             id="audioTab"        role="tabpanel" data-role-visible="master standalone">@await Html.PartialAsync("_AudioSettings", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })</div>
+                    <div class="tab-pane fade"             id="subtitleTab"     role="tabpanel" data-role-visible="master standalone">@await Html.PartialAsync("_SubtitleSettings", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })</div>
+                    <div class="tab-pane fade"             id="muxTab"          role="tabpanel" data-role-visible="master standalone">@await Html.PartialAsync("_MuxSettings", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })</div>
+                    <div class="tab-pane fade"             id="videoTab"        role="tabpanel" data-role-visible="master standalone">@await Html.PartialAsync("_VideoSettings", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })</div>
+                    <div class="tab-pane fade"             id="libraryTab"      role="tabpanel" data-role-visible="master standalone">@await Html.PartialAsync("_LibrarySettings")</div>
+                    <div class="tab-pane fade"             id="integrationsTab" role="tabpanel" data-role-visible="master standalone">@await Html.PartialAsync("_IntegrationSettings")</div>
+                    <div class="tab-pane fade"             id="clusterTab"      role="tabpanel">@await Html.PartialAsync("_ClusterSettings")</div>
+                    <div class="tab-pane fade"             id="securityTab"     role="tabpanel">@await Html.PartialAsync("_SecuritySettings")</div>
+                    <div class="tab-pane fade"             id="advancedTab"     role="tabpanel">@await Html.PartialAsync("_AdvancedSettings")</div>
+
+                    <div class="tab-pane fade" id="nodeSyncTab" role="tabpanel" data-role-visible="node">
+                        <div class="alert alert-info mb-4">
+                            <i class="fas fa-info-circle me-2"></i>
+                            <strong>Worker mode.</strong> Encoding settings (codec, bitrate, filters, integrations)
+                            are managed by the master. This worker pulls the master's integration credentials
+                            before every encode — they are never edited locally.
+                        </div>
+                        <div class="encoder-panel rounded">
+                            <h6 class="fw-bold mb-3"><i class="fas fa-sync me-2 text-primary"></i>Integration Sync Status</h6>
+                            <dl class="row mb-3">
+                                <dt class="col-sm-3">Master URL</dt>
+                                <dd class="col-sm-9"><code id="nodeSyncMasterUrl">—</code></dd>
+                                <dt class="col-sm-3">Last sync</dt>
+                                <dd class="col-sm-9"><span id="nodeSyncLastAt">Never</span></dd>
+                                <dt class="col-sm-3">Status</dt>
+                                <dd class="col-sm-9"><span id="nodeSyncStatus" class="badge bg-secondary">Unknown</span></dd>
+                            </dl>
+                            <button class="btn btn-sm btn-outline-primary" id="nodeSyncRefreshBtn"><i class="fas fa-rotate me-1"></i>Pull from master now</button>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -253,91 +283,205 @@
             <small class="text-muted fw-normal ms-2">Only checked fields override the global settings</small>
         </h6>
         <div id="overrideFields">
+            <div class="encoder-panel rounded mb-3">
+            <h6 class="fw-bold mb-3"><i class="fas fa-cogs me-2 text-primary"></i>General</h6>
             <div class="row g-2">
                 <div class="col-md-6">
-                    <div class="form-check mb-2">
+                    <div class="form-check mb-2" data-context="folder,node">
                         <input class="form-check-input override-toggle" type="checkbox" id="ovr_Format" data-field="Format">
-                        <label class="form-check-label" for="ovr_Format">Format</label>
+                        <label class="form-check-label" for="ovr_Format">Output Format</label>
                         <select class="form-select form-select-sm mt-1" id="ovrFormat" disabled>
-                            <option value="mkv">MKV</option><option value="mp4">MP4</option>
+                            <option value="mkv">MKV (Matroska)</option><option value="mp4">MP4</option>
                         </select>
                     </div>
-                    <div class="form-check mb-2">
+                    <div class="form-check mb-2" data-context="folder,node">
                         <input class="form-check-input override-toggle" type="checkbox" id="ovr_Codec" data-field="Codec">
-                        <label class="form-check-label" for="ovr_Codec">Codec</label>
+                        <label class="form-check-label" for="ovr_Codec">Video Codec</label>
                         <select class="form-select form-select-sm mt-1" id="ovrCodec" disabled>
                             <option value="h265">H.265/HEVC</option><option value="h264">H.264/AVC</option><option value="av1">AV1</option>
                         </select>
                     </div>
-                    <div class="form-check mb-2">
-                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_HardwareAcceleration" data-field="HardwareAcceleration">
-                        <label class="form-check-label" for="ovr_HardwareAcceleration">Hardware Acceleration</label>
-                        <select class="form-select form-select-sm mt-1" id="ovrHardwareAcceleration" disabled>
-                            <option value="auto">Auto Detect</option><option value="intel">Intel QSV</option><option value="amd">AMD VAAPI</option><option value="nvidia">NVIDIA NVENC</option><option value="none">Software Only</option>
-                        </select>
-                    </div>
-                    <div class="form-check mb-2">
+                    <div class="form-check mb-2" data-context="folder,node">
                         <input class="form-check-input override-toggle" type="checkbox" id="ovr_TargetBitrate" data-field="TargetBitrate">
                         <label class="form-check-label" for="ovr_TargetBitrate">Target Bitrate (kbps)</label>
                         <input type="number" class="form-control form-control-sm mt-1" id="ovrTargetBitrate" min="500" max="50000" step="100" value="3500" disabled>
                     </div>
-                    <div class="form-check mb-2">
+                    <div class="form-check mb-2" data-context="folder,node">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_StrictBitrate" data-field="StrictBitrate">
+                        <label class="form-check-label" for="ovr_StrictBitrate">Strict Bitrate</label>
+                        <div class="form-check form-switch mt-1"><input class="form-check-input" type="checkbox" id="ovrStrictBitrate" disabled></div>
+                    </div>
+                    <div class="form-check mb-2" data-context="folder,node">
                         <input class="form-check-input override-toggle" type="checkbox" id="ovr_FourKBitrateMultiplier" data-field="FourKBitrateMultiplier">
                         <label class="form-check-label" for="ovr_FourKBitrateMultiplier">4K Bitrate Multiplier</label>
                         <select class="form-select form-select-sm mt-1" id="ovrFourKBitrateMultiplier" disabled>
-                            <option value="2">2x</option><option value="3">3x</option><option value="4" selected>4x</option><option value="5">5x</option><option value="6">6x</option><option value="8">8x</option>
+                            <option value="2">2x</option><option value="3">3x</option><option value="4">4x</option><option value="5">5x</option><option value="6">6x</option><option value="8">8x</option>
                         </select>
                     </div>
                 </div>
                 <div class="col-md-6">
-                    <div class="form-check mb-2">
+                    <div class="form-check mb-2" data-context="folder">
                         <input class="form-check-input override-toggle" type="checkbox" id="ovr_Skip4K" data-field="Skip4K">
                         <label class="form-check-label" for="ovr_Skip4K">Skip 4K Videos</label>
-                        <div class="form-check form-switch mt-1">
-                            <input class="form-check-input" type="checkbox" id="ovrSkip4K" disabled>
-                        </div>
+                        <div class="form-check form-switch mt-1"><input class="form-check-input" type="checkbox" id="ovrSkip4K" disabled></div>
                     </div>
-                    <div class="form-check mb-2">
-                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_StrictBitrate" data-field="StrictBitrate">
-                        <label class="form-check-label" for="ovr_StrictBitrate">Strict Bitrate</label>
-                        <div class="form-check form-switch mt-1">
-                            <input class="form-check-input" type="checkbox" id="ovrStrictBitrate" disabled>
-                        </div>
-                    </div>
-                    <div class="form-check mb-2">
-                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_TwoChannelAudio" data-field="TwoChannelAudio">
-                        <label class="form-check-label" for="ovr_TwoChannelAudio">Convert to Stereo</label>
-                        <div class="form-check form-switch mt-1">
-                            <input class="form-check-input" type="checkbox" id="ovrTwoChannelAudio" disabled>
-                        </div>
-                    </div>
-                    <div class="form-check mb-2">
-                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_EnglishOnlyAudio" data-field="EnglishOnlyAudio">
-                        <label class="form-check-label" for="ovr_EnglishOnlyAudio">English Audio Only</label>
-                        <div class="form-check form-switch mt-1">
-                            <input class="form-check-input" type="checkbox" id="ovrEnglishOnlyAudio" disabled>
-                        </div>
-                    </div>
-                    <div class="form-check mb-2">
-                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_EnglishOnlySubtitles" data-field="EnglishOnlySubtitles">
-                        <label class="form-check-label" for="ovr_EnglishOnlySubtitles">English Subtitles Only</label>
-                        <div class="form-check form-switch mt-1">
-                            <input class="form-check-input" type="checkbox" id="ovrEnglishOnlySubtitles" disabled>
-                        </div>
-                    </div>
-                    <div class="form-check mb-2">
-                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_DeleteOriginalFile" data-field="DeleteOriginalFile">
-                        <label class="form-check-label" for="ovr_DeleteOriginalFile">Replace Original Files</label>
-                        <div class="form-check form-switch mt-1">
-                            <input class="form-check-input" type="checkbox" id="ovrDeleteOriginalFile" disabled>
-                        </div>
-                    </div>
-                    <div class="form-check mb-2">
+                    <div class="form-check mb-2" data-context="folder">
                         <input class="form-check-input override-toggle" type="checkbox" id="ovr_SkipPercentAboveTarget" data-field="SkipPercentAboveTarget">
                         <label class="form-check-label" for="ovr_SkipPercentAboveTarget">Skip Threshold (%)</label>
                         <input type="number" class="form-control form-control-sm mt-1" id="ovrSkipPercentAboveTarget" min="0" max="100" value="20" disabled>
                     </div>
+                    <div class="form-check mb-2" data-context="folder">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_DeleteOriginalFile" data-field="DeleteOriginalFile">
+                        <label class="form-check-label" for="ovr_DeleteOriginalFile">Replace Original Files</label>
+                        <div class="form-check form-switch mt-1"><input class="form-check-input" type="checkbox" id="ovrDeleteOriginalFile" disabled></div>
+                    </div>
+                    <div class="form-check mb-2" data-context="folder,node">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_RetryOnFail" data-field="RetryOnFail">
+                        <label class="form-check-label" for="ovr_RetryOnFail">Retry on Failure</label>
+                        <div class="form-check form-switch mt-1"><input class="form-check-input" type="checkbox" id="ovrRetryOnFail" disabled></div>
+                    </div>
                 </div>
+            </div>
+
+            </div>
+
+            <div class="encoder-panel rounded mb-3">
+            <h6 class="fw-bold mb-3"><i class="fas fa-film me-2 text-info"></i>Video Pipeline</h6>
+            <div class="row g-2">
+                <div class="col-md-6">
+                    <div class="form-check mb-2" data-context="folder,node">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_DownscalePolicy" data-field="DownscalePolicy">
+                        <label class="form-check-label" for="ovr_DownscalePolicy">Downscale Policy</label>
+                        <select class="form-select form-select-sm mt-1" id="ovrDownscalePolicy" disabled>
+                            <option value="Never">Never</option><option value="CapAtTarget">Cap at target</option><option value="Always">Always downscale</option>
+                        </select>
+                    </div>
+                    <div class="form-check mb-2" data-context="folder,node">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_DownscaleTarget" data-field="DownscaleTarget">
+                        <label class="form-check-label" for="ovr_DownscaleTarget">Downscale Target</label>
+                        <select class="form-select form-select-sm mt-1" id="ovrDownscaleTarget" disabled>
+                            <option value="4K">4K (2160p)</option><option value="1440p">1440p</option><option value="1080p">1080p</option><option value="720p">720p</option>
+                        </select>
+                    </div>
+                    <div class="form-check mb-2" data-context="folder,node">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_FfmpegQualityPreset" data-field="FfmpegQualityPreset">
+                        <label class="form-check-label" for="ovr_FfmpegQualityPreset">FFmpeg Preset</label>
+                        <select class="form-select form-select-sm mt-1" id="ovrFfmpegQualityPreset" disabled>
+                            <option value="veryfast">veryfast</option><option value="fast">fast</option><option value="medium">medium</option><option value="slow">slow</option><option value="veryslow">veryslow</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="col-md-6">
+                    <div class="form-check mb-2" data-context="folder,node">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_TonemapHdrToSdr" data-field="TonemapHdrToSdr">
+                        <label class="form-check-label" for="ovr_TonemapHdrToSdr">Tonemap HDR → SDR</label>
+                        <div class="form-check form-switch mt-1"><input class="form-check-input" type="checkbox" id="ovrTonemapHdrToSdr" disabled></div>
+                    </div>
+                    <div class="form-check mb-2" data-context="folder,node">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_RemoveBlackBorders" data-field="RemoveBlackBorders">
+                        <label class="form-check-label" for="ovr_RemoveBlackBorders">Remove Black Borders</label>
+                        <div class="form-check form-switch mt-1"><input class="form-check-input" type="checkbox" id="ovrRemoveBlackBorders" disabled></div>
+                    </div>
+                </div>
+            </div>
+
+            </div>
+
+            <div class="encoder-panel rounded mb-3">
+            <h6 class="fw-bold mb-3"><i class="fas fa-volume-high me-2 text-primary"></i>Audio</h6>
+            <div class="row g-2">
+                <div class="col-md-6">
+                    <div class="form-check mb-2" data-context="folder,node">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_AudioCodec" data-field="AudioCodec">
+                        <label class="form-check-label" for="ovr_AudioCodec">Audio Codec</label>
+                        <select class="form-select form-select-sm mt-1" id="ovrAudioCodec" disabled>
+                            <option value="copy">Copy (no re-encode)</option><option value="aac">AAC</option><option value="eac3">E-AC3</option><option value="opus">Opus</option>
+                        </select>
+                    </div>
+                    <div class="form-check mb-2" data-context="folder,node">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_AudioBitrateKbps" data-field="AudioBitrateKbps">
+                        <label class="form-check-label" for="ovr_AudioBitrateKbps">Audio Bitrate (kbps)</label>
+                        <input type="number" class="form-control form-control-sm mt-1" id="ovrAudioBitrateKbps" min="32" max="1536" step="16" value="192" disabled>
+                    </div>
+                    <div class="form-check mb-2" data-context="folder,node">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_TwoChannelAudio" data-field="TwoChannelAudio">
+                        <label class="form-check-label" for="ovr_TwoChannelAudio">Downmix to Stereo</label>
+                        <div class="form-check form-switch mt-1"><input class="form-check-input" type="checkbox" id="ovrTwoChannelAudio" disabled></div>
+                    </div>
+                </div>
+                <div class="col-md-6">
+                    <div class="form-check mb-2" data-context="folder,node">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_KeepOriginalLanguage" data-field="KeepOriginalLanguage">
+                        <label class="form-check-label" for="ovr_KeepOriginalLanguage">Auto-keep Original Language</label>
+                        <div class="form-check form-switch mt-1"><input class="form-check-input" type="checkbox" id="ovrKeepOriginalLanguage" disabled></div>
+                    </div>
+                    <div class="form-check mb-2" data-context="folder,node">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_OriginalLanguageProvider" data-field="OriginalLanguageProvider">
+                        <label class="form-check-label" for="ovr_OriginalLanguageProvider">Original-Language Provider</label>
+                        <select class="form-select form-select-sm mt-1" id="ovrOriginalLanguageProvider" disabled>
+                            <option value="None">None</option><option value="Auto">Auto (pick best available)</option>
+                            <option value="Sonarr">Sonarr (TV)</option><option value="Radarr">Radarr (Movies)</option>
+                            <option value="TVDB">TVDB (TV)</option><option value="TMDb">TMDb</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+
+            </div>
+
+            <div class="encoder-panel rounded mb-3">
+            <h6 class="fw-bold mb-3"><i class="fas fa-closed-captioning me-2 text-info"></i>Subtitles</h6>
+            <div class="row g-2">
+                <div class="col-md-6">
+                    <div class="form-check mb-2" data-context="folder,node">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_ExtractSubtitlesToSidecar" data-field="ExtractSubtitlesToSidecar">
+                        <label class="form-check-label" for="ovr_ExtractSubtitlesToSidecar">Extract Subtitles to Sidecar Files</label>
+                        <div class="form-check form-switch mt-1"><input class="form-check-input" type="checkbox" id="ovrExtractSubtitlesToSidecar" disabled></div>
+                    </div>
+                    <div class="form-check mb-2" data-context="folder,node">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_SidecarSubtitleFormat" data-field="SidecarSubtitleFormat">
+                        <label class="form-check-label" for="ovr_SidecarSubtitleFormat">Sidecar Subtitle Format</label>
+                        <select class="form-select form-select-sm mt-1" id="ovrSidecarSubtitleFormat" disabled>
+                            <option value="srt">SRT (text)</option><option value="ass">ASS (styled text)</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="col-md-6">
+                    <div class="form-check mb-2" data-context="folder,node">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_ConvertImageSubtitlesToSrt" data-field="ConvertImageSubtitlesToSrt">
+                        <label class="form-check-label" for="ovr_ConvertImageSubtitlesToSrt">OCR Image Subtitles to SRT</label>
+                        <div class="form-check form-switch mt-1"><input class="form-check-input" type="checkbox" id="ovrConvertImageSubtitlesToSrt" disabled></div>
+                    </div>
+                </div>
+            </div>
+            </div>
+
+            <div class="encoder-panel rounded mb-3">
+            <h6 class="fw-bold mb-3"><i class="fas fa-layer-group me-2 text-primary"></i>Encoding Mode</h6>
+            <div class="row g-2">
+                <div class="col-md-6">
+                    <div class="form-check mb-2" data-context="folder,node">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_EncodingMode" data-field="EncodingMode">
+                        <label class="form-check-label" for="ovr_EncodingMode">Encoding Mode</label>
+                        <select class="form-select form-select-sm mt-1" id="ovrEncodingMode" disabled>
+                            <option value="Transcode">Transcode</option>
+                            <option value="Hybrid">Hybrid</option>
+                            <option value="MuxOnly">Mux Only</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="col-md-6">
+                    <div class="form-check mb-2" data-context="folder,node">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_MuxStreams" data-field="MuxStreams">
+                        <label class="form-check-label" for="ovr_MuxStreams">Mux Touches</label>
+                        <select class="form-select form-select-sm mt-1" id="ovrMuxStreams" disabled>
+                            <option value="Both">Audio + Subtitles</option>
+                            <option value="Audio">Audio only</option>
+                            <option value="Subtitles">Subtitles only</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
             </div>
         </div>
     </div>
@@ -350,76 +494,90 @@
     </div>
 </div>
 
-<!-- Stop/Cancel Modal -->
-<div class="modal fade" id="stopCancelModal" tabindex="-1">
-    <div class="modal-dialog modal-dialog-centered">
-        <div class="modal-content">
+<!-- Folder Picker Modal (folders only — attached to directory inputs via .folder-picker-btn) -->
+<div class="snacks-modal-backdrop" id="folderPickerModal" style="--snacks-modal-z: 9200">
+    <div class="snacks-modal-wrapper">
+        <div class="snacks-modal-dialog" style="max-width: 640px;">
             <div class="modal-header">
-                <h5 class="modal-title">
-                    <i class="fas fa-question-circle me-2"></i>
-                    Remove from Queue
-                </h5>
-                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                <h5 class="modal-title"><i class="fas fa-folder-tree me-2"></i>Select Folder</h5>
+                <button type="button" class="btn-close" onclick="document.getElementById('folderPickerModal').classList.remove('open')"></button>
+            </div>
+            <div class="modal-body">
+                <div class="folder-picker-breadcrumb mb-2 small text-muted" id="folderPickerBreadcrumb">/</div>
+                <div class="input-group input-group-sm mb-2">
+                    <span class="input-group-text"><i class="fas fa-keyboard"></i></span>
+                    <input type="text" class="form-control" id="folderPickerManualPath" placeholder="Or type a path directly and press Enter">
+                </div>
+                <div id="folderPickerList" class="border rounded p-2" style="height: 360px; overflow-y: auto;">
+                    <div class="text-center text-muted py-4">
+                        <div class="spinner-border spinner-border-sm" role="status"></div>
+                        <div class="mt-2 small">Loading folders…</div>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <div class="me-auto small text-muted" id="folderPickerSelection">No folder selected</div>
+                <button type="button" class="btn btn-secondary" onclick="document.getElementById('folderPickerModal').classList.remove('open')">Cancel</button>
+                <button type="button" class="btn btn-primary" id="folderPickerConfirm" disabled><i class="fas fa-check me-1"></i> Select</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Stop/Cancel Modal -->
+<div class="snacks-modal-backdrop" id="stopCancelModal" style="--snacks-modal-z: 9050">
+    <div class="snacks-modal-wrapper">
+        <div class="snacks-modal-dialog" style="max-width: 520px;">
+            <div class="modal-header">
+                <h5 class="modal-title"><i class="fas fa-question-circle me-2"></i>Remove from Queue</h5>
+                <button type="button" class="btn-close" data-snacks-dismiss="stopCancelModal"></button>
             </div>
             <div class="modal-body">
                 <p class="mb-0">What would you like to do with this item?</p>
             </div>
             <div class="modal-footer">
-                <button type="button" class="btn btn-warning" id="stopCancelStop">
-                    <i class="fas fa-pause me-1"></i>Stop (Encode Later)
-                </button>
-                <button type="button" class="btn btn-danger" id="stopCancelCancel">
-                    <i class="fas fa-ban me-1"></i>Cancel (Don't Reprocess)
-                </button>
+                <button type="button" class="btn btn-warning" id="stopCancelStop"><i class="fas fa-pause me-1"></i>Stop (Encode Later)</button>
+                <button type="button" class="btn btn-danger"  id="stopCancelCancel"><i class="fas fa-ban me-1"></i>Cancel (Don't Reprocess)</button>
             </div>
         </div>
     </div>
 </div>
 
 <!-- Log Modal -->
-<div class="modal fade modal-fullscreen-mobile" id="logModal" tabindex="-1">
-    <div class="modal-dialog modal-xl modal-dialog-centered">
-        <div class="modal-content">
+<div class="snacks-modal-backdrop" id="logModal" style="--snacks-modal-z: 9050">
+    <div class="snacks-modal-wrapper">
+        <div class="snacks-modal-dialog" style="max-width: 1140px;">
             <div class="modal-header">
-                <h5 class="modal-title">
-                    <i class="fas fa-terminal me-2"></i>
-                    Transcoding Log
-                </h5>
-                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                <h5 class="modal-title"><i class="fas fa-terminal me-2"></i>Transcoding Log</h5>
+                <button type="button" class="btn-close" data-snacks-dismiss="logModal"></button>
             </div>
             <div class="modal-body">
-                <div id="logContent">
-                    <!-- Log content will be loaded here -->
-                </div>
+                <div id="logContent"></div>
             </div>
             <div class="modal-footer">
-                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                <button type="button" class="btn btn-secondary" data-snacks-dismiss="logModal">Close</button>
             </div>
         </div>
     </div>
 </div>
 
 <!-- Confirm Modal -->
-<div class="modal fade" id="confirmModal" tabindex="-1">
-    <div class="modal-dialog modal-dialog-centered">
-        <div class="modal-content">
+<div class="snacks-modal-backdrop" id="confirmModal" style="--snacks-modal-z: 9300">
+    <div class="snacks-modal-wrapper">
+        <div class="snacks-modal-dialog" style="max-width: 520px;">
             <div class="modal-header">
-                <h5 class="modal-title" id="confirmModalTitle">
-                    <i class="fas fa-exclamation-triangle me-2"></i>
-                    Confirm
-                </h5>
-                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                <h5 class="modal-title" id="confirmModalTitle"><i class="fas fa-exclamation-triangle me-2"></i>Confirm</h5>
+                <button type="button" class="btn-close" data-snacks-dismiss="confirmModal"></button>
             </div>
-            <div class="modal-body" id="confirmModalBody">
-            </div>
+            <div class="modal-body" id="confirmModalBody"></div>
             <div class="modal-footer">
-                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
-                <button type="button" class="btn btn-danger" id="confirmModalConfirm">Confirm</button>
+                <button type="button" class="btn btn-secondary" data-snacks-dismiss="confirmModal">Cancel</button>
+                <button type="button" class="btn btn-danger"    id="confirmModalConfirm">Confirm</button>
             </div>
         </div>
     </div>
 </div>
 
 @section Scripts {
-    <script src="~/js/transcoding.js"></script>
+    <script type="module" src="~/js/main.js"></script>
 }

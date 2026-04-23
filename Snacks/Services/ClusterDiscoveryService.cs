@@ -41,7 +41,7 @@ public sealed class ClusterDiscoveryService
     };
 
     /// <summary> Protocol version for cluster inter-node communication. </summary>
-    internal const string ClusterVersion = "2.3.1";
+    internal const string ClusterVersion = "2.4.0";
 
     private volatile ClusterConfig       _config;
     private UdpClient?                   _udpListener;
@@ -465,6 +465,26 @@ public sealed class ClusterDiscoveryService
 
             if (remoteNode != null)
             {
+                // The peer's self-reported IP may be unreachable (e.g. an internal
+                // container IP from Docker Desktop on Windows). The URL we just used
+                // to reach them works by definition — trust it over the self-report.
+                try
+                {
+                    var uri = new Uri(baseUrl);
+                    if (!string.IsNullOrEmpty(uri.Host))
+                    {
+                        if (!string.Equals(uri.Host, remoteNode.IpAddress, StringComparison.OrdinalIgnoreCase))
+                        {
+                            Console.WriteLine(
+                                $"ClusterDiscovery: Overriding self-reported IP {remoteNode.IpAddress} " +
+                                $"with {uri.Host} from handshake URL");
+                            remoteNode.IpAddress = uri.Host;
+                        }
+                        remoteNode.Port = uri.Port;
+                    }
+                }
+                catch { }
+
                 RegisterOrUpdateNode(remoteNode, fromHandshake: true);
                 Console.WriteLine($"ClusterDiscovery: Handshake with {remoteNode.Hostname} ({baseUrl}) successful");
             }

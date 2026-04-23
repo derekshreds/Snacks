@@ -20,6 +20,7 @@ namespace Snacks.Controllers;
 public sealed class ClusterController : ControllerBase
 {
     private readonly ClusterService              _clusterService;
+    private readonly IntegrationService          _integrationService;
     private readonly IHubContext<TranscodingHub> _hubContext;
     private readonly JsonSerializerOptions       _jsonOptions = new()
     {
@@ -32,11 +33,16 @@ public sealed class ClusterController : ControllerBase
     ///     context used to push real-time transfer progress to the local UI.
     /// </summary>
     /// <param name="clusterService"> The cluster coordination service. </param>
+    /// <param name="integrationService"> Source of master-side integration credentials served to workers. </param>
     /// <param name="hubContext"> SignalR hub context for pushing transfer progress to the UI. </param>
-    public ClusterController(ClusterService clusterService, IHubContext<TranscodingHub> hubContext)
+    public ClusterController(
+        ClusterService clusterService,
+        IntegrationService integrationService,
+        IHubContext<TranscodingHub> hubContext)
     {
-        _clusterService = clusterService;
-        _hubContext     = hubContext;
+        _clusterService     = clusterService;
+        _integrationService = integrationService;
+        _hubContext         = hubContext;
     }
 
         /******************************************************************
@@ -53,6 +59,18 @@ public sealed class ClusterController : ControllerBase
         [HttpPost("handshake")]
         public IActionResult Handshake([FromBody] ClusterNode senderNode)
         {
+            // Override the sender's self-reported IP with the actual source address of
+            // the TCP connection. A peer running in a container (e.g. Docker Desktop on
+            // Windows) may advertise an internal VM IP that is unreachable from here;
+            // the address we actually received the request from is, by definition,
+            // routable back to it.
+            var remoteIp = HttpContext.Connection.RemoteIpAddress;
+            if (remoteIp != null)
+            {
+                var ipv4 = remoteIp.IsIPv4MappedToIPv6 ? remoteIp.MapToIPv4() : remoteIp;
+                senderNode.IpAddress = ipv4.ToString();
+            }
+
             var (accepted, rejectReason) = _clusterService.RegisterOrUpdateNode(senderNode, fromHandshake: true);
             if (!accepted)
                 return Conflict(new { error = rejectReason });
@@ -112,6 +130,71 @@ public sealed class ClusterController : ControllerBase
         public IActionResult GetCapabilities()
         {
             return Ok(_clusterService.GetCapabilities());
+        }
+
+        /// <summary>
+        ///     Returns the master's current integration credentials (Plex / Jellyfin / Sonarr /
+        ///     Radarr / TVDB / TMDb) so a worker can use them during original-language lookups
+        ///     and sidecar OCR. Workers pull this endpoint before every encode.
+        ///
+        ///     <para>This endpoint is additionally protected by
+        ///     <see cref="LocalNetworkOnlyFilter"/> which enforces a LAN-range source IP and a
+        ///     match against a currently-connected <see cref="ClusterNode"/>. Credentials must
+        ///     never leave the cluster, so the three filters — shared secret, LAN-only, and
+        ///     connected-node allowlist — all have to pass.</para>
+        ///
+        ///     <para>The response omits <c>SharedSecret</c> (cluster-level, not an integration)
+        ///     and forces <c>RescanOnComplete</c> to <c>false</c> — rescans are triggered centrally
+        ///     by the master.</para>
+        /// </summary>
+        [HttpGet("integrations")]
+        [ServiceFilter(typeof(LocalNetworkOnlyFilter))]
+        public IActionResult GetIntegrations()
+        {
+            var source = _integrationService.GetConfig();
+
+            // Copy without RescanOnComplete — workers never trigger rescans themselves.
+            var payload = new IntegrationConfig
+            {
+                Plex = new MediaServerIntegration
+                {
+                    BaseUrl          = source.Plex.BaseUrl,
+                    Token            = source.Plex.Token,
+                    Enabled          = source.Plex.Enabled,
+                    RescanOnComplete = false,
+                },
+                Jellyfin = new MediaServerIntegration
+                {
+                    BaseUrl          = source.Jellyfin.BaseUrl,
+                    Token            = source.Jellyfin.Token,
+                    Enabled          = source.Jellyfin.Enabled,
+                    RescanOnComplete = false,
+                },
+                Sonarr = new ArrIntegration
+                {
+                    BaseUrl = source.Sonarr.BaseUrl,
+                    ApiKey  = source.Sonarr.ApiKey,
+                    Enabled = source.Sonarr.Enabled,
+                },
+                Radarr = new ArrIntegration
+                {
+                    BaseUrl = source.Radarr.BaseUrl,
+                    ApiKey  = source.Radarr.ApiKey,
+                    Enabled = source.Radarr.Enabled,
+                },
+                Tvdb = new TvdbIntegration
+                {
+                    ApiKey  = source.Tvdb.ApiKey,
+                    Pin     = source.Tvdb.Pin,
+                    Enabled = source.Tvdb.Enabled,
+                },
+                Tmdb = new TmdbIntegration
+                {
+                    ApiKey  = source.Tmdb.ApiKey,
+                    Enabled = source.Tmdb.Enabled,
+                },
+            };
+            return new JsonResult(payload);
         }
 
         /// <summary> Returns the list of all known nodes in the cluster. Only available on master nodes. </summary>
