@@ -2736,24 +2736,7 @@ public class TranscodingService
                 await LogAsync(workItem.Id, $"Warning: Could not clean up output file: {ex.Message}");
             }
 
-            // Retry 1: Strip all subtitles (covers bitmap subs, broken streams, etc.)
-            if (!subtitlesWereStripped)
-            {
-                await LogAsync(workItem.Id, "Retrying without subtitles...");
-                workItem.Progress = 0;
-                await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
-                await ConvertVideoAsync(workItem, options,
-                    stripSubtitles: true,
-                    useConservativeHwFlags: conservativeHwFlagsTried,
-                    cachedOcrSrts: cachedOcrSrts,
-                    cachedOcrMuxTmpDir: cachedOcrMuxTmpDir,
-                    cancellationToken: cancellationToken);
-                return;
-            }
-
-            // Retry 2a: Hardware encoder rejected a feature flag (older NVENC silicon missing
-            // Temporal AQ, QSV iGPUs missing oneVPL lookahead). Drop the optional flags and
-            // keep hardware encoding before falling through to software.
+            // Classify the failure once — order of the retry tiers below is driven by this.
             bool isEncoderFeatureError =
                 reason.Contains("not supported", StringComparison.OrdinalIgnoreCase) ||
                 reason.Contains("Provided device doesn't support", StringComparison.OrdinalIgnoreCase) ||
@@ -2763,6 +2746,10 @@ public class TranscodingService
 
             bool isHwEncoder = !options.HardwareAcceleration.Equals("none", StringComparison.OrdinalIgnoreCase);
 
+            // Retry 1: Hardware encoder rejected a feature flag (older NVENC silicon missing
+            // Temporal AQ, QSV iGPUs missing oneVPL lookahead). Try this BEFORE stripping
+            // subtitles — the failure has nothing to do with the sub streams, and stripping
+            // them would drop the cached OCR tracks from the final output for no reason.
             if (isEncoderFeatureError && isHwEncoder && !conservativeHwFlagsTried)
             {
                 await LogAsync(workItem.Id, "Retrying with conservative hardware encoder flags...");
@@ -2778,7 +2765,22 @@ public class TranscodingService
                 return;
             }
 
-            // Retry 2b: Software decode + VAAPI encode for hwaccel filter graph errors
+            // Retry 2: Strip all subtitles (covers bitmap subs, broken streams, etc.)
+            if (!subtitlesWereStripped)
+            {
+                await LogAsync(workItem.Id, "Retrying without subtitles...");
+                workItem.Progress = 0;
+                await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
+                await ConvertVideoAsync(workItem, options,
+                    stripSubtitles: true,
+                    useConservativeHwFlags: conservativeHwFlagsTried,
+                    cachedOcrSrts: cachedOcrSrts,
+                    cachedOcrMuxTmpDir: cachedOcrMuxTmpDir,
+                    cancellationToken: cancellationToken);
+                return;
+            }
+
+            // Retry 3: Software decode + VAAPI encode for hwaccel filter graph errors
             // This keeps GPU encoding but avoids the problematic hardware decoder that crashes
             // on mid-stream format/resolution changes
             bool isHwaccelError = reason.Contains("hwaccel", StringComparison.OrdinalIgnoreCase)
