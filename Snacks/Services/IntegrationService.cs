@@ -666,6 +666,28 @@ public sealed class IntegrationService
             .OrderByDescending(e => e.path.Length)
             .FirstOrDefault();
 
+        // Fallback: Radarr/Sonarr often run in containers or on a different host, so their
+        // stored paths (e.g. "/movies/TRON - Legacy (2010)") won't prefix the local path
+        // (e.g. "D:\Media\Movies\TRON - Legacy (2010).mkv"). When prefix matching misses,
+        // compare by the movie/series folder name — it's part of the Arr naming convention
+        // ("Title (year)") and collides rarely in practice.
+        if (string.IsNullOrEmpty(hit.lang))
+        {
+            var sourceSegments = norm
+                .Split('/', StringSplitOptions.RemoveEmptyEntries)
+                .Select(s => Path.GetFileNameWithoutExtension(s))
+                .Where(s => !string.IsNullOrEmpty(s))
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+            hit = cached
+                .Select(e => (e.path, e.lang,
+                              folder: Path.GetFileName(e.path.Replace('\\', '/').TrimEnd('/')) ?? ""))
+                .Where(e => e.folder.Length > 0 && sourceSegments.Contains(e.folder))
+                .OrderByDescending(e => e.folder.Length)
+                .Select(e => (e.path, e.lang))
+                .FirstOrDefault();
+        }
+
         return string.IsNullOrEmpty(hit.lang) ? null : LanguageMatcher.ToTwoLetter(hit.lang);
     }
 

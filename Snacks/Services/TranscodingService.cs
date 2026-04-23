@@ -906,8 +906,19 @@ public class TranscodingService
         /// <param name="options">Encoding options (may be mutated by retry logic).</param>
         /// <param name="stripSubtitles">When <c>true</c>, forces <c>-sn</c> to drop all subtitle streams.</param>
         /// <param name="forceSwDecode">When <c>true</c>, disables VAAPI hardware decoding while keeping VAAPI encoding.</param>
+        /// <param name="useConservativeHwFlags">When <c>true</c>, drops optional hw-encoder flags that older GPUs reject (NVENC temporal AQ, QSV lookahead/extbrc). Set by the retry chain after an encoder-feature failure.</param>
+        /// <param name="cachedOcrSrts">OCR'd SRT results from an earlier attempt. When non-null, the OCR pass is skipped and these files are muxed as-is.</param>
+        /// <param name="cachedOcrMuxTmpDir">Temp dir that owns the files in <paramref name="cachedOcrSrts"/>. Paired with the cache so cleanup still fires on success / exhaustion.</param>
         /// <param name="cancellationToken">Token to abort the encode mid-stream.</param>
-        private async Task ConvertVideoAsync(WorkItem workItem, EncoderOptions options, bool stripSubtitles = false, bool forceSwDecode = false, CancellationToken cancellationToken = default)
+        private async Task ConvertVideoAsync(
+            WorkItem workItem,
+            EncoderOptions options,
+            bool stripSubtitles = false,
+            bool forceSwDecode = false,
+            bool useConservativeHwFlags = false,
+            IReadOnlyList<SubtitleExtractionService.OcrMuxResult>? cachedOcrSrts = null,
+            string? cachedOcrMuxTmpDir = null,
+            CancellationToken cancellationToken = default)
         {
             if (workItem.Probe == null)
                 throw new Exception("No probe data available");
@@ -1013,8 +1024,11 @@ public class TranscodingService
                 // NVENC VBR doesn't strictly enforce -maxrate, but lookahead + adaptive QP
                 // gets it within ~2-4%. This is the best VBR can do on NVENC — CBR would be
                 // exact but wastes bits on simple scenes.
+                // Conservative mode drops -temporal_aq 1, which older NVENC silicon rejects
+                // ("Temporal AQ not supported" → encoder fails to open on Pascal and earlier).
                 int maxBitrateVal = int.Parse(maxBitrate.TrimEnd('k'));
-                compressionFlags = $"-g 25 -rc vbr -rc-lookahead 32 -spatial_aq 1 -temporal_aq 1 -b:v {targetBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
+                string aqFlags = useConservativeHwFlags ? "-spatial_aq 1" : "-spatial_aq 1 -temporal_aq 1";
+                compressionFlags = $"-g 25 -rc vbr -rc-lookahead 32 {aqFlags} -b:v {targetBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
             }
             else if (encoder.Contains("amf"))
             {
@@ -1026,8 +1040,11 @@ public class TranscodingService
             else if (encoder.Contains("qsv"))
             {
                 // QSV needs lookahead and extbrc for reliable maxrate enforcement.
+                // Conservative mode drops both — iGPUs that don't implement oneVPL lookahead
+                // fail surface handoff at frame 0 ("Invalid FrameType:0" on Tiger Lake).
                 int maxBitrateVal = int.Parse(maxBitrate.TrimEnd('k'));
-                compressionFlags = $"-g 25 -extbrc 1 -look_ahead 1 -look_ahead_depth 40 -b:v {targetBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
+                string laFlags = useConservativeHwFlags ? "" : "-extbrc 1 -look_ahead 1 -look_ahead_depth 40 ";
+                compressionFlags = $"-g 25 {laFlags}-b:v {targetBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
             }
             else
             {
@@ -1073,7 +1090,7 @@ public class TranscodingService
                 useVaapi = encoder.Contains("vaapi");
                 compressionFlags = GetForcedReencodeCompressionFlags(
                     encoder, useVaapi, encoder == "libsvtav1",
-                    targetBitrate, minBitrate, maxBitrate);
+                    targetBitrate, minBitrate, maxBitrate, useConservativeHwFlags);
             }
 
             // forceSwDecode: external retry path when VAAPI hwaccel fails mid-stream.
@@ -1146,7 +1163,15 @@ public class TranscodingService
             var ocrMuxSrts  = new List<SubtitleExtractionService.OcrMuxResult>();
             string? ocrMuxTmpDir = null;
 
-            if (doSubtitleWork && options.ExtractSubtitlesToSidecar && !stripSubtitles && _subtitleExtractionService != null)
+            if (cachedOcrSrts != null)
+            {
+                // Retry path: an earlier attempt already produced the SRTs. Reuse them
+                // instead of re-OCR'ing thousands of PGS cues — OCR is the single most
+                // expensive step in the pipeline.
+                ocrMuxSrts.AddRange(cachedOcrSrts);
+                ocrMuxTmpDir = cachedOcrMuxTmpDir;
+            }
+            else if (doSubtitleWork && options.ExtractSubtitlesToSidecar && !stripSubtitles && _subtitleExtractionService != null)
             {
                 string sidecarBase = Path.Combine(
                     Path.GetDirectoryName(outputPath)!,
@@ -1284,8 +1309,9 @@ public class TranscodingService
             }
             catch (Exception ex)
             {
-                TryCleanupOcrMuxDir(ocrMuxTmpDir);
-                await HandleConversionFailure(workItem, options, outputPath, ex.Message, stripSubtitles, forceSwDecode, cancellationToken: cancellationToken);
+                // Don't clean up the OCR tmp dir here — retries reuse the cached SRTs.
+                // HandleConversionFailure is responsible for cleanup on final exhaustion.
+                await HandleConversionFailure(workItem, options, outputPath, ex.Message, stripSubtitles, forceSwDecode, useConservativeHwFlags, ocrMuxSrts, ocrMuxTmpDir, cancellationToken: cancellationToken);
                 return;
             }
 
@@ -1293,14 +1319,14 @@ public class TranscodingService
 
             if (!File.Exists(outputPath))
             {
-                await HandleConversionFailure(workItem, options, outputPath, "Output file not found", stripSubtitles, forceSwDecode, cancellationToken: cancellationToken);
+                await HandleConversionFailure(workItem, options, outputPath, "Output file not found", stripSubtitles, forceSwDecode, useConservativeHwFlags, ocrMuxSrts, ocrMuxTmpDir, cancellationToken: cancellationToken);
                 return;
             }
 
             var outputProbe = await _ffprobeService.ProbeAsync(outputPath);
             if (!_ffprobeService.ConvertedSuccessfully(workItem.Probe!, outputProbe))
             {
-                await HandleConversionFailure(workItem, options, outputPath, "Duration mismatch detected", stripSubtitles, forceSwDecode, cancellationToken: cancellationToken);
+                await HandleConversionFailure(workItem, options, outputPath, "Duration mismatch detected", stripSubtitles, forceSwDecode, useConservativeHwFlags, ocrMuxSrts, ocrMuxTmpDir, cancellationToken: cancellationToken);
                 return;
             }
 
@@ -1665,7 +1691,7 @@ public class TranscodingService
         ///     already implies bitrate guesswork is acceptable for an exceptional case.
         /// </summary>
         private static string GetForcedReencodeCompressionFlags(string encoder, bool useVaapi, bool isSvtAv1,
-            string targetBitrate, string minBitrate, string maxBitrate)
+            string targetBitrate, string minBitrate, string maxBitrate, bool useConservativeHwFlags)
         {
             int maxBitrateVal = int.Parse(maxBitrate.TrimEnd('k'));
             if (useVaapi)
@@ -1676,11 +1702,17 @@ public class TranscodingService
                 return $"-svtav1-params rc=1 -b:v {(long)(tbr * 1.05)}k ";
             }
             if (encoder.Contains("nvenc"))
-                return $"-g 25 -rc vbr -rc-lookahead 32 -spatial_aq 1 -temporal_aq 1 -b:v {targetBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
+            {
+                string aqFlags = useConservativeHwFlags ? "-spatial_aq 1" : "-spatial_aq 1 -temporal_aq 1";
+                return $"-g 25 -rc vbr -rc-lookahead 32 {aqFlags} -b:v {targetBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
+            }
             if (encoder.Contains("amf"))
                 return $"-g 25 -rc vbr_peak -enforce_hrd 1 -b:v {targetBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
             if (encoder.Contains("qsv"))
-                return $"-g 25 -extbrc 1 -look_ahead 1 -look_ahead_depth 40 -b:v {targetBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
+            {
+                string laFlags = useConservativeHwFlags ? "" : "-extbrc 1 -look_ahead 1 -look_ahead_depth 40 ";
+                return $"-g 25 {laFlags}-b:v {targetBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
+            }
             return $"-g 25 -b:v {targetBitrate} -minrate {minBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
         }
 
@@ -1921,7 +1953,7 @@ public class TranscodingService
 
             return hardwareAcceleration.ToLower() switch
             {
-                "intel" when isWindows => "-y -hwaccel qsv -qsv_device auto",
+                "intel" when isWindows => "-y -hwaccel qsv -hwaccel_output_format qsv -qsv_device auto",
                 "amd" when isWindows => "-y -hwaccel auto",
                 // Software decode + VAAPI encode: init the device but don't force hwaccel decode
                 "intel" when !hwDecode => "-y -init_hw_device vaapi=hw:/dev/dri/renderD128 -filter_hw_device hw",
@@ -2680,7 +2712,17 @@ public class TranscodingService
             }
         }
 
-        private async Task HandleConversionFailure(WorkItem workItem, EncoderOptions options, string outputPath, string reason, bool subtitlesWereStripped, bool swDecodeWasForced = false, CancellationToken cancellationToken = default)
+        private async Task HandleConversionFailure(
+            WorkItem workItem,
+            EncoderOptions options,
+            string outputPath,
+            string reason,
+            bool subtitlesWereStripped,
+            bool swDecodeWasForced = false,
+            bool conservativeHwFlagsTried = false,
+            IReadOnlyList<SubtitleExtractionService.OcrMuxResult>? cachedOcrSrts = null,
+            string? cachedOcrMuxTmpDir = null,
+            CancellationToken cancellationToken = default)
         {
             await LogAsync(workItem.Id, $"Conversion failed: {reason}");
 
@@ -2694,17 +2736,51 @@ public class TranscodingService
                 await LogAsync(workItem.Id, $"Warning: Could not clean up output file: {ex.Message}");
             }
 
-            // Retry 1: Strip all subtitles (covers bitmap subs, broken streams, etc.)
+            // Classify the failure once — order of the retry tiers below is driven by this.
+            bool isEncoderFeatureError =
+                reason.Contains("not supported", StringComparison.OrdinalIgnoreCase) ||
+                reason.Contains("Provided device doesn't support", StringComparison.OrdinalIgnoreCase) ||
+                reason.Contains("Error while opening encoder", StringComparison.OrdinalIgnoreCase) ||
+                reason.Contains("Invalid FrameType", StringComparison.OrdinalIgnoreCase) ||
+                reason.Contains("Function not implemented", StringComparison.OrdinalIgnoreCase);
+
+            bool isHwEncoder = !options.HardwareAcceleration.Equals("none", StringComparison.OrdinalIgnoreCase);
+
+            // Retry 1: Hardware encoder rejected a feature flag (older NVENC silicon missing
+            // Temporal AQ, QSV iGPUs missing oneVPL lookahead). Try this BEFORE stripping
+            // subtitles — the failure has nothing to do with the sub streams, and stripping
+            // them would drop the cached OCR tracks from the final output for no reason.
+            if (isEncoderFeatureError && isHwEncoder && !conservativeHwFlagsTried)
+            {
+                await LogAsync(workItem.Id, "Retrying with conservative hardware encoder flags...");
+                workItem.Progress = 0;
+                await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
+                await ConvertVideoAsync(workItem, options,
+                    stripSubtitles: subtitlesWereStripped,
+                    forceSwDecode: swDecodeWasForced,
+                    useConservativeHwFlags: true,
+                    cachedOcrSrts: cachedOcrSrts,
+                    cachedOcrMuxTmpDir: cachedOcrMuxTmpDir,
+                    cancellationToken: cancellationToken);
+                return;
+            }
+
+            // Retry 2: Strip all subtitles (covers bitmap subs, broken streams, etc.)
             if (!subtitlesWereStripped)
             {
                 await LogAsync(workItem.Id, "Retrying without subtitles...");
                 workItem.Progress = 0;
                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
-                await ConvertVideoAsync(workItem, options, stripSubtitles: true, cancellationToken: cancellationToken);
+                await ConvertVideoAsync(workItem, options,
+                    stripSubtitles: true,
+                    useConservativeHwFlags: conservativeHwFlagsTried,
+                    cachedOcrSrts: cachedOcrSrts,
+                    cachedOcrMuxTmpDir: cachedOcrMuxTmpDir,
+                    cancellationToken: cancellationToken);
                 return;
             }
 
-            // Retry 2: Software decode + VAAPI encode for hwaccel filter graph errors
+            // Retry 3: Software decode + VAAPI encode for hwaccel filter graph errors
             // This keeps GPU encoding but avoids the problematic hardware decoder that crashes
             // on mid-stream format/resolution changes
             bool isHwaccelError = reason.Contains("hwaccel", StringComparison.OrdinalIgnoreCase)
@@ -2721,7 +2797,13 @@ public class TranscodingService
                     "Retrying with software decode + VAAPI encode...");
                 workItem.Progress = 0;
                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
-                await ConvertVideoAsync(workItem, options, stripSubtitles: subtitlesWereStripped, forceSwDecode: true, cancellationToken: cancellationToken);
+                await ConvertVideoAsync(workItem, options,
+                    stripSubtitles: subtitlesWereStripped,
+                    forceSwDecode: true,
+                    useConservativeHwFlags: conservativeHwFlagsTried,
+                    cachedOcrSrts: cachedOcrSrts,
+                    cachedOcrMuxTmpDir: cachedOcrMuxTmpDir,
+                    cancellationToken: cancellationToken);
                 return;
             }
 
@@ -2738,11 +2820,17 @@ public class TranscodingService
                 bool isAv1Target = options.Encoder.Contains("av1") || options.Encoder.Contains("svt") || options.Codec == "av1";
                 options.Encoder = isAv1Target ? "libsvtav1" : "libx265";
                 options.HardwareAcceleration = "none";
-                await ConvertVideoAsync(workItem, options, stripSubtitles: false, cancellationToken: cancellationToken);
+                await ConvertVideoAsync(workItem, options,
+                    stripSubtitles: false,
+                    cachedOcrSrts: cachedOcrSrts,
+                    cachedOcrMuxTmpDir: cachedOcrMuxTmpDir,
+                    cancellationToken: cancellationToken);
                 return;
             }
 
-            // All retries exhausted — original file is untouched
+            // All retries exhausted — original file is untouched. Clean up the OCR tmp dir
+            // now that no retry will reuse it.
+            TryCleanupOcrMuxDir(cachedOcrMuxTmpDir);
             await LogAsync(workItem.Id, "All retries exhausted. Original file is unchanged.");
             throw new Exception($"Conversion failed after retries: {reason}");
         }
