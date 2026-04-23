@@ -458,8 +458,13 @@ public sealed class ClusterNodeJobService
         {
             if (encodingSucceeded && !noSavings && _currentRemoteJob != null)
             {
-                _currentRemoteJob.Progress = 100;
-                _currentRemoteJob.Status   = WorkItemStatus.Downloading;
+                // Zero TransferProgress and set RemoteJobPhase so the UI renders
+                // the download bar from 0% instead of flashing Progress=100 through
+                // the encode-progress field.
+                _currentRemoteJob.Progress         = 100;
+                _currentRemoteJob.Status           = WorkItemStatus.Downloading;
+                _currentRemoteJob.RemoteJobPhase   = "Downloading";
+                _currentRemoteJob.TransferProgress = 0;
                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", _currentRemoteJob);
             }
 

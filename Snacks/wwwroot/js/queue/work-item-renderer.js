@@ -210,8 +210,10 @@ export function updateWorkItemDom(element, workItem, clusterEnabled) {
     }
 
 
-    // Progress bar (transfer-style or simple encode).
-    const isTransfer = workItem.remoteJobPhase === 'Uploading' || workItem.remoteJobPhase === 'Downloading';
+    // Progress bar (transfer-style or simple encode). Key off status, not
+    // remoteJobPhase — status is always set, phase can be stale/null and would
+    // flip the bar between transferProgress and progress.
+    const isTransfer = statusString === 'Uploading' || statusString === 'Downloading';
     const pct        = isTransfer ? (workItem.transferProgress || 0) : (workItem.progress || 0);
     const progressContainer = element.querySelector('.progress');
 

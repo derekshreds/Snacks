@@ -213,15 +213,18 @@ public sealed class ClusterFileTransferService
                     offset              += bytesRead;
                     consecutiveFailures  = 0;
 
-                    // Don't re-assert Status/Phase here. Dispatch already set them to
-                    // Uploading before this loop began; re-setting them on every chunk
-                    // creates a race with CancelWorkItemAsync — if cancel fires between
-                    // two chunks, the chunk that completes next would clobber Cancelled
-                    // and flip the item back to Uploading forever.
+                    // Reassert RemoteJobPhase inside the Status guard so concurrent writers
+                    // can't leave it stale between chunks — the UI picks transfer vs encode
+                    // progress off the phase, and a null phase flips the bar to workItem.Progress.
+                    // Status itself is sticky against terminal→active via its setter, so this
+                    // doesn't reintroduce the cancel race the original guard was added to fix.
                     workItem.TransferProgress = (int)(offset * 100 / totalSize);
                     workItem.ErrorMessage     = null;
                     if (workItem.Status == WorkItemStatus.Uploading)
+                    {
+                        workItem.RemoteJobPhase = "Uploading";
                         await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem, ct);
+                    }
 
                     break;
                 }
@@ -365,10 +368,13 @@ public sealed class ClusterFileTransferService
                 offset              += chunkData.Length;
                 consecutiveFailures  = 0;
 
-                // Update progress
-                if (totalSize > 0)
+                // Update progress. Reassert RemoteJobPhase so concurrent writers can't
+                // leave it stale — the UI picks transfer vs encode progress off the phase,
+                // and a null phase flips the bar to workItem.Progress.
+                if (totalSize > 0 && workItem.Status == WorkItemStatus.Downloading)
                 {
                     workItem.TransferProgress = (int)(offset * 100 / totalSize);
+                    workItem.RemoteJobPhase   = "Downloading";
                     await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem, ct);
                 }
 

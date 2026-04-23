@@ -928,9 +928,12 @@ public sealed class ClusterService : IHostedService, IDisposable
 
                 var workItem = _transcodingService.DequeueForRemoteProcessing(item =>
                 {
-                    // If master has a 4K preference, only dispatch items it doesn't want
-                    if (masterExcludes4K && !item.Is4K) return false; // master handles non-4K locally
-                    if (masterOnly4K && item.Is4K) return false;      // master handles 4K locally
+                    // Master's 4K preference only hogs an item type when no worker
+                    // shares that preference — otherwise a worker configured the same
+                    // way as the master would sit idle forever while master monopolised
+                    // the queue. When a worker can take the type, load-share instead.
+                    if (masterExcludes4K && !item.Is4K && !anyNon4KWorker) return false;
+                    if (masterOnly4K     &&  item.Is4K && !any4KWorker)    return false;
 
                     return item.Is4K ? any4KWorker : anyNon4KWorker;
                 });

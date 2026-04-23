@@ -69,6 +69,9 @@ export class SignalRClient {
 
         /** Keepalive polling handle (iOS Safari paint fix). */
         this._statusInterval  = null;
+
+        /** Last observed connected state, for edge-triggered lifecycle fan-out. */
+        this._lastConnected   = null;
     }
 
     /**
@@ -137,23 +140,27 @@ export class SignalRClient {
             // Lifecycle wiring.
             this._connection.onreconnected(() => {
                 console.log('SignalR reconnected — resyncing');
+                this._lastConnected = true;
                 this._lifecycle.open.forEach(cb => cb());
             });
 
             this._connection.onreconnecting(() => {
                 console.log('SignalR reconnecting…');
+                this._lastConnected = false;
                 this._lifecycle.close.forEach(cb => cb());
             });
 
             this._connection.onclose(() => {
                 if (this._intentionalStop) return;
                 console.log('SignalR disconnected — retrying in 5s');
+                this._lastConnected = false;
                 this._lifecycle.close.forEach(cb => cb());
                 setTimeout(() => this.start(), 5000);
             });
 
             await this._connection.start();
             console.log('SignalR connected');
+            this._lastConnected = true;
             this._lifecycle.open.forEach(cb => cb());
 
         } catch (err) {
@@ -167,9 +174,14 @@ export class SignalRClient {
 
         // Poll-driven safety net: iOS Safari can miss the initial paint
         // without this, since its JS loop is sometimes delayed at wake-up.
+        // Edge-triggered — only fire lifecycle callbacks on state transitions,
+        // otherwise `loadItems` gets invoked every 3s and reconciles against
+        // the server mid-transfer, wiping transient SignalR-only cards.
         if (!this._statusInterval) {
             this._statusInterval = setInterval(() => {
                 const connected = this._connection?.state === 'Connected';
+                if (connected === this._lastConnected) return;
+                this._lastConnected = connected;
                 const callbacks = connected ? this._lifecycle.open : this._lifecycle.close;
                 callbacks.forEach(cb => cb());
             }, 3000);
