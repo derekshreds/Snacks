@@ -121,6 +121,7 @@ public class TranscodingService
         private readonly IntegrationService?         _integrationService;
         private readonly SubtitleExtractionService?  _subtitleExtractionService;
         private Func<bool>?                          _externalDispatchGate;
+        private Func<ExclusionRules?>?               _exclusionRulesProvider;
 
         /// <summary>
         ///     Installs a predicate that returns <c>true</c> when this instance
@@ -132,6 +133,17 @@ public class TranscodingService
         public void SetExternalDispatchGate(Func<bool> gate) => _externalDispatchGate = gate;
 
         private bool ShouldDispatchExternal => _externalDispatchGate?.Invoke() ?? true;
+
+        /// <summary>
+        ///     Installs a provider for the current library <see cref="ExclusionRules"/> so manual
+        ///     adds honor the same filename/size/resolution filters the auto-scanner applies.
+        ///     Wired from <see cref="AutoScanService"/> (avoids the TranscodingService ↔ AutoScanService
+        ///     DI cycle). When unset (tests / node mode) no exclusions are applied.
+        /// </summary>
+        public void SetExclusionRulesProvider(Func<ExclusionRules?> provider) =>
+            _exclusionRulesProvider = provider;
+
+        private ExclusionRules? GetExclusionRules() => _exclusionRulesProvider?.Invoke();
 
         /// <summary>
         ///     Initializes the service and eagerly starts hardware acceleration detection in the
@@ -322,6 +334,27 @@ public class TranscodingService
                 var videoStream = probe.Streams.FirstOrDefault(s => s.CodecType == "video");
                 var normalizedPath = Path.GetFullPath(filePath);
 
+                // Library exclusion rules — shared with the auto-scanner via a provider that
+                // AutoScanService wires in StartAsync. Respect `force` so manually re-added
+                // files aren't silently dropped when the user asks explicitly.
+                if (!force)
+                {
+                    var exclusions = GetExclusionRules();
+                    if (exclusions != null)
+                    {
+                        string? resolutionLabel = ExclusionRules.ClassifyResolution(
+                            videoStream?.Width ?? 0, videoStream?.Height ?? 0);
+                        if (exclusions.IsExcluded(
+                                Path.GetFileName(normalizedPath),
+                                fileInfo.Length,
+                                resolutionLabel))
+                        {
+                            Console.WriteLine($"Excluded by library rules: {workItem.FileName}");
+                            return workItem.Id;
+                        }
+                    }
+                }
+
                 async Task MarkSkippedInDb()
                 {
                     await _mediaFileRepo.UpsertAsync(new MediaFile
@@ -341,14 +374,19 @@ public class TranscodingService
                         Is4K = isHighDef,
                         Status = MediaFileStatus.Skipped,
                         LastScannedAt = DateTime.UtcNow,
-                        FileMtime = fileInfo.LastWriteTimeUtc.Ticks
+                        FileMtime = fileInfo.LastWriteTimeUtc.Ticks,
+                        // Per-track summaries so the Mux re-evaluation on settings save can decide
+                        // whether to flip this file back to Unseen without a re-probe.
+                        AudioStreams    = MuxStreamSummary.Serialize(ProjectAudioSummaries(probe)),
+                        SubtitleStreams = MuxStreamSummary.Serialize(ProjectSubtitleSummaries(probe)),
                     });
                 }
 
-                // Settings may require non-video work (audio re-encode, track removal, OCR,
-                // sidecar extraction) even when the video itself is already efficient. In that
-                // case the bitrate-based skip gates would silently swallow the job, so bypass them.
-                bool hasNonVideoWork = HasNonVideoWork(options, probe);
+                // Bypass the skip gate only when a configured Mux mode has actual work to do on
+                // this file. Both scopes require HasMuxableWork — a pointless remux of a file
+                // that already matches every audio/subtitle setting is never what the user wants.
+                // MuxScope only differs at encode time: AllFiles also mux-passes above-target files.
+                bool bypassSkip = options.MuxMode != MuxMode.Off && HasMuxableWork(options, probe);
 
                 if (options.Skip4K && isHighDef)
                 {
@@ -359,7 +397,7 @@ public class TranscodingService
 
                 string targetCodecLabel = targetIsAv1 ? "AV1" : (isHevc ? "HEVC" : "H.264");
                 double skipMultiplier = 1.0 + (Math.Clamp(options.SkipPercentAboveTarget, 0, 100) / 100.0);
-                if (alreadyTargetCodec && bitrate > 0 && bitrate <= options.TargetBitrate * skipMultiplier && !isHighDef && !hasNonVideoWork)
+                if (alreadyTargetCodec && bitrate > 0 && bitrate <= options.TargetBitrate * skipMultiplier && !isHighDef && !bypassSkip)
                 {
                     Console.WriteLine($"Skipping {workItem.FileName}: already {targetCodecLabel} at {bitrate}kbps (target {options.TargetBitrate}kbps, skip threshold {skipMultiplier:P0})");
                     await MarkSkippedInDb();
@@ -368,7 +406,7 @@ public class TranscodingService
 
                 int fourKMultiplier = Math.Clamp(options.FourKBitrateMultiplier, 2, 8);
                 int fourKTarget = options.TargetBitrate * fourKMultiplier;
-                if (alreadyTargetCodec && isHighDef && bitrate > 0 && bitrate <= fourKTarget * skipMultiplier && !hasNonVideoWork)
+                if (alreadyTargetCodec && isHighDef && bitrate > 0 && bitrate <= fourKTarget * skipMultiplier && !bypassSkip)
                 {
                     Console.WriteLine($"Skipping {workItem.FileName}: already {targetCodecLabel} 4K at {bitrate}kbps (4K target {fourKTarget}kbps)");
                     await MarkSkippedInDb();
@@ -380,7 +418,7 @@ public class TranscodingService
                 bool isVaapiMode = IsVaapiAcceleration(options.HardwareAcceleration) ||
                     (options.HardwareAcceleration.Equals("auto", StringComparison.OrdinalIgnoreCase) &&
                      _detectedHardware != null && IsVaapiAcceleration(_detectedHardware));
-                if (isVaapiMode && !isHevc && targetIsHevc && bitrate > 0 && bitrate <= options.TargetBitrate && !isHighDef && !hasNonVideoWork)
+                if (isVaapiMode && !isHevc && targetIsHevc && bitrate > 0 && bitrate <= options.TargetBitrate && !isHighDef && !bypassSkip)
                 {
                     Console.WriteLine($"Skipping {workItem.FileName}: VAAPI can't compress {bitrate}kbps H.264 below target");
                     await MarkSkippedInDb();
@@ -456,7 +494,9 @@ public class TranscodingService
                     Is4K = isHighDef,
                     Status = MediaFileStatus.Queued,
                     LastScannedAt = DateTime.UtcNow,
-                    FileMtime = fileInfo.LastWriteTimeUtc.Ticks
+                    FileMtime = fileInfo.LastWriteTimeUtc.Ticks,
+                    AudioStreams    = MuxStreamSummary.Serialize(ProjectAudioSummaries(probe)),
+                    SubtitleStreams = MuxStreamSummary.Serialize(ProjectSubtitleSummaries(probe)),
                 });
 
                 _workItems[workItem.Id] = workItem;
@@ -891,12 +931,20 @@ public class TranscodingService
 
             var (targetBitrate, minBitrate, maxBitrate, videoCopy) = CalculateBitrates(workItem, options);
 
-            // Audio-only mode: copy the video stream regardless of codec match.
-            // The audio side still honors AudioCodec / AudioBitrateKbps below.
-            if (options.AudioOnlyMode)
+            // Mux pass: copy the video stream and only touch the stream types selected by
+            // MuxMode. Requires actual muxable work — otherwise re-encode normally (or, for
+            // at-target files, the skip gate would have already skipped). MuxScope controls
+            // whether above-target files also get the mux pass treatment instead of a full
+            // re-encode.
+            bool isMuxPass = options.MuxMode != MuxMode.Off &&
+                HasMuxableWork(options, workItem.Probe!) &&
+                (options.MuxScope == MuxScope.AllFiles || MeetsBitrateTarget(workItem, options));
+            bool doAudioWork    = !isMuxPass || options.MuxMode is MuxMode.Audio     or MuxMode.Both;
+            bool doSubtitleWork = !isMuxPass || options.MuxMode is MuxMode.Subtitles or MuxMode.Both;
+            if (isMuxPass)
             {
                 videoCopy = true;
-                await LogAsync(workItem.Id, "Audio-only mode: copying video stream, re-encoding audio.");
+                await LogAsync(workItem.Id, $"Mux pass ({options.MuxMode}, scope {options.MuxScope}): copying video stream.");
             }
 
             // Resolve the actual encoder — verify it works, fall back to software if not
@@ -982,15 +1030,15 @@ public class TranscodingService
                 s.CodecType == "video" && (s.PixFmt?.Contains("10") == true || s.Profile?.Contains("10") == true)) == true;
 
             // Filter decisions: crop / downscale / tonemap. All three produce SW filter expressions
-            // that feed VideoFilterBuilder. Audio-only mode disables every video filter.
+            // that feed VideoFilterBuilder. A mux pass disables every video filter.
             string? cropExpr = null;
-            if (options.RemoveBlackBorders && !options.AudioOnlyMode)
+            if (options.RemoveBlackBorders && !isMuxPass)
             {
                 var detected = await GetCropParametersAsync(workItem, options, workItem.Path);
                 if (!string.IsNullOrEmpty(detected)) cropExpr = detected;
             }
-            string? scaleExpr = options.AudioOnlyMode ? null : ComputeScaleExpr(workItem, options);
-            bool tonemap = options.TonemapHdrToSdr && !options.AudioOnlyMode && FfprobeService.IsHdr(workItem.Probe!);
+            string? scaleExpr = isMuxPass ? null : ComputeScaleExpr(workItem, options);
+            bool tonemap = options.TonemapHdrToSdr && !isMuxPass && FfprobeService.IsHdr(workItem.Probe!);
             bool hasFilter = cropExpr != null || scaleExpr != null || tonemap;
 
             // Any active filter forces a re-encode even if bitrate logic chose videoCopy.
@@ -1043,12 +1091,14 @@ public class TranscodingService
                 $"{_ffprobeService.MapVideo(workItem.Probe!)} -c:v copy " :
                 $"{_ffprobeService.MapVideo(workItem.Probe!)} -c:v {encoder} {presetFlag}{vfFlag}";
 
+            // On a mux pass that excludes audio (MuxMode.Subtitles), keep every audio track as-is:
+            // empty language list = keep all, "copy" codec = no re-encode, no downmix.
             string audioFlags = _ffprobeService.MapAudio(
                 workItem.Probe!,
-                options.AudioLanguagesToKeep,
-                options.AudioCodec,
+                doAudioWork ? options.AudioLanguagesToKeep : new List<string>(),
+                doAudioWork ? options.AudioCodec : "copy",
                 options.AudioBitrateKbps,
-                options.TwoChannelAudio,
+                doAudioWork && options.TwoChannelAudio,
                 options.Format == "mkv") + " ";
 
             string varFlags = options.Format == "mkv" ? "-max_muxing_queue_size 9999 " : "-movflags +faststart -max_muxing_queue_size 9999 ";
@@ -1085,7 +1135,7 @@ public class TranscodingService
             var ocrMuxSrts  = new List<SubtitleExtractionService.OcrMuxResult>();
             string? ocrMuxTmpDir = null;
 
-            if (options.ExtractSubtitlesToSidecar && !stripSubtitles && _subtitleExtractionService != null)
+            if (doSubtitleWork && options.ExtractSubtitlesToSidecar && !stripSubtitles && _subtitleExtractionService != null)
             {
                 string sidecarBase = Path.Combine(
                     Path.GetDirectoryName(outputPath)!,
@@ -1099,7 +1149,7 @@ public class TranscodingService
                     cancellationToken);
                 stripSubtitles = true;
             }
-            else if (options.ConvertImageSubtitlesToSrt && !stripSubtitles && _subtitleExtractionService != null)
+            else if (doSubtitleWork && options.ConvertImageSubtitlesToSrt && !stripSubtitles && _subtitleExtractionService != null)
             {
                 // OCR-without-sidecar: run OCR and mux the resulting SRTs back into the main output
                 // as text subtitle tracks, so the user gets a single file with searchable subtitles.
@@ -1195,7 +1245,10 @@ public class TranscodingService
             }
             else
             {
-                subtitleFlags = _ffprobeService.MapSub(workItem.Probe!, options.SubtitleLanguagesToKeep, options.Format == "mkv") + " ";
+                // On a mux pass that excludes subs (MuxMode.Audio), keep every subtitle track by
+                // passing an empty language list — MapSub treats that as "keep all".
+                var subLangs = doSubtitleWork ? options.SubtitleLanguagesToKeep : new List<string>();
+                subtitleFlags = _ffprobeService.MapSub(workItem.Probe!, subLangs, options.Format == "mkv") + " ";
             }
 
             // -analyzeduration and -probesize handle files with many streams (e.g. 30+ PGS subtitle tracks)
@@ -1243,6 +1296,7 @@ public class TranscodingService
             var outputSize = new FileInfo(outputPath).Length;
             float savings = (workItem.Size - outputSize) / 1048576f;
             float percent = 1 - ((float)outputSize / workItem.Size);
+            workItem.OutputSize = outputSize;
 
             await LogAsync(workItem.Id,
                 $"Converted successfully in {DateTime.Now.Subtract(startTime).TotalMinutes:0.00} minutes.");
@@ -1291,73 +1345,182 @@ public class TranscodingService
         }
 
         /// <summary>
-        ///     Returns <see langword="true"/> when the current settings would cause the output to
-        ///     differ from the source even if the video is already at-or-below target bitrate.
-        ///     Used to bypass the "already efficient" skip gates so workflows like audio-only
-        ///     re-encodes, OCR, sidecar extraction, and track-removal still process the file.
+        ///     Returns <see langword="true"/> when audio settings would change the output
+        ///     (language drop, codec re-encode, or downmix) versus a straight stream copy.
         /// </summary>
-        private static bool HasNonVideoWork(EncoderOptions options, ProbeResult probe)
+        private static bool HasAudioWork(EncoderOptions options, IReadOnlyList<AudioStreamSummary> audioStreams)
         {
-            // --- Audio ---
-            if (options.AudioOnlyMode) return true;
+            if (audioStreams.Count == 0) return false;
 
-            var audioStreams = probe.Streams.Where(s => s.CodecType == "audio").ToList();
-            if (audioStreams.Count > 0)
+            // Language filter would drop at least one track?
+            if (options.AudioLanguagesToKeep is { Count: > 0 } audLangs)
             {
-                // Language filter would drop at least one track?
-                if (options.AudioLanguagesToKeep is { Count: > 0 } audLangs)
-                {
-                    var kept = audioStreams
-                        .Where(s => LanguageMatcher.Matches(s.Tags?.Language, audLangs))
-                        .ToList();
-                    if (kept.Count < audioStreams.Count) return true;
-                    audioStreams = kept;
-                }
-
-                // Codec re-encode on any surviving track?
-                if (!string.IsNullOrEmpty(options.AudioCodec)
-                    && !options.AudioCodec.Equals("copy", StringComparison.OrdinalIgnoreCase))
-                {
-                    foreach (var s in audioStreams)
-                        if (!string.Equals(s.CodecName, options.AudioCodec, StringComparison.OrdinalIgnoreCase))
-                            return true;
-                }
-
-                // Downmix would reduce channels on any surviving track?
-                if (options.TwoChannelAudio)
-                {
-                    foreach (var s in audioStreams)
-                        if (s.Channels > 2) return true;
-                }
+                var kept = audioStreams
+                    .Where(s => LanguageMatcher.Matches(s.Language, audLangs))
+                    .ToList();
+                if (kept.Count < audioStreams.Count) return true;
+                audioStreams = kept;
             }
 
-            // --- Subtitles ---
-            var subStreams = probe.Streams.Where(s => s.CodecType == "subtitle").ToList();
-            if (subStreams.Count > 0)
+            // Codec re-encode on any surviving track?
+            if (!string.IsNullOrEmpty(options.AudioCodec)
+                && !options.AudioCodec.Equals("copy", StringComparison.OrdinalIgnoreCase))
             {
-                // Language filter would drop at least one track?
-                if (options.SubtitleLanguagesToKeep is { Count: > 0 } subLangs)
-                {
-                    var kept = subStreams
-                        .Where(s => LanguageMatcher.Matches(s.Tags?.Language, subLangs))
-                        .ToList();
-                    if (kept.Count < subStreams.Count) return true;
-                    subStreams = kept;
-                }
+                foreach (var s in audioStreams)
+                    if (!string.Equals(s.CodecName, options.AudioCodec, StringComparison.OrdinalIgnoreCase))
+                        return true;
+            }
 
-                // Sidecar extraction with any text (or OCR-able bitmap) track present?
-                if (options.ExtractSubtitlesToSidecar && subStreams.Count > 0) return true;
-
-                // OCR requested and a bitmap track is actually present to OCR?
-                if (options.ConvertImageSubtitlesToSrt)
-                {
-                    foreach (var s in subStreams)
-                        if (FfprobeService._bitmapSubCodecs.Contains(s.CodecName ?? ""))
-                            return true;
-                }
+            // Downmix would reduce channels on any surviving track?
+            if (options.TwoChannelAudio)
+            {
+                foreach (var s in audioStreams)
+                    if (s.Channels > 2) return true;
             }
 
             return false;
+        }
+
+        /// <summary>
+        ///     Returns <see langword="true"/> when subtitle settings would change the output
+        ///     (language drop, sidecar extraction, or OCR of bitmap subs) versus a straight copy.
+        /// </summary>
+        private static bool HasSubtitleWork(EncoderOptions options, IReadOnlyList<SubtitleStreamSummary> subStreams)
+        {
+            if (subStreams.Count == 0) return false;
+
+            // Language filter would drop at least one track?
+            if (options.SubtitleLanguagesToKeep is { Count: > 0 } subLangs)
+            {
+                var kept = subStreams
+                    .Where(s => LanguageMatcher.Matches(s.Language, subLangs))
+                    .ToList();
+                if (kept.Count < subStreams.Count) return true;
+                subStreams = kept;
+            }
+
+            // Sidecar extraction with any text (or OCR-able bitmap) track present?
+            if (options.ExtractSubtitlesToSidecar && subStreams.Count > 0) return true;
+
+            // OCR requested and a bitmap track is actually present to OCR?
+            if (options.ConvertImageSubtitlesToSrt)
+            {
+                foreach (var s in subStreams)
+                    if (FfprobeService._bitmapSubCodecs.Contains(s.CodecName ?? ""))
+                        return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        ///     Projects a probe into the minimal audio summary shape used by <see cref="HasAudioWork" />.
+        /// </summary>
+        internal static List<AudioStreamSummary> ProjectAudioSummaries(ProbeResult probe) =>
+            probe.Streams.Where(s => s.CodecType == "audio")
+                .Select(s => new AudioStreamSummary
+                {
+                    Language  = s.Tags?.Language,
+                    CodecName = s.CodecName,
+                    Channels  = s.Channels,
+                })
+                .ToList();
+
+        /// <summary>
+        ///     Projects a probe into the minimal subtitle summary shape used by <see cref="HasSubtitleWork" />.
+        /// </summary>
+        internal static List<SubtitleStreamSummary> ProjectSubtitleSummaries(ProbeResult probe) =>
+            probe.Streams.Where(s => s.CodecType == "subtitle")
+                .Select(s => new SubtitleStreamSummary
+                {
+                    Language  = s.Tags?.Language,
+                    CodecName = s.CodecName,
+                })
+                .ToList();
+
+        /// <summary>
+        ///     Returns <see langword="true"/> when <see cref="EncoderOptions.MuxMode"/> selects a
+        ///     non-video branch that has work to do on this file. Drives the skip-gate bypass so
+        ///     at-target files still get a video-copy mux pass when their audio or subs need attention.
+        /// </summary>
+        private static bool HasMuxableWork(EncoderOptions options, ProbeResult probe) =>
+            HasMuxableWork(options, ProjectAudioSummaries(probe), ProjectSubtitleSummaries(probe));
+
+        /// <summary>
+        ///     Overload that takes the compact summary shape directly — used by the settings-save
+        ///     re-evaluation path to decide whether a previously-skipped file should be re-queued.
+        /// </summary>
+        public static bool HasMuxableWork(
+            EncoderOptions options,
+            IReadOnlyList<AudioStreamSummary> audioStreams,
+            IReadOnlyList<SubtitleStreamSummary> subtitleStreams) =>
+            (options.MuxMode is MuxMode.Audio     or MuxMode.Both && HasAudioWork(options, audioStreams)) ||
+            (options.MuxMode is MuxMode.Subtitles or MuxMode.Both && HasSubtitleWork(options, subtitleStreams));
+
+        /// <summary>
+        ///     Pure function that mirrors the scan-phase skip gate using only <see cref="MediaFile"/>
+        ///     fields (no probe required). Returns <see langword="true"/> when the file would still be
+        ///     skipped under the given options — used on settings-save to decide whether to reset
+        ///     <see cref="MediaFileStatus.Skipped"/> rows back to <see cref="MediaFileStatus.Unseen"/>.
+        /// </summary>
+        public static bool WouldSkipUnderOptions(MediaFile mf, EncoderOptions options)
+        {
+            // Skip4K overrides everything else.
+            if (options.Skip4K && mf.Is4K) return true;
+
+            // If the user's current Mux settings would turn this file into a mux pass, it's
+            // no longer a skip candidate. We need the per-track summaries to answer that.
+            bool muxable = options.MuxMode != MuxMode.Off &&
+                HasMuxableWork(
+                    options,
+                    MuxStreamSummary.DeserializeAudio(mf.AudioStreams),
+                    MuxStreamSummary.DeserializeSubtitle(mf.SubtitleStreams));
+            if (muxable) return false;
+
+            // Codec match — mirrors the scan-phase `alreadyTargetCodec` computation.
+            bool targetIsHevc = options.Encoder.Contains("265");
+            bool targetIsAv1  = options.Encoder.Contains("av1") || options.Encoder.Contains("svt");
+            bool sourceIsAv1  = string.Equals(mf.Codec, "av1", StringComparison.OrdinalIgnoreCase);
+            bool alreadyTargetCodec = targetIsAv1 ? sourceIsAv1
+                                    : targetIsHevc ? mf.IsHevc
+                                    : !mf.IsHevc;
+            if (!alreadyTargetCodec || mf.Bitrate <= 0) return false;
+
+            double skipMultiplier = 1.0 + (Math.Clamp(options.SkipPercentAboveTarget, 0, 100) / 100.0);
+            int fourKMultiplier = Math.Clamp(options.FourKBitrateMultiplier, 2, 8);
+            long ceilingKbps = mf.Is4K
+                ? options.TargetBitrate * fourKMultiplier
+                : options.TargetBitrate;
+
+            return mf.Bitrate <= ceilingKbps * skipMultiplier;
+        }
+
+        /// <summary>
+        ///     Mirrors the scan-phase skip-gate check: <see langword="true"/> when the source is
+        ///     already at the target codec and below the configured bitrate tolerance (with the
+        ///     4K multiplier when applicable). Used at encode time to decide whether a configured
+        ///     <c>MuxScope.TargetMatchOnly</c> should trigger a video-copy mux pass.
+        /// </summary>
+        private static bool MeetsBitrateTarget(WorkItem workItem, EncoderOptions options)
+        {
+            if (workItem.Bitrate <= 0 || workItem.Probe == null) return false;
+
+            var videoStream = workItem.Probe.Streams.FirstOrDefault(s => s.CodecType == "video");
+            bool targetIsHevc = options.Encoder.Contains("265");
+            bool targetIsAv1  = options.Encoder.Contains("av1") || options.Encoder.Contains("svt");
+            bool sourceIsAv1  = string.Equals(videoStream?.CodecName, "av1", StringComparison.OrdinalIgnoreCase);
+            bool alreadyTargetCodec = targetIsAv1 ? sourceIsAv1
+                                    : targetIsHevc ? workItem.IsHevc
+                                    : !workItem.IsHevc;
+            if (!alreadyTargetCodec) return false;
+
+            double skipMultiplier = 1.0 + (Math.Clamp(options.SkipPercentAboveTarget, 0, 100) / 100.0);
+            int fourKMultiplier = Math.Clamp(options.FourKBitrateMultiplier, 2, 8);
+            int ceilingKbps = workItem.Is4K
+                ? options.TargetBitrate * fourKMultiplier
+                : options.TargetBitrate;
+
+            return workItem.Bitrate <= ceilingKbps * skipMultiplier;
         }
 
         /// <summary>
@@ -2865,6 +3028,7 @@ public class TranscodingService
             var outputSize = new FileInfo(outputPath).Length;
             float savings = (workItem.Size - outputSize) / 1048576f;
             float percent = 1 - ((float)outputSize / workItem.Size);
+            workItem.OutputSize = outputSize;
 
             Console.WriteLine($"Cluster: Remote encode of {workItem.FileName}: {FormatSize(workItem.Size)} → {FormatSize(outputSize)} (saved {FormatSize((long)(savings * 1048576))}, {percent:P0})");
 

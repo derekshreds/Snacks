@@ -51,4 +51,26 @@ public sealed class ExclusionRules
         return System.Text.RegularExpressions.Regex.IsMatch(
             input, regex, System.Text.RegularExpressions.RegexOptions.IgnoreCase);
     }
+
+    /// <summary>
+    ///     Maps a width/height pair to the nearest standard resolution label
+    ///     (<c>2160p</c>, <c>1440p</c>, <c>1080p</c>, <c>720p</c>, <c>480p</c>) for comparison
+    ///     against <see cref="ExcludeResolutions"/>. Returns <see langword="null"/> when either
+    ///     dimension is non-positive. Buckets by height with a small tolerance to absorb
+    ///     odd-aspect masters (e.g. 1920&#215;800).
+    /// </summary>
+    public static string? ClassifyResolution(int width, int height)
+    {
+        if (width <= 0 || height <= 0) return null;
+
+        // Classify by the larger of height / derived-4:3 from width so ultra-wide crops still
+        // bucket with their native vertical resolution.
+        int h = Math.Max(height, width * 3 / 4);
+        if (h >= 2000) return "2160p";
+        if (h >= 1300) return "1440p";
+        if (h >= 900)  return "1080p";
+        if (h >= 600)  return "720p";
+        if (h >= 380)  return "480p";
+        return null;
+    }
 }

@@ -1,4 +1,34 @@
+using System.Text.Json.Serialization;
+
 namespace Snacks.Models;
+
+/// <summary>
+///     Which non-video operations are eligible for a video-copy "mux pass".
+///     Off disables the feature. Audio/Subtitles gate one stream type;
+///     Both covers either. Drives skip-bypass and video-copy decisions.
+/// </summary>
+[JsonConverter(typeof(JsonStringEnumConverter))]
+public enum MuxMode
+{
+    Off,
+    Audio,
+    Subtitles,
+    Both,
+}
+
+/// <summary>
+///     Whether a configured <see cref="MuxMode"/> only triggers for files that
+///     already meet bitrate targets (<c>TargetMatchOnly</c>) or applies
+///     universally so every file gets a video-copy pass (<c>AllFiles</c>).
+///     <c>TargetMatchOnly</c> is the typical choice; <c>AllFiles</c> is for
+///     workflows that always want a remux regardless of source bitrate.
+/// </summary>
+[JsonConverter(typeof(JsonStringEnumConverter))]
+public enum MuxScope
+{
+    TargetMatchOnly,
+    AllFiles,
+}
 
 /// <summary>
 ///     User-configurable encoding options for transcoding jobs.
@@ -51,14 +81,30 @@ public sealed class EncoderOptions
     /// <summary> Provider used to look up the original language of a file (e.g. "None", "Sonarr"). </summary>
     public string OriginalLanguageProvider { get; set; } = "None";
 
-    /// <summary> When <see langword="true"/>, processes audio tracks only and skips video re-encoding. </summary>
-    public bool AudioOnlyMode { get; set; } = false;
-
     /// <summary> FFmpeg audio codec name (e.g. "copy", "aac", "ac3"). </summary>
     public string AudioCodec { get; set; } = "copy";
 
     /// <summary> Target audio bitrate in kilobits per second. </summary>
     public int AudioBitrateKbps { get; set; } = 192;
+
+    /******************************************************************
+     *  Mux Pass
+     ******************************************************************/
+
+    /// <summary>
+    ///     Selects which non-video operations warrant a video-copy "mux pass".
+    ///     <see cref="MuxMode.Off"/> disables the feature entirely — files already
+    ///     at or below target bitrate are skipped even when audio/subtitle settings
+    ///     differ.
+    /// </summary>
+    public MuxMode MuxMode { get; set; } = MuxMode.Off;
+
+    /// <summary>
+    ///     Scope of <see cref="MuxMode"/>. <see cref="MuxScope.TargetMatchOnly"/>
+    ///     limits the mux pass to files that already meet bitrate targets;
+    ///     <see cref="MuxScope.AllFiles"/> forces video-copy on every file.
+    /// </summary>
+    public MuxScope MuxScope { get; set; } = MuxScope.TargetMatchOnly;
 
     /******************************************************************
      *  Subtitles
@@ -136,9 +182,10 @@ public sealed class EncoderOptions
         AudioLanguagesToKeep       = new List<string>(AudioLanguagesToKeep),
         KeepOriginalLanguage       = KeepOriginalLanguage,
         OriginalLanguageProvider   = OriginalLanguageProvider,
-        AudioOnlyMode              = AudioOnlyMode,
         AudioCodec                 = AudioCodec,
         AudioBitrateKbps           = AudioBitrateKbps,
+        MuxMode                    = MuxMode,
+        MuxScope                   = MuxScope,
         SubtitleLanguagesToKeep    = new List<string>(SubtitleLanguagesToKeep),
         ExtractSubtitlesToSidecar  = ExtractSubtitlesToSidecar,
         SidecarSubtitleFormat      = SidecarSubtitleFormat,

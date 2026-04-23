@@ -26,6 +26,13 @@ public sealed class WorkItem
     public long Size { get; set; } = 0;
 
     /// <summary>
+    ///     File size in bytes of the encoded output. Populated when the job completes;
+    ///     <see langword="null"/> while pending/processing or when the output was discarded
+    ///     before a size could be read. Surfaced in the UI to show size reduction on completed cards.
+    /// </summary>
+    public long? OutputSize { get; set; }
+
+    /// <summary>
     ///     Video bitrate in kbps, calculated from file size and duration.
     ///     Used for queue prioritization — higher bitrate files are processed first
     ///     to maximize perceived throughput.

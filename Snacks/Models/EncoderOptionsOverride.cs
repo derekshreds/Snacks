@@ -57,14 +57,21 @@ public sealed class EncoderOptionsOverride
     /// <summary> Overrides <see cref="EncoderOptions.OriginalLanguageProvider"/> when non-<see langword="null"/>. </summary>
     public string? OriginalLanguageProvider { get; set; }
 
-    /// <summary> Overrides <see cref="EncoderOptions.AudioOnlyMode"/> when non-<see langword="null"/>. </summary>
-    public bool? AudioOnlyMode { get; set; }
-
     /// <summary> Overrides <see cref="EncoderOptions.AudioCodec"/> when non-<see langword="null"/>. </summary>
     public string? AudioCodec { get; set; }
 
     /// <summary> Overrides <see cref="EncoderOptions.AudioBitrateKbps"/> when non-<see langword="null"/>. </summary>
     public int? AudioBitrateKbps { get; set; }
+
+    /******************************************************************
+     *  Mux Pass
+     ******************************************************************/
+
+    /// <summary> Overrides <see cref="EncoderOptions.MuxMode"/> when non-<see langword="null"/>. </summary>
+    public MuxMode? MuxMode { get; set; }
+
+    /// <summary> Overrides <see cref="EncoderOptions.MuxScope"/> when non-<see langword="null"/>. </summary>
+    public MuxScope? MuxScope { get; set; }
 
     /******************************************************************
      *  Subtitles
@@ -159,9 +166,10 @@ public sealed class EncoderOptionsOverride
         if (over.AudioLanguagesToKeep != null)        target.AudioLanguagesToKeep       = over.AudioLanguagesToKeep;
         if (over.KeepOriginalLanguage.HasValue)       target.KeepOriginalLanguage       = over.KeepOriginalLanguage.Value;
         if (over.OriginalLanguageProvider != null)    target.OriginalLanguageProvider   = over.OriginalLanguageProvider;
-        if (over.AudioOnlyMode.HasValue)              target.AudioOnlyMode              = over.AudioOnlyMode.Value;
         if (over.AudioCodec != null)                  target.AudioCodec                 = over.AudioCodec;
         if (over.AudioBitrateKbps.HasValue)           target.AudioBitrateKbps           = over.AudioBitrateKbps.Value;
+        if (over.MuxMode.HasValue)                    target.MuxMode                    = over.MuxMode.Value;
+        if (over.MuxScope.HasValue)                   target.MuxScope                   = over.MuxScope.Value;
         if (over.SubtitleLanguagesToKeep != null)     target.SubtitleLanguagesToKeep    = over.SubtitleLanguagesToKeep;
         if (over.ExtractSubtitlesToSidecar.HasValue)  target.ExtractSubtitlesToSidecar  = over.ExtractSubtitlesToSidecar.Value;
         if (over.SidecarSubtitleFormat != null)       target.SidecarSubtitleFormat      = over.SidecarSubtitleFormat;

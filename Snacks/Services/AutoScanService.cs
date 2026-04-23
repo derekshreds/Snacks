@@ -87,6 +87,13 @@ public sealed class AutoScanService : IHostedService, IDisposable
         // Wire up folder override resolver for cluster dispatch (avoids circular DI)
         _clusterService.FolderOverrideResolver = FindFolderOverride;
 
+        // Feed library exclusion rules into the transcoding service so manual adds honor
+        // the same filename/size/resolution filters the auto-scanner applies.
+        _transcodingService.SetExclusionRulesProvider(() =>
+        {
+            lock (_configLock) { return _config.ExclusionRules; }
+        });
+
         if (_config.QueuePaused)
         {
             _transcodingService.SetPaused(true);
@@ -237,6 +244,16 @@ public sealed class AutoScanService : IHostedService, IDisposable
             _config.ExclusionRules = rules;
             SaveConfig();
         }
+    }
+
+    /// <summary>
+    ///     Returns a snapshot of the current exclusion rules. Threaded services poll through this
+    ///     getter instead of holding a direct <see cref="AutoScanService"/> reference (avoids
+    ///     the TranscodingService &#8596; AutoScanService DI cycle).
+    /// </summary>
+    public ExclusionRules GetCurrentExclusionRules()
+    {
+        lock (_configLock) { return _config.ExclusionRules; }
     }
 
     /// <summary> Persists the queue paused state to disk so it survives restarts. </summary>
@@ -479,11 +496,26 @@ public sealed class AutoScanService : IHostedService, IDisposable
             var knownPaths     = await _mediaFileRepo.GetFileInfoBatchAsync(scannedDirs);
             var knownBaseNames = await _mediaFileRepo.GetBaseNameStatusBatchAsync(scannedDirs);
 
+            // Snapshot the exclusion rules once per scan — using the same rules for every file
+            // in a pass keeps behavior predictable even if the user edits exclusions mid-scan.
+            ExclusionRules exclusions;
+            lock (_configLock) { exclusions = _config.ExclusionRules; }
+
             var newFiles = new List<string>();
             foreach (var file in allVideoFiles)
             {
                 ct.ThrowIfCancellationRequested();
                 var normalizedPath = Path.GetFullPath(file);
+
+                // Cheap exclusion filter — filename and size are available without probing.
+                // Resolution-based exclusion is applied downstream in AddFileAsync (needs probe).
+                long? earlySize = null;
+                try { earlySize = new FileInfo(normalizedPath).Length; } catch { }
+                if (exclusions.IsExcluded(Path.GetFileName(normalizedPath), earlySize, resolutionLabel: null))
+                {
+                    Console.WriteLine($"AutoScan: Excluded by library rules: {Path.GetFileName(file)}");
+                    continue;
+                }
 
                 if (knownPaths.TryGetValue(normalizedPath, out var info) &&
                     info.Status is not MediaFileStatus.Unseen)

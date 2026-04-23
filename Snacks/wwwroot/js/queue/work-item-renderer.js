@@ -59,6 +59,31 @@ export function getStatusString(status) {
 }
 
 /**
+ * Builds the size/bitrate/duration meta line shown under the filename.
+ *
+ * For completed items with a known output size we append the post-encode size
+ * and reduction percentage so users can see at a glance how much space they
+ * saved. `outputSize` is populated by the master/service once the encode
+ * finishes; while the job is still running we just show the source size.
+ *
+ * @param {object} workItem
+ * @returns {string}
+ */
+function getMetaLineHtml(workItem) {
+    let sizeStr = formatFileSize(workItem.size);
+
+    if (workItem.status === 'Completed' && workItem.outputSize != null && workItem.size > 0) {
+        const delta   = workItem.size - workItem.outputSize;
+        const percent = Math.round((delta / workItem.size) * 100);
+        const sign    = percent > 0 ? '−' : (percent < 0 ? '+' : '');
+        const cls     = percent > 0 ? 'text-success' : (percent < 0 ? 'text-danger' : 'text-muted');
+        sizeStr = `${sizeStr} &rarr; ${formatFileSize(workItem.outputSize)} <span class="${cls}">(${sign}${Math.abs(percent)}%)</span>`;
+    }
+
+    return `${sizeStr} &bull; ${formatBitrate(workItem.bitrate)} &bull; ${formatDuration(workItem.length)}`;
+}
+
+/**
  * Returns the HTML markup for the action buttons appropriate to the item's
  * current status (empty string when none are relevant).
  *
@@ -142,8 +167,8 @@ export function getWorkItemHtml(workItem, clusterEnabled) {
                     <span class="status-badge ${statusClass} flex-shrink-0">${workItem.status}</span>
                     ${nodeBadge}
                 </div>
-                <small class="text-muted">
-                    ${formatFileSize(workItem.size)} &bull; ${formatBitrate(workItem.bitrate)} &bull; ${formatDuration(workItem.length)}
+                <small class="text-muted work-meta">
+                    ${getMetaLineHtml(workItem)}
                 </small>
             </div>
             <div class="ms-2 flex-shrink-0">${getActionButtons(workItem)}</div>
@@ -212,6 +237,15 @@ export function updateWorkItemDom(element, workItem, clusterEnabled) {
     if (prevStatus !== statusString) {
         const actions = element.querySelector('.ms-2.flex-shrink-0');
         if (actions) actions.innerHTML = getActionButtons(workItem);
+    }
+
+
+    // Meta line (size / bitrate / duration) — repaint so the post-encode size
+    // and reduction % appear when an item flips to Completed.
+    const metaEl = element.querySelector('.work-meta');
+    if (metaEl) {
+        const newMeta = getMetaLineHtml(workItem);
+        if (metaEl.innerHTML.trim() !== newMeta.trim()) metaEl.innerHTML = newMeta;
     }
 
 

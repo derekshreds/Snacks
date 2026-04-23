@@ -112,7 +112,6 @@ export function getEncoderOptions(prefix = 'settings') {
         AudioLanguagesToKeep:     chips('AudioLanguagesToKeep') ?? ['en'],
         KeepOriginalLanguage:     bool('KeepOriginalLanguage'),
         OriginalLanguageProvider: str('OriginalLanguageProvider', 'None'),
-        AudioOnlyMode:            bool('AudioOnlyMode'),
         AudioCodec:               str('AudioCodec', 'copy'),
         AudioBitrateKbps:         num('AudioBitrateKbps', 192),
 
@@ -121,6 +120,10 @@ export function getEncoderOptions(prefix = 'settings') {
         ExtractSubtitlesToSidecar:  bool('ExtractSubtitlesToSidecar'),
         SidecarSubtitleFormat:      str('SidecarSubtitleFormat', 'srt'),
         ConvertImageSubtitlesToSrt: bool('ConvertImageSubtitlesToSrt'),
+
+        // Mux pass.
+        MuxMode:  str('MuxMode',  'Off'),
+        MuxScope: str('MuxScope', 'TargetMatchOnly'),
 
         // Video.
         DownscalePolicy:     str('DownscalePolicy', 'Never'),
@@ -204,7 +207,6 @@ export async function restoreEncoderOptions(prefix = 'settings') {
         // Audio.
         set('KeepOriginalLanguage',     pick('KeepOriginalLanguage'));
         set('OriginalLanguageProvider', pick('OriginalLanguageProvider') || 'None');
-        set('AudioOnlyMode',            pick('AudioOnlyMode'));
         set('AudioCodec',               pick('AudioCodec')               || 'copy');
         set('AudioBitrateKbps',         pick('AudioBitrateKbps')          ?? 192);
 
@@ -212,6 +214,10 @@ export async function restoreEncoderOptions(prefix = 'settings') {
         set('ExtractSubtitlesToSidecar',  pick('ExtractSubtitlesToSidecar'));
         set('SidecarSubtitleFormat',      pick('SidecarSubtitleFormat') || 'srt');
         set('ConvertImageSubtitlesToSrt', pick('ConvertImageSubtitlesToSrt'));
+
+        // Mux pass.
+        set('MuxMode',  pick('MuxMode')  || 'Off');
+        set('MuxScope', pick('MuxScope') || 'TargetMatchOnly');
 
         // Video.
         set('DownscalePolicy',     pick('DownscalePolicy')     || 'Never');

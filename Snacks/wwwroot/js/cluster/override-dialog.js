@@ -53,7 +53,6 @@ const FOLDER_OVERRIDE_FIELDS = Object.freeze({
     AudioCodec:                 'select',
     AudioBitrateKbps:           'number',
     TwoChannelAudio:            'bool',
-    AudioOnlyMode:              'bool',
     KeepOriginalLanguage:       'bool',
     OriginalLanguageProvider:   'select',
 
@@ -61,6 +60,10 @@ const FOLDER_OVERRIDE_FIELDS = Object.freeze({
     ExtractSubtitlesToSidecar:  'bool',
     SidecarSubtitleFormat:      'select',
     ConvertImageSubtitlesToSrt: 'bool',
+
+    // Mux pass
+    MuxMode:                    'select',
+    MuxScope:                   'select',
 });
 
 /**
@@ -89,7 +92,6 @@ const NODE_OVERRIDE_FIELDS = Object.freeze({
     AudioCodec:                 'select',
     AudioBitrateKbps:           'number',
     TwoChannelAudio:            'bool',
-    AudioOnlyMode:              'bool',
     KeepOriginalLanguage:       'bool',
     OriginalLanguageProvider:   'select',
 
@@ -97,6 +99,10 @@ const NODE_OVERRIDE_FIELDS = Object.freeze({
     ExtractSubtitlesToSidecar:  'bool',
     SidecarSubtitleFormat:      'select',
     ConvertImageSubtitlesToSrt: 'bool',
+
+    // Mux pass
+    MuxMode:                    'select',
+    MuxScope:                   'select',
 });
 
 /** Default values restored when a numeric override is toggled off. */

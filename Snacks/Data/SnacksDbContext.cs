@@ -58,6 +58,11 @@ public class SnacksDbContext : DbContext
             entity.Property(e => e.AssignedNodeName).HasMaxLength(128);
             entity.Property(e => e.RemoteJobPhase).HasMaxLength(32);
             entity.Property(e => e.AssignedNodeIp).HasMaxLength(64);
+
+            // Bounded to prevent pathological track counts from bloating rows. Typical
+            // payload is ~30 B/audio track and ~20 B/subtitle track; 4 KB holds ~100 tracks.
+            entity.Property(e => e.AudioStreams).HasMaxLength(4096);
+            entity.Property(e => e.SubtitleStreams).HasMaxLength(4096);
         });
 
 

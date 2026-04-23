@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Microsoft.AspNetCore.Mvc;
+using Snacks.Data;
 using Snacks.Models;
 using Snacks.Services;
 
@@ -14,8 +15,9 @@ namespace Snacks.Controllers;
 [ApiController]
 public sealed class SettingsController : ControllerBase
 {
-    private readonly TranscodingService _transcodingService;
-    private readonly FileService        _fileService;
+    private readonly TranscodingService  _transcodingService;
+    private readonly FileService         _fileService;
+    private readonly MediaFileRepository _mediaFileRepo;
 
     private static readonly JsonSerializerOptions _jsonOptions = new()
     {
@@ -23,12 +25,14 @@ public sealed class SettingsController : ControllerBase
         PropertyNameCaseInsensitive = true,
     };
 
-    public SettingsController(TranscodingService transcodingService, FileService fileService)
+    public SettingsController(TranscodingService transcodingService, FileService fileService, MediaFileRepository mediaFileRepo)
     {
         ArgumentNullException.ThrowIfNull(transcodingService);
         ArgumentNullException.ThrowIfNull(fileService);
+        ArgumentNullException.ThrowIfNull(mediaFileRepo);
         _transcodingService = transcodingService;
         _fileService        = fileService;
+        _mediaFileRepo      = mediaFileRepo;
     }
 
     /******************************************************************
@@ -64,11 +68,13 @@ public sealed class SettingsController : ControllerBase
     /// <summary>
     ///     Persists updated encoder settings using an atomic write-then-rename. The previous
     ///     file is retained as <c>.bak</c>. Also updates the in-memory options on the
-    ///     transcoding service.
+    ///     transcoding service and re-evaluates previously-skipped files — any whose skip
+    ///     decision would no longer hold under the new options are flipped to Unseen so
+    ///     the next scan picks them up.
     /// </summary>
     /// <param name="settings"> The raw JSON settings document to persist. </param>
     [HttpPost]
-    public IActionResult Save([FromBody] JsonElement settings)
+    public async Task<IActionResult> Save([FromBody] JsonElement settings)
     {
         try
         {
@@ -82,9 +88,10 @@ public sealed class SettingsController : ControllerBase
                 System.IO.File.Copy(path, backup, overwrite: true);
             System.IO.File.Move(temp, path, overwrite: true);
 
+            EncoderOptions? parsed = null;
             try
             {
-                var parsed = JsonSerializer.Deserialize<EncoderOptions>(json, _jsonOptions);
+                parsed = JsonSerializer.Deserialize<EncoderOptions>(json, _jsonOptions);
                 if (parsed != null) _transcodingService.UpdateOptions(parsed);
             }
             catch
@@ -92,7 +99,19 @@ public sealed class SettingsController : ControllerBase
                 /* non-fatal — in-memory options retain their previous values */
             }
 
-            return new JsonResult(new { success = true });
+            int requeued = 0;
+            if (parsed != null)
+            {
+                // Legacy rows scanned before the stream-summary columns existed have null
+                // AudioStreams/SubtitleStreams — we can't fully re-evaluate them, so flip
+                // them to Unseen to force a re-probe on the next scan.
+                requeued = await _mediaFileRepo.ReevaluateSkippedAsync(mf =>
+                    mf.AudioStreams != null || mf.SubtitleStreams != null
+                        ? TranscodingService.WouldSkipUnderOptions(mf, parsed)
+                        : false);
+            }
+
+            return new JsonResult(new { success = true, requeued });
         }
         catch (Exception ex)
         {
