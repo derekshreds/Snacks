@@ -56,7 +56,7 @@ function render() {
                 <input class="form-check-input" type="checkbox" ${d.enabled !== false ? 'checked' : ''} data-idx="${idx}" data-toggle-dest>
             </div>
             <strong class="small">${escapeHtml(d.name || '')}</strong>
-            <span class="dest-url text-muted">${escapeHtml(d.url)}</span>
+            <span class="dest-url text-muted" title="${escapeHtml(d.url)}">${escapeHtml(d.url)}</span>
             ${isWebhook ? `<input class="form-control form-control-sm dest-secret" type="password" placeholder="${escapeHtml(secretPlaceholder)}" data-secret="${idx}" autocomplete="new-password">` : ''}
             <button class="btn btn-sm btn-outline-primary" data-test-dest="${idx}" title="Send test"><i class="fas fa-vial"></i></button>
             <button class="btn btn-sm btn-outline-danger"  data-remove-dest="${idx}" title="Remove"><i class="fas fa-trash"></i></button>`;

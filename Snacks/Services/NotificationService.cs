@@ -2,6 +2,7 @@ using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Snacks.Models;
 
 namespace Snacks.Services;
@@ -176,6 +177,34 @@ public sealed class NotificationService
                     break;
 
                 default: // webhook
+                    // Discord rejects any POST that doesn't match its own schema, so a
+                    // user-pasted Discord webhook URL needs the Discord payload shape
+                    // (username + embed) instead of the generic {event,message,...}.
+                    // HMAC signing is skipped here because Discord doesn't verify it and
+                    // the shared-secret feature is for user-owned webhook receivers.
+                    if (IsDiscordWebhook(url))
+                    {
+                        var discordBody = JsonSerializer.Serialize(new
+                        {
+                            username = "Snacks",
+                            embeds = new[]
+                            {
+                                new
+                                {
+                                    title       = PrettyEventName(eventName),
+                                    description = TruncateDiscordDescription(message),
+                                    color       = DiscordColorForEvent(eventName),
+                                    timestamp   = DateTime.UtcNow.ToString("o"),
+                                },
+                            },
+                        });
+                        request = new HttpRequestMessage(HttpMethod.Post, url)
+                        {
+                            Content = new StringContent(discordBody, Encoding.UTF8, "application/json"),
+                        };
+                        break;
+                    }
+
                     var body = JsonSerializer.Serialize(new
                     {
                         @event  = eventName,
@@ -216,4 +245,40 @@ public sealed class NotificationService
         if (url.Contains("/ntfy.") || url.Contains("ntfy.sh")) return "ntfy";
         return "webhook";
     }
+
+    /// <summary>
+    ///     Recognises both canonical Discord webhook hosts. The legacy
+    ///     <c>discordapp.com</c> aliases still resolve and some users save URLs
+    ///     from old tutorials, so we accept either.
+    /// </summary>
+    private static bool IsDiscordWebhook(string url) =>
+        url.Contains("discord.com/api/webhooks",    StringComparison.OrdinalIgnoreCase) ||
+        url.Contains("discordapp.com/api/webhooks", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary> Splits <c>EncodeCompleted</c> → <c>"Encode Completed"</c> for the embed title. </summary>
+    private static string PrettyEventName(string pascalCase) =>
+        Regex.Replace(pascalCase, "(?<=[a-z])([A-Z])", " $1");
+
+    /// <summary>
+    ///     Discord embed <c>description</c> has a 4096-character hard limit. Our messages
+    ///     are almost always short, but a pathological error string from ffmpeg can blow
+    ///     past it; truncate with an ellipsis rather than getting the whole POST rejected.
+    /// </summary>
+    private static string TruncateDiscordDescription(string s) =>
+        s.Length <= 4096 ? s : string.Concat(s.AsSpan(0, 4093), "...");
+
+    /// <summary>
+    ///     Sidebar color for the Discord embed, keyed to the event's sentiment so
+    ///     failures pop visually (red) vs successes (green) vs routine events (blue).
+    /// </summary>
+    private static int DiscordColorForEvent(string eventName) => eventName switch
+    {
+        "EncodeCompleted" => 0x2ecc71, // green
+        "NodeOnline"      => 0x2ecc71, // green
+        "EncodeFailed"    => 0xe74c3c, // red
+        "NodeOffline"     => 0xe67e22, // orange
+        "EncodeStarted"   => 0x3498db, // blue
+        "ScanCompleted"   => 0x9b59b6, // purple
+        _                 => 0x95a5a6, // neutral gray
+    };
 }
