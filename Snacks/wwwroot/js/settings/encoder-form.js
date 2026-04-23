@@ -121,9 +121,9 @@ export function getEncoderOptions(prefix = 'settings') {
         SidecarSubtitleFormat:      str('SidecarSubtitleFormat', 'srt'),
         ConvertImageSubtitlesToSrt: bool('ConvertImageSubtitlesToSrt'),
 
-        // Mux pass.
-        MuxMode:  str('MuxMode',  'Off'),
-        MuxScope: str('MuxScope', 'TargetMatchOnly'),
+        // Encoding mode.
+        EncodingMode: str('EncodingMode', 'Transcode'),
+        MuxStreams:   str('MuxStreams',   'Both'),
 
         // Video.
         DownscalePolicy:     str('DownscalePolicy', 'Never'),
@@ -215,9 +215,9 @@ export async function restoreEncoderOptions(prefix = 'settings') {
         set('SidecarSubtitleFormat',      pick('SidecarSubtitleFormat') || 'srt');
         set('ConvertImageSubtitlesToSrt', pick('ConvertImageSubtitlesToSrt'));
 
-        // Mux pass.
-        set('MuxMode',  pick('MuxMode')  || 'Off');
-        set('MuxScope', pick('MuxScope') || 'TargetMatchOnly');
+        // Encoding mode.
+        set('EncodingMode', pick('EncodingMode') || 'Transcode');
+        set('MuxStreams',   pick('MuxStreams')   || 'Both');
 
         // Video.
         set('DownscalePolicy',     pick('DownscalePolicy')     || 'Never');

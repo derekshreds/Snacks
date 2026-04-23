@@ -61,9 +61,9 @@ const FOLDER_OVERRIDE_FIELDS = Object.freeze({
     SidecarSubtitleFormat:      'select',
     ConvertImageSubtitlesToSrt: 'bool',
 
-    // Mux pass
-    MuxMode:                    'select',
-    MuxScope:                   'select',
+    // Encoding mode
+    EncodingMode:               'select',
+    MuxStreams:                 'select',
 });
 
 /**
@@ -100,9 +100,9 @@ const NODE_OVERRIDE_FIELDS = Object.freeze({
     SidecarSubtitleFormat:      'select',
     ConvertImageSubtitlesToSrt: 'bool',
 
-    // Mux pass
-    MuxMode:                    'select',
-    MuxScope:                   'select',
+    // Encoding mode
+    EncodingMode:               'select',
+    MuxStreams:                 'select',
 });
 
 /** Default values restored when a numeric override is toggled off. */

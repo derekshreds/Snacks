@@ -3,31 +3,33 @@ using System.Text.Json.Serialization;
 namespace Snacks.Models;
 
 /// <summary>
-///     Which non-video operations are eligible for a video-copy "mux pass".
-///     Off disables the feature. Audio/Subtitles gate one stream type;
-///     Both covers either. Drives skip-bypass and video-copy decisions.
+///     Top-level encoding strategy.
+///     <list type="bullet">
+///         <item><see cref="Transcode"/> — re-encode video per the video settings; audio and subtitles per their tabs.</item>
+///         <item><see cref="Hybrid"/> — files already at the bitrate target get a video-copy mux pass (audio/subs still processed); above-target files get a full re-encode.</item>
+///         <item><see cref="MuxOnly"/> — never re-encode video. Files with muxable audio/subtitle work get a mux pass; files without muxable work are skipped entirely.</item>
+///     </list>
 /// </summary>
 [JsonConverter(typeof(JsonStringEnumConverter))]
-public enum MuxMode
+public enum EncodingMode
 {
-    Off,
-    Audio,
-    Subtitles,
-    Both,
+    Transcode,
+    Hybrid,
+    MuxOnly,
 }
 
 /// <summary>
-///     Whether a configured <see cref="MuxMode"/> only triggers for files that
-///     already meet bitrate targets (<c>TargetMatchOnly</c>) or applies
-///     universally so every file gets a video-copy pass (<c>AllFiles</c>).
-///     <c>TargetMatchOnly</c> is the typical choice; <c>AllFiles</c> is for
-///     workflows that always want a remux regardless of source bitrate.
+///     Which non-video stream types a mux pass is allowed to touch. Streams outside
+///     the selected type are always stream-copied through untouched — their tab settings
+///     are ignored during the mux pass. Only consulted when <see cref="EncoderOptions.EncodingMode"/>
+///     is not <see cref="EncodingMode.Transcode"/>.
 /// </summary>
 [JsonConverter(typeof(JsonStringEnumConverter))]
-public enum MuxScope
+public enum MuxStreams
 {
-    TargetMatchOnly,
-    AllFiles,
+    Both,
+    Audio,
+    Subtitles,
 }
 
 /// <summary>
@@ -88,23 +90,22 @@ public sealed class EncoderOptions
     public int AudioBitrateKbps { get; set; } = 192;
 
     /******************************************************************
-     *  Mux Pass
+     *  Encoding Mode
      ******************************************************************/
 
     /// <summary>
-    ///     Selects which non-video operations warrant a video-copy "mux pass".
-    ///     <see cref="MuxMode.Off"/> disables the feature entirely — files already
-    ///     at or below target bitrate are skipped even when audio/subtitle settings
-    ///     differ.
+    ///     Top-level strategy. <see cref="EncodingMode.Transcode"/> re-encodes video
+    ///     as usual. <see cref="EncodingMode.Hybrid"/> mux-passes at-target files and
+    ///     transcodes above-target files. <see cref="EncodingMode.MuxOnly"/> never
+    ///     re-encodes video; files with no muxable work are skipped.
     /// </summary>
-    public MuxMode MuxMode { get; set; } = MuxMode.Off;
+    public EncodingMode EncodingMode { get; set; } = EncodingMode.Transcode;
 
     /// <summary>
-    ///     Scope of <see cref="MuxMode"/>. <see cref="MuxScope.TargetMatchOnly"/>
-    ///     limits the mux pass to files that already meet bitrate targets;
-    ///     <see cref="MuxScope.AllFiles"/> forces video-copy on every file.
+    ///     Which stream types a mux pass is allowed to touch. Ignored when
+    ///     <see cref="EncodingMode"/> is <see cref="EncodingMode.Transcode"/>.
     /// </summary>
-    public MuxScope MuxScope { get; set; } = MuxScope.TargetMatchOnly;
+    public MuxStreams MuxStreams { get; set; } = MuxStreams.Both;
 
     /******************************************************************
      *  Subtitles
@@ -184,8 +185,8 @@ public sealed class EncoderOptions
         OriginalLanguageProvider   = OriginalLanguageProvider,
         AudioCodec                 = AudioCodec,
         AudioBitrateKbps           = AudioBitrateKbps,
-        MuxMode                    = MuxMode,
-        MuxScope                   = MuxScope,
+        EncodingMode               = EncodingMode,
+        MuxStreams                 = MuxStreams,
         SubtitleLanguagesToKeep    = new List<string>(SubtitleLanguagesToKeep),
         ExtractSubtitlesToSidecar  = ExtractSubtitlesToSidecar,
         SidecarSubtitleFormat      = SidecarSubtitleFormat,

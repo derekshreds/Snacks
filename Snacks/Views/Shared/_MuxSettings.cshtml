@@ -5,42 +5,45 @@
 <div class="row g-4">
     <div class="col-md-6">
         <div class="encoder-panel rounded">
-            <h6 class="fw-bold mb-3"><i class="fas fa-layer-group me-2 text-primary"></i>Mux Pass</h6>
+            <h6 class="fw-bold mb-3"><i class="fas fa-layer-group me-2 text-primary"></i>Encoding Mode</h6>
 
             <p class="form-text mb-3">
-                A mux pass copies the video stream verbatim (no re-encode) and only applies the
-                non-video work you select here. Useful for files that already meet bitrate targets
-                but need audio or subtitle changes. Files that already satisfy every audio and
-                subtitle setting are never remuxed — this feature never produces pointless output.
+                Top-level strategy. Choose whether Snacks re-encodes video, takes a shortcut
+                for files that already meet target, or never re-encodes at all.
             </p>
 
             <div class="mb-3">
-                <label for="@(formPrefix)MuxMode" class="form-label">Mux Mode</label>
-                <select class="form-select" id="@(formPrefix)MuxMode" name="MuxMode">
-                    <option value="Off" selected>Off</option>
-                    <option value="Audio">Audio only</option>
-                    <option value="Subtitles">Subtitles only</option>
-                    <option value="Both">Audio + Subtitles</option>
+                <label for="@(formPrefix)EncodingMode" class="form-label">Mode</label>
+                <select class="form-select" id="@(formPrefix)EncodingMode" name="EncodingMode">
+                    <option value="Transcode" selected>Transcode &mdash; re-encode above-target files</option>
+                    <option value="Hybrid">Hybrid &mdash; mux-pass at-target, transcode above-target</option>
+                    <option value="MuxOnly">Mux Only &mdash; never re-encode video</option>
                 </select>
                 <div class="form-text">
-                    Selects which stream types the mux pass is allowed to touch. Streams outside
-                    the selected type are always copied through untouched.
+                    <strong>Transcode</strong> &mdash; standard behavior. Files above the bitrate
+                    target are re-encoded per the Video tab; files already at or below the target
+                    are skipped. Audio and subtitles are processed per their tabs on any file
+                    that gets re-encoded.<br>
+                    <strong>Hybrid</strong> &mdash; same as Transcode for above-target files, but
+                    at-target files that would otherwise be skipped now get a video-copy mux pass
+                    so the selected audio/subtitle work can still run.<br>
+                    <strong>Mux Only</strong> &mdash; guarantees the video stream is never
+                    re-encoded. Files with audio/subtitle work get a mux pass; files with
+                    nothing to change are skipped entirely, regardless of bitrate.
                 </div>
             </div>
 
             <div class="mb-3">
-                <label for="@(formPrefix)MuxScope" class="form-label">Apply To</label>
-                <select class="form-select" id="@(formPrefix)MuxScope" name="MuxScope">
-                    <option value="TargetMatchOnly" selected>Files meeting bitrate targets</option>
-                    <option value="AllFiles">All files</option>
+                <label for="@(formPrefix)MuxStreams" class="form-label">Mux Touches</label>
+                <select class="form-select" id="@(formPrefix)MuxStreams" name="MuxStreams">
+                    <option value="Both" selected>Audio + Subtitles</option>
+                    <option value="Audio">Audio only</option>
+                    <option value="Subtitles">Subtitles only</option>
                 </select>
                 <div class="form-text">
-                    <strong>Files meeting bitrate targets</strong> — only files that would
-                    otherwise be skipped get the mux pass; files above target still get a
-                    normal re-encode (with audio/subtitle work included).<br>
-                    <strong>All files</strong> — files above target also get a video-copy
-                    mux pass (audio/subtitle work only, no video re-encode). Files with no
-                    audio/subtitle work are unaffected either way.
+                    Which stream types a mux pass is allowed to touch. Streams outside the
+                    selected type are copied through untouched &mdash; their tab settings are
+                    ignored during a mux pass. Ignored in <em>Transcode</em> mode.
                 </div>
             </div>
         </div>
@@ -50,15 +53,19 @@
         <div class="encoder-panel rounded">
             <h6 class="fw-bold mb-3"><i class="fas fa-circle-info me-2 text-info"></i>What a Mux Pass Does</h6>
             <ul class="mb-0 small">
-                <li><strong>Video</strong> — always stream-copied. Crop, downscale, and tonemap
+                <li><strong>Video</strong> &mdash; always stream-copied. Crop, downscale, and tonemap
                     are disabled during a mux pass.</li>
-                <li><strong>Audio</strong> — processed per the Audio tab when the selected mode
-                    is <em>Audio only</em> or <em>Audio + Subtitles</em>; otherwise copied
-                    through with every track preserved.</li>
-                <li><strong>Subtitles</strong> — processed per the Subtitles tab (sidecar
-                    extraction, OCR, language filter) when the selected mode is
-                    <em>Subtitles only</em> or <em>Audio + Subtitles</em>; otherwise copied
-                    through with every track preserved.</li>
+                <li><strong>Audio</strong> &mdash; processed per the Audio tab when <em>Mux Touches</em>
+                    is <em>Audio</em> or <em>Audio + Subtitles</em>; otherwise copied through with
+                    every track preserved.</li>
+                <li><strong>Subtitles</strong> &mdash; processed per the Subtitles tab (sidecar
+                    extraction, OCR, language filter) when <em>Mux Touches</em> is
+                    <em>Subtitles</em> or <em>Audio + Subtitles</em>; otherwise copied through
+                    with every track preserved.</li>
+                <li><strong>Mux Only caveat</strong> &mdash; files that would otherwise need a
+                    video re-encode (codec change, bitrate reduction, HDR tonemap) are
+                    <em>skipped</em> instead. The <em>Mux Touches</em> setting decides what
+                    counts as "work worth doing".</li>
             </ul>
         </div>
     </div>

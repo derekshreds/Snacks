@@ -457,27 +457,27 @@
             </div>
 
             <div class="encoder-panel rounded mb-3">
-            <h6 class="fw-bold mb-3"><i class="fas fa-layer-group me-2 text-primary"></i>Mux</h6>
+            <h6 class="fw-bold mb-3"><i class="fas fa-layer-group me-2 text-primary"></i>Encoding Mode</h6>
             <div class="row g-2">
                 <div class="col-md-6">
                     <div class="form-check mb-2" data-context="folder,node">
-                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_MuxMode" data-field="MuxMode">
-                        <label class="form-check-label" for="ovr_MuxMode">Mux Mode</label>
-                        <select class="form-select form-select-sm mt-1" id="ovrMuxMode" disabled>
-                            <option value="Off">Off</option>
-                            <option value="Audio">Audio only</option>
-                            <option value="Subtitles">Subtitles only</option>
-                            <option value="Both">Audio + Subtitles</option>
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_EncodingMode" data-field="EncodingMode">
+                        <label class="form-check-label" for="ovr_EncodingMode">Encoding Mode</label>
+                        <select class="form-select form-select-sm mt-1" id="ovrEncodingMode" disabled>
+                            <option value="Transcode">Transcode</option>
+                            <option value="Hybrid">Hybrid</option>
+                            <option value="MuxOnly">Mux Only</option>
                         </select>
                     </div>
                 </div>
                 <div class="col-md-6">
                     <div class="form-check mb-2" data-context="folder,node">
-                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_MuxScope" data-field="MuxScope">
-                        <label class="form-check-label" for="ovr_MuxScope">Mux Apply To</label>
-                        <select class="form-select form-select-sm mt-1" id="ovrMuxScope" disabled>
-                            <option value="TargetMatchOnly">Files meeting bitrate targets</option>
-                            <option value="AllFiles">All files</option>
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_MuxStreams" data-field="MuxStreams">
+                        <label class="form-check-label" for="ovr_MuxStreams">Mux Touches</label>
+                        <select class="form-select form-select-sm mt-1" id="ovrMuxStreams" disabled>
+                            <option value="Both">Audio + Subtitles</option>
+                            <option value="Audio">Audio only</option>
+                            <option value="Subtitles">Subtitles only</option>
                         </select>
                     </div>
                 </div>

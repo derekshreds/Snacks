@@ -382,11 +382,20 @@ public class TranscodingService
                     });
                 }
 
-                // Bypass the skip gate only when a configured Mux mode has actual work to do on
-                // this file. Both scopes require HasMuxableWork — a pointless remux of a file
-                // that already matches every audio/subtitle setting is never what the user wants.
-                // MuxScope only differs at encode time: AllFiles also mux-passes above-target files.
-                bool bypassSkip = options.MuxMode != MuxMode.Off && HasMuxableWork(options, probe);
+                // Bypass the skip gate only when a non-Transcode mode has actual work to do on
+                // this file. A pointless remux of a file that already matches every audio/subtitle
+                // setting is never what the user wants.
+                bool hasMuxableWork = HasMuxableWork(options, probe);
+                bool bypassSkip     = options.EncodingMode != EncodingMode.Transcode && hasMuxableWork;
+
+                // MuxOnly: video is never re-encoded, so a file with no muxable audio/sub work
+                // has nothing to do — skip it unconditionally, even if it's above the bitrate target.
+                if (options.EncodingMode == EncodingMode.MuxOnly && !hasMuxableWork)
+                {
+                    Console.WriteLine($"Skipping {workItem.FileName}: MuxOnly mode, no audio/subtitle work");
+                    await MarkSkippedInDb();
+                    return workItem.Id;
+                }
 
                 if (options.Skip4K && isHighDef)
                 {
@@ -932,19 +941,21 @@ public class TranscodingService
             var (targetBitrate, minBitrate, maxBitrate, videoCopy) = CalculateBitrates(workItem, options);
 
             // Mux pass: copy the video stream and only touch the stream types selected by
-            // MuxMode. Requires actual muxable work — otherwise re-encode normally (or, for
-            // at-target files, the skip gate would have already skipped). MuxScope controls
-            // whether above-target files also get the mux pass treatment instead of a full
-            // re-encode.
-            bool isMuxPass = options.MuxMode != MuxMode.Off &&
+            // MuxStreams. Requires actual muxable work — otherwise re-encode normally (or, for
+            // at-target files, the skip gate would have already skipped). EncodingMode decides
+            // when a mux pass is chosen over a full re-encode:
+            //   Hybrid  — mux pass only for files at the bitrate target; above-target re-encodes.
+            //   MuxOnly — mux pass for every file with muxable work (files without work were
+            //             already force-skipped upstream; video is never re-encoded).
+            bool isMuxPass = options.EncodingMode != EncodingMode.Transcode &&
                 HasMuxableWork(options, workItem.Probe!) &&
-                (options.MuxScope == MuxScope.AllFiles || MeetsBitrateTarget(workItem, options));
-            bool doAudioWork    = !isMuxPass || options.MuxMode is MuxMode.Audio     or MuxMode.Both;
-            bool doSubtitleWork = !isMuxPass || options.MuxMode is MuxMode.Subtitles or MuxMode.Both;
+                (options.EncodingMode == EncodingMode.MuxOnly || MeetsBitrateTarget(workItem, options));
+            bool doAudioWork    = !isMuxPass || options.MuxStreams is MuxStreams.Audio     or MuxStreams.Both;
+            bool doSubtitleWork = !isMuxPass || options.MuxStreams is MuxStreams.Subtitles or MuxStreams.Both;
             if (isMuxPass)
             {
                 videoCopy = true;
-                await LogAsync(workItem.Id, $"Mux pass ({options.MuxMode}, scope {options.MuxScope}): copying video stream.");
+                await LogAsync(workItem.Id, $"Mux pass ({options.EncodingMode}, streams {options.MuxStreams}): copying video stream.");
             }
 
             // Resolve the actual encoder — verify it works, fall back to software if not
@@ -1091,7 +1102,7 @@ public class TranscodingService
                 $"{_ffprobeService.MapVideo(workItem.Probe!)} -c:v copy " :
                 $"{_ffprobeService.MapVideo(workItem.Probe!)} -c:v {encoder} {presetFlag}{vfFlag}";
 
-            // On a mux pass that excludes audio (MuxMode.Subtitles), keep every audio track as-is:
+            // On a mux pass that excludes audio (MuxStreams.Subtitles), keep every audio track as-is:
             // empty language list = keep all, "copy" codec = no re-encode, no downmix.
             string audioFlags = _ffprobeService.MapAudio(
                 workItem.Probe!,
@@ -1245,7 +1256,7 @@ public class TranscodingService
             }
             else
             {
-                // On a mux pass that excludes subs (MuxMode.Audio), keep every subtitle track by
+                // On a mux pass that excludes subs (MuxStreams.Audio), keep every subtitle track by
                 // passing an empty language list — MapSub treats that as "keep all".
                 var subLangs = doSubtitleWork ? options.SubtitleLanguagesToKeep : new List<string>();
                 subtitleFlags = _ffprobeService.MapSub(workItem.Probe!, subLangs, options.Format == "mkv") + " ";
@@ -1356,7 +1367,7 @@ public class TranscodingService
             if (options.AudioLanguagesToKeep is { Count: > 0 } audLangs)
             {
                 var kept = audioStreams
-                    .Where(s => LanguageMatcher.Matches(s.Language, audLangs))
+                    .Where(s => LanguageMatcher.Matches(s.Language, s.Title, audLangs))
                     .ToList();
                 if (kept.Count < audioStreams.Count) return true;
                 audioStreams = kept;
@@ -1393,7 +1404,7 @@ public class TranscodingService
             if (options.SubtitleLanguagesToKeep is { Count: > 0 } subLangs)
             {
                 var kept = subStreams
-                    .Where(s => LanguageMatcher.Matches(s.Language, subLangs))
+                    .Where(s => LanguageMatcher.Matches(s.Language, s.Title, subLangs))
                     .ToList();
                 if (kept.Count < subStreams.Count) return true;
                 subStreams = kept;
@@ -1423,6 +1434,7 @@ public class TranscodingService
                     Language  = s.Tags?.Language,
                     CodecName = s.CodecName,
                     Channels  = s.Channels,
+                    Title     = s.Tags?.Title,
                 })
                 .ToList();
 
@@ -1435,13 +1447,15 @@ public class TranscodingService
                 {
                     Language  = s.Tags?.Language,
                     CodecName = s.CodecName,
+                    Title     = s.Tags?.Title,
                 })
                 .ToList();
 
         /// <summary>
-        ///     Returns <see langword="true"/> when <see cref="EncoderOptions.MuxMode"/> selects a
+        ///     Returns <see langword="true"/> when <see cref="EncoderOptions.MuxStreams"/> selects a
         ///     non-video branch that has work to do on this file. Drives the skip-gate bypass so
         ///     at-target files still get a video-copy mux pass when their audio or subs need attention.
+        ///     Always <see langword="false"/> in <see cref="EncodingMode.Transcode"/>.
         /// </summary>
         private static bool HasMuxableWork(EncoderOptions options, ProbeResult probe) =>
             HasMuxableWork(options, ProjectAudioSummaries(probe), ProjectSubtitleSummaries(probe));
@@ -1453,9 +1467,12 @@ public class TranscodingService
         public static bool HasMuxableWork(
             EncoderOptions options,
             IReadOnlyList<AudioStreamSummary> audioStreams,
-            IReadOnlyList<SubtitleStreamSummary> subtitleStreams) =>
-            (options.MuxMode is MuxMode.Audio     or MuxMode.Both && HasAudioWork(options, audioStreams)) ||
-            (options.MuxMode is MuxMode.Subtitles or MuxMode.Both && HasSubtitleWork(options, subtitleStreams));
+            IReadOnlyList<SubtitleStreamSummary> subtitleStreams)
+        {
+            if (options.EncodingMode == EncodingMode.Transcode) return false;
+            return (options.MuxStreams is MuxStreams.Audio     or MuxStreams.Both && HasAudioWork(options, audioStreams))
+                || (options.MuxStreams is MuxStreams.Subtitles or MuxStreams.Both && HasSubtitleWork(options, subtitleStreams));
+        }
 
         /// <summary>
         ///     Pure function that mirrors the scan-phase skip gate using only <see cref="MediaFile"/>
@@ -1470,12 +1487,15 @@ public class TranscodingService
 
             // If the user's current Mux settings would turn this file into a mux pass, it's
             // no longer a skip candidate. We need the per-track summaries to answer that.
-            bool muxable = options.MuxMode != MuxMode.Off &&
-                HasMuxableWork(
-                    options,
-                    MuxStreamSummary.DeserializeAudio(mf.AudioStreams),
-                    MuxStreamSummary.DeserializeSubtitle(mf.SubtitleStreams));
+            bool muxable = HasMuxableWork(
+                options,
+                MuxStreamSummary.DeserializeAudio(mf.AudioStreams),
+                MuxStreamSummary.DeserializeSubtitle(mf.SubtitleStreams));
             if (muxable) return false;
+
+            // MuxOnly guarantees video is never re-encoded, so a file with no muxable work
+            // is skipped regardless of its bitrate / codec.
+            if (options.EncodingMode == EncodingMode.MuxOnly) return true;
 
             // Codec match — mirrors the scan-phase `alreadyTargetCodec` computation.
             bool targetIsHevc = options.Encoder.Contains("265");
@@ -1499,7 +1519,7 @@ public class TranscodingService
         ///     Mirrors the scan-phase skip-gate check: <see langword="true"/> when the source is
         ///     already at the target codec and below the configured bitrate tolerance (with the
         ///     4K multiplier when applicable). Used at encode time to decide whether a configured
-        ///     <c>MuxScope.TargetMatchOnly</c> should trigger a video-copy mux pass.
+        ///     <see cref="EncodingMode.Hybrid"/> should trigger a video-copy mux pass.
         /// </summary>
         private static bool MeetsBitrateTarget(WorkItem workItem, EncoderOptions options)
         {

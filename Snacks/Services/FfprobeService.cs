@@ -146,7 +146,7 @@ public class FfprobeService
         if (languagesToKeep != null && languagesToKeep.Count > 0)
         {
             var filtered = audioStreams
-                .Where(s => LanguageMatcher.Matches(s.Tags?.Language, languagesToKeep)
+                .Where(s => LanguageMatcher.Matches(s.Tags?.Language, s.Tags?.Title, languagesToKeep)
                     && (s.Tags?.Title == null || !s.Tags.Title.ToLower().Contains("comm")))
                 .ToList();
 
@@ -241,11 +241,9 @@ public class FfprobeService
 
         if (languagesToKeep != null && languagesToKeep.Count > 0)
         {
-            var filtered = keepSubs
-                .Where(s => LanguageMatcher.Matches(s.Tags?.Language, languagesToKeep))
+            keepSubs = keepSubs
+                .Where(s => LanguageMatcher.Matches(s.Tags?.Language, s.Tags?.Title, languagesToKeep))
                 .ToList();
-            if (filtered.Any())
-                keepSubs = filtered;
         }
 
         if (keepSubs.Any())
@@ -284,7 +282,7 @@ public class FfprobeService
         var subs = probe.Streams.Where(s => s.CodecType == "subtitle").ToList();
         var keepByLang = languagesToKeep == null || languagesToKeep.Count == 0
             ? subs
-            : subs.Where(s => LanguageMatcher.Matches(s.Tags?.Language, languagesToKeep)).ToList();
+            : subs.Where(s => LanguageMatcher.Matches(s.Tags?.Language, s.Tags?.Title, languagesToKeep)).ToList();
 
         var result = new List<SidecarSpec>();
         foreach (var s in keepByLang)
@@ -293,7 +291,9 @@ public class FfprobeService
             if (isBitmap && !includeBitmaps) continue;
             result.Add(new SidecarSpec(
                 StreamIndex: s.Index,
-                Lang:        LanguageMatcher.ToTwoLetter(s.Tags?.Language) ?? "und",
+                Lang:        LanguageMatcher.ToTwoLetter(s.Tags?.Language)
+                          ?? LanguageMatcher.InferFromTitle(s.Tags?.Title)
+                          ?? "und",
                 CodecName:   s.CodecName ?? "",
                 IsBitmap:    isBitmap,
                 Title:       string.IsNullOrWhiteSpace(s.Tags?.Title) ? null : s.Tags.Title));

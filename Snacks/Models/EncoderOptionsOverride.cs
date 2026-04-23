@@ -64,14 +64,14 @@ public sealed class EncoderOptionsOverride
     public int? AudioBitrateKbps { get; set; }
 
     /******************************************************************
-     *  Mux Pass
+     *  Encoding Mode
      ******************************************************************/
 
-    /// <summary> Overrides <see cref="EncoderOptions.MuxMode"/> when non-<see langword="null"/>. </summary>
-    public MuxMode? MuxMode { get; set; }
+    /// <summary> Overrides <see cref="EncoderOptions.EncodingMode"/> when non-<see langword="null"/>. </summary>
+    public EncodingMode? EncodingMode { get; set; }
 
-    /// <summary> Overrides <see cref="EncoderOptions.MuxScope"/> when non-<see langword="null"/>. </summary>
-    public MuxScope? MuxScope { get; set; }
+    /// <summary> Overrides <see cref="EncoderOptions.MuxStreams"/> when non-<see langword="null"/>. </summary>
+    public MuxStreams? MuxStreams { get; set; }
 
     /******************************************************************
      *  Subtitles
@@ -168,8 +168,8 @@ public sealed class EncoderOptionsOverride
         if (over.OriginalLanguageProvider != null)    target.OriginalLanguageProvider   = over.OriginalLanguageProvider;
         if (over.AudioCodec != null)                  target.AudioCodec                 = over.AudioCodec;
         if (over.AudioBitrateKbps.HasValue)           target.AudioBitrateKbps           = over.AudioBitrateKbps.Value;
-        if (over.MuxMode.HasValue)                    target.MuxMode                    = over.MuxMode.Value;
-        if (over.MuxScope.HasValue)                   target.MuxScope                   = over.MuxScope.Value;
+        if (over.EncodingMode.HasValue)               target.EncodingMode               = over.EncodingMode.Value;
+        if (over.MuxStreams.HasValue)                 target.MuxStreams                 = over.MuxStreams.Value;
         if (over.SubtitleLanguagesToKeep != null)     target.SubtitleLanguagesToKeep    = over.SubtitleLanguagesToKeep;
         if (over.ExtractSubtitlesToSidecar.HasValue)  target.ExtractSubtitlesToSidecar  = over.ExtractSubtitlesToSidecar.Value;
         if (over.SidecarSubtitleFormat != null)       target.SidecarSubtitleFormat      = over.SidecarSubtitleFormat;

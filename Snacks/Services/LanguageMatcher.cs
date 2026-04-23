@@ -124,22 +124,61 @@ public static class LanguageMatcher
     }
 
     /// <summary>
+    ///     Infers the canonical 2-letter language code from a free-form track
+    ///     title, for bitmap subtitle tracks (PGS, VobSub) that commonly ship
+    ///     with a missing or <c>und</c> language tag but a descriptive title
+    ///     like <c>"English SDH"</c> or <c>"English (Forced)"</c>.
+    /// </summary>
+    /// <remarks>
+    ///     Tries the whole title first (so <c>"English"</c> resolves directly),
+    ///     then splits on common separators and returns the first token that
+    ///     resolves to a known language. Returns <see langword="null"/> when no
+    ///     token matches — the caller should fall back to <c>und</c> or skip.
+    /// </remarks>
+    public static string? InferFromTitle(string? title)
+    {
+        if (string.IsNullOrWhiteSpace(title)) return null;
+
+        var direct = ToTwoLetter(title.Trim());
+        if (direct != null) return direct;
+
+        var separators = new[] { ' ', '(', ')', '[', ']', '-', ',', '/', '.', ':' };
+        foreach (var token in title.Split(separators, StringSplitOptions.RemoveEmptyEntries))
+        {
+            var m = ToTwoLetter(token);
+            if (m != null) return m;
+        }
+        return null;
+    }
+
+    /// <summary>
     ///     Returns <see langword="true"/> when <paramref name="trackLang"/>
     ///     should be kept given the user-selected languages
-    ///     <paramref name="wantedTwoLetter"/>.
+    ///     <paramref name="wantedTwoLetter"/>. See <see cref="Matches(string?, string?, IReadOnlyList{string}?)" />
+    ///     for the title-aware form used when the caller has a track title.
+    /// </summary>
+    public static bool Matches(string? trackLang, IReadOnlyList<string>? wantedTwoLetter)
+        => Matches(trackLang, trackTitle: null, wantedTwoLetter);
+
+    /// <summary>
+    ///     Returns <see langword="true"/> when a track should be kept given
+    ///     the user-selected languages, consulting the language tag first and
+    ///     falling back to an inference from the track title. Bitmap subtitle
+    ///     tracks from Blu-ray / DVD rips frequently carry a missing or
+    ///     <c>und</c> language tag with a descriptive title like <c>"English SDH"</c>,
+    ///     so the title is our only reliable source of language for those.
     /// </summary>
     /// <remarks>
     ///     A null or empty <paramref name="wantedTwoLetter"/> keeps every
-    ///     track. Otherwise the track's tag is canonicalized and compared
-    ///     against the list. If the track tag can't be canonicalized (exotic
-    ///     code not in the table), falls back to a case-insensitive exact
-    ///     match against the raw entries in <paramref name="wantedTwoLetter"/>.
+    ///     track. When the language tag can't be canonicalized (exotic code
+    ///     not in the table), falls back to a case-insensitive exact match
+    ///     against the raw entries in <paramref name="wantedTwoLetter"/>.
     /// </remarks>
-    public static bool Matches(string? trackLang, IReadOnlyList<string>? wantedTwoLetter)
+    public static bool Matches(string? trackLang, string? trackTitle, IReadOnlyList<string>? wantedTwoLetter)
     {
         if (wantedTwoLetter == null || wantedTwoLetter.Count == 0) return true;
 
-        var trackTwo = ToTwoLetter(trackLang);
+        var trackTwo = ToTwoLetter(trackLang) ?? InferFromTitle(trackTitle);
         if (trackTwo != null)
         {
             foreach (var w in wantedTwoLetter)
