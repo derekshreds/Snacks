@@ -1008,16 +1008,32 @@ public sealed class ClusterService : IHostedService, IDisposable
                 var hbBody = await hbResponse.Content.ReadAsStringAsync();
                 var hbData = JsonSerializer.Deserialize<JsonElement>(hbBody);
 
-                bool nodeIsBusy = false;
+                string? reportedJobId = null;
                 if (hbData.TryGetProperty("currentJobId", out var curJob) && curJob.ValueKind != JsonValueKind.Null)
-                    nodeIsBusy = true;
-                else if (hbData.TryGetProperty("status", out var statusProp) && statusProp.GetString() == "busy")
-                    nodeIsBusy = true;
+                    reportedJobId = curJob.GetString();
+                else if (hbData.TryGetProperty("completedJobId", out var compJob) && compJob.ValueKind != JsonValueKind.Null)
+                    reportedJobId = compJob.GetString();
+                else if (hbData.TryGetProperty("receivingJobId", out var recvJob) && recvJob.ValueKind != JsonValueKind.Null)
+                    reportedJobId = recvJob.GetString();
 
-                if (nodeIsBusy)
+                if (reportedJobId != null)
                 {
-                    var busyJobId = curJob.ValueKind != JsonValueKind.Null ? curJob.GetString() : "unknown";
-                    Console.WriteLine($"Cluster: Node {node.Hostname} is busy (job {busyJobId}) — re-queuing {workItem.FileName}");
+                    // Worker reports it's working on / sitting on a completed job. If the
+                    // master no longer tracks it, the worker is wedged on stale state
+                    // (DELETE cleanup handshake failed) — auto-reset and let the next
+                    // dispatch tick pick this work item back up cleanly.
+                    if (!_remoteJobs.ContainsKey(reportedJobId))
+                    {
+                        Console.WriteLine($"Cluster: Node {node.Hostname} is stuck on orphan job {reportedJobId} (not tracked by master) — auto-resetting");
+                        _activeUploads.TryRemove(workItem.Id, out _);
+                        _transcodingService.RequeueWorkItem(workItem, silent: true);
+                        nodeLock.Release();
+                        await ResetNodeAsync(node.NodeId);
+                        return;
+                    }
+
+                    // Legitimately busy — master also tracks this job. Wait it out.
+                    Console.WriteLine($"Cluster: Node {node.Hostname} is busy (job {reportedJobId}) — re-queuing {workItem.FileName}");
                     _activeUploads.TryRemove(workItem.Id, out _);
                     UpdateNodeStatus(node.NodeId, NodeStatus.Busy);
                     _transcodingService.RequeueWorkItem(workItem, silent: true);
@@ -1504,7 +1520,8 @@ public sealed class ClusterService : IHostedService, IDisposable
         await completeScope.CompleteAsync();
         _activeTransitions.TryRemove(jobId, out _);
 
-        try { await _discovery.CreateAuthenticatedClient().DeleteAsync($"{nodeBaseUrl}/api/cluster/files/{jobId}"); } catch { }
+        try { await _discovery.CreateAuthenticatedClient().DeleteAsync($"{nodeBaseUrl}/api/cluster/files/{jobId}"); }
+        catch (Exception ex) { Console.WriteLine($"Cluster: Cleanup DELETE failed for {jobId} on {nodeBaseUrl}: {ex.Message} — worker will be auto-reset on next dispatch"); }
 
         if (workItem.AssignedNodeId != null)
         {
@@ -1546,7 +1563,8 @@ public sealed class ClusterService : IHostedService, IDisposable
     private async Task RequeueForEncodingAsync(string jobId, WorkItem workItem, string nodeBaseUrl)
     {
         await CompleteActiveTransitionAsync(jobId);
-        try { await _discovery.CreateAuthenticatedClient().DeleteAsync($"{nodeBaseUrl}/api/cluster/files/{jobId}"); } catch { }
+        try { await _discovery.CreateAuthenticatedClient().DeleteAsync($"{nodeBaseUrl}/api/cluster/files/{jobId}"); }
+        catch (Exception ex) { Console.WriteLine($"Cluster: Cleanup DELETE failed for {jobId} on {nodeBaseUrl}: {ex.Message} — worker will be auto-reset on next dispatch"); }
         var prevNodeId = workItem.AssignedNodeId;
 
         // Release the node before clearing the assignment
