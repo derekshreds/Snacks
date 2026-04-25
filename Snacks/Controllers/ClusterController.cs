@@ -539,9 +539,6 @@ public sealed class ClusterController : ControllerBase
 
                     var (started, rejectReason) = await _clusterService.StartAutonomousEncodingAsync(jobId, metadata, filePath);
 
-                    // Clean up metadata file
-                    try { System.IO.File.Delete(metadataPath); } catch { }
-
                     if (!started)
                     {
                         return StatusCode(503, new { error = $"Node rejected encoding: {rejectReason}", size = fileSize });
