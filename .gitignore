@@ -383,8 +383,10 @@ signing/
 # macOS local signing/notarization secrets (CSC_NAME, APPLE_ID, APPLE_TEAM_ID, etc.)
 electron-app/.env.mac.local
 
-# Snacks runtime data (SQLite databases, config)
-data/
+# Snacks runtime data (SQLite databases, config) — anchored to repo root so it
+# does NOT match the C# source directory Snacks/Data/, which would silently
+# block new EF Core migration files from being committed.
+/data/
 
 # OCR wordlists — downloaded at build/dev time via download-wordlists.bat,
 # not tracked (50k-word files per language, ~10MB total). English is the
