@@ -1535,27 +1535,33 @@ public sealed class ClusterService : IHostedService, IDisposable
         }
     }
 
-    /// <summary>Validates the downloaded output against the source probe data.</summary>
+    /// <summary>
+    ///     Sanity-checks the downloaded output: file present, non-empty, parses as a
+    ///     media container with a video stream and a non-zero duration. The worker is
+    ///     responsible for validating encoding correctness; the master only confirms
+    ///     the upload landed intact.
+    /// </summary>
     private async Task<OutputValidation> ValidateOutputAsync(string jobId, WorkItem workItem, string outputPath)
     {
-        if (!File.Exists(outputPath))
+        if (!File.Exists(outputPath) || new FileInfo(outputPath).Length == 0)
             return OutputValidation.DownloadCorrupt;
 
         var outputProbe = await _ffprobeService.ProbeAsync(outputPath);
-        if (workItem.Probe != null && !_ffprobeService.ConvertedSuccessfully(workItem.Probe, outputProbe))
+        bool hasVideo    = outputProbe.Streams.Any(s => s.CodecType == "video");
+        bool hasDuration = _ffprobeService.GetVideoDuration(outputProbe) > 0;
+
+        if (!hasVideo || !hasDuration)
         {
             var failCount = _downloadRetryCounts.AddOrUpdate($"_validation_{jobId}", 1, (_, c) => c + 1);
+            try { File.Delete(outputPath); } catch { }
 
             if (failCount >= 3)
             {
-                Console.WriteLine($"Cluster: Output validation failed {failCount} times for {workItem.FileName} — output corrupt, need re-encode");
-                try { File.Delete(outputPath); } catch { }
+                Console.WriteLine($"Cluster: Sanity probe failed {failCount} times for {workItem.FileName} — uploaded file is broken");
                 return OutputValidation.EncodeCorrupt;
             }
 
-            // Transient validation failure — try re-downloading
-            Console.WriteLine($"Cluster: Validation failed ({failCount}) — duration mismatch, retrying download");
-            try { File.Delete(outputPath); } catch { }
+            Console.WriteLine($"Cluster: Sanity probe failed ({failCount}) for {workItem.FileName} — file missing video or duration, retrying download");
             return OutputValidation.DownloadCorrupt;
         }
 

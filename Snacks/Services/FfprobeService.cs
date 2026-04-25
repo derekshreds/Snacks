@@ -1,6 +1,9 @@
 using Newtonsoft.Json;
 using Snacks.Models;
 using System.Diagnostics;
+using System.Globalization;
+using System.Text;
+using System.Text.RegularExpressions;
 
 namespace Snacks.Services;
 
@@ -8,6 +11,10 @@ namespace Snacks.Services;
 public class FfprobeService
 {
     private readonly string _ffprobePath;
+    private readonly string _ffmpegPath;
+    private static readonly Regex BlackDetectRegex = new(
+        @"black_start:(?<start>[\d.]+)\s+black_end:(?<end>[\d.]+)\s+black_duration:(?<dur>[\d.]+)",
+        RegexOptions.Compiled);
 
     /// <summary>
     ///     Initializes the service, resolving the ffprobe binary path from the
@@ -16,6 +23,7 @@ public class FfprobeService
     public FfprobeService()
     {
         _ffprobePath = Environment.GetEnvironmentVariable("FFPROBE_PATH") ?? "ffprobe";
+        _ffmpegPath  = Environment.GetEnvironmentVariable("FFMPEG_PATH")  ?? "ffmpeg";
     }
 
     /// <summary>
@@ -335,6 +343,118 @@ public class FfprobeService
             // Trust FFmpeg's exit code if probe fails.
             return true;
         }
+    }
+
+    /// <summary>
+    ///     Decides whether an output that failed <see cref="ConvertedSuccessfully"/> should still
+    ///     be accepted because the missing tail of the source is just blank/black padding.
+    ///     Runs <see cref="AnalyzeTailBlackAsync"/> over the gap between the output's end and
+    ///     the source's claimed end and returns true when ≥95% of that range is black.
+    /// </summary>
+    public async Task<bool> IsTailMostlyBlackAsync(
+        string            sourcePath,
+        ProbeResult       sourceProbe,
+        ProbeResult       outputProbe,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(sourcePath);
+        ArgumentNullException.ThrowIfNull(sourceProbe);
+        ArgumentNullException.ThrowIfNull(outputProbe);
+
+        double sourceDur = GetVideoDuration(sourceProbe);
+        double outputDur = GetVideoDuration(outputProbe);
+        if (outputDur <= 0 || sourceDur <= outputDur + 1) return false;
+
+        var (black, tail, ok) = await AnalyzeTailBlackAsync(sourcePath, outputDur, sourceDur, ct);
+        if (!ok || tail <= 0) return false;
+        return (black / tail) >= 0.95;
+    }
+
+    /// <summary>
+    ///     Runs ffmpeg with the <c>blackdetect</c> filter over a tail range of the source file
+    ///     and reports how much of the range is black. Used to distinguish trailing blank padding
+    ///     (output is fine) from real content the encoder dropped (output is truncated).
+    /// </summary>
+    /// <returns>
+    ///     <c>blackSeconds</c> = total reported black duration in the range,
+    ///     <c>tailSeconds</c>  = clamped length of the analyzed range,
+    ///     <c>ok</c>           = true when ffmpeg ran and stderr was parseable.
+    /// </returns>
+    public async Task<(double blackSeconds, double tailSeconds, bool ok)> AnalyzeTailBlackAsync(
+        string sourcePath, double startSec, double endSec, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(sourcePath);
+
+        // Cap the analyzed window so a wildly inflated container duration cannot stall us
+        // decoding hours of blank video.
+        const double MaxTailSeconds = 30 * 60;
+        double tailSeconds = Math.Min(endSec - startSec, MaxTailSeconds);
+        if (tailSeconds <= 0) return (0, 0, false);
+        double clampedEnd = startSec + tailSeconds;
+
+        string args =
+            $"-v info -nostats -ss {startSec.ToString("0.###", CultureInfo.InvariantCulture)} " +
+            $"-to {clampedEnd.ToString("0.###", CultureInfo.InvariantCulture)} " +
+            $"-i \"{sourcePath}\" -map 0:v:0 -vf blackdetect=d=0.1:pic_th=0.98 -an -sn -f null -";
+
+        var psi = new ProcessStartInfo(_ffmpegPath)
+        {
+            Arguments              = args,
+            UseShellExecute        = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError  = true,
+            CreateNoWindow         = true,
+        };
+
+        using var proc = new Process { StartInfo = psi };
+        var stderr = new StringBuilder();
+
+        proc.ErrorDataReceived += (_, e) =>
+        {
+            if (!string.IsNullOrEmpty(e.Data)) stderr.AppendLine(e.Data);
+        };
+
+        try
+        {
+            proc.Start();
+            proc.BeginErrorReadLine();
+            // Drain stdout to keep the buffer from filling, even though -f null produces ~nothing.
+            _ = proc.StandardOutput.ReadToEndAsync(ct);
+
+            try
+            {
+                await proc.WaitForExitAsync(ct);
+            }
+            catch (OperationCanceledException)
+            {
+                try { if (!proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
+                throw;
+            }
+            proc.WaitForExit();
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            return (0, tailSeconds, false);
+        }
+
+        double blackTotal = 0;
+        bool sawAnyMatch = false;
+        foreach (Match m in BlackDetectRegex.Matches(stderr.ToString()))
+        {
+            sawAnyMatch = true;
+            if (double.TryParse(m.Groups["dur"].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var d))
+                blackTotal += d;
+        }
+
+        // No matches can mean either "nothing was black" (a healthy non-match) or "ffmpeg
+        // produced no useful output" (inconclusive). Distinguish via exit code: a clean exit
+        // with no matches means there were no black intervals — that's a real result.
+        bool ok = proc.ExitCode == 0 || sawAnyMatch;
+        return (blackTotal, tailSeconds, ok);
     }
 
     /// <summary>
