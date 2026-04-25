@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- .NET CoreCLR JIT requires writable+executable memory; without this the
+         backend SIGABRTs on launch under Hardened Runtime. -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+
+    <!-- We bundle ffmpeg, ffprobe, and (potentially) libtesseract/libleptonica
+         dylibs that aren't signed with our Team ID. Library validation rejects
+         them by default. -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+
+    <!-- Hardened Runtime strips DYLD_* env vars by default. We pass FFMPEG_PATH
+         / FFPROBE_PATH / SNACKS_WORK_DIR (not DYLD_*), but enable this for
+         forward-compat if .NET ever needs DYLD_FALLBACK_LIBRARY_PATH. -->
+    <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+    <true/>
+</dict>
+</plist>

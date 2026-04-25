@@ -380,6 +380,9 @@ video-library/
 # Code signing certificates
 signing/
 
+# macOS local signing/notarization secrets (CSC_NAME, APPLE_ID, APPLE_TEAM_ID, etc.)
+electron-app/.env.mac.local
+
 # Snacks runtime data (SQLite databases, config)
 data/
 
@@ -389,6 +392,9 @@ data/
 # with on fresh clones and in CI where the download batch hasn't run.
 Snacks/tools/wordlists/*.txt
 !Snacks/tools/wordlists/eng.txt
+
+# macOS Finder metadata
+.DS_Store
 
 # Claude Code
 .claude/

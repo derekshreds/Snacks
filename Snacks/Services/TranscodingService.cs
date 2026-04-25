@@ -1713,6 +1713,8 @@ public class TranscodingService
                 string laFlags = useConservativeHwFlags ? "" : "-extbrc 1 -look_ahead 1 -look_ahead_depth 40 ";
                 return $"-g 25 {laFlags}-b:v {targetBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
             }
+            if (encoder.Contains("videotoolbox"))
+                return $"-b:v {targetBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
             return $"-g 25 -b:v {targetBitrate} -minrate {minBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
         }
 
@@ -1754,6 +1756,21 @@ public class TranscodingService
                 }
 
                 Console.WriteLine("Auto-detect: No hardware acceleration available on Windows, using software");
+                _detectedHardware = "none";
+                return _detectedHardware;
+            }
+
+            // macOS GPU detection (VideoToolbox — works on both Apple Silicon and Intel Macs).
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+            {
+                Console.WriteLine("Auto-detect: Running on macOS, testing VideoToolbox...");
+                if (await TestEncoderAsync("-hwaccel videotoolbox", "hevc_videotoolbox"))
+                {
+                    Console.WriteLine("Auto-detect: VideoToolbox available");
+                    _detectedHardware = "apple";
+                    return _detectedHardware;
+                }
+                Console.WriteLine("Auto-detect: VideoToolbox unavailable, using software");
                 _detectedHardware = "none";
                 return _detectedHardware;
             }
@@ -1801,8 +1818,9 @@ public class TranscodingService
         /// </summary>
         private async Task LogVaapiInfoAsync()
         {
-            // VAAPI is Linux-only — skip entirely on Windows
-            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            // VAAPI is Linux-only — skip entirely on Windows and macOS
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ||
+                RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
                 return;
 
             try
@@ -1961,6 +1979,7 @@ public class TranscodingService
                 "intel" => "-y -init_hw_device vaapi=hw:/dev/dri/renderD128 -hwaccel vaapi -hwaccel_output_format vaapi -filter_hw_device hw",
                 "amd" => "-y -init_hw_device vaapi=hw:/dev/dri/renderD128 -hwaccel vaapi -hwaccel_output_format vaapi -filter_hw_device hw",
                 "nvidia" => "-y -hwaccel cuda",
+                "apple" => "-y -hwaccel videotoolbox",
                 _ => "-y"
             };
         }
@@ -1996,6 +2015,13 @@ public class TranscodingService
                 "intel" when isH265 => "hevc_vaapi",
                 "amd" when isH265 => "hevc_vaapi",
                 "nvidia" when isH265 => "hevc_nvenc",
+                // VideoToolbox (macOS). H.264 + HEVC encode in hardware. AV1 has no
+                // av1_videotoolbox encoder in ffmpeg yet, so we use libsvtav1 software encode —
+                // input is still hw-decoded via "-hwaccel videotoolbox" (see GetInitFlags),
+                // ffmpeg auto-downloads frames to system memory before the software encoder.
+                "apple" when isAv1 => "libsvtav1",
+                "apple" when isH265 => "hevc_videotoolbox",
+                "apple" when isH264 => "h264_videotoolbox",
                 _ => options.Encoder
             };
         }

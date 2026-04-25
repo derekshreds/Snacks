@@ -596,7 +596,9 @@ public sealed class ClusterDiscoveryService
         {
             GpuVendor              = _detectedGpuVendor ?? "none",
             SupportedEncoders      = _supportedEncoders ?? BuildSupportedEncodersList(),
-            OsPlatform             = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "Windows" : "Linux",
+            OsPlatform             = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "Windows"
+                                   : RuntimeInformation.IsOSPlatform(OSPlatform.OSX)     ? "macOS"
+                                   : "Linux",
             AvailableDiskSpaceBytes = diskSpace,
             CanAcceptJobs          = _transcodingService.GetActiveWorkItem() == null
         };
@@ -622,6 +624,10 @@ public sealed class ClusterDiscoveryService
         else if (hw == "amd")
         {
             encoders.AddRange(new[] { "hevc_amf", "h264_amf" });
+        }
+        else if (hw == "apple")
+        {
+            encoders.AddRange(new[] { "hevc_videotoolbox", "h264_videotoolbox" });
         }
 
         _supportedEncoders = encoders;

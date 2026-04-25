@@ -15,7 +15,7 @@
  *                          so we don't orphan it on shutdown.
  */
 
-const { app, BrowserWindow, Menu, dialog, shell, session } = require("electron");
+const { app, BrowserWindow, Menu, dialog, shell, session, nativeImage } = require("electron");
 const { spawn } = require("child_process");
 const path     = require("path");
 const net      = require("net");
@@ -83,19 +83,22 @@ function getResourceBase() {
     return __dirname;
 }
 
-/** Path to the bundled backend exe. */
+/** Adds the platform-appropriate executable suffix (.exe on Windows, none elsewhere). */
+const exeName = (name) => process.platform === "win32" ? `${name}.exe` : name;
+
+/** Path to the bundled backend executable. */
 function resolveBackendExe() {
-    return path.join(getResourceBase(), "backend", "Snacks.exe");
+    return path.join(getResourceBase(), "backend", exeName("Snacks"));
 }
 
-/** Path to the bundled ffmpeg exe. */
+/** Path to the bundled ffmpeg executable. */
 function resolveFfmpegPath() {
-    return path.join(getResourceBase(), "ffmpeg", "ffmpeg.exe");
+    return path.join(getResourceBase(), "ffmpeg", exeName("ffmpeg"));
 }
 
-/** Path to the bundled ffprobe exe. */
+/** Path to the bundled ffprobe executable. */
 function resolveFfprobePath() {
-    return path.join(getResourceBase(), "ffmpeg", "ffprobe.exe");
+    return path.join(getResourceBase(), "ffmpeg", exeName("ffprobe"));
 }
 
 /**
@@ -103,17 +106,21 @@ function resolveFfprobePath() {
  * queue DB, temp files, and scan history.
  *
  * - Windows: `%LOCALAPPDATA%\Snacks\work`
- * - Other:   `~/.local/share/Snacks/work`
+ * - macOS:   `~/Library/Application Support/Snacks/work`
+ * - Linux:   `~/.local/share/Snacks/work`
  *
  * @returns {string}
  */
 function getWorkDir() {
+    const home = require("os").homedir();
     if (process.platform === "win32") {
-        const localAppData = process.env.LOCALAPPDATA
-            || path.join(require("os").homedir(), "AppData", "Local");
+        const localAppData = process.env.LOCALAPPDATA || path.join(home, "AppData", "Local");
         return path.join(localAppData, "Snacks", "work");
     }
-    return path.join(require("os").homedir(), ".local", "share", "Snacks", "work");
+    if (process.platform === "darwin") {
+        return path.join(home, "Library", "Application Support", "Snacks", "work");
+    }
+    return path.join(home, ".local", "share", "Snacks", "work");
 }
 
 
@@ -276,10 +283,11 @@ function buildMenu() {
  * @param {number} port
  */
 function createWindow(port) {
+    const iconFile = process.platform === "darwin" ? "snacks.icns" : "snacks.ico";
     mainWindow = new BrowserWindow({
         width:           1280,
         height:          900,
-        icon:            path.join(__dirname, "icons", "snacks.ico"),
+        icon:            path.join(__dirname, "icons", iconFile),
         autoHideMenuBar: true,
         webPreferences: {
             nodeIntegration:  false,
@@ -294,18 +302,22 @@ function createWindow(port) {
         if (input.key === "F12") mainWindow.webContents.toggleDevTools();
     });
 
-    // window.open(...) → open in the system browser, not a new Electron window.
+    // External URLs (target="_blank", window.open, in-page nav, redirects) all
+    // open in the system browser — never inside the Electron window.
+    const openExternal = (url) => {
+        shell.openExternal(url).catch((err) => console.error(`openExternal failed for ${url}:`, err));
+    };
     mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-        shell.openExternal(url);
+        openExternal(url);
         return { action: "deny" };
     });
-
-    // In-page navigation to off-site URLs goes to the system browser instead.
-    mainWindow.webContents.on("will-navigate", (event, url) => {
+    const interceptNav = (event, url) => {
         if (url.startsWith(`http://localhost:${port}`)) return;
         event.preventDefault();
-        shell.openExternal(url);
-    });
+        openExternal(url);
+    };
+    mainWindow.webContents.on("will-navigate", interceptNav);
+    mainWindow.webContents.on("will-redirect",  interceptNav);
 
     mainWindow.on("closed", () => {
         mainWindow = null;
@@ -319,6 +331,21 @@ function createWindow(port) {
 
 app.on("ready", async () => {
     try {
+        // Override the process name + dock icon so dev runs (`npx electron .`) show
+        // "Snacks" with our icon instead of the generic Electron defaults — packaged
+        // builds get this from the .app's Info.plist, but unpackaged dev does not.
+        if (!app.isPackaged) {
+            app.setName("Snacks");
+            // Use the PNG, not the .icns — Electron's nativeImage is finicky about
+            // some .icns variants and silently produces an empty image. PNG always works.
+            if (process.platform === "darwin" && app.dock) {
+                const iconPath = path.join(__dirname, "icons", "snacks.png");
+                if (fs.existsSync(iconPath)) {
+                    app.dock.setIcon(nativeImage.createFromPath(iconPath));
+                }
+            }
+        }
+
         // Clear cached JS/CSS so the renderer always loads fresh files from
         // the newly-spawned backend. Without this, an older build's assets
         // can linger after an update.

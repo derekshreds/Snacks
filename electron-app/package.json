@@ -6,12 +6,14 @@
   "scripts": {
     "start": "electron .",
     "build": "electron-builder",
-    "build:win": "electron-builder --win"
+    "build:win": "electron-builder --win",
+    "build:mac": "electron-builder --mac --arm64"
   },
   "dependencies": {
     "tree-kill": "^1.2.2"
   },
   "devDependencies": {
+    "@electron/notarize": "^2.5.0",
     "electron": "^41.1.0",
     "electron-builder": "^26.8.1"
   },
@@ -27,6 +29,25 @@
         "publisherName": "Derek Morris"
       }
     },
+    "mac": {
+      "target": [
+        { "target": "dmg", "arch": "arm64" }
+      ],
+      "icon": "icons/snacks.icns",
+      "category": "public.app-category.video",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "entitlements.mac.plist",
+      "entitlementsInherit": "entitlements.mac.plist",
+      "extendInfo": {
+        "LSMinimumSystemVersion": "11.0"
+      }
+    },
+    "dmg": {
+      "title": "Snacks ${version}",
+      "icon": "icons/snacks.icns"
+    },
+    "afterSign": "scripts/notarize.js",
     "nsis": {
       "oneClick": false,
       "perMachine": true,
@@ -57,7 +78,8 @@
     ],
     "files": [
       "main.js",
-      "icons/**/*"
+      "icons/**/*",
+      "scripts/**/*"
     ]
   }
 }

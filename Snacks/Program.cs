@@ -3,7 +3,18 @@ using Snacks.Data;
 using Snacks.Services;
 using Snacks.Hubs;
 using Snacks.Models;
+using System.Runtime.InteropServices;
 using System.Text.Json;
+
+// macOS: TesseractOCR ships only Windows DLLs and uses its own LibraryLoader (not
+// .NET DllImport), so a SetDllImportResolver wouldn't fire. Instead we point its
+// CustomSearchPath at AppContext.BaseDirectory and rely on the loader's "x64/lib<name>.dll.dylib"
+// convention. The bundle-ocr-mac.sh build step lays out the dylibs under <basedir>/x64/
+// with all transitive paths rewritten to @loader_path so no Homebrew is required at runtime.
+if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+{
+    TesseractOCR.InteropDotNet.LibraryLoader.Instance.CustomSearchPath = AppContext.BaseDirectory;
+}
 
 var builder = WebApplication.CreateBuilder(args);
 
