@@ -616,16 +616,21 @@ public sealed class ClusterService : IHostedService, IDisposable
      ******************************************************************/
 
     /// <summary>
-    ///     Pings all nodes, detects timeouts, and reconciles job state between master
-    ///     and worker nodes.
+    ///     Pings all nodes, updates display status (LastHeartbeat / Online / Paused / Busy),
+    ///     and on the master reconciles dispatch state. Workers run the polling loop too so
+    ///     their own UIs show accurate cluster status, but every block that mutates dispatch
+    ///     state, requeues work items, or DELETEs jobs/files on peers is gated on
+    ///     <c>isMaster</c> — a worker issuing those DELETEs would tear down whatever the
+    ///     master had legitimately running on the targeted peer.
     /// </summary>
     private async Task RunHeartbeatAsync()
     {
         if (!_recoveryComplete.Task.IsCompleted) return;
 
-        var now     = DateTime.UtcNow;
-        var timeout = TimeSpan.FromSeconds(_config.NodeTimeoutSeconds);
-        var removeAfter = TimeSpan.FromMinutes(5);
+        bool isMaster    = _config.Role == "master";
+        var  now         = DateTime.UtcNow;
+        var  timeout     = TimeSpan.FromSeconds(_config.NodeTimeoutSeconds);
+        var  removeAfter = TimeSpan.FromMinutes(5);
 
         foreach (var kvp in _nodes)
         {
@@ -655,7 +660,10 @@ public sealed class ClusterService : IHostedService, IDisposable
                 _ = _notificationService.NotifyNodeOfflineAsync(NodeDisplayName(node));
                 await _hubContext.Clients.All.SendAsync("WorkerUpdated", node);
 
-                if (node.ActiveWorkItemId != null)
+                // Failure handling (cancel master-side transfer CTS, requeue work item)
+                // is master-only — workers don't track _activeUploads / _jobCts and have no
+                // queue to requeue into.
+                if (isMaster && node.ActiveWorkItemId != null)
                 {
                     var failJobId = node.ActiveWorkItemId;
                     bool hasActiveTransfer = _activeUploads.ContainsKey(failJobId)
@@ -682,8 +690,8 @@ public sealed class ClusterService : IHostedService, IDisposable
             // Ping the node
             try
             {
-                var client  = _discovery.CreateAuthenticatedClient();
-                var baseUrl = NodeBaseUrl(node);
+                var client   = _discovery.CreateAuthenticatedClient();
+                var baseUrl  = NodeBaseUrl(node);
                 var response = await client.GetAsync($"{baseUrl}/api/cluster/heartbeat");
 
                 if (response.IsSuccessStatusCode)
@@ -714,52 +722,70 @@ public sealed class ClusterService : IHostedService, IDisposable
                     else if (heartbeat.TryGetProperty("currentJobId", out var jobId) && jobId.ValueKind != JsonValueKind.Null)
                     {
                         var nodeJobId = jobId.GetString();
-                        node.Status          = NodeStatus.Busy;
+                        node.Status           = NodeStatus.Busy;
                         node.ActiveWorkItemId = nodeJobId;
 
-                        // Node is actively working — clear any idle grace counter
-                        if (nodeJobId != null)
-                            _downloadRetryCounts.TryRemove($"_idle_grace_{nodeJobId}", out _);
-
-                        // Sync progress from heartbeat as fallback
-                        if (nodeJobId != null && heartbeat.TryGetProperty("progress", out var progProp) &&
-                            _remoteJobs.TryGetValue(nodeJobId, out var trackedJob))
+                        // Grace-counter clearing, progress sync against _remoteJobs, and
+                        // cancel-unknown-job DELETEs all read or mutate master-only dispatch
+                        // state. A worker running these would issue cross-node DELETEs that
+                        // wipe the file the master is actively uploading to the targeted
+                        // peer. Status display (node.Status / ActiveWorkItemId above) is
+                        // safe and remains unconditional so worker UIs render correctly.
+                        if (isMaster)
                         {
-                            trackedJob.Progress = progProp.GetInt32();
-                            await _hubContext.Clients.All.SendAsync("WorkItemUpdated", trackedJob);
-                        }
+                            // Node is actively working — clear any idle grace counter
+                            if (nodeJobId != null)
+                                _downloadRetryCounts.TryRemove($"_idle_grace_{nodeJobId}", out _);
 
-                        // Reconciliation: unknown job on node
-                        if (nodeJobId != null && !_remoteJobs.ContainsKey(nodeJobId))
-                        {
-                            var dbFile = await _mediaFileRepo.GetByRemoteWorkItemIdAsync(nodeJobId);
-                            if (dbFile?.AssignedNodeId != null)
+                            // Sync progress from heartbeat as fallback
+                            if (nodeJobId != null && heartbeat.TryGetProperty("progress", out var progProp) &&
+                                _remoteJobs.TryGetValue(nodeJobId, out var trackedJob))
                             {
-                                Console.WriteLine($"Cluster: Node {node.Hostname} is working on DB-assigned job {nodeJobId} — skipping cancellation");
+                                trackedJob.Progress = progProp.GetInt32();
+                                await _hubContext.Clients.All.SendAsync("WorkItemUpdated", trackedJob);
                             }
-                            else
+
+                            // Reconciliation: unknown job on node
+                            if (nodeJobId != null && !_remoteJobs.ContainsKey(nodeJobId))
                             {
-                                Console.WriteLine($"Cluster: Node {node.Hostname} is working on unknown job {nodeJobId} — telling it to cancel");
-                                try
+                                var dbFile = await _mediaFileRepo.GetByRemoteWorkItemIdAsync(nodeJobId);
+                                if (dbFile?.AssignedNodeId != null)
                                 {
-                                    await client.DeleteAsync($"{baseUrl}/api/cluster/jobs/{nodeJobId}");
-                                    await client.DeleteAsync($"{baseUrl}/api/cluster/files/{nodeJobId}");
+                                    Console.WriteLine($"Cluster: Node {node.Hostname} is working on DB-assigned job {nodeJobId} — skipping cancellation");
                                 }
-                                catch (Exception ex) { Console.WriteLine($"Cluster: Failed to cancel unknown job: {ex.Message}"); }
+                                else
+                                {
+                                    Console.WriteLine($"Cluster: Node {node.Hostname} is working on unknown job {nodeJobId} — telling it to cancel");
+                                    try
+                                    {
+                                        await client.DeleteAsync($"{baseUrl}/api/cluster/jobs/{nodeJobId}");
+                                        await client.DeleteAsync($"{baseUrl}/api/cluster/files/{nodeJobId}");
+                                    }
+                                    catch (Exception ex) { Console.WriteLine($"Cluster: Failed to cancel unknown job: {ex.Message}"); }
+                                }
                             }
                         }
                     }
                     else
                     {
-                        // Node is idle — reconcile if master expected a job.
-                        // But DON'T re-queue immediately: there's a window between upload
-                        // completing and the node starting to encode where the heartbeat
-                        // shows idle. Also check completedJobId — the node may have finished.
-
+                        // Node is idle. Workers stop at the simple display update — the
+                        // grace-counter / HandleNodeFailureAsync / HandleRemoteCompletionAsync
+                        // paths below all rely on master-only state (_remoteJobs, _activeUploads,
+                        // _activeDispatchTasks, the master's queue) and would either no-op or
+                        // worse, mis-fire failure handling against jobs the master is running.
+                        if (!isMaster)
+                        {
+                            node.Status           = NodeStatus.Online;
+                            node.ActiveWorkItemId = null;
+                        }
+                        // Reconcile if master expected a job. DON'T re-queue immediately:
+                        // there's a window between upload completing and the node starting
+                        // to encode where the heartbeat shows idle. Also check completedJobId
+                        // — the node may have finished.
                         // Skip idle detection entirely if an upload or dispatch is in progress
-                        if (node.ActiveWorkItemId != null &&
+                        else if (node.ActiveWorkItemId != null &&
                             (_activeUploads.ContainsKey(node.ActiveWorkItemId) ||
-                             (_activeDispatchTasks.TryGetValue(node.NodeId, out var pendingDispatch) && !pendingDispatch.IsCompleted)))
+                            (_activeDispatchTasks.TryGetValue(node.NodeId, out var pendingDispatch) && !pendingDispatch.IsCompleted)))
                         {
                             // Master-side upload or dispatch task in progress — don't count as idle
                         }
