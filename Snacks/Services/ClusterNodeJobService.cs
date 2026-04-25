@@ -187,15 +187,9 @@ public sealed class ClusterNodeJobService
             var staleId = _receivingJobId;
             _receivingJobId = null;
             Console.WriteLine($"Cluster: Cleared stale receiving state for job {staleId} (no activity for {timeout.TotalSeconds:0}s)");
-
-            _ = _hubContext.Clients.All.SendAsync("WorkItemUpdated", new
-            {
-                id             = staleId,
-                status         = "Completed",
-                progress       = 100,
-                remoteJobPhase = (string?)null,
-                completedAt    = DateTime.UtcNow
-            });
+            // Master is the source of truth for job lifecycle — don't broadcast a
+            // synthetic "Completed" here; it races with the master's own re-queue
+            // and dispatch messages and produces UI flicker.
         }
     }
 
@@ -207,21 +201,10 @@ public sealed class ClusterNodeJobService
     /// <param name="jobId">The job ID being received, or <see langword="null"/> to clear.</param>
     public void SetReceivingJob(string? jobId)
     {
-        var oldJobId = _receivingJobId;
         _receivingJobId = jobId;
         if (jobId != null) _lastReceiveActivity = DateTime.UtcNow;
-
-        if (oldJobId != null && oldJobId != jobId)
-        {
-            _ = _hubContext.Clients.All.SendAsync("WorkItemUpdated", new
-            {
-                id             = oldJobId,
-                status         = "Completed",
-                progress       = 100,
-                remoteJobPhase = (string?)null,
-                completedAt    = DateTime.UtcNow
-            });
-        }
+        // No synthetic completion broadcast for any displaced previous receivingJobId —
+        // master owns lifecycle messaging.
     }
 
     /******************************************************************

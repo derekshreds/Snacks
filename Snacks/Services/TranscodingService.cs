@@ -2204,36 +2204,77 @@ public class TranscodingService
                         return (currentQp, lowPower);
                     }
 
-                    // Calculate adjustment based on peak sample: each +2 QP ≈ 0.72x bitrate
-                    double qpDelta = 2.0 * Math.Log((double)targetKbps / peakKbps) / Math.Log(0.72);
-                    int adjustment = (int)Math.Round(qpDelta);
-                    if (adjustment == 0) adjustment = peakKbps > targetKbps ? 1 : -1;
+                    // Pick next QP. If we already bracket the target, bisect within the
+                    // bracket — converges in ~log2(range) passes and is immune to the
+                    // encoder's nonlinear QP→bitrate curve. Only extrapolate when no
+                    // bracket exists yet.
+                    int? lowQp  = tested.Where(kv => kv.Value >  targetKbps).Select(kv => (int?)kv.Key).DefaultIfEmpty(null).Max(); // higher bitrate = lower QP
+                    int? highQp = tested.Where(kv => kv.Value <= targetKbps).Select(kv => (int?)kv.Key).DefaultIfEmpty(null).Min(); // lower bitrate = higher QP
 
-                    int nextQp = Math.Clamp(currentQp + adjustment, 18, 51);
-
-                    // Oscillation guard: the log-based predictor assumes a constant 0.72x
-                    // per +2QP, but real content breaks that — it can bounce between two
-                    // QPs that straddle the target forever. If we already tested the
-                    // predicted QP, bisect between the closest under- and over-target pair.
-                    if (tested.ContainsKey(nextQp))
+                    int nextQp;
+                    if (lowQp.HasValue && highQp.HasValue)
                     {
-                        int? lowQp  = tested.Where(kv => kv.Value >  targetKbps).Select(kv => (int?)kv.Key).DefaultIfEmpty(null).Max(); // higher bitrate = lower QP
-                        int? highQp = tested.Where(kv => kv.Value <= targetKbps).Select(kv => (int?)kv.Key).DefaultIfEmpty(null).Min(); // lower bitrate = higher QP
-
-                        if (lowQp.HasValue && highQp.HasValue && highQp.Value - lowQp.Value > 1)
+                        if (highQp.Value - lowQp.Value <= 1)
                         {
-                            nextQp = (lowQp.Value + highQp.Value) / 2;
-                            if (tested.ContainsKey(nextQp))
-                                nextQp = (lowQp.Value + highQp.Value + 1) / 2;
+                            await LogAsync(workItem.Id,
+                                $"Calibration converged — adjacent QPs {lowQp}/{highQp} bracket target. Selecting best observed.");
+                            break;
                         }
 
+                        nextQp = (lowQp.Value + highQp.Value) / 2;
+                        if (tested.ContainsKey(nextQp))
+                            nextQp = (lowQp.Value + highQp.Value + 1) / 2;
                         if (tested.ContainsKey(nextQp))
                         {
-                            // Bracket is exhausted (adjacent QPs both tested, or no bracket
-                            // at all). Stop and pick the best observed QP below.
                             await LogAsync(workItem.Id,
-                                $"Calibration converged — adjacent QPs exhausted. Selecting best observed.");
+                                $"Calibration converged — bracket {lowQp}–{highQp} exhausted. Selecting best observed.");
                             break;
+                        }
+                    }
+                    else
+                    {
+                        // No bracket — extrapolate. Fit the slope from prior samples when we
+                        // have ≥2; the default 0.72x-per-+2QP heuristic is wrong for many
+                        // VAAPI encoders (real slope is often ~0.5x per +2QP), so a fixed
+                        // model overshoots and skips past the bracket on each pass.
+                        double logSlopePerQp;
+                        if (tested.Count >= 2)
+                        {
+                            var sorted = tested.OrderBy(kv => kv.Key).ToList();
+                            var firstSample = sorted.First();
+                            var lastSample  = sorted.Last();
+                            double s = Math.Log((double)lastSample.Value / firstSample.Value) / (lastSample.Key - firstSample.Key);
+                            // Reject positive/near-zero slopes (measurement noise) — fall back to default
+                            logSlopePerQp = s < -0.05 ? s : Math.Log(0.72) / 2.0;
+                        }
+                        else
+                        {
+                            logSlopePerQp = Math.Log(0.72) / 2.0;
+                        }
+
+                        double qpDelta = Math.Log((double)targetKbps / peakKbps) / logSlopePerQp;
+                        int adjustment = (int)Math.Round(qpDelta);
+                        if (adjustment == 0) adjustment = peakKbps > targetKbps ? 1 : -1;
+                        // Cap step to keep extrapolation sane — the QP→bitrate curve gets
+                        // steeper at higher QP, so a long extrapolation often overshoots.
+                        adjustment = Math.Clamp(adjustment, -4, 4);
+
+                        nextQp = Math.Clamp(currentQp + adjustment, 18, 51);
+                        if (tested.ContainsKey(nextQp))
+                        {
+                            // Predictor wants a duplicate — step further in the same direction
+                            // to find a novel QP and establish the bracket.
+                            int direction = peakKbps > targetKbps ? 1 : -1;
+                            int candidate = nextQp + direction;
+                            while (candidate >= 18 && candidate <= 51 && tested.ContainsKey(candidate))
+                                candidate += direction;
+                            if (candidate < 18 || candidate > 51)
+                            {
+                                await LogAsync(workItem.Id,
+                                    $"Calibration exhausted on {modeLabel} — no novel QP available. Selecting best observed.");
+                                break;
+                            }
+                            nextQp = candidate;
                         }
                     }
 

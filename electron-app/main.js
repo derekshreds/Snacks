@@ -35,6 +35,29 @@ let isQuitting     = false;
 
 
 // ---------------------------------------------------------------------------
+// Single-instance lock
+// ---------------------------------------------------------------------------
+//
+// Two Snacks instances sharing the same per-user work directory will race on
+// the SQLite DB and on `remote-jobs/<jobId>/` temp files (one instance's
+// cleanup deletes the other's in-flight upload). Acquire the lock before any
+// other lifecycle wiring so the duplicate process exits before it spawns the
+// .NET backend. The .NET backend has its own file-lock fallback for launches
+// that bypass Electron (tests, headless dev runs).
+
+if (!app.requestSingleInstanceLock()) {
+    app.quit();
+    process.exit(0);
+}
+
+app.on("second-instance", () => {
+    if (!mainWindow) return;
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.focus();
+});
+
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 

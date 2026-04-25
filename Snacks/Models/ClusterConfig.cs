@@ -57,6 +57,14 @@ public sealed class ClusterConfig
     public int NodeTimeoutSeconds { get; set; } = 30;
 
     /// <summary>
+    ///     Seconds without a chunk arriving before the worker clears its receivingJobId.
+    ///     Kept short (and independent of <see cref="NodeTimeoutSeconds"/>) so the worker
+    ///     self-clears stale receive state between dispatch ticks if the master's cleanup
+    ///     DELETE was lost. Default: 8 seconds.
+    /// </summary>
+    public int StaleReceiveTimeoutSeconds { get; set; } = 8;
+
+    /// <summary>
     ///     Whether the master should also encode files locally.
     ///     When false, the master only dispatches jobs to worker nodes.
     /// </summary>

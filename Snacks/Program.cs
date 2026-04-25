@@ -114,6 +114,26 @@ var workDir = Environment.GetEnvironmentVariable("SNACKS_WORK_DIR")
         "Snacks", "work");
 var configDir = Path.Combine(workDir, "config");
 Directory.CreateDirectory(configDir);
+
+// Single-instance work-dir lock. Two backends sharing the same workDir race on
+// the SQLite WAL and on remote-jobs/<jobId>/ temp files. Hold an exclusive lock
+// for the process lifetime so the second backend exits before opening the DB.
+// Electron's app.requestSingleInstanceLock() handles the common case before we
+// spawn; this guards launches that bypass Electron.
+var lockPath = Path.Combine(workDir, ".snacks.lock");
+FileStream workDirLock;
+try
+{
+    workDirLock = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.Write, FileShare.None);
+}
+catch (IOException ex)
+{
+    Console.Error.WriteLine($"Snacks: Another Snacks instance is already using {workDir}. Close it before starting a new one. ({ex.Message})");
+    Environment.Exit(2);
+    return;
+}
+AppDomain.CurrentDomain.ProcessExit += (_, _) => { try { workDirLock.Dispose(); } catch { } };
+
 var dbPath = Path.Combine(configDir, "snacks.db");
 
 builder.Services.AddDbContextFactory<SnacksDbContext>(options =>

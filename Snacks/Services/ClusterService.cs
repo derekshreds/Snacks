@@ -551,7 +551,7 @@ public sealed class ClusterService : IHostedService, IDisposable
         if (needsDiscovery)
             _discovery.Start(_cts.Token);
 
-        // Heartbet with jitter
+        // Heartbeat with jitter
         var heartbeatInterval = TimeSpan.FromSeconds(_config.HeartbeatIntervalSeconds);
         var jitter = TimeSpan.FromMilliseconds(Random.Shared.Next(0, (int)heartbeatInterval.TotalMilliseconds));
         _heartbeatTimer = new Timer(async _ =>
@@ -563,7 +563,7 @@ public sealed class ClusterService : IHostedService, IDisposable
             // On nodes, clear stale receiving state and retry any pending completions
             if (_config.Role == "node")
             {
-                _nodeJobs.ExpireStaleReceiving(TimeSpan.FromSeconds(_config.NodeTimeoutSeconds));
+                _nodeJobs.ExpireStaleReceiving(TimeSpan.FromSeconds(_config.StaleReceiveTimeoutSeconds));
                 try { await _nodeJobs.RetryPendingCompletionsAsync(); }
                 catch (Exception ex) { Console.WriteLine($"Cluster: Pending completion retry error: {ex.Message}"); }
             }
@@ -987,9 +987,11 @@ public sealed class ClusterService : IHostedService, IDisposable
     {
         if (!_activeUploads.TryAdd(workItem.Id, true))
         {
-            Console.WriteLine($"Cluster: Upload already in progress for {workItem.FileName} — skipping");
-            UpdateNodeStatus(node.NodeId, NodeStatus.Online);
-            _transcodingService.RequeueWorkItem(workItem, silent: true);
+            // Another dispatch attempt for this exact work item is already in flight.
+            // Don't requeue — that races with the in-flight attempt and zeroes
+            // TransferProgress mid-upload. The in-flight attempt will publish progress
+            // and either succeed or hit its own retry/failure path.
+            Console.WriteLine($"Cluster: Upload already in progress for {workItem.FileName} — skipping duplicate dispatch");
             nodeLock.Release();
             return;
         }
@@ -1008,37 +1010,82 @@ public sealed class ClusterService : IHostedService, IDisposable
                 var hbBody = await hbResponse.Content.ReadAsStringAsync();
                 var hbData = JsonSerializer.Deserialize<JsonElement>(hbBody);
 
-                string? reportedJobId = null;
-                if (hbData.TryGetProperty("currentJobId", out var curJob) && curJob.ValueKind != JsonValueKind.Null)
-                    reportedJobId = curJob.GetString();
-                else if (hbData.TryGetProperty("completedJobId", out var compJob) && compJob.ValueKind != JsonValueKind.Null)
-                    reportedJobId = compJob.GetString();
-                else if (hbData.TryGetProperty("receivingJobId", out var recvJob) && recvJob.ValueKind != JsonValueKind.Null)
-                    reportedJobId = recvJob.GetString();
+                static string? ReadJobId(JsonElement data, string field) =>
+                    data.TryGetProperty(field, out var prop) && prop.ValueKind != JsonValueKind.Null
+                        ? prop.GetString()
+                        : null;
 
-                if (reportedJobId != null)
+                var currentId   = ReadJobId(hbData, "currentJobId");
+                var completedId = ReadJobId(hbData, "completedJobId");
+                var receivingId = ReadJobId(hbData, "receivingJobId");
+
+                // Worker is reporting state for THIS work item. Don't re-upload, don't
+                // requeue (which would zero TransferProgress and flicker the UI) — route
+                // each phase to its proper handler.
+                if (completedId == workItem.Id)
                 {
-                    // Worker reports it's working on / sitting on a completed job. If the
-                    // master no longer tracks it, the worker is wedged on stale state
-                    // (DELETE cleanup handshake failed) — auto-reset and let the next
-                    // dispatch tick pick this work item back up cleanly.
-                    if (!_remoteJobs.ContainsKey(reportedJobId))
-                    {
-                        Console.WriteLine($"Cluster: Node {node.Hostname} is stuck on orphan job {reportedJobId} (not tracked by master) — auto-resetting");
-                        _activeUploads.TryRemove(workItem.Id, out _);
-                        _transcodingService.RequeueWorkItem(workItem, silent: true);
-                        nodeLock.Release();
-                        await ResetNodeAsync(node.NodeId);
-                        return;
-                    }
-
-                    // Legitimately busy — master also tracks this job. Wait it out.
-                    Console.WriteLine($"Cluster: Node {node.Hostname} is busy (job {reportedJobId}) — re-queuing {workItem.FileName}");
+                    // Worker has the encoded output. Master must have lost tracking
+                    // (crash/restart). Re-register and pull the result via the normal
+                    // completion path instead of dispatching a fresh upload.
+                    Console.WriteLine($"Cluster: Node {node.Hostname} already has output for {workItem.FileName} — re-attaching for download");
                     _activeUploads.TryRemove(workItem.Id, out _);
-                    UpdateNodeStatus(node.NodeId, NodeStatus.Busy);
-                    _transcodingService.RequeueWorkItem(workItem, silent: true);
+                    workItem.AssignedNodeId   = node.NodeId;
+                    workItem.AssignedNodeName = node.Hostname;
+                    _remoteJobs[workItem.Id]  = workItem;
+                    UpdateNodeStatus(node.NodeId, NodeStatus.Busy, workItem.Id, workItem.FileName);
+                    nodeLock.Release();
+                    _ = Task.Run(() => HandleRemoteCompletionAsync(workItem.Id, NodeBaseUrl(node)));
+                    return;
+                }
+
+                if (currentId == workItem.Id)
+                {
+                    // Worker is actively encoding our job. Re-register and wait —
+                    // requeueing here would race with the encode that's already running.
+                    Console.WriteLine($"Cluster: Node {node.Hostname} is already encoding {workItem.FileName} — re-attaching, no re-dispatch");
+                    _activeUploads.TryRemove(workItem.Id, out _);
+                    workItem.AssignedNodeId   = node.NodeId;
+                    workItem.AssignedNodeName = node.Hostname;
+                    _remoteJobs[workItem.Id]  = workItem;
+                    UpdateNodeStatus(node.NodeId, NodeStatus.Busy, workItem.Id, workItem.FileName);
                     nodeLock.Release();
                     return;
+                }
+
+                if (receivingId == workItem.Id)
+                {
+                    // Worker still has a partial source file from the previous interrupted
+                    // upload. Fall through to the upload path — UploadFileToNodeAsync will
+                    // resume from the chunk-aligned offset via GetNodeReceivedBytesAsync.
+                    Console.WriteLine($"Cluster: Node {node.Hostname} has partial upload for {workItem.FileName} — resuming");
+                }
+                else
+                {
+                    var reportedJobId = currentId ?? completedId ?? receivingId;
+                    if (reportedJobId != null)
+                    {
+                        // Worker reports it's working on / sitting on a DIFFERENT job. If the
+                        // master no longer tracks it, the worker is wedged on stale state
+                        // (DELETE cleanup handshake failed) — auto-reset and let the next
+                        // dispatch tick pick this work item back up cleanly.
+                        if (!_remoteJobs.ContainsKey(reportedJobId))
+                        {
+                            Console.WriteLine($"Cluster: Node {node.Hostname} is stuck on orphan job {reportedJobId} (not tracked by master) — auto-resetting");
+                            _activeUploads.TryRemove(workItem.Id, out _);
+                            _transcodingService.RequeueWorkItem(workItem, silent: true);
+                            nodeLock.Release();
+                            await ResetNodeAsync(node.NodeId);
+                            return;
+                        }
+
+                        // Legitimately busy with a different tracked job. Wait it out.
+                        Console.WriteLine($"Cluster: Node {node.Hostname} is busy (job {reportedJobId}) — re-queuing {workItem.FileName}");
+                        _activeUploads.TryRemove(workItem.Id, out _);
+                        UpdateNodeStatus(node.NodeId, NodeStatus.Busy);
+                        _transcodingService.RequeueWorkItem(workItem, silent: true);
+                        nodeLock.Release();
+                        return;
+                    }
                 }
             }
         }
@@ -1138,7 +1185,8 @@ public sealed class ClusterService : IHostedService, IDisposable
             if (receivedBytes != workItem.Size)
             {
                 Console.WriteLine($"Cluster: Upload verification failed for {workItem.FileName} — expected {workItem.Size}, node has {receivedBytes}");
-                try { await client.DeleteAsync($"{baseUrl}/api/cluster/files/{workItem.Id}"); } catch { }
+                try { await client.DeleteAsync($"{baseUrl}/api/cluster/files/{workItem.Id}"); }
+                catch (Exception delEx) { Console.WriteLine($"Cluster: Cleanup DELETE failed for {workItem.Id} on {baseUrl}: {delEx.Message} — worker will be auto-reset on next dispatch"); }
                 throw new Exception("Upload verification failed");
             }
 
@@ -1174,7 +1222,8 @@ public sealed class ClusterService : IHostedService, IDisposable
                 // Node timed out mid-upload — requeue the work item
                 Console.WriteLine($"Cluster: Upload cancelled due to node timeout for {workItem.FileName} — re-queuing");
                 await CompleteActiveTransitionAsync(workItem.Id);
-                try { await _discovery.CreateAuthenticatedClient().DeleteAsync($"{baseUrl}/api/cluster/files/{workItem.Id}"); } catch { }
+                try { await _discovery.CreateAuthenticatedClient().DeleteAsync($"{baseUrl}/api/cluster/files/{workItem.Id}"); }
+                catch (Exception delEx) { Console.WriteLine($"Cluster: Cleanup DELETE failed for {workItem.Id} on {baseUrl}: {delEx.Message} — worker will be auto-reset on next dispatch"); }
                 workItem.AssignedNodeId   = null;
                 workItem.AssignedNodeName = null;
                 workItem.RemoteJobPhase   = null;
@@ -1192,7 +1241,8 @@ public sealed class ClusterService : IHostedService, IDisposable
                 // User-initiated cancellation — don't re-queue, let CancelWorkItemAsync handle status
                 Console.WriteLine($"Cluster: Upload cancelled by user for {workItem.FileName}");
                 await CompleteActiveTransitionAsync(workItem.Id);
-                try { await _discovery.CreateAuthenticatedClient().DeleteAsync($"{baseUrl}/api/cluster/files/{workItem.Id}"); } catch { }
+                try { await _discovery.CreateAuthenticatedClient().DeleteAsync($"{baseUrl}/api/cluster/files/{workItem.Id}"); }
+                catch (Exception delEx) { Console.WriteLine($"Cluster: Cleanup DELETE failed for {workItem.Id} on {baseUrl}: {delEx.Message} — worker will be auto-reset on next dispatch"); }
                 _remoteJobs.TryRemove(workItem.Id, out _);
                 UpdateNodeStatus(node.NodeId, NodeStatus.Online);
             }
@@ -1204,7 +1254,8 @@ public sealed class ClusterService : IHostedService, IDisposable
             workItem.ErrorMessage = $"Dispatch failed: {ex.Message}";
             await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
             await CompleteActiveTransitionAsync(workItem.Id);
-            try { await _discovery.CreateAuthenticatedClient().DeleteAsync($"{baseUrl}/api/cluster/files/{workItem.Id}"); } catch { }
+            try { await _discovery.CreateAuthenticatedClient().DeleteAsync($"{baseUrl}/api/cluster/files/{workItem.Id}"); }
+            catch (Exception delEx) { Console.WriteLine($"Cluster: Cleanup DELETE failed for {workItem.Id} on {baseUrl}: {delEx.Message} — worker will be auto-reset on next dispatch"); }
 
             workItem.AssignedNodeId   = null;
             workItem.AssignedNodeName = null;
@@ -1317,7 +1368,8 @@ public sealed class ClusterService : IHostedService, IDisposable
                 _remoteJobs.TryRemove(jobId, out _);
                 await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Failed);
                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
-                try { await _discovery.CreateAuthenticatedClient().DeleteAsync($"{nodeBaseUrl}/api/cluster/files/{jobId}"); } catch { }
+                try { await _discovery.CreateAuthenticatedClient().DeleteAsync($"{nodeBaseUrl}/api/cluster/files/{jobId}"); }
+                catch (Exception delEx) { Console.WriteLine($"Cluster: Cleanup DELETE failed for {jobId} on {nodeBaseUrl}: {delEx.Message} — worker will be auto-reset on next dispatch"); }
                 return;
             }
 
@@ -1402,8 +1454,10 @@ public sealed class ClusterService : IHostedService, IDisposable
             }
             else
             {
-                workItem.TransferProgress = 0;
-                workItem.ErrorMessage     = null;
+                // Retry path — DownloadFileFromNodeAsync resumes from the partial file on
+                // disk, so leave TransferProgress at its current value. Only clear the
+                // error so the UI shows the retry as recovered.
+                workItem.ErrorMessage = null;
                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
             }
 
