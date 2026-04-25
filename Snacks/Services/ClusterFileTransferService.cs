@@ -445,8 +445,22 @@ public sealed class ClusterFileTransferService
             {
                 return received;
             }
+
+            // The master treats "0" as "node has nothing — start fresh." If we silently
+            // degrade here when the node actually has data, the next PUT will arrive at
+            // offset 0 with FileMode.Create and truncate the worker's existing file. Log
+            // the reason so a stuck loop is diagnosable instead of invisible.
+            var headerValue = response.Headers.TryGetValues("X-Received-Bytes", out var hv)
+                ? hv.FirstOrDefault() ?? "<missing>"
+                : "<missing>";
+            Console.WriteLine(
+                $"Cluster: GetNodeReceivedBytesAsync({jobId}) degraded to 0 — " +
+                $"status={(int)response.StatusCode}, X-Received-Bytes={headerValue}");
         }
-        catch { }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Cluster: GetNodeReceivedBytesAsync({jobId}) failed: {ex.Message}");
+        }
 
         return 0;
     }
