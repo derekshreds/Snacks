@@ -130,6 +130,61 @@ This publishes the backend and launches Snacks in dev mode without creating an i
 
 ---
 
+### Option 3: macOS Desktop App (Apple Silicon)
+
+Snacks runs natively on Apple Silicon Macs with VideoToolbox hardware encoding.
+
+**Prerequisites for the developer building from source** (end users of the resulting DMG don't need any of these — the build script bundles everything in):
+- macOS 11 (Big Sur) or later, Apple Silicon
+- [.NET 10 SDK](https://dotnet.microsoft.com/download)
+- Node.js 18+
+- Homebrew with `tesseract`, `leptonica`, and `ffmpeg` installed:
+  ```bash
+  brew install tesseract leptonica ffmpeg
+  ```
+  The build script copies these dylibs into the app bundle (with all transitive paths rewritten to `@loader_path/...`), so the resulting `.app` is self-contained.
+
+**Building from source:**
+
+1. Clone the repository
+2. Copy ffmpeg + ffprobe into the app:
+   ```bash
+   mkdir -p electron-app/ffmpeg
+   cp "$(brew --prefix ffmpeg)/bin/ffmpeg"  electron-app/ffmpeg/
+   cp "$(brew --prefix ffmpeg)/bin/ffprobe" electron-app/ffmpeg/
+   ```
+3. `./build-mac.sh` — publishes the .NET backend, bundles OCR libs (libtesseract + libleptonica + transitive deps, paths rewritten to `@loader_path`), and produces the DMG
+4. Open the resulting DMG from `electron-app/dist/` and drag Snacks to Applications
+
+**Code-signing & notarization (optional, for distribution):**
+
+The build is unsigned by default. To produce a signed and notarized DMG, create
+`electron-app/.env.mac.local` (gitignored) with:
+
+```bash
+export CSC_NAME="Your Name (TEAMID)"
+export APPLE_ID="you@example.com"
+export APPLE_APP_SPECIFIC_PASSWORD="xxxx-xxxx-xxxx-xxxx"
+export APPLE_TEAM_ID="ABCD123456"
+```
+
+Setup checklist:
+
+1. Apple Developer Program membership ($99/year, [developer.apple.com](https://developer.apple.com))
+2. Developer ID Application certificate (Xcode → Settings → Accounts → Manage Certificates → +)
+3. App-specific password from [appleid.apple.com](https://appleid.apple.com) → App-Specific Passwords
+4. Team ID from [developer.apple.com/account](https://developer.apple.com/account) (Membership)
+
+`build-mac.sh` sources the env file automatically; if any of the four vars is missing, signing/notarization is skipped and the unsigned DMG path is taken (users will need to right-click → Open the first time).
+
+Verify a signed build:
+```bash
+spctl --assess --type execute --verbose=4 electron-app/dist/mac-arm64/Snacks.app
+xcrun stapler validate electron-app/dist/Snacks-*-arm64.dmg
+```
+
+---
+
 ## Usage
 
 ### Browse & Select
@@ -245,12 +300,15 @@ Files are automatically skipped if they already meet requirements:
 
 ### Supported Platforms
 
-| Platform | NAS (Docker) | Desktop (Windows) |
-|----------|:---:|:---:|
-| NVIDIA NVENC | CUDA | CUDA |
-| Intel | VAAPI (CQP) | QSV (VBR) |
-| AMD | VAAPI (CQP) | AMF (VBR) |
-| Software (x265/SVT-AV1) | Always available | Always available |
+| Platform | NAS (Docker) | Desktop (Windows) | Desktop (macOS) |
+|----------|:---:|:---:|:---:|
+| NVIDIA NVENC | CUDA | CUDA | -- |
+| Intel | VAAPI (CQP) | QSV (VBR) | -- |
+| AMD | VAAPI (CQP) | AMF (VBR) | -- |
+| Apple VideoToolbox | -- | -- | H.264 / HEVC (VBR) + AV1 hw decode |
+| Software (x265/SVT-AV1) | Always available | Always available | Always available |
+
+> **Mac AV1 caveat**: M3+ Macs have AV1 encode silicon, but ffmpeg doesn't yet expose an `av1_videotoolbox` encoder — so when you pick `apple` + AV1, Snacks runs **hardware AV1 decode** (VideoToolbox) on the input and **software AV1 encode** (`libsvtav1`) on the output. Decode is free; encode still costs CPU. HEVC at the same bitrate is fully hardware on both ends.
 
 ### NAS Notes
 
@@ -314,6 +372,7 @@ Snacks/
   build-and-export.bat    Build & push Docker image
   build-installer.bat     Build Windows installer
   build-electron.bat      Build Electron app
+  build-mac.sh            Build macOS DMG (Apple Silicon)
   run-electron-dev.bat    Run desktop app in dev mode
   deploy-compose.yml      Docker Compose for NAS deployment
   start-snacks.bat     Start backend (Windows)
@@ -339,6 +398,14 @@ build-installer.bat
 ```
 
 Creates a self-contained Windows installer at `electron-app/dist/` with the .NET runtime, FFmpeg, and desktop shortcuts bundled.
+
+### macOS DMG (Apple Silicon)
+
+```bash
+./build-mac.sh
+```
+
+Creates a self-contained `.dmg` at `electron-app/dist/` with the .NET runtime, FFmpeg, and the `.app` bundle. Signing and notarization activate automatically when `electron-app/.env.mac.local` is present (see [Option 3](#option-3-macos-desktop-app-apple-silicon)).
 
 ---
 

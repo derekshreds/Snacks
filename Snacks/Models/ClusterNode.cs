@@ -79,7 +79,7 @@ public sealed class WorkerCapabilities
     /// </summary>
     public List<string> SupportedEncoders { get; set; } = new();
 
-    /// <summary> Operating system platform: "Windows" or "Linux". </summary>
+    /// <summary> Operating system platform: "Windows", "macOS", or "Linux". </summary>
     public string OsPlatform { get; set; } = "";
 
     /// <summary>
