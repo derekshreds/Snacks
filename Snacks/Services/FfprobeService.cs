@@ -1,4 +1,5 @@
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using Snacks.Models;
 using System.Diagnostics;
 using System.Globalization;
@@ -310,13 +311,33 @@ public class FfprobeService
     }
 
     /// <summary>
-    ///     Validates a transcoded file by comparing input and output durations.
+    ///     Validates a transcoded file by comparing pre-computed input and output durations.
     ///     Allows up to 30 seconds or 1% of total duration as tolerance.
-    ///     Returns <c>true</c> if the output duration cannot be read (trusts FFmpeg's exit code).
+    ///     Returns <c>true</c> if the output duration is unreadable (trusts FFmpeg's exit code).
     /// </summary>
-    /// <param name="input">Probe result of the source file.</param>
-    /// <param name="output">Probe result of the transcoded output file.</param>
+    /// <param name="inputDuration">Duration of the source file in seconds.</param>
+    /// <param name="outputDuration">Duration of the transcoded output file in seconds.</param>
     /// <returns><c>true</c> if the output appears valid; <c>false</c> if durations diverge beyond tolerance.</returns>
+    public bool ConvertedSuccessfully(double inputDuration, double outputDuration)
+    {
+        // If we can't read the output duration (common with freshly written MKV),
+        // trust that the encode completed since FFmpeg exited successfully.
+        if (outputDuration <= 0)
+            return true;
+
+        double durationDifference = Math.Abs(inputDuration - outputDuration);
+
+        // Allow up to 30 seconds or 1% of total duration, whichever is greater.
+        double tolerance = Math.Max(30, inputDuration * 0.01);
+        return durationDifference < tolerance;
+    }
+
+    /// <summary>
+    ///     Convenience overload that reads durations from container header metadata.
+    ///     Use the <see cref="ConvertedSuccessfully(double, double)"/> overload with values
+    ///     from <see cref="GetAccurateVideoDurationAsync"/> when validating real encoded
+    ///     content — header metadata can lie on broken sources.
+    /// </summary>
     public bool ConvertedSuccessfully(ProbeResult input, ProbeResult output)
     {
         ArgumentNullException.ThrowIfNull(input);
@@ -324,19 +345,7 @@ public class FfprobeService
 
         try
         {
-            double inputDuration = GetVideoDuration(input);
-            double outputDuration = GetVideoDuration(output);
-
-            // If we can't read the output duration (common with freshly written MKV),
-            // trust that the encode completed since FFmpeg exited successfully.
-            if (outputDuration <= 0)
-                return true;
-
-            double durationDifference = Math.Abs(inputDuration - outputDuration);
-
-            // Allow up to 30 seconds or 1% of total duration, whichever is greater.
-            double tolerance = Math.Max(30, inputDuration * 0.01);
-            return durationDifference < tolerance;
+            return ConvertedSuccessfully(GetVideoDuration(input), GetVideoDuration(output));
         }
         catch
         {
@@ -346,26 +355,24 @@ public class FfprobeService
     }
 
     /// <summary>
-    ///     Decides whether an output that failed <see cref="ConvertedSuccessfully"/> should still
-    ///     be accepted because the missing tail of the source is just blank/black padding.
-    ///     Runs <see cref="AnalyzeTailBlackAsync"/> over the gap between the output's end and
-    ///     the source's claimed end and returns true when ≥95% of that range is black.
+    ///     Decides whether an output that failed <see cref="ConvertedSuccessfully(double, double)"/>
+    ///     should still be accepted because the missing tail of the source is just blank/black
+    ///     padding. Runs <see cref="AnalyzeTailBlackAsync"/> over the gap between the output's end
+    ///     and the source's measured end and returns true when ≥95% of that range is black.
+    ///     Pass durations measured by <see cref="GetAccurateVideoDurationAsync"/> — header-only
+    ///     values can produce a window past real EOF where blackdetect finds nothing.
     /// </summary>
     public async Task<bool> IsTailMostlyBlackAsync(
         string            sourcePath,
-        ProbeResult       sourceProbe,
-        ProbeResult       outputProbe,
+        double            outputDuration,
+        double            sourceDuration,
         CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(sourcePath);
-        ArgumentNullException.ThrowIfNull(sourceProbe);
-        ArgumentNullException.ThrowIfNull(outputProbe);
 
-        double sourceDur = GetVideoDuration(sourceProbe);
-        double outputDur = GetVideoDuration(outputProbe);
-        if (outputDur <= 0 || sourceDur <= outputDur + 1) return false;
+        if (outputDuration <= 0 || sourceDuration <= outputDuration + 1) return false;
 
-        var (black, tail, ok) = await AnalyzeTailBlackAsync(sourcePath, outputDur, sourceDur, ct);
+        var (black, tail, ok) = await AnalyzeTailBlackAsync(sourcePath, outputDuration, sourceDuration, ct);
         if (!ok || tail <= 0) return false;
         return (black / tail) >= 0.95;
     }
@@ -486,6 +493,106 @@ public class FfprobeService
         }
 
         return 0;
+    }
+
+    /// <summary>
+    ///     Reads the real end-of-content time of the first video stream by probing the last
+    ///     packets of the file directly, rather than reading container header metadata
+    ///     (which can be inaccurate on broken sources or freshly-muxed outputs). Falls back
+    ///     to <see cref="GetVideoDuration"/> on the supplied probe if the packet probe fails.
+    /// </summary>
+    /// <param name="filePath">Absolute path to the media file.</param>
+    /// <param name="fallbackProbe">Optional previously-obtained probe; supplies the fallback duration if the packet probe fails.</param>
+    /// <param name="ct">Cancellation token. Cancellation kills the ffprobe process tree.</param>
+    /// <returns>End-of-content time in seconds, or 0 if no duration can be determined.</returns>
+    public async Task<double> GetAccurateVideoDurationAsync(
+        string            filePath,
+        ProbeResult?      fallbackProbe = null,
+        CancellationToken ct            = default)
+    {
+        ArgumentNullException.ThrowIfNull(filePath);
+
+        // 99999%+#100 seeks ffprobe to EOF and reads only the last 100 packets, so this
+        // stays fast on multi-GB files while still surfacing the real last-frame PTS.
+        string args =
+            "-v error -select_streams v:0 -read_intervals \"99999%+#100\" " +
+            "-show_entries packet=pts_time,duration_time -of json " +
+            $"\"{filePath}\"";
+
+        var psi = new ProcessStartInfo(_ffprobePath)
+        {
+            Arguments              = args,
+            UseShellExecute        = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError  = true,
+            CreateNoWindow         = true,
+        };
+
+        var stdout = new StringBuilder();
+        using var proc = new Process { StartInfo = psi };
+
+        proc.OutputDataReceived += (_, e) =>
+        {
+            if (!string.IsNullOrEmpty(e.Data)) stdout.AppendLine(e.Data);
+        };
+
+        try
+        {
+            proc.Start();
+            proc.BeginOutputReadLine();
+            // Drain stderr so the buffer can't fill and stall the process.
+            _ = proc.StandardError.ReadToEndAsync(ct);
+
+            try
+            {
+                await proc.WaitForExitAsync(ct);
+            }
+            catch (OperationCanceledException)
+            {
+                try { if (!proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
+                throw;
+            }
+            proc.WaitForExit();
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            return GetVideoDuration(fallbackProbe ?? new ProbeResult());
+        }
+
+        try
+        {
+            string json = stdout.ToString();
+            int braceIndex = json.IndexOf('{');
+            if (braceIndex < 0) return GetVideoDuration(fallbackProbe ?? new ProbeResult());
+            json = json.Substring(braceIndex);
+
+            var packets = JObject.Parse(json)["packets"] as JArray;
+            if (packets == null || packets.Count == 0)
+                return GetVideoDuration(fallbackProbe ?? new ProbeResult());
+
+            double maxEnd = 0;
+            foreach (var pkt in packets)
+            {
+                if (!double.TryParse(pkt["pts_time"]?.ToString(), NumberStyles.Float, CultureInfo.InvariantCulture, out double pts))
+                    continue;
+                double dur = 0;
+                double.TryParse(pkt["duration_time"]?.ToString(), NumberStyles.Float, CultureInfo.InvariantCulture, out dur);
+                double end = pts + dur;
+                if (end > maxEnd) maxEnd = end;
+            }
+
+            if (maxEnd > 0) return maxEnd;
+        }
+        catch
+        {
+            // Fall through to fallback on malformed JSON.
+        }
+
+        return GetVideoDuration(fallbackProbe ?? new ProbeResult());
     }
 
     /// <summary>

@@ -851,18 +851,24 @@ public class TranscodingService
 
             await ConvertVideoAsync(workItem, options, cancellationToken: jobCts.Token);
 
-            workItem.Status = WorkItemStatus.Completed;
-            workItem.CompletedAt = DateTime.UtcNow;
-            workItem.Progress = 100;
-            Interlocked.Increment(ref _localCompletedJobs);
-            await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Completed);
-
-            if (ShouldDispatchExternal)
+            // ConvertVideoAsync's internal fail paths (e.g. truncation detection) call
+            // MarkWorkItemFailed and return without throwing. Don't overwrite Failed status
+            // with Completed in that case.
+            if (workItem.Status != WorkItemStatus.Failed)
             {
-                if (_notificationService != null)
-                    _ = _notificationService.NotifyEncodeCompletedAsync(Path.GetFileName(workItem.Path), workItem.Size);
-                if (_integrationService != null)
-                    _ = _integrationService.TriggerRescansAsync(workItem.Path);
+                workItem.Status = WorkItemStatus.Completed;
+                workItem.CompletedAt = DateTime.UtcNow;
+                workItem.Progress = 100;
+                Interlocked.Increment(ref _localCompletedJobs);
+                await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Completed);
+
+                if (ShouldDispatchExternal)
+                {
+                    if (_notificationService != null)
+                        _ = _notificationService.NotifyEncodeCompletedAsync(Path.GetFileName(workItem.Path), workItem.Size);
+                    if (_integrationService != null)
+                        _ = _integrationService.TriggerRescansAsync(workItem.Path);
+                }
             }
         }
         catch (OperationCanceledException)
@@ -1324,21 +1330,28 @@ public class TranscodingService
         }
 
         var outputProbe = await _ffprobeService.ProbeAsync(outputPath);
-        if (!_ffprobeService.ConvertedSuccessfully(workItem.Probe!, outputProbe))
+
+        // Container header metadata (Format.Duration / stream.Duration) can lie on broken
+        // sources and on freshly-muxed outputs. Read the real end-of-content from the last
+        // packets of each file so the comparison reflects what the streams actually contain.
+        double srcDur = await _ffprobeService.GetAccurateVideoDurationAsync(workItem.Path, workItem.Probe, cancellationToken);
+        double outDur = await _ffprobeService.GetAccurateVideoDurationAsync(outputPath,    outputProbe,     cancellationToken);
+
+        if (!_ffprobeService.ConvertedSuccessfully(srcDur, outDur))
         {
-            // Duration metadata mismatch: if the source's tail past the encoded end is
-            // just blank/black padding, the output captured all real content and we
-            // accept it. If the tail has real content, the encoder genuinely truncated
-            // something — retries would produce the same truncation, so fail permanently.
-            if (await _ffprobeService.IsTailMostlyBlackAsync(workItem.Path, workItem.Probe!, outputProbe, cancellationToken))
+            // Duration mismatch: if the source's tail past the encoded end is just blank/black
+            // padding, the output captured all real content and we accept it. If the tail has
+            // real content, the encoder genuinely truncated something — retries would produce
+            // the same truncation, so fail permanently.
+            if (await _ffprobeService.IsTailMostlyBlackAsync(workItem.Path, outDur, srcDur, cancellationToken))
             {
                 await LogAsync(workItem.Id,
-                    "Duration mismatch detected, but the source tail is blank/black — accepting output.");
+                    $"Duration mismatch detected (source={srcDur:0.##}s output={outDur:0.##}s), but the source tail is blank/black — accepting output.");
             }
             else
             {
                 await LogAsync(workItem.Id,
-                    "Duration mismatch detected and source tail contains real content — output is truncated. Failing without retries.");
+                    $"Duration mismatch detected (source={srcDur:0.##}s output={outDur:0.##}s) and source tail contains real content — output is truncated. Failing without retries.");
                 try { await _fileService.FileDeleteAsync(outputPath); }
                 catch (Exception ex) { await LogAsync(workItem.Id, $"Warning: Could not clean up output file: {ex.Message}"); }
                 TryCleanupOcrMuxDir(ocrMuxTmpDir);
