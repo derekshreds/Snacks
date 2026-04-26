@@ -123,6 +123,13 @@ public sealed class EncoderOptions
     /// <summary> When <see langword="true"/>, image-based subtitle tracks are OCR-converted to SRT. </summary>
     public bool ConvertImageSubtitlesToSrt { get; set; } = false;
 
+    /// <summary>
+    ///     When <see langword="true"/>, image-based subtitles (PGS/VOBSUB/DVB) are passed through
+    ///     into MKV outputs alongside any text-based and OCR'd tracks. MP4 always strips them
+    ///     regardless of this flag, since the format does not officially support PGS muxing.
+    /// </summary>
+    public bool PassThroughImageSubtitlesMkv { get; set; } = false;
+
     /******************************************************************
      *  Video Pipeline
      ******************************************************************/
@@ -191,6 +198,7 @@ public sealed class EncoderOptions
         ExtractSubtitlesToSidecar  = ExtractSubtitlesToSidecar,
         SidecarSubtitleFormat      = SidecarSubtitleFormat,
         ConvertImageSubtitlesToSrt = ConvertImageSubtitlesToSrt,
+        PassThroughImageSubtitlesMkv = PassThroughImageSubtitlesMkv,
         DownscalePolicy            = DownscalePolicy,
         DownscaleTarget            = DownscaleTarget,
         TonemapHdrToSdr            = TonemapHdrToSdr,

@@ -42,6 +42,12 @@
                 <label class="form-check-label" for="@(formPrefix)ConvertImageSubtitlesToSrt">Convert image-based subtitles to SRT (OCR)</label>
                 <div class="form-text">Run OCR on image-based subtitles (PGS/VOBSUB) to produce searchable text. With sidecar extraction on, the result is written as a <code>.srt</code> file; without sidecar extraction, it's embedded in the output as a text subtitle track alongside any existing text subtitles.</div>
             </div>
+
+            <div class="form-check mb-3">
+                <input class="form-check-input" type="checkbox" id="@(formPrefix)PassThroughImageSubtitlesMkv" name="PassThroughImageSubtitlesMkv">
+                <label class="form-check-label" for="@(formPrefix)PassThroughImageSubtitlesMkv">Pass through image-based subtitles (MKV only)</label>
+                <div class="form-text">Keep original image-based subtitle tracks (PGS/VOBSUB/DVB) in MKV outputs. MP4 always strips them — the format does not officially support PGS muxing. Combine with OCR to get both the original tracks <em>and</em> searchable SRT versions. If the encode fails, the pipeline automatically retries without these tracks before falling back to no subtitles.</div>
+            </div>
         </div>
     </div>
 </div>

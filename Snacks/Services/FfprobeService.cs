@@ -224,7 +224,7 @@ public class FfprobeService
 
     /// <summary>
     ///     Returns the FFmpeg <c>-map</c> and subtitle codec arguments for the selected subtitle streams.
-    ///     Always drops bitmap subtitle codecs (PGS, VOBSUB, DVB) that can cause encoding failures.
+    ///     By default drops bitmap subtitle codecs (PGS, VOBSUB, DVB) that can cause encoding failures.
     ///     Returns <c>-sn</c> (no subtitles) for MP4 containers, which don't support text subtitle passthrough.
     /// </summary>
     /// <param name="probe">The ffprobe analysis of the source file.</param>
@@ -233,8 +233,12 @@ public class FfprobeService
     ///     accepts the track's tag in any of its common forms (2-letter, 3-letter, or English name).
     /// </param>
     /// <param name="isMatroska">When <c>false</c>, subtitles are always stripped (<c>-sn</c>).</param>
+    /// <param name="includeBitmaps">
+    ///     When <c>true</c> AND the container is Matroska, bitmap subs (PGS/VOBSUB/DVB) are passed through
+    ///     instead of dropped. <c>-c:s copy</c> handles them without re-decoding.
+    /// </param>
     /// <returns>FFmpeg subtitle mapping arguments, or <c>-sn</c> to strip all subtitles.</returns>
-    public string MapSub(ProbeResult probe, IReadOnlyList<string>? languagesToKeep, bool isMatroska)
+    public string MapSub(ProbeResult probe, IReadOnlyList<string>? languagesToKeep, bool isMatroska, bool includeBitmaps = false)
     {
         ArgumentNullException.ThrowIfNull(probe);
 
@@ -243,10 +247,12 @@ public class FfprobeService
 
         var subtitleStreams = probe.Streams.Where(s => s.CodecType == "subtitle").ToList();
 
-        // Drop bitmap subtitles (PGS, VOBSUB, DVB) — they cause hangs and encoding failures.
-        var keepSubs = subtitleStreams
-            .Where(s => !_bitmapSubCodecs.Contains(s.CodecName ?? ""))
-            .ToList();
+        // Bitmap subs (PGS, VOBSUB, DVB) are dropped by default because they have historically
+        // caused hangs and encoding failures; opt-in pass-through keeps them when the user wants
+        // a faithful Blu-ray-style remux.
+        var keepSubs = includeBitmaps
+            ? subtitleStreams
+            : subtitleStreams.Where(s => !_bitmapSubCodecs.Contains(s.CodecName ?? "")).ToList();
 
         if (languagesToKeep != null && languagesToKeep.Count > 0)
         {

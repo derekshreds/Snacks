@@ -915,6 +915,7 @@ public class TranscodingService
     /// <param name="useConservativeHwFlags">When <c>true</c>, drops optional hw-encoder flags that older GPUs reject (NVENC temporal AQ, QSV lookahead/extbrc). Set by the retry chain after an encoder-feature failure.</param>
     /// <param name="cachedOcrSrts">OCR'd SRT results from an earlier attempt. When non-null, the OCR pass is skipped and these files are muxed as-is.</param>
     /// <param name="cachedOcrMuxTmpDir">Temp dir that owns the files in <paramref name="cachedOcrSrts"/>. Paired with the cache so cleanup still fires on success / exhaustion.</param>
+    /// <param name="dropImageSubtitlesOnly">When <c>true</c>, suppresses MKV bitmap-subtitle pass-through for this attempt (OCR'd and text subs still pass through). Set by the retry chain when the previous attempt may have failed because of the image-based streams.</param>
     /// <param name="cancellationToken">Token to abort the encode mid-stream.</param>
     private async Task ConvertVideoAsync(
         WorkItem workItem,
@@ -924,6 +925,7 @@ public class TranscodingService
         bool useConservativeHwFlags = false,
         IReadOnlyList<SubtitleExtractionService.OcrMuxResult>? cachedOcrSrts = null,
         string? cachedOcrMuxTmpDir = null,
+        bool dropImageSubtitlesOnly = false,
         CancellationToken cancellationToken = default)
     {
         if (workItem.Probe == null)
@@ -1229,13 +1231,16 @@ public class TranscodingService
         {
             // Mux mode — build the subtitle args ourselves so we can interleave source text
             // subs (passed through as-is via per-stream -c:s:N copy) with the OCR'd SRTs
-            // (encoded to the container's native text codec). Source bitmap subs are replaced
-            // by the OCR output and so are dropped from the map.
+            // (encoded to the container's native text codec). When MKV pass-through is on,
+            // bitmap streams are also kept here so the output has both PGS + OCR'd SRT.
             string ocrCodec = options.Format == "mkv" ? "srt" : "mov_text";
 
-            var textSubs = _ffprobeService
-                .SelectSidecarStreams(workItem.Probe!, options.SubtitleLanguagesToKeep, includeBitmaps: false)
-                .Where(s => !s.IsBitmap)
+            bool passBitmaps = options.Format == "mkv"
+                            && options.PassThroughImageSubtitlesMkv
+                            && !dropImageSubtitlesOnly;
+
+            var sourceSubs = _ffprobeService
+                .SelectSidecarStreams(workItem.Probe!, options.SubtitleLanguagesToKeep, includeBitmaps: passBitmaps)
                 .ToList();
 
             string maps   = "";
@@ -1243,7 +1248,7 @@ public class TranscodingService
             string meta   = "";
             int    outSubIndex = 0;
 
-            foreach (var s in textSubs)
+            foreach (var s in sourceSubs)
             {
                 maps   += $"-map 0:{s.StreamIndex} ";
                 codecs += $"-c:s:{outSubIndex} copy ";
@@ -1290,7 +1295,10 @@ public class TranscodingService
             // On a mux pass that excludes subs (MuxStreams.Audio), keep every subtitle track by
             // passing an empty language list — MapSub treats that as "keep all".
             var subLangs = doSubtitleWork ? options.SubtitleLanguagesToKeep : new List<string>();
-            subtitleFlags = _ffprobeService.MapSub(workItem.Probe!, subLangs, options.Format == "mkv") + " ";
+            bool passBitmaps = options.Format == "mkv"
+                            && options.PassThroughImageSubtitlesMkv
+                            && !dropImageSubtitlesOnly;
+            subtitleFlags = _ffprobeService.MapSub(workItem.Probe!, subLangs, options.Format == "mkv", passBitmaps) + " ";
         }
 
         // -analyzeduration and -probesize handle files with many streams (e.g. 30+ PGS subtitle tracks)
@@ -1317,7 +1325,7 @@ public class TranscodingService
         {
             // Don't clean up the OCR tmp dir here — retries reuse the cached SRTs.
             // HandleConversionFailure is responsible for cleanup on final exhaustion.
-            await HandleConversionFailure(workItem, options, outputPath, ex.Message, stripSubtitles, forceSwDecode, useConservativeHwFlags, ocrMuxSrts, ocrMuxTmpDir, cancellationToken: cancellationToken);
+            await HandleConversionFailure(workItem, options, outputPath, ex.Message, stripSubtitles, forceSwDecode, useConservativeHwFlags, ocrMuxSrts, ocrMuxTmpDir, dropImageSubtitlesOnly, cancellationToken: cancellationToken);
             return;
         }
 
@@ -1325,7 +1333,7 @@ public class TranscodingService
 
         if (!File.Exists(outputPath))
         {
-            await HandleConversionFailure(workItem, options, outputPath, "Output file not found", stripSubtitles, forceSwDecode, useConservativeHwFlags, ocrMuxSrts, ocrMuxTmpDir, cancellationToken: cancellationToken);
+            await HandleConversionFailure(workItem, options, outputPath, "Output file not found", stripSubtitles, forceSwDecode, useConservativeHwFlags, ocrMuxSrts, ocrMuxTmpDir, dropImageSubtitlesOnly, cancellationToken: cancellationToken);
             return;
         }
 
@@ -2819,6 +2827,7 @@ public class TranscodingService
         bool conservativeHwFlagsTried = false,
         IReadOnlyList<SubtitleExtractionService.OcrMuxResult>? cachedOcrSrts = null,
         string? cachedOcrMuxTmpDir = null,
+        bool imageSubtitlesAlreadyDropped = false,
         CancellationToken cancellationToken = default)
     {
         await LogAsync(workItem.Id, $"Conversion failed: {reason}");
@@ -2858,11 +2867,32 @@ public class TranscodingService
                 useConservativeHwFlags: true,
                 cachedOcrSrts: cachedOcrSrts,
                 cachedOcrMuxTmpDir: cachedOcrMuxTmpDir,
+                dropImageSubtitlesOnly: imageSubtitlesAlreadyDropped,
                 cancellationToken: cancellationToken);
             return;
         }
 
-        // Retry 2: Strip all subtitles (covers bitmap subs, broken streams, etc.)
+        // Retry 2a: Drop image-based subs only — keeps OCR'd SRTs and text-based (srt/ass)
+        // streams. Bitmap streams (PGS/VOBSUB/DVB) are the most common cause of subtitle
+        // failures; many failures clear once they're removed without sacrificing the rest
+        // of the user's subtitles. Only relevant when the user opted into MKV pass-through.
+        bool wasPassingBitmaps = options.Format == "mkv" && options.PassThroughImageSubtitlesMkv;
+        if (!subtitlesWereStripped && !imageSubtitlesAlreadyDropped && wasPassingBitmaps)
+        {
+            await LogAsync(workItem.Id, "Retrying without image-based subtitles...");
+            workItem.Progress = 0;
+            await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
+            await ConvertVideoAsync(workItem, options,
+                stripSubtitles: false,
+                useConservativeHwFlags: conservativeHwFlagsTried,
+                cachedOcrSrts: cachedOcrSrts,
+                cachedOcrMuxTmpDir: cachedOcrMuxTmpDir,
+                dropImageSubtitlesOnly: true,
+                cancellationToken: cancellationToken);
+            return;
+        }
+
+        // Retry 2b: Strip all subtitles (covers broken streams that survived 2a).
         if (!subtitlesWereStripped)
         {
             await LogAsync(workItem.Id, "Retrying without subtitles...");
@@ -2900,6 +2930,7 @@ public class TranscodingService
                 useConservativeHwFlags: conservativeHwFlagsTried,
                 cachedOcrSrts: cachedOcrSrts,
                 cachedOcrMuxTmpDir: cachedOcrMuxTmpDir,
+                dropImageSubtitlesOnly: imageSubtitlesAlreadyDropped,
                 cancellationToken: cancellationToken);
             return;
         }

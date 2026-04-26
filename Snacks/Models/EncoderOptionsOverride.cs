@@ -89,6 +89,9 @@ public sealed class EncoderOptionsOverride
     /// <summary> Overrides <see cref="EncoderOptions.ConvertImageSubtitlesToSrt"/> when non-<see langword="null"/>. </summary>
     public bool? ConvertImageSubtitlesToSrt { get; set; }
 
+    /// <summary> Overrides <see cref="EncoderOptions.PassThroughImageSubtitlesMkv"/> when non-<see langword="null"/>. </summary>
+    public bool? PassThroughImageSubtitlesMkv { get; set; }
+
     /******************************************************************
      *  Video Pipeline
      ******************************************************************/
@@ -173,7 +176,8 @@ public sealed class EncoderOptionsOverride
         if (over.SubtitleLanguagesToKeep != null)     target.SubtitleLanguagesToKeep    = over.SubtitleLanguagesToKeep;
         if (over.ExtractSubtitlesToSidecar.HasValue)  target.ExtractSubtitlesToSidecar  = over.ExtractSubtitlesToSidecar.Value;
         if (over.SidecarSubtitleFormat != null)       target.SidecarSubtitleFormat      = over.SidecarSubtitleFormat;
-        if (over.ConvertImageSubtitlesToSrt.HasValue) target.ConvertImageSubtitlesToSrt = over.ConvertImageSubtitlesToSrt.Value;
+        if (over.ConvertImageSubtitlesToSrt.HasValue)   target.ConvertImageSubtitlesToSrt   = over.ConvertImageSubtitlesToSrt.Value;
+        if (over.PassThroughImageSubtitlesMkv.HasValue) target.PassThroughImageSubtitlesMkv = over.PassThroughImageSubtitlesMkv.Value;
         if (over.DownscalePolicy != null)             target.DownscalePolicy            = over.DownscalePolicy;
         if (over.DownscaleTarget != null)             target.DownscaleTarget            = over.DownscaleTarget;
         if (over.TonemapHdrToSdr.HasValue)            target.TonemapHdrToSdr            = over.TonemapHdrToSdr.Value;

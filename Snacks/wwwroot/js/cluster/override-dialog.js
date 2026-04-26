@@ -57,9 +57,10 @@ const FOLDER_OVERRIDE_FIELDS = Object.freeze({
     OriginalLanguageProvider:   'select',
 
     // Subtitles
-    ExtractSubtitlesToSidecar:  'bool',
-    SidecarSubtitleFormat:      'select',
-    ConvertImageSubtitlesToSrt: 'bool',
+    ExtractSubtitlesToSidecar:    'bool',
+    SidecarSubtitleFormat:        'select',
+    ConvertImageSubtitlesToSrt:   'bool',
+    PassThroughImageSubtitlesMkv: 'bool',
 
     // Encoding mode
     EncodingMode:               'select',
@@ -96,9 +97,10 @@ const NODE_OVERRIDE_FIELDS = Object.freeze({
     OriginalLanguageProvider:   'select',
 
     // Subtitles
-    ExtractSubtitlesToSidecar:  'bool',
-    SidecarSubtitleFormat:      'select',
-    ConvertImageSubtitlesToSrt: 'bool',
+    ExtractSubtitlesToSidecar:    'bool',
+    SidecarSubtitleFormat:        'select',
+    ConvertImageSubtitlesToSrt:   'bool',
+    PassThroughImageSubtitlesMkv: 'bool',
 
     // Encoding mode
     EncodingMode:               'select',

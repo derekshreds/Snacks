@@ -116,10 +116,11 @@ export function getEncoderOptions(prefix = 'settings') {
         AudioBitrateKbps:         num('AudioBitrateKbps', 192),
 
         // Subtitles.
-        SubtitleLanguagesToKeep:    chips('SubtitleLanguagesToKeep') ?? ['en'],
-        ExtractSubtitlesToSidecar:  bool('ExtractSubtitlesToSidecar'),
-        SidecarSubtitleFormat:      str('SidecarSubtitleFormat', 'srt'),
-        ConvertImageSubtitlesToSrt: bool('ConvertImageSubtitlesToSrt'),
+        SubtitleLanguagesToKeep:      chips('SubtitleLanguagesToKeep') ?? ['en'],
+        ExtractSubtitlesToSidecar:    bool('ExtractSubtitlesToSidecar'),
+        SidecarSubtitleFormat:        str('SidecarSubtitleFormat', 'srt'),
+        ConvertImageSubtitlesToSrt:   bool('ConvertImageSubtitlesToSrt'),
+        PassThroughImageSubtitlesMkv: bool('PassThroughImageSubtitlesMkv'),
 
         // Encoding mode.
         EncodingMode: str('EncodingMode', 'Transcode'),
@@ -211,9 +212,10 @@ export async function restoreEncoderOptions(prefix = 'settings') {
         set('AudioBitrateKbps',         pick('AudioBitrateKbps')          ?? 192);
 
         // Subtitles.
-        set('ExtractSubtitlesToSidecar',  pick('ExtractSubtitlesToSidecar'));
-        set('SidecarSubtitleFormat',      pick('SidecarSubtitleFormat') || 'srt');
-        set('ConvertImageSubtitlesToSrt', pick('ConvertImageSubtitlesToSrt'));
+        set('ExtractSubtitlesToSidecar',    pick('ExtractSubtitlesToSidecar'));
+        set('SidecarSubtitleFormat',        pick('SidecarSubtitleFormat') || 'srt');
+        set('ConvertImageSubtitlesToSrt',   pick('ConvertImageSubtitlesToSrt'));
+        set('PassThroughImageSubtitlesMkv', pick('PassThroughImageSubtitlesMkv'));
 
         // Encoding mode.
         set('EncodingMode', pick('EncodingMode') || 'Transcode');
