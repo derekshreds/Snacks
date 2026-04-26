@@ -351,7 +351,12 @@ public sealed class NativeOcrService
             }
             catch (Exception ex)
             {
-                await log($"OCR: failed to construct Tesseract engine for '{tessLang}': {ex.Message}");
+                // TesseractOCR wraps native-load failures in TargetInvocationException;
+                // the outer message is generic, so unwrap to surface the real cause
+                // (DllNotFoundException / missing tessdata file / etc).
+                var root = ex;
+                while (root.InnerException != null) root = root.InnerException;
+                await log($"OCR: failed to construct Tesseract engine for '{tessLang}': {root.GetType().Name}: {root.Message}");
                 return null;
             }
         }

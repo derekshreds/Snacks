@@ -1,0 +1,11 @@
+## Windows (Docker Desktop) override.
+## Host networking does not publish ports to the Windows host — Docker Desktop
+## runs containers inside a Linux VM and "host" binds to the VM, not Windows.
+## Switch to bridge mode and publish 6767 explicitly. Cluster UDP broadcast
+## discovery will not work from this container; that is expected for dev.
+
+services:
+  snacks:
+    network_mode: bridge
+    ports:
+      - "6767:6767"

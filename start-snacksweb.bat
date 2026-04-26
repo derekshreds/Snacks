@@ -18,17 +18,17 @@ if not exist "video-library" (
     echo ?? Note: The container has READ-WRITE access for in-place transcoding
 )
 
-REM Build and start the container
+REM Build and start the container (Windows override publishes port 6767)
 echo ?? Building and starting Snacks container...
-docker-compose down >nul 2>&1
-docker-compose up -d --build
+docker-compose -f docker-compose.yml -f docker-compose.windows.yml down >nul 2>&1
+docker-compose -f docker-compose.yml -f docker-compose.windows.yml up -d --build
 
 REM Wait for container to be ready
 echo ? Waiting for container to start...
 timeout /t 15 /nobreak >nul
 
 REM Check container status
-docker-compose ps | findstr "Up" >nul
+docker-compose -f docker-compose.yml -f docker-compose.windows.yml ps | findstr "Up" >nul
 if %errorlevel% == 0 (
     echo ? Snacks is running successfully!
     echo.
@@ -46,14 +46,14 @@ if %errorlevel% == 0 (
     echo   4. Files are processed IN-PLACE unless you specify an output directory
     echo   5. Original files are backed up with '-OG' suffix during processing
     echo.
-    echo To view logs: docker-compose logs -f snacks
-    echo To stop: docker-compose down
+    echo To view logs: docker-compose -f docker-compose.yml -f docker-compose.windows.yml logs -f snacks
+    echo To stop: docker-compose -f docker-compose.yml -f docker-compose.windows.yml down
     echo.
     echo Opening browser...
     start http://localhost:6767
 ) else (
     echo ? Failed to start Snacks. Check logs:
-    docker-compose logs snacks
+    docker-compose -f docker-compose.yml -f docker-compose.windows.yml logs snacks
 )
 
 pause

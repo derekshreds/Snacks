@@ -29,6 +29,21 @@ RUN apt-get update && apt-get install -y \
     libtesseract5 \
     && rm -rf /var/lib/apt/lists/*
 
+# TesseractOCR's LibraryLoader hardcodes Windows-DLL filenames and just appends
+# .so on Linux, so it dlopens "libleptonica-1.83.1.dll.so" / "libtesseract53.dll.so"
+# from a "x64/" subdir of CustomSearchPath. Noble ships the same ABI under different
+# names (liblept.so.5 from leptonica 1.82, libtesseract.so.5), so symlink them into
+# the names the loader expects. Mirrors electron-app/scripts/bundle-ocr-mac.sh.
+RUN mkdir -p /app/x64 && \
+    ln -sf /lib/x86_64-linux-gnu/liblept.so.5      /app/x64/libleptonica-1.83.1.dll.so && \
+    ln -sf /lib/x86_64-linux-gnu/libtesseract.so.5 /app/x64/libtesseract53.dll.so
+
+# The loader uses [DllImport("libdl")] to call dlopen itself. glibc 2.34+ folded libdl
+# into libc.so.6 and only the libdl.so.2 compat stub remains; the unversioned libdl.so
+# linker symlink only ships in libc6-dev. Provide it at the runtime path so the bare
+# "libdl" P/Invoke resolves without dragging in the dev package.
+RUN ln -sf /lib/x86_64-linux-gnu/libdl.so.2 /lib/x86_64-linux-gnu/libdl.so
+
 # Verify FFmpeg has VAAPI support
 RUN /usr/lib/jellyfin-ffmpeg/ffmpeg -hwaccels 2>/dev/null | grep -q vaapi && echo "VAAPI support confirmed" || echo "WARNING: No VAAPI support"
 RUN /usr/lib/jellyfin-ffmpeg/ffmpeg -encoders 2>/dev/null | grep vaapi && echo "VAAPI encoders confirmed"
