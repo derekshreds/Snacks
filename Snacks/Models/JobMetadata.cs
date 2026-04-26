@@ -41,6 +41,13 @@ public sealed class JobMetadata
     public bool IsHevc { get; set; }
 
     /// <summary>
+    ///     Whether the source is 4K (any video stream wider than 1920px).
+    ///     Determines which bitrate ceiling <c>MeetsBitrateTarget</c> uses when
+    ///     deciding whether a Hybrid-mode job is eligible for a mux pass.
+    /// </summary>
+    public bool Is4K { get; set; }
+
+    /// <summary>
     ///     SHA256 hash of the source file for end-to-end integrity verification.
     ///     The node computes this after upload and rejects the job if it doesn't match,
     ///     protecting against network corruption that could produce invalid output.

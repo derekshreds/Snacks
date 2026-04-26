@@ -1197,7 +1197,8 @@ public sealed class ClusterService : IHostedService, IDisposable
                 Probe    = workItem.Probe,
                 Duration = workItem.Length,
                 Bitrate  = workItem.Bitrate,
-                IsHevc   = workItem.IsHevc
+                IsHevc   = workItem.IsHevc,
+                Is4K     = workItem.Is4K
             };
 
             var client = _discovery.CreateAuthenticatedClient();
@@ -2353,7 +2354,8 @@ public sealed class ClusterService : IHostedService, IDisposable
                                     Probe    = workItem.Probe,
                                     Duration = workItem.Length,
                                     Bitrate  = workItem.Bitrate,
-                                    IsHevc   = workItem.IsHevc
+                                    IsHevc   = workItem.IsHevc,
+                                    Is4K     = workItem.Is4K
                                 };
 
                                 var uploadClient = _discovery.CreateAuthenticatedClient();

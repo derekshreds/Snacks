@@ -296,6 +296,7 @@ public sealed class ClusterNodeJobService
             Bitrate   = metadata.Bitrate,
             Length    = metadata.Duration,
             IsHevc    = metadata.IsHevc,
+            Is4K      = metadata.Is4K,
             Probe     = metadata.Probe,
             Status    = WorkItemStatus.Processing,
             StartedAt = DateTime.UtcNow
@@ -333,6 +334,13 @@ public sealed class ClusterNodeJobService
             options.OutputDirectory     = null;
             options.EncodeDirectory     = tempDir;
             options.DeleteOriginalFile  = false;
+
+            // Surface the mux-decision inputs as the worker received them — if the user
+            // ever sees these print as defaults while the master is configured otherwise,
+            // it points at a metadata-flow bug rather than a transcode-logic bug.
+            Console.WriteLine($"Cluster: Encoding {workItem.FileName} — " +
+                $"EncodingMode={options.EncodingMode}, MuxStreams={options.MuxStreams}, " +
+                $"Is4K={workItem.Is4K}, IsHevc={workItem.IsHevc}, Bitrate={workItem.Bitrate}kbps");
 
             // Pull the master's integration credentials before every encode so
             // KeepOriginalLanguage lookups and OCR on this worker use the master's
