@@ -37,7 +37,7 @@ if %errorlevel% == 0 (
     echo ?? Optional Output: .\data\output (for separate output)
     echo ?? Logs Directory: .\data\logs
     echo.
-    echo ?? Health Check: http://localhost:6767/Home/Health
+    echo ?? Health Check: http://localhost:6767/api/health
     echo.
     echo ?? Usage Instructions:
     echo   1. Place your video files in the 'video-library' folder

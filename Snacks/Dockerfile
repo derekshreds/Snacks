@@ -12,8 +12,9 @@ RUN apt-get update && apt-get install -y curl gnupg && \
 
 # Install jellyfin-ffmpeg7 (latest available for Noble), Intel VAAPI drivers, supporting
 # libraries, and the runtime deps that SkiaSharp needs for its native bitmap decoder
-# (libfontconfig1, libfreetype6). Tesseract's native libs are carried by the TesseractOCR
-# NuGet so no apt package is needed for OCR itself.
+# (libfontconfig1, libfreetype6). The TesseractOCR NuGet only ships native libs for
+# Windows; on Linux its LibraryLoader dlopens the system libtesseract.so.5 /
+# libleptonica.so.6, so libtesseract5 + libleptonica must be present.
 RUN apt-get update && apt-get install -y \
     coreutils \
     jellyfin-ffmpeg7=7.1.3-5* \
@@ -25,6 +26,8 @@ RUN apt-get update && apt-get install -y \
     libva-drm2 \
     libfontconfig1 \
     libfreetype6 \
+    libtesseract5 \
+    libleptonica \
     && rm -rf /var/lib/apt/lists/*
 
 # Verify FFmpeg has VAAPI support
@@ -66,6 +69,6 @@ RUN mkdir -p /app/work/uploads /app/work/output /app/work/logs
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD curl -f http://localhost:6767/Home/Health || exit 1
+    CMD curl -f http://localhost:6767/api/health || exit 1
 
 ENTRYPOINT ["dotnet", "Snacks.dll"]

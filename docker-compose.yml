@@ -22,7 +22,7 @@ services:
     privileged: false
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6767/Home/Health"]
+      test: ["CMD", "curl", "-f", "http://localhost:6767/api/health"]
       interval: 30s
       timeout: 10s
       retries: 3
