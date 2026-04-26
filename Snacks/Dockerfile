@@ -27,7 +27,6 @@ RUN apt-get update && apt-get install -y \
     libfontconfig1 \
     libfreetype6 \
     libtesseract5 \
-    libleptonica \
     && rm -rf /var/lib/apt/lists/*
 
 # Verify FFmpeg has VAAPI support
