@@ -50,6 +50,7 @@ public sealed class ClusterService : IHostedService, IDisposable
     private readonly MediaFileRepository                       _mediaFileRepo;
     private readonly StateTransitionService                    _stateTransitions;
     private readonly NotificationService                       _notificationService;
+    private readonly IntegrationService                        _integrationService;
     private readonly ConcurrentDictionary<string, ClusterNode> _nodes = new();
     private readonly ConcurrentDictionary<string, WorkItem>    _remoteJobs         = new();
     private readonly ConcurrentDictionary<string, bool>        _activeDownloads    = new();
@@ -122,6 +123,7 @@ public sealed class ClusterService : IHostedService, IDisposable
         _mediaFileRepo       = mediaFileRepo;
         _stateTransitions    = stateTransitions;
         _notificationService = notificationService;
+        _integrationService  = integrationService;
 
         transcodingService.SetExternalDispatchGate(() => ShouldDispatchExternal);
 
@@ -1254,7 +1256,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                 JobId    = workItem.Id,
                 FileName = workItem.FileName,
                 FileSize = workItem.Size,
-                Options  = CloneOptions(options),
+                Options  = await CloneOptionsForWorkerAsync(options, workItem.Path, workItem.Id, jobCts.Token),
                 Probe    = workItem.Probe,
                 Duration = workItem.Length,
                 Bitrate  = workItem.Bitrate,
@@ -2482,7 +2484,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                                     JobId    = workItem.Id,
                                     FileName = workItem.FileName,
                                     FileSize = workItem.Size,
-                                    Options  = CloneOptions(options),
+                                    Options  = await CloneOptionsForWorkerAsync(options, workItem.Path, workItem.Id, recoveryCts.Token),
                                     Probe    = workItem.Probe,
                                     Duration = workItem.Length,
                                     Bitrate  = workItem.Bitrate,
@@ -2592,6 +2594,41 @@ public sealed class ClusterService : IHostedService, IDisposable
     {
         var json = JsonSerializer.Serialize(options, _jsonOptions);
         return JsonSerializer.Deserialize<EncoderOptions>(json, _jsonOptions) ?? new EncoderOptions();
+    }
+
+    /// <summary>
+    ///     Clones <paramref name="options"/> for shipping to a worker, and — if the job has
+    ///     <see cref="EncoderOptions.KeepOriginalLanguage"/> set — pre-resolves the original
+    ///     language on the master and merges it into the keep-lists. Workers can't run this
+    ///     lookup themselves: their workItem.Path is a temp upload path that doesn't match
+    ///     any Sonarr/Radarr root and the folder-name fallback hits a UUID job dir.
+    /// </summary>
+    private async Task<EncoderOptions> CloneOptionsForWorkerAsync(
+        EncoderOptions options, string originalPath, string workItemId, CancellationToken ct)
+    {
+        var clone = CloneOptions(options);
+        if (!clone.KeepOriginalLanguage) return clone;
+
+        try
+        {
+            var orig = await _integrationService.LookupOriginalLanguageAsync(
+                originalPath, clone.OriginalLanguageProvider, ct);
+            if (!string.IsNullOrEmpty(orig))
+            {
+                if (!clone.AudioLanguagesToKeep.Contains(orig))    clone.AudioLanguagesToKeep.Add(orig);
+                if (!clone.SubtitleLanguagesToKeep.Contains(orig)) clone.SubtitleLanguagesToKeep.Add(orig);
+                Console.WriteLine($"Cluster: Pre-resolved original language '{orig}' for {Path.GetFileName(originalPath)}");
+            }
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Cluster: Original-language pre-resolve failed for {workItemId}: {ex.Message}");
+        }
+
+        // Prevent the worker from re-attempting the lookup against its temp path.
+        clone.KeepOriginalLanguage = false;
+        return clone;
     }
 
     /******************************************************************
