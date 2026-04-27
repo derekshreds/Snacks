@@ -187,6 +187,12 @@ public class TranscodingService
     /// </summary>
     private async Task LogAsync(string workItemId, string message)
     {
+        // Any log line is a sign of life — refresh LastUpdatedAt so the watchdog
+        // doesn't kill jobs that are emitting output but no formal progress ticks
+        // (e.g. crop-detect, OCR pre-pass, hardware-accel probing).
+        if (_workItems.TryGetValue(workItemId, out var logItem))
+            logItem.Touch();
+
         await _hubContext.Clients.All.SendAsync("TranscodingLog", workItemId, message);
 
         if (_logCallback != null)
@@ -849,7 +855,38 @@ public class TranscodingService
                     workItem.Length = _ffprobeService.DurationStringToSeconds(workItem.Probe.Format.Duration);
             }
 
-            await ConvertVideoAsync(workItem, options, cancellationToken: jobCts.Token);
+            // Per-job watchdog: aborts the job if no log line, status change, or progress
+            // tick has refreshed LastUpdatedAt for 15 minutes. Defends against hangs in
+            // pre-encode stages (hardware-accel detection, FFprobe, crop-detect) that
+            // wouldn't be caught by FFmpeg's own no-output stall detection.
+            using var watchdogCts = new CancellationTokenSource();
+            var watchdogTask = Task.Run(async () =>
+            {
+                try
+                {
+                    while (!watchdogCts.IsCancellationRequested)
+                    {
+                        await Task.Delay(TimeSpan.FromSeconds(30), watchdogCts.Token);
+                        if ((DateTime.UtcNow - workItem.LastUpdatedAt) > TimeSpan.FromMinutes(15))
+                        {
+                            await LogAsync(workItem.Id, "Watchdog: no progress for 15 min — aborting job");
+                            jobCts.Cancel();
+                            return;
+                        }
+                    }
+                }
+                catch (OperationCanceledException) { }
+            });
+
+            try
+            {
+                await ConvertVideoAsync(workItem, options, cancellationToken: jobCts.Token);
+            }
+            finally
+            {
+                watchdogCts.Cancel();
+                try { await watchdogTask; } catch { }
+            }
 
             // ConvertVideoAsync's internal fail paths (e.g. truncation detection) call
             // MarkWorkItemFailed and return without throwing. Don't overwrite Failed status
