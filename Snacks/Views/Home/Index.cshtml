@@ -190,6 +190,58 @@
     </div>
 </div>
 
+<!-- Analyze Results Modal -->
+<div class="snacks-modal-backdrop" id="analyzeResultsModal" style="--snacks-modal-z: 9050">
+    <div class="snacks-modal-wrapper">
+        <div class="snacks-modal-dialog" style="max-width: 1100px;">
+            <div class="modal-header">
+                <h5 class="modal-title">
+                    <i class="fas fa-search me-2"></i>
+                    Directory Analysis
+                    <small class="text-muted ms-2" id="analyzeTargetLabel"></small>
+                </h5>
+                <button type="button" class="btn-close" onclick="document.getElementById('analyzeResultsModal').classList.remove('open')"></button>
+            </div>
+            <div class="modal-body">
+                <div id="analyzeLoading" class="text-center py-5">
+                    <div class="spinner-border text-info mb-3" role="status"><span class="visually-hidden">Analyzing...</span></div>
+                    <div class="text-muted">Probing files — this can take a moment on large folders.</div>
+                </div>
+                <div id="analyzeContent" style="display: none;">
+                    <div id="analyzeSummary" class="row g-2 mb-3"></div>
+                    <div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
+                        <div id="analyzeFilterTabs" class="btn-group btn-group-sm"></div>
+                        <input type="text" class="form-control form-control-sm" id="analyzeFilterText" placeholder="Filter by name..." style="max-width: 260px;">
+                    </div>
+                    <div class="border rounded" style="max-height: 55vh; overflow-y: auto;">
+                        <table class="table table-sm table-hover align-middle mb-0" id="analyzeTable">
+                            <thead class="sticky-top" style="background: var(--bg-surface, #1a1a1e);">
+                                <tr>
+                                    <th style="min-width: 260px;">File</th>
+                                    <th style="min-width: 220px; white-space: nowrap;">Source</th>
+                                    <th style="min-width: 340px;">Decision</th>
+                                </tr>
+                            </thead>
+                            <tbody id="analyzeTableBody"></tbody>
+                        </table>
+                    </div>
+                    <div id="analyzeEmpty" class="text-muted text-center py-4" style="display: none;">
+                        <i class="fas fa-inbox fa-2x mb-2"></i><br>No files match the current filter.
+                    </div>
+                </div>
+                <div id="analyzeError" class="alert alert-danger" style="display: none;"></div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" onclick="document.getElementById('analyzeResultsModal').classList.remove('open')">Close</button>
+                <button type="button" class="btn btn-primary" id="analyzeProceed" disabled>
+                    <i class="fas fa-folder-plus me-2"></i>
+                    Proceed with Conversion
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
 <!-- Settings Modal -->
 <div class="snacks-modal-backdrop" id="settingsModal">
     <div class="snacks-modal-wrapper">

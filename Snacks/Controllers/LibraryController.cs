@@ -173,6 +173,34 @@ public sealed class LibraryController : ControllerBase
         return new JsonResult(new { success = true, message = result });
     }
 
+    /// <summary>
+    ///     Dry-run preview: returns per-file Queue/Mux/Skip predictions for a directory under
+    ///     the supplied options without writing to the DB or queueing any work. Used by the
+    ///     "Analyze (Dry Run)" UI before the user commits to a real <c>process-directory</c>.
+    /// </summary>
+    /// <param name="request"> Directory path, encoder options, and recursion flag. </param>
+    [HttpPost("analyze-directory")]
+    public async Task<IActionResult> AnalyzeDirectory([FromBody] ProcessDirectoryRequest request)
+    {
+        try
+        {
+            ArgumentNullException.ThrowIfNull(request);
+            if (string.IsNullOrEmpty(request.DirectoryPath)) return BadRequest("Directory path is required");
+            if (request.Options == null) return BadRequest("Encoder options are required");
+            if (!Directory.Exists(request.DirectoryPath)) return BadRequest($"Directory does not exist: {request.DirectoryPath}");
+            if (!_fileService.IsPathAllowed(request.DirectoryPath))
+                return BadRequest("Directory is not within allowed library path");
+
+            var results = await _transcodingService.AnalyzeDirectoryAsync(
+                request.DirectoryPath, request.Options, request.Recursive, HttpContext.RequestAborted);
+            return new JsonResult(new { success = true, results });
+        }
+        catch (OperationCanceledException)
+        {
+            return StatusCode(499, "Analysis cancelled");
+        }
+    }
+
     /// <summary> Enqueues a single video file using the supplied encoder options. </summary>
     /// <param name="request"> File path and encoder options. </param>
     [HttpPost("process-file")]
