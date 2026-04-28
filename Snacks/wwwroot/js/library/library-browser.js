@@ -36,12 +36,16 @@ export class LibraryBrowser {
      * @param {object} deps
      * @param {() => void} deps.onWatchAdded
      *        Called after a directory is successfully added to auto-scan.
+     * @param {(path: string, recursive: boolean) => void} [deps.onAnalyzeRequested]
+     *        Called when the user clicks the "Analyze (Dry Run)" button. The
+     *        composition root forwards this to the AnalyzeModal.
      */
-    constructor({ onWatchAdded } = {}) {
-        this._currentDir    = null;
-        this._rootDir       = null;
-        this._selectedFiles = new Set();
-        this._onWatchAdded  = onWatchAdded ?? (() => {});
+    constructor({ onWatchAdded, onAnalyzeRequested } = {}) {
+        this._currentDir         = null;
+        this._rootDir            = null;
+        this._selectedFiles      = new Set();
+        this._onWatchAdded       = onWatchAdded       ?? (() => {});
+        this._onAnalyzeRequested = onAnalyzeRequested ?? (() => {});
     }
 
 
@@ -150,6 +154,9 @@ export class LibraryBrowser {
             html += `<div class="directory-item p-2 border-bottom bg-success bg-opacity-10" id="dirProcessRecursive" style="cursor:pointer;">
                 <i class="fas fa-layer-group text-success me-2"></i><span>Process Folder + Subfolders</span>
             </div>`;
+            html += `<div class="directory-item p-2 border-bottom" id="dirAnalyze" style="cursor:pointer; opacity: 0.8;">
+                <i class="fas fa-search me-2" style="color: var(--bs-info);"></i><span>Analyze (Dry Run)</span>
+            </div>`;
             html += `<div class="directory-item p-2 border-bottom" id="dirWatch" style="cursor:pointer; opacity: 0.8;">
                 <i class="fas fa-eye me-2" style="color: var(--primary);"></i><span>Watch This Folder (Auto-Scan)</span>
             </div>`;
@@ -171,6 +178,7 @@ export class LibraryBrowser {
             });
             document.getElementById('dirProcess')         .addEventListener('click', () => this.processCurrentDirectory(false));
             document.getElementById('dirProcessRecursive').addEventListener('click', () => this.processCurrentDirectory(true));
+            document.getElementById('dirAnalyze')         .addEventListener('click', () => this.analyzeCurrentDirectory(true));
             document.getElementById('dirWatch')           .addEventListener('click', () => this._watchDirectory(directoryPath));
 
             container.querySelectorAll('.directory-item[data-path]').forEach(item => {
@@ -334,6 +342,23 @@ export class LibraryBrowser {
         } catch (err) {
             showToast('Error processing directory: ' + err.message, 'danger');
         }
+    }
+
+    /**
+     * Hands the current directory off to the analyze (dry-run) modal so the
+     * user can preview what would be queued before committing. The library
+     * modal stays open behind the analyze modal so a Close on the analyze
+     * modal returns the user to where they were.
+     *
+     * @param {boolean} [recursive=true] Descend into subfolders when true.
+     */
+    analyzeCurrentDirectory(recursive = true) {
+        const dirPath = this._currentDir || this._rootDir;
+        if (!dirPath) {
+            showToast('No directory available', 'warning');
+            return;
+        }
+        this._onAnalyzeRequested(dirPath, recursive);
     }
 
 

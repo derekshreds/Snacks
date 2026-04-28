@@ -33,16 +33,18 @@ async function getJson(url) {
 /**
  * Issues a POST with a JSON body and returns the parsed JSON response.
  *
- * @param {string} url
- * @param {unknown} [body] Sent as `{}` when omitted/null.
+ * @param {string}      url
+ * @param {unknown}     [body]    Sent as `{}` when omitted/null.
+ * @param {AbortSignal} [signal]  Optional — abort the request when triggered.
  * @returns {Promise<any>}
  * @throws {Error} When the response status is not OK.
  */
-async function postJson(url, body) {
+async function postJson(url, body, signal) {
     const resp = await fetch(url, {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify(body ?? {}),
+        signal,
     });
     if (!resp.ok) throw new Error(`POST ${url} → ${resp.status}`);
     return resp.json();
@@ -169,6 +171,16 @@ export const libraryApi = {
     /** Enqueues a single video file at `filePath` with the given encoder `options`. */
     processFile: (filePath, options) =>
         postJson('/api/library/process-file', { filePath, options }),
+
+    /**
+     * Dry-run preview: returns per-file decisions for `directoryPath` under `options`
+     * without writing to the DB or queueing any work. Resolves `{ success, results }`
+     * where each result has `decision`, `reason`, codec/bitrate metadata, and an
+     * `encodeTargetKbps` for Queue/Shrink/Copy rows. Pass an `AbortSignal` to cancel
+     * a long-running analysis (the server honors it via `HttpContext.RequestAborted`).
+     */
+    analyzeDirectory: (directoryPath, recursive, options, signal) =>
+        postJson('/api/library/analyze-directory', { directoryPath, recursive, options }, signal),
 };
 
 

@@ -36,6 +36,7 @@ import { StopCancelDialog }     from './queue/stop-cancel-dialog.js';
 import { QueueManager }         from './queue/queue-manager.js';
 
 import { LibraryBrowser }       from './library/library-browser.js';
+import { AnalyzeModal }         from './library/analyze-modal.js';
 
 import { ClusterDashboard }     from './cluster/cluster-dashboard.js';
 import { ClusterSettingsForm }  from './cluster/cluster-settings-form.js';
@@ -118,14 +119,19 @@ document.addEventListener('DOMContentLoaded', () => {
         (id) => queueManager.cancel(id),
     );
 
-    const queueManager = new QueueManager({ stopCancelDialog, logViewer, pauseControl });
-    const library      = new LibraryBrowser({ onWatchAdded: () => autoScan.reload() });
+    const queueManager  = new QueueManager({ stopCancelDialog, logViewer, pauseControl });
+    const analyzeModal  = new AnalyzeModal();
+    const library       = new LibraryBrowser({
+        onWatchAdded:       () => autoScan.reload(),
+        onAnalyzeRequested: (dirPath, recursive) => analyzeModal.open(dirPath, recursive),
+    });
 
 
     // 3. Initialize (bind DOM events). No data fetches here — those happen in step 4.
     pauseControl.init();
     queueManager.init();
     library.init();
+    analyzeModal.init();
     autoScan.init();
     clusterSettings.init();
 

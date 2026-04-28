@@ -434,6 +434,18 @@ public class TranscodingService
                 return workItem.Id;
             }
 
+            // No-op gate: an HEVC file just above the bitrate ceiling would otherwise fall through
+            // to a videoCopy=true encode, and if the audio/sub pipeline has nothing to change either,
+            // running ffmpeg just produces a near-identical output. Skip it instead.
+            if (!bypassSkip && WouldEncodeBeNoOp(
+                    options, bitrate, isHevc, videoStream?.Height ?? 0, FfprobeService.IsHdr(probe),
+                    ProjectAudioSummaries(probe), ProjectSubtitleSummaries(probe)))
+            {
+                Console.WriteLine($"Skipping {workItem.FileName}: no work to do (video would copy, no audio/sub changes, no filters)");
+                await MarkSkippedInDb();
+                return workItem.Id;
+            }
+
             Console.WriteLine($"Queuing {workItem.FileName}: {sourceCodec} {bitrate}kbps {(isHighDef ? "4K" : "HD")}");
 
             if (_workItems.Values.Any(w =>
@@ -569,6 +581,313 @@ public class TranscodingService
         }
 
         return $"Added {addedCount} files from directory";
+    }
+
+    /// <summary>
+    ///     Dry-run analysis of a directory: probes each video file and predicts whether it would
+    ///     be queued, mux-passed, copied, or skipped under the given options, without touching
+    ///     the database or queue. Decision logic mirrors <see cref="AddFileAsync"/>; keep in sync
+    ///     when skip rules change. Skips the 15s video-only bitrate remeasurement, so files just
+    ///     above the skip ceiling are flagged <see cref="FileAnalysisResult.Borderline"/> — the
+    ///     real run may decide differently once the accurate video-only bitrate is known.
+    /// </summary>
+    /// <param name="directoryPath">Directory to scan.</param>
+    /// <param name="options">Encoder options used for the prediction.</param>
+    /// <param name="recursive">When <see langword="true"/>, subdirectories are included.</param>
+    /// <param name="cancellationToken">Token to abort a long-running analysis.</param>
+    public async Task<List<FileAnalysisResult>> AnalyzeDirectoryAsync(
+        string directoryPath, EncoderOptions options, bool recursive = true, CancellationToken cancellationToken = default)
+    {
+        var directories = recursive
+            ? _fileService.RecursivelyFindDirectories(directoryPath)
+            : new List<string> { directoryPath };
+        var videoFiles = _fileService.GetAllVideoFiles(directories);
+
+        var results = new List<FileAnalysisResult>(videoFiles.Count);
+        foreach (var file in videoFiles)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            results.Add(await AnalyzeFileAsync(file, options, cancellationToken));
+        }
+        return results;
+    }
+
+    /// <summary>
+    ///     Predicts what would happen to a single file under <paramref name="options"/>. Never
+    ///     writes to the DB, never queues work. Returns a result with <c>Decision = "Error"</c>
+    ///     when probing fails rather than throwing.
+    /// </summary>
+    private async Task<FileAnalysisResult> AnalyzeFileAsync(string filePath, EncoderOptions options, CancellationToken cancellationToken)
+    {
+        var result = new FileAnalysisResult
+        {
+            FilePath = filePath,
+            FileName = _fileService.GetFileName(filePath),
+        };
+
+        try
+        {
+            var fileInfo = new FileInfo(filePath);
+            result.SizeBytes = fileInfo.Length;
+
+            var normalizedPath = Path.GetFullPath(filePath);
+            var dbFile = await _mediaFileRepo.GetByPathAsync(normalizedPath);
+
+            // Reuse cached probe data when the file on disk hasn't moved much since the DB
+            // record was written. Same change-detection thresholds AddFileAsync uses (>10%
+            // size delta or >30s duration delta = treat as a different file). Avoids an
+            // expensive ffprobe on every file in large libraries.
+            bool dbFresh = false;
+            if (dbFile != null && dbFile.FileSize > 0 && !string.IsNullOrEmpty(dbFile.Codec))
+            {
+                double sizeDelta = Math.Abs(1.0 - (double)fileInfo.Length / dbFile.FileSize);
+                bool mtimeMatches = dbFile.FileMtime == fileInfo.LastWriteTimeUtc.Ticks;
+                dbFresh = mtimeMatches && sizeDelta <= 0.10;
+            }
+
+            string sourceCodec;
+            long bitrate;
+            int width, height;
+            double length;
+            bool isHevc, isAv1;
+            ProbeResult? probe = null;
+            string? pixelFormat = null;
+
+            if (dbFresh)
+            {
+                sourceCodec = dbFile!.Codec;
+                bitrate = dbFile.Bitrate;
+                width = dbFile.Width;
+                height = dbFile.Height;
+                length = dbFile.Duration;
+                isHevc = dbFile.IsHevc;
+                isAv1 = string.Equals(sourceCodec, "av1", StringComparison.OrdinalIgnoreCase);
+                pixelFormat = dbFile.PixelFormat;
+            }
+            else
+            {
+                probe = await _ffprobeService.ProbeAsync(filePath, cancellationToken);
+                length = _ffprobeService.GetVideoDuration(probe);
+                var videoStream = probe.Streams.FirstOrDefault(s => s.CodecType == "video");
+                sourceCodec = videoStream?.CodecName ?? "unknown";
+                isHevc = sourceCodec == "hevc";
+                isAv1 = sourceCodec == "av1";
+                width = videoStream?.Width ?? 0;
+                height = videoStream?.Height ?? 0;
+                pixelFormat = videoStream?.PixFmt;
+                bitrate = length > 0 ? (long)(fileInfo.Length * 8 / length / 1000) : 0;
+            }
+
+            result.Codec = sourceCodec;
+            result.BitrateKbps = bitrate;
+            result.Width = width;
+            result.Height = height;
+            result.Duration = length;
+
+            bool targetIsHevc = options.Encoder.Contains("265");
+            bool targetIsAv1 = options.Encoder.Contains("av1") || options.Encoder.Contains("svt");
+            bool alreadyTargetCodec = targetIsAv1 ? isAv1 : (targetIsHevc ? isHevc : !isHevc);
+            bool isHighDef = width > 1920;
+            result.Is4K = isHighDef;
+
+            string targetCodecLabel = targetIsAv1 ? "AV1" : (targetIsHevc ? "HEVC" : "H.264");
+
+            // Borderline = real run's remeasured video-only bitrate could flip Queue/Skip.
+            // Window: 30% above the applicable ceiling — wider flagged nearly every file.
+            double skipMultiplier = 1.0 + (Math.Clamp(options.SkipPercentAboveTarget, 0, 100) / 100.0);
+            int fourKMultiplier = Math.Clamp(options.FourKBitrateMultiplier, 2, 8);
+            int fourKTarget = options.TargetBitrate * fourKMultiplier;
+            int borderlineCeiling = isHighDef ? fourKTarget : options.TargetBitrate;
+            borderlineCeiling = (int)(borderlineCeiling * skipMultiplier);
+            result.Borderline = alreadyTargetCodec && bitrate > borderlineCeiling
+                && bitrate <= borderlineCeiling * 1.3 && length > 5;
+
+            // Library exclusion rules — same provider used by AddFileAsync. Mirrors the
+            // non-forced path; analyze never has `force` because it's a preview.
+            var exclusions = GetExclusionRules();
+            if (exclusions != null)
+            {
+                string? resolutionLabel = ExclusionRules.ClassifyResolution(width, height);
+                if (exclusions.IsExcluded(Path.GetFileName(normalizedPath), fileInfo.Length, resolutionLabel))
+                {
+                    result.Decision = "Excluded";
+                    result.Reason  = "Excluded by library rules.";
+                    return result;
+                }
+            }
+
+            // DB status: split the AddFileAsync "previously failed/cancelled/completed" lump
+            // into distinct decisions so the UI can group them on separate filter tabs.
+            // Skipped status is not terminal — it gets re-evaluated under current options below.
+            if (dbFile != null && dbFresh)
+            {
+                if (dbFile.Status == MediaFileStatus.Completed)
+                {
+                    result.Decision = "AlreadyCompleted";
+                    result.Reason   = "Already encoded in a previous run.";
+                    return result;
+                }
+                if (dbFile.Status == MediaFileStatus.Failed)
+                {
+                    result.Decision = "AlreadyFailed";
+                    result.Reason   = $"Previous run failed ({dbFile.FailureCount} attempt{(dbFile.FailureCount == 1 ? "" : "s")}).";
+                    return result;
+                }
+                if (dbFile.Status == MediaFileStatus.Cancelled)
+                {
+                    result.Decision = "AlreadyCancelled";
+                    result.Reason   = "Cancelled in a previous run.";
+                    return result;
+                }
+            }
+
+            // EncodingMode/MuxStreams gates — must precede the bitrate/codec ladder so a
+            // Hybrid+muxable file shows as Mux instead of Skip. We need stream summaries to
+            // answer HasMuxableWork; build them from probe (or from the cached DB blob when
+            // we skipped the probe).
+            IReadOnlyList<AudioStreamSummary> audioStreams;
+            IReadOnlyList<SubtitleStreamSummary> subtitleStreams;
+            if (probe != null)
+            {
+                audioStreams    = ProjectAudioSummaries(probe);
+                subtitleStreams = ProjectSubtitleSummaries(probe);
+            }
+            else
+            {
+                audioStreams    = MuxStreamSummary.DeserializeAudio(dbFile?.AudioStreams);
+                subtitleStreams = MuxStreamSummary.DeserializeSubtitle(dbFile?.SubtitleStreams);
+            }
+            bool hasMuxableWork = HasMuxableWork(options, audioStreams, subtitleStreams);
+            bool bypassSkip     = options.EncodingMode != EncodingMode.Transcode && hasMuxableWork;
+
+            if (options.EncodingMode == EncodingMode.MuxOnly && !hasMuxableWork)
+            {
+                result.Decision = "Skip";
+                result.Reason   = "MuxOnly mode and no audio/subtitle work to do.";
+                return result;
+            }
+
+            if (options.Skip4K && isHighDef)
+            {
+                result.Decision = "Skip";
+                result.Reason   = $"4K video ({width}×{height}) — Skip 4K enabled.";
+                return result;
+            }
+
+            string tolLabel = options.SkipPercentAboveTarget > 0
+                ? $" (target {options.TargetBitrate} + {options.SkipPercentAboveTarget}% tolerance)"
+                : $" (target {options.TargetBitrate}kbps)";
+            int skipCeilingHd = (int)(options.TargetBitrate * skipMultiplier);
+            int skipCeiling4K = (int)(fourKTarget * skipMultiplier);
+
+            if (alreadyTargetCodec && bitrate > 0 && bitrate <= skipCeilingHd && !isHighDef && !bypassSkip)
+            {
+                result.Decision = "Skip";
+                result.Reason   = $"Already {targetCodecLabel} · {bitrate}kbps ≤ {skipCeilingHd}kbps{tolLabel}.";
+                return result;
+            }
+
+            if (alreadyTargetCodec && isHighDef && bitrate > 0 && bitrate <= skipCeiling4K && !bypassSkip)
+            {
+                result.Decision = "Skip";
+                result.Reason   = $"Already {targetCodecLabel} 4K · {bitrate}kbps ≤ {skipCeiling4K}kbps (4K target {fourKTarget}kbps).";
+                return result;
+            }
+
+            bool isVaapiMode = IsVaapiAcceleration(options.HardwareAcceleration) ||
+                (options.HardwareAcceleration.Equals("auto", StringComparison.OrdinalIgnoreCase) &&
+                 _detectedHardware != null && IsVaapiAcceleration(_detectedHardware));
+            if (isVaapiMode && !isHevc && targetIsHevc && bitrate > 0 && bitrate <= options.TargetBitrate && !isHighDef && !bypassSkip)
+            {
+                result.Decision = "Skip";
+                result.Reason   = $"VAAPI can't compress {bitrate}kbps H.264 below {options.TargetBitrate}kbps target.";
+                return result;
+            }
+
+            // No-op gate (mirrors AddFileAsync). Detecting HDR requires the probe; when we used
+            // cached DB data the safe fall-back is "isHdr unknown → don't claim no-op," which we
+            // express by treating the cached path as never-HDR (matches AddFileAsync conservatively
+            // since the DB doesn't carry HDR metadata).
+            int sourceHeight = height;
+            bool isHdr = probe != null && FfprobeService.IsHdr(probe);
+            if (!bypassSkip && WouldEncodeBeNoOp(options, bitrate, isHevc, sourceHeight, isHdr, audioStreams, subtitleStreams))
+            {
+                result.Decision = "Skip";
+                result.Reason   = $"Already {targetCodecLabel} at {bitrate}kbps · no audio/subtitle changes · no filters — nothing to do.";
+                return result;
+            }
+
+            // The skip ladder cleared — predict what the encode pass actually does. When the
+            // mode is Hybrid/MuxOnly and the file qualifies for a mux pass (already-target or
+            // MuxOnly), the encoder runs with -c:v copy. Otherwise replicate CalculateBitrates.
+            bool meetsBitrateTarget = alreadyTargetCodec && bitrate > 0
+                && bitrate <= (isHighDef ? skipCeiling4K : skipCeilingHd);
+            bool isMuxPass = options.EncodingMode != EncodingMode.Transcode && hasMuxableWork
+                && (options.EncodingMode == EncodingMode.MuxOnly || meetsBitrateTarget);
+            if (isMuxPass)
+            {
+                result.EncodeTargetKbps = 0;
+                result.Decision = "Mux";
+                result.Reason   = options.EncodingMode == EncodingMode.MuxOnly
+                    ? $"MuxOnly · {targetCodecLabel} {bitrate}kbps — copy video, mux audio/subs."
+                    : $"Hybrid mux pass · already {targetCodecLabel} at {bitrate}kbps — copy video, mux audio/subs.";
+                return result;
+            }
+
+            // CalculateBitrates path — keep aligned with TranscodingService.CalculateBitrates.
+            bool willDownscaleBelow4K = WillDownscaleBelow4K(options);
+            bool useFourKBudget = isHighDef && !willDownscaleBelow4K;
+            int hdReference = useFourKBudget ? fourKTarget : options.TargetBitrate;
+            int encodeTarget;
+
+            if (options.StrictBitrate)
+            {
+                encodeTarget    = options.TargetBitrate;
+                result.Decision = "Queue";
+                result.Reason   = $"{sourceCodec} {bitrate}kbps {(isHighDef ? "4K" : "HD")} → {targetCodecLabel} @ {encodeTarget}kbps (strict).";
+            }
+            else if (useFourKBudget && bitrate > 0 && bitrate < hdReference + 700 && !isHevc)
+            {
+                encodeTarget    = (int)(bitrate * 0.7);
+                result.Decision = "Shrink";
+                result.Reason   = $"{sourceCodec} 4K {bitrate}kbps below {hdReference + 700}kbps threshold → {targetCodecLabel} @ {encodeTarget}kbps (source × 0.7).";
+            }
+            else if (!useFourKBudget && bitrate > 0 && bitrate < options.TargetBitrate + 700 && !isHevc)
+            {
+                encodeTarget    = (int)(bitrate * 0.7);
+                result.Decision = "Shrink";
+                result.Reason   = $"{sourceCodec} {bitrate}kbps below {options.TargetBitrate + 700}kbps threshold → {targetCodecLabel} @ {encodeTarget}kbps (source × 0.7).";
+            }
+            else if (isHevc && bitrate > 0 && bitrate < options.TargetBitrate + 700
+                     && !HasActiveFilter(options, sourceHeight, isHdr))
+            {
+                // CalculateBitrates' final video-copy override: HEVC source below target+700
+                // with no active filter ⇒ -c:v copy (independent of the 4K branch). Filters
+                // would flip videoCopy back to false at encode time, so we exclude that case
+                // here and let it fall through to the Queue branch below.
+                encodeTarget    = 0;
+                result.Decision = "Copy";
+                result.Reason   = $"Already HEVC at {bitrate}kbps · audio/sub work to apply → -c:v copy with stream re-mapping.";
+            }
+            else
+            {
+                encodeTarget    = bitrate > 0 ? (int)Math.Min(hdReference, bitrate) : hdReference;
+                result.Decision = "Queue";
+                result.Reason   = $"{sourceCodec} {bitrate}kbps {(isHighDef ? "4K" : "HD")} → {targetCodecLabel} @ {encodeTarget}kbps.";
+            }
+            result.EncodeTargetKbps = encodeTarget;
+            return result;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            result.Decision = "Error";
+            result.Reason   = $"Probe failed: {ex.Message}";
+            return result;
+        }
     }
 
     /// <summary>Returns the work item with the specified ID, or <c>null</c> if not found.</summary>
@@ -1539,6 +1858,66 @@ public class TranscodingService
     }
 
     /// <summary>
+    ///     Returns <see langword="true"/> when an encode would do nothing meaningful: the video
+    ///     stream would be copied (HEVC under <c>TargetBitrate + 700</c> with no filter-forced
+    ///     re-encode) and neither the audio nor subtitle pipeline would change anything. Used as
+    ///     a skip-ladder rung in <see cref="AddFileAsync"/> so we don't run ffmpeg just to produce
+    ///     a near-identical output.
+    /// </summary>
+    private static bool WouldEncodeBeNoOp(
+        EncoderOptions options,
+        long bitrate,
+        bool isHevc,
+        int sourceHeight,
+        bool isHdr,
+        IReadOnlyList<AudioStreamSummary> audioStreams,
+        IReadOnlyList<SubtitleStreamSummary> subtitleStreams)
+    {
+        // Video would only stream-copy when CalculateBitrates' override fires AND no filter
+        // forces a re-encode (matches the videoCopy=false flip-back in ConvertVideoAsync).
+        bool videoCopyEligible = isHevc && bitrate > 0 && bitrate < options.TargetBitrate + 700;
+        if (!videoCopyEligible)                              return false;
+        if (HasActiveFilter(options, sourceHeight, isHdr))   return false;
+
+        // Audio/sub work checks are intentionally EncodingMode-agnostic — the encoder pipeline
+        // applies these in any mode, so they're the right test for "would the audio/sub mapping
+        // actually change anything?"
+        if (HasAudioWork(options, audioStreams))             return false;
+        if (HasSubtitleWork(options, subtitleStreams))       return false;
+
+        return true;
+    }
+
+    /// <summary>
+    ///     Returns <see langword="true"/> when any video-stream filter (crop, downscale, HDR
+    ///     tonemap) would be active for this source. Used by both the no-op skip gate and the
+    ///     analyze preview's Copy-vs-Queue prediction, since an active filter forces a re-encode
+    ///     even when bitrate logic would otherwise have chosen <c>videoCopy</c>.
+    /// </summary>
+    private static bool HasActiveFilter(EncoderOptions options, int sourceHeight, bool isHdr)
+    {
+        if (options.RemoveBlackBorders)                       return true;
+        if (WouldDownscale(options, sourceHeight))            return true;
+        if (options.TonemapHdrToSdr && isHdr)                 return true;
+        return false;
+    }
+
+    /// <summary>
+    ///     Returns <see langword="true"/> when the active downscale policy would actually fire
+    ///     for a source of the given height. Mirrors <see cref="ComputeScaleExpr"/>'s decision
+    ///     without producing an FFmpeg expression.
+    /// </summary>
+    private static bool WouldDownscale(EncoderOptions options, int sourceHeight)
+    {
+        if (!IsDownscalePolicyActive(options.DownscalePolicy)) return false;
+        if (sourceHeight <= 0)                                 return false;
+
+        int targetH = ResolveDownscaleHeight(options.DownscaleTarget);
+        bool always = string.Equals(options.DownscalePolicy, "Always", StringComparison.OrdinalIgnoreCase);
+        return always || sourceHeight > targetH;
+    }
+
+    /// <summary>
     ///     Pure function that mirrors the scan-phase skip gate using only <see cref="MediaFile"/>
     ///     fields (no probe required). Returns <see langword="true"/> when the file would still be
     ///     skipped under the given options — used on settings-save to decide whether to reset
@@ -1576,7 +1955,26 @@ public class TranscodingService
             ? options.TargetBitrate * fourKMultiplier
             : options.TargetBitrate;
 
-        return mf.Bitrate <= ceilingKbps * skipMultiplier;
+        if (mf.Bitrate <= ceilingKbps * skipMultiplier) return true;
+
+        // No-op gate — mirrors AddFileAsync's WouldEncodeBeNoOp rung. An HEVC file just above
+        // the ceiling but under target+700 would get a videoCopy=true encode at run-time, and
+        // if there's no audio/sub work or filters either, the encode is a near-no-op. MediaFile
+        // doesn't carry HDR metadata so we treat tonemap as inactive here — worst case the file
+        // gets re-evaluated by AddFileAsync, which has the probe and will catch the HDR case.
+        if (mf.IsHevc && mf.Bitrate < options.TargetBitrate + 700)
+        {
+            var audioStreams = MuxStreamSummary.DeserializeAudio(mf.AudioStreams);
+            var subStreams   = MuxStreamSummary.DeserializeSubtitle(mf.SubtitleStreams);
+            if (!HasActiveFilter(options, mf.Height, isHdr: false)
+                && !HasAudioWork(options, audioStreams)
+                && !HasSubtitleWork(options, subStreams))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>
