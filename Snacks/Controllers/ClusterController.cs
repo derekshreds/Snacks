@@ -505,6 +505,10 @@ public sealed class ClusterController : ControllerBase
             if (long.TryParse(totalSizeHeader, out var totalSize) && totalSize > 0)
             {
                 var percent = (int)(fileSize * 100 / totalSize);
+                // assignedNodeName is intentionally omitted: this broadcast goes
+                // to the worker's own hub, where the work item is being processed
+                // locally. The "Processing on remote node X" badge would mislabel
+                // it (the worker is the processor, not "master").
                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", new
                 {
                     id = jobId,
@@ -513,7 +517,6 @@ public sealed class ClusterController : ControllerBase
                     progress = 0,
                     remoteJobPhase = "Uploading",
                     transferProgress = percent,
-                    assignedNodeName = "master",
                     size = totalSize,
                     bitrate,
                     length = duration,
@@ -554,6 +557,9 @@ public sealed class ClusterController : ControllerBase
                         // doesn't stay stuck at "Uploading 100%" through the OCR
                         // pre-pass — there is no other broadcast on the worker's
                         // hub for this job until encode completion otherwise.
+                        // assignedNodeName is intentionally omitted: this worker
+                        // is processing the job locally, so the "Processing on
+                        // remote node X" badge would mislabel it.
                         await _hubContext.Clients.All.SendAsync("WorkItemUpdated", new
                         {
                             id               = jobId,
@@ -562,7 +568,6 @@ public sealed class ClusterController : ControllerBase
                             progress         = 0,
                             remoteJobPhase   = "Encoding",
                             transferProgress = 0,
-                            assignedNodeName = "master",
                             size             = totalSize,
                             bitrate,
                             length           = duration,
@@ -739,6 +744,9 @@ public sealed class ClusterController : ControllerBase
         var chunkHash = Convert.ToHexString(incrementalHash.GetHashAndReset()).ToLower();
 
         var percent = totalSize > 0 ? (int)((offset + length) * 100 / totalSize) : 0;
+        // assignedNodeName is intentionally omitted: this broadcast goes to the
+        // worker's own hub, where the work item was processed locally. The
+        // "Processing on remote node X" badge would mislabel the source node.
         await _hubContext.Clients.All.SendAsync("WorkItemUpdated", new
         {
             id = jobId,
@@ -747,7 +755,6 @@ public sealed class ClusterController : ControllerBase
             progress = 100,
             remoteJobPhase = "Downloading",
             transferProgress = percent,
-            assignedNodeName = "master",
             size = totalSize,
             bitrate = 0L,
             length = 0.0,

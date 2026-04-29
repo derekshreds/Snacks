@@ -268,11 +268,26 @@ export function updateWorkItemDom(element, workItem, clusterEnabled) {
     }
 
 
-    // Assigned-node badge.
+    // Assigned-node badge. Create on demand if a card that started without
+    // an assignment later gets dispatched — otherwise the badge would only
+    // appear after a full rebuild and the card stays unlabeled in the meantime.
     const nodeBadge = element.querySelector('.badge.bg-secondary');
     if (clusterEnabled && workItem.assignedNodeName) {
-        if (nodeBadge && !nodeBadge.textContent.includes(workItem.assignedNodeName)) {
-            nodeBadge.innerHTML = `<i class="fas fa-server me-1"></i>${escapeHtml(workItem.assignedNodeName)}`;
+        const inner = `<i class="fas fa-server me-1"></i>${escapeHtml(workItem.assignedNodeName)}`;
+        if (nodeBadge) {
+            if (!nodeBadge.textContent.includes(workItem.assignedNodeName))
+                nodeBadge.innerHTML = inner;
+        } else {
+            // Insert next to the status badge so it sits in the same row the
+            // initial getWorkItemHtml lays out (status-badge then node-badge).
+            const statusBadge = element.querySelector('.status-badge');
+            if (statusBadge) {
+                const span = document.createElement('span');
+                span.className   = 'badge bg-secondary flex-shrink-0';
+                span.title       = 'Processing on remote node';
+                span.innerHTML   = inner;
+                statusBadge.after(span);
+            }
         }
     } else if (nodeBadge && !workItem.assignedNodeName) {
         nodeBadge.remove();
