@@ -482,6 +482,18 @@ export class ClusterDashboard {
     }
 
     /**
+     * Repaints both the cluster panel and the node-mode banner from
+     * cached in-memory state, without re-fetching from the server. Used by
+     * the SPA shell when the queue page is re-mounted: the old DOM was
+     * thrown out during navigation, but the dashboard's worker/role state
+     * is still here, so we just need to draw it into the fresh DOM.
+     */
+    redraw() {
+        this.render();
+        this._updateBanner();
+    }
+
+    /**
      * Shows/hides the "running as node" banner at the top of the page and
      * updates the master's name/IP inside it.
      */

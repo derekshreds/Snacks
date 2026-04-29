@@ -235,6 +235,11 @@ document.addEventListener('DOMContentLoaded', () => {
         mount: () => {
             queueManager.init();
             queueManager.loadItems();
+            // The cluster panel and node-mode banner DOM only exist on the
+            // queue page. The dashboard module has the worker list cached
+            // in memory from its initial load, so we just need to repaint
+            // it into the freshly-mounted markup — no extra network call.
+            clusterDashboard.redraw();
         },
     });
 
