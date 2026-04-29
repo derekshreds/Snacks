@@ -2092,7 +2092,11 @@ public sealed class ClusterService : IHostedService, IDisposable
         var orphanThreshold = TimeSpan.FromMinutes(5);
         var stalledThreshold = TimeSpan.FromMinutes(10);
 
-        var activeLocal = _transcodingService.GetActiveWorkItem();
+        // Snapshot all in-flight local encodes — multi-slot can have several
+        // running concurrently
+        var activeLocalIds = new HashSet<string>(
+            _transcodingService.GetActiveLocalJobs().Select(j => j.JobId),
+            StringComparer.Ordinal);
 
         foreach (var item in _transcodingService.GetAllWorkItems())
         {
@@ -2112,10 +2116,11 @@ public sealed class ClusterService : IHostedService, IDisposable
                 continue;
             }
 
-            // (b) Orphaned local-side: no node assignment, not the master's active local job,
-            //     and not in _remoteJobs. This is the line-1014-leak recovery case.
+            // (b) Orphaned local-side: no node assignment, not running in any
+            //     of the master's active local slots, and not in _remoteJobs.
+            //     Recovers items leaked into a permanent in-progress state.
             if (item.AssignedNodeId == null
-                && (activeLocal == null || activeLocal.Id != item.Id)
+                && !activeLocalIds.Contains(item.Id)
                 && !_remoteJobs.ContainsKey(item.Id))
             {
                 Console.WriteLine($"Cluster: Watchdog: orphaned local-side item {item.FileName} ({sinceUpdate.TotalMinutes:F0}min silent) — requeueing");
