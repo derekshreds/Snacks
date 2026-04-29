@@ -50,6 +50,7 @@ public sealed class ClusterService : IHostedService, IDisposable
     private readonly MediaFileRepository                       _mediaFileRepo;
     private readonly StateTransitionService                    _stateTransitions;
     private readonly NotificationService                       _notificationService;
+    private readonly IntegrationService                        _integrationService;
     private readonly ConcurrentDictionary<string, ClusterNode> _nodes = new();
     private readonly ConcurrentDictionary<string, WorkItem>    _remoteJobs         = new();
     private readonly ConcurrentDictionary<string, bool>        _activeDownloads    = new();
@@ -92,6 +93,7 @@ public sealed class ClusterService : IHostedService, IDisposable
     private readonly string          _nodeSettingsPath;
     private Timer?                   _heartbeatTimer;
     private Timer?                   _dispatchTimer;
+    private Timer?                   _stuckWatchdogTimer;
     private CancellationTokenSource? _cts;
     private TaskCompletionSource     _recoveryComplete = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly SemaphoreSlim   _dispatchLock = new(1, 1);
@@ -130,6 +132,7 @@ public sealed class ClusterService : IHostedService, IDisposable
         _stateTransitions    = stateTransitions;
         _notificationService = notificationService;
         _encodeHistoryRepo   = encodeHistoryRepo;
+        _integrationService  = integrationService;
 
         transcodingService.SetExternalDispatchGate(() => ShouldDispatchExternal);
 
@@ -241,6 +244,7 @@ public sealed class ClusterService : IHostedService, IDisposable
         _cts?.Cancel();
         _heartbeatTimer?.Dispose();
         _dispatchTimer?.Dispose();
+        _stuckWatchdogTimer?.Dispose();
         _dispatchLock.Dispose();
         _cts?.Dispose();
         _cts = null;
@@ -619,6 +623,17 @@ public sealed class ClusterService : IHostedService, IDisposable
                 try { await RunDispatchAsync(); }
                 catch (Exception ex) { Console.WriteLine($"Cluster: Dispatch error: {ex.Message}"); }
             }, null, TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(2));
+
+            // Stuck-item watchdog: catches work items that have been orphaned into the
+            // Processing/Uploading/Downloading state with no owning processor — a permanent
+            // dead state that no other code path can rescue. First tick deferred 60s to
+            // give recovery time to settle.
+            _stuckWatchdogTimer = new Timer(async _ =>
+            {
+                if (_cts?.IsCancellationRequested == true) return;
+                try { await RunStuckItemWatchdogAsync(); }
+                catch (Exception ex) { Console.WriteLine($"Cluster: Stuck-item watchdog error: {ex.Message}"); }
+            }, null, TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(30));
         }
         else
         {
@@ -641,6 +656,8 @@ public sealed class ClusterService : IHostedService, IDisposable
         _heartbeatTimer = null;
         _dispatchTimer?.Dispose();
         _dispatchTimer = null;
+        _stuckWatchdogTimer?.Dispose();
+        _stuckWatchdogTimer = null;
 
         _cts?.Dispose();
         _cts = null;
@@ -679,6 +696,23 @@ public sealed class ClusterService : IHostedService, IDisposable
                 if (_nodes.TryRemove(kvp.Key, out _))
                 {
                     Console.WriteLine($"Cluster: Removed unreachable node {node.Hostname}");
+
+                    // Requeue any remote jobs still assigned to the now-removed node.
+                    // Without this, jobs whose owning node disappeared would linger in
+                    // _remoteJobs forever — a permanent orphan state.
+                    if (isMaster)
+                    {
+                        var orphanedJobIds = _remoteJobs
+                            .Where(rj => rj.Value.AssignedNodeId == node.NodeId)
+                            .Select(rj => rj.Key)
+                            .ToList();
+                        foreach (var jobId in orphanedJobIds)
+                        {
+                            Console.WriteLine($"Cluster: Requeueing orphaned job {jobId} from removed node {node.Hostname}");
+                            await HandleNodeFailureAsync(jobId);
+                        }
+                    }
+
                     await _hubContext.Clients.All.SendAsync("WorkerDisconnected", node.NodeId);
                     // Clean up dispatch tracking for removed node
                     _nodeDispatchCooldowns.TryRemove(kvp.Key, out _);
@@ -963,6 +997,16 @@ public sealed class ClusterService : IHostedService, IDisposable
             {
                 Console.WriteLine($"Cluster: Node {node.Hostname} idle for {graceCount} heartbeats for job {job.Id} — re-queuing");
                 _downloadRetryCounts.TryRemove(graceKey, out _);
+
+                // Tell the worker to kill any straggler encode for this job
+                // before requeuing — otherwise a confused worker that's still
+                // encoding silently could double-process the same job.
+                try { await client.DeleteAsync($"{baseUrl}/api/cluster/jobs/{job.Id}"); }
+                catch (Exception graceEx)
+                {
+                    Console.WriteLine($"Cluster: Grace-cancel DELETE failed for {job.Id}: {graceEx.Message}");
+                }
+
                 await HandleNodeFailureAsync(job.Id);
                 node.ActiveJobs.RemoveAll(j => j.JobId == job.Id);
                 if (node.ActiveWorkItemId == job.Id) node.ActiveWorkItemId = null;
@@ -1150,11 +1194,26 @@ public sealed class ClusterService : IHostedService, IDisposable
     {
         if (!_activeUploads.TryAdd(workItem.Id, true))
         {
-            // Another dispatch attempt for this exact work item is already in flight.
-            // Don't requeue — that races with the in-flight attempt and zeroes
-            // TransferProgress mid-upload. The in-flight attempt will publish progress
-            // and either succeed or hit its own retry/failure path.
-            Console.WriteLine($"Cluster: Upload already in progress for {workItem.FileName} — skipping duplicate dispatch");
+            if (_remoteJobs.ContainsKey(workItem.Id))
+            {
+                // A real concurrent dispatch is in flight (item is registered in
+                // _remoteJobs). Don't requeue — that races with the in-flight attempt
+                // and zeroes TransferProgress mid-upload.
+                Console.WriteLine($"Cluster: Upload already in progress for {workItem.FileName} — skipping duplicate dispatch");
+            }
+            else
+            {
+                // Stale _activeUploads entry from a prior aborted attempt. The work
+                // item was just dequeued and marked Processing by DequeueForRemoteProcessing —
+                // returning silently here would orphan it (no AssignedNodeId, not in
+                // _remoteJobs, not in _workQueue, not the master's _activeWorkItem).
+                // Clear the stale entry and requeue so the next dispatch tick can retry.
+                Console.WriteLine($"Cluster: Stale _activeUploads entry for {workItem.FileName} — clearing and requeueing");
+                _activeUploads.TryRemove(workItem.Id, out _);
+                _transcodingService.RequeueWorkItem(workItem, silent: true);
+            }
+            // Note: legacy per-node nodeLock.Release() removed when multi-slot
+            // dispatch eliminated the per-node serialization gate.
             return;
         }
 
@@ -1318,7 +1377,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                 JobId    = workItem.Id,
                 FileName = workItem.FileName,
                 FileSize = workItem.Size,
-                Options  = CloneOptions(options),
+                Options  = await CloneOptionsForWorkerAsync(options, workItem.Path, workItem.Id, jobCts.Token),
                 Probe    = workItem.Probe,
                 Duration = workItem.Length,
                 Bitrate  = workItem.Bitrate,
@@ -2004,6 +2063,77 @@ public sealed class ClusterService : IHostedService, IDisposable
             workItem.RemoteJobPhase   = null;
             await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Queued);
             _transcodingService.RequeueWorkItem(workItem);
+        }
+    }
+
+    /******************************************************************
+     *  Stuck-Item Watchdog
+     ******************************************************************/
+
+    /// <summary>
+    ///     Periodic safety net for items that have been orphaned into the
+    ///     <see cref="WorkItemStatus.Processing"/>, <see cref="WorkItemStatus.Uploading"/>,
+    ///     or <see cref="WorkItemStatus.Downloading"/> state but have no actual processor
+    ///     working on them. Without this, any future leak in the dispatch path produces
+    ///     a permanent dead state that no other code path rescues.
+    /// </summary>
+    /// <remarks>
+    ///     Runs master-only on a 30s tick, after recovery completes. Items younger than
+    ///     5 minutes by <see cref="WorkItem.LastUpdatedAt"/> are skipped to avoid racing
+    ///     legitimate startup. Stalled-remote items defer to a 10-minute threshold so this
+    ///     check cooperates with — and fires after — the existing 100-second grace counter.
+    /// </remarks>
+    private async Task RunStuckItemWatchdogAsync()
+    {
+        if (!IsMasterMode) return;
+        if (!_recoveryComplete.Task.IsCompleted) return;
+
+        var now            = DateTime.UtcNow;
+        var orphanThreshold = TimeSpan.FromMinutes(5);
+        var stalledThreshold = TimeSpan.FromMinutes(10);
+
+        var activeLocal = _transcodingService.GetActiveWorkItem();
+
+        foreach (var item in _transcodingService.GetAllWorkItems())
+        {
+            if (item.Status is not (WorkItemStatus.Processing
+                                    or WorkItemStatus.Uploading
+                                    or WorkItemStatus.Downloading))
+                continue;
+
+            var sinceUpdate = now - item.LastUpdatedAt;
+            if (sinceUpdate < orphanThreshold) continue;
+
+            // (a) Assigned to a node that no longer exists in the cluster.
+            if (item.AssignedNodeId != null && !_nodes.ContainsKey(item.AssignedNodeId))
+            {
+                Console.WriteLine($"Cluster: Watchdog: {item.FileName} assigned to ghost node {item.AssignedNodeId} — requeueing");
+                await HandleNodeFailureAsync(item.Id);
+                continue;
+            }
+
+            // (b) Orphaned local-side: no node assignment, not the master's active local job,
+            //     and not in _remoteJobs. This is the line-1014-leak recovery case.
+            if (item.AssignedNodeId == null
+                && (activeLocal == null || activeLocal.Id != item.Id)
+                && !_remoteJobs.ContainsKey(item.Id))
+            {
+                Console.WriteLine($"Cluster: Watchdog: orphaned local-side item {item.FileName} ({sinceUpdate.TotalMinutes:F0}min silent) — requeueing");
+                _transcodingService.RequeueWorkItem(item);
+                try { await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(item.Path), MediaFileStatus.Queued); }
+                catch (Exception ex) { Console.WriteLine($"Cluster: Watchdog: DB clear failed for {item.FileName}: {ex.Message}"); }
+                continue;
+            }
+
+            // (c) Stalled remote: tracked in _remoteJobs but no progress in 10 min.
+            //     Delegate to HandleNodeFailureAsync which respects RemoteFailureCount < 3.
+            if (item.AssignedNodeId != null
+                && _remoteJobs.ContainsKey(item.Id)
+                && sinceUpdate >= stalledThreshold)
+            {
+                Console.WriteLine($"Cluster: Watchdog: {item.FileName} stalled on {item.AssignedNodeName} ({sinceUpdate.TotalMinutes:F0}min silent) — requeueing");
+                await HandleNodeFailureAsync(item.Id);
+            }
         }
     }
 
@@ -2696,7 +2826,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                                     JobId    = workItem.Id,
                                     FileName = workItem.FileName,
                                     FileSize = workItem.Size,
-                                    Options  = CloneOptions(options),
+                                    Options  = await CloneOptionsForWorkerAsync(options, workItem.Path, workItem.Id, recoveryCts.Token),
                                     Probe    = workItem.Probe,
                                     Duration = workItem.Length,
                                     Bitrate  = workItem.Bitrate,
@@ -2806,6 +2936,41 @@ public sealed class ClusterService : IHostedService, IDisposable
     {
         var json = JsonSerializer.Serialize(options, _jsonOptions);
         return JsonSerializer.Deserialize<EncoderOptions>(json, _jsonOptions) ?? new EncoderOptions();
+    }
+
+    /// <summary>
+    ///     Clones <paramref name="options"/> for shipping to a worker, and — if the job has
+    ///     <see cref="EncoderOptions.KeepOriginalLanguage"/> set — pre-resolves the original
+    ///     language on the master and merges it into the keep-lists. Workers can't run this
+    ///     lookup themselves: their workItem.Path is a temp upload path that doesn't match
+    ///     any Sonarr/Radarr root and the folder-name fallback hits a UUID job dir.
+    /// </summary>
+    private async Task<EncoderOptions> CloneOptionsForWorkerAsync(
+        EncoderOptions options, string originalPath, string workItemId, CancellationToken ct)
+    {
+        var clone = CloneOptions(options);
+        if (!clone.KeepOriginalLanguage) return clone;
+
+        try
+        {
+            var orig = await _integrationService.LookupOriginalLanguageAsync(
+                originalPath, clone.OriginalLanguageProvider, ct);
+            if (!string.IsNullOrEmpty(orig))
+            {
+                if (!clone.AudioLanguagesToKeep.Contains(orig))    clone.AudioLanguagesToKeep.Add(orig);
+                if (!clone.SubtitleLanguagesToKeep.Contains(orig)) clone.SubtitleLanguagesToKeep.Add(orig);
+                Console.WriteLine($"Cluster: Pre-resolved original language '{orig}' for {Path.GetFileName(originalPath)}");
+            }
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Cluster: Original-language pre-resolve failed for {workItemId}: {ex.Message}");
+        }
+
+        // Prevent the worker from re-attempting the lookup against its temp path.
+        clone.KeepOriginalLanguage = false;
+        return clone;
     }
 
     /******************************************************************
