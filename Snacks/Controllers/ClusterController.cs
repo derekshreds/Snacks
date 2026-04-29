@@ -113,11 +113,18 @@ public sealed class ClusterController : ControllerBase
             nodeId = config.NodeId,
             status,
             isPaused,
-            currentJobId = _clusterService.GetCurrentRemoteJobId(),
-            progress = _clusterService.GetCurrentRemoteJobProgress(),
+            // Legacy single-slot fields — preserved so older masters that only
+            // read the first job still see a value.
+            currentJobId   = _clusterService.GetCurrentRemoteJobId(),
+            progress       = _clusterService.GetCurrentRemoteJobProgress(),
             completedJobId = _clusterService.GetCompletedJobId(),
             receivingJobId = _clusterService.GetReceivingJobId(),
-            diskSpace = capabilities.AvailableDiskSpaceBytes,
+            // Multi-slot fields — newer masters reconcile their per-device slot
+            // accounting against these arrays.
+            activeJobs      = _clusterService.GetActiveJobs(),
+            completedJobIds = _clusterService.GetCompletedJobIds(),
+            receivingJobIds = _clusterService.GetReceivingJobIds(),
+            diskSpace       = capabilities.AvailableDiskSpaceBytes,
             capabilities
         });
     }
@@ -541,6 +548,25 @@ public sealed class ClusterController : ControllerBase
 
                     if (!started)
                     {
+                        // Clear the synthetic 100% Uploading card we broadcast above —
+                        // encoding will never start for this id, so no follow-up
+                        // WorkItemUpdated would ever overwrite it. A non-transfer status
+                        // also trips the UI's throttled refresh, which reconciles the
+                        // orphan against the server's authoritative work-item list.
+                        await _hubContext.Clients.All.SendAsync("WorkItemUpdated", new
+                        {
+                            id               = jobId,
+                            fileName,
+                            status           = WorkItemStatus.Cancelled,
+                            progress         = 0,
+                            remoteJobPhase   = (string?)null,
+                            transferProgress = 0,
+                            completedAt      = DateTime.UtcNow,
+                            size             = 0L,
+                            bitrate          = 0L,
+                            length           = 0.0,
+                            createdAt        = DateTime.UtcNow
+                        });
                         return StatusCode(503, new { error = $"Node rejected encoding: {rejectReason}", size = fileSize });
                     }
                 }

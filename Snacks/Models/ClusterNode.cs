@@ -42,7 +42,8 @@ public sealed class ClusterNode
 
     /// <summary>
     ///     ID of the work item currently being processed by this node.
-    ///     Null when idle.
+    ///     Legacy single-slot field — derived from the first entry of
+    ///     <see cref="ActiveJobs"/> on multi-slot nodes. Null when idle.
     /// </summary>
     public string? ActiveWorkItemId { get; set; }
 
@@ -51,6 +52,14 @@ public sealed class ClusterNode
 
     /// <summary> Encoding progress percentage (0–100) for the active work item. </summary>
     public int ActiveProgress { get; set; }
+
+    /// <summary>
+    ///     All in-flight remote jobs on this node, one entry per occupied slot.
+    ///     Maintained by the master from heartbeat reports plus optimistic
+    ///     book-keeping on dispatch. Empty for legacy single-slot nodes that do
+    ///     not report <see cref="WorkerCapabilities.Devices"/>.
+    /// </summary>
+    public List<ActiveJobInfo> ActiveJobs { get; set; } = new();
 
     /// <summary> Total number of jobs successfully completed by this node. </summary>
     public int CompletedJobs { get; set; }
@@ -93,6 +102,18 @@ public sealed class WorkerCapabilities
     ///     False when busy, paused, or processing a remote job.
     /// </summary>
     public bool CanAcceptJobs { get; set; } = true;
+
+    /// <summary>
+    ///     Hardware devices this node can drive concurrently. One entry per
+    ///     vendor family the worker detected. Each device contributes its
+    ///     <see cref="HardwareDevice.DefaultConcurrency"/> slots to the master's
+    ///     dispatch pool, optionally overridden by
+    ///     <see cref="NodeSettings.DeviceSettings"/>.
+    ///
+    ///     <para>Empty for legacy nodes — the master falls back to single-slot
+    ///     dispatch keyed off <see cref="GpuVendor"/> in that case.</para>
+    /// </summary>
+    public List<HardwareDevice> Devices { get; set; } = new();
 }
 
 /// <summary> Operational status of a cluster node. </summary>

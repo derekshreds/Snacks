@@ -137,6 +137,15 @@ public sealed class WorkItem
 
     /// <summary> Convenience property — <see langword="true" /> if this job is assigned to a remote node. </summary>
     public bool IsRemote => AssignedNodeId != null;
+
+    /// <summary>
+    ///     The hardware device family (<c>"nvidia"</c>, <c>"intel"</c>,
+    ///     <c>"cpu"</c>, ...) the master picked when scheduling this job.
+    ///     Captured at dispatch time so the encode-history ledger and the
+    ///     dashboard's per-device analytics can attribute the work even
+    ///     after the slot has been released. Null until scheduled.
+    /// </summary>
+    public string? DispatchedDeviceId { get; set; }
 }
 
 /// <summary> Lifecycle states for a <see cref="WorkItem"/>. </summary>

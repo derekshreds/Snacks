@@ -218,7 +218,13 @@ document.addEventListener('DOMContentLoaded', () => {
     signalR.onClose(() => connectionStatus.setDisconnected());
 
     signalR.on('WorkItemAdded',     (wi)      => queueManager.addItem(wi));
-    signalR.on('WorkItemUpdated',   (wi)      => queueManager.updateItem(wi));
+    signalR.on('WorkItemUpdated',   (wi)      => {
+        queueManager.updateItem(wi);
+        // The dashboard self-card mirrors the master's own slot occupancy;
+        // refresh it on local-job transitions so chips and per-job bars stay
+        // in sync as encodes start, progress, and finish.
+        clusterDashboard.onWorkItemUpdated?.(wi);
+    });
     signalR.on('TranscodingLog',    (id, msg) => logViewer.appendLine(id, msg));
 
     signalR.on('AutoScanCompleted', (newFiles) => {

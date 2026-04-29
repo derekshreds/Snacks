@@ -1,0 +1,185 @@
+@{
+    ViewData["Title"] = "Dashboard";
+    Layout = "~/Views/Shared/_Layout.cshtml";
+}
+
+<div class="dashboard-page">
+
+    <!-- Title row -->
+    <div class="d-flex align-items-center justify-content-between mb-3 flex-wrap gap-2">
+        <div>
+            <h3 class="mb-0"><i class="fas fa-chart-line me-2 text-primary"></i>Encode Dashboard</h3>
+            <small class="text-muted">Where the bytes go after they hit Snacks.</small>
+        </div>
+        <div class="btn-group btn-group-sm" role="group" aria-label="Range">
+            <button type="button" class="btn btn-outline-secondary range-btn" data-range="7">7d</button>
+            <button type="button" class="btn btn-outline-secondary range-btn active" data-range="30">30d</button>
+            <button type="button" class="btn btn-outline-secondary range-btn" data-range="90">90d</button>
+            <button type="button" class="btn btn-outline-secondary range-btn" data-range="365">1y</button>
+        </div>
+    </div>
+
+    <!-- Hero stat cards -->
+    <div class="row g-3 mb-3 dashboard-hero">
+        <div class="col-12 col-md-6 col-xl-3">
+            <div class="card hover-lift hero-card hero-saved">
+                <div class="card-body">
+                    <div class="d-flex justify-content-between align-items-start mb-2">
+                        <div class="hero-label"><i class="fas fa-piggy-bank me-1"></i> Bytes Saved</div>
+                        <div class="hero-icon"><i class="fas fa-arrow-trend-down"></i></div>
+                    </div>
+                    <div class="hero-value" id="heroBytesSaved">—</div>
+                    <div class="hero-subtext" id="heroBytesSavedSub">&nbsp;</div>
+                    <svg class="hero-spark" id="sparkBytesSaved" viewBox="0 0 120 32" preserveAspectRatio="none"></svg>
+                </div>
+            </div>
+        </div>
+        <div class="col-12 col-md-6 col-xl-3">
+            <div class="card hover-lift hero-card hero-files">
+                <div class="card-body">
+                    <div class="d-flex justify-content-between align-items-start mb-2">
+                        <div class="hero-label"><i class="fas fa-film me-1"></i> Files Encoded</div>
+                        <div class="hero-icon"><i class="fas fa-check"></i></div>
+                    </div>
+                    <div class="hero-value" id="heroFiles">—</div>
+                    <div class="hero-subtext" id="heroFilesSub">&nbsp;</div>
+                    <svg class="hero-spark" id="sparkFiles" viewBox="0 0 120 32" preserveAspectRatio="none"></svg>
+                </div>
+            </div>
+        </div>
+        <div class="col-12 col-md-6 col-xl-3">
+            <div class="card hover-lift hero-card hero-hours">
+                <div class="card-body">
+                    <div class="d-flex justify-content-between align-items-start mb-2">
+                        <div class="hero-label"><i class="fas fa-clock me-1"></i> Encode Time</div>
+                        <div class="hero-icon"><i class="fas fa-bolt"></i></div>
+                    </div>
+                    <div class="hero-value" id="heroHours">—</div>
+                    <div class="hero-subtext" id="heroHoursSub">&nbsp;</div>
+                    <svg class="hero-spark" id="sparkHours" viewBox="0 0 120 32" preserveAspectRatio="none"></svg>
+                </div>
+            </div>
+        </div>
+        <div class="col-12 col-md-6 col-xl-3">
+            <div class="card hover-lift hero-card hero-ratio">
+                <div class="card-body">
+                    <div class="d-flex justify-content-between align-items-start mb-2">
+                        <div class="hero-label"><i class="fas fa-compress-arrows-alt me-1"></i> Avg Compression</div>
+                        <div class="hero-icon"><i class="fas fa-percentage"></i></div>
+                    </div>
+                    <div class="hero-value" id="heroRatio">—</div>
+                    <div class="hero-subtext" id="heroRatioSub">&nbsp;</div>
+                    <svg class="hero-spark" id="sparkRatio" viewBox="0 0 120 32" preserveAspectRatio="none"></svg>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Charts row -->
+    <div class="row g-3 mb-3">
+        <div class="col-12 col-xl-8">
+            <div class="card chart-card">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <h6 class="mb-0"><i class="fas fa-chart-area me-2"></i>Savings Over Time</h6>
+                    <small class="text-muted" id="savingsChartCaption">&mdash;</small>
+                </div>
+                <div class="card-body">
+                    <svg class="savings-chart" id="savingsChart" viewBox="0 0 800 280" preserveAspectRatio="none"></svg>
+                    <div class="savings-legend">
+                        <span><span class="dot" style="background: var(--primary)"></span>Bytes Saved</span>
+                        <span><span class="dot" style="background: var(--info-color)"></span>Files</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="col-12 col-xl-4">
+            <div class="card chart-card">
+                <div class="card-header">
+                    <h6 class="mb-0"><i class="fas fa-microchip me-2"></i>Device Workload</h6>
+                </div>
+                <div class="card-body">
+                    <div id="deviceUtilContainer" class="device-util-container">
+                        <div class="text-muted small text-center py-4"><em>No encodes yet in this window.</em></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Recent + Top savings -->
+    <div class="row g-3 mb-3">
+        <div class="col-12 col-xl-7">
+            <div class="card chart-card">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <h6 class="mb-0"><i class="fas fa-history me-2"></i>Recent Encodes</h6>
+                    <small class="text-muted" id="recentCount">&nbsp;</small>
+                </div>
+                <div class="card-body p-0">
+                    <div class="dash-table-wrap">
+                        <table class="dash-table" id="recentTable">
+                            <thead><tr>
+                                <th>File</th>
+                                <th>Codec</th>
+                                <th>Size</th>
+                                <th>Saved</th>
+                                <th>Device</th>
+                                <th>When</th>
+                            </tr></thead>
+                            <tbody><tr><td colspan="6" class="text-center text-muted py-4"><em>Loading…</em></td></tr></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="col-12 col-xl-5">
+            <div class="card chart-card">
+                <div class="card-header">
+                    <h6 class="mb-0"><i class="fas fa-trophy me-2"></i>Top Compression Wins</h6>
+                </div>
+                <div class="card-body p-0">
+                    <div class="dash-table-wrap">
+                        <table class="dash-table" id="topSavingsTable">
+                            <thead><tr>
+                                <th>File</th>
+                                <th>Saved</th>
+                                <th>Ratio</th>
+                            </tr></thead>
+                            <tbody><tr><td colspan="3" class="text-center text-muted py-4"><em>Loading…</em></td></tr></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Codec mix + Node throughput -->
+    <div class="row g-3 mb-3">
+        <div class="col-12 col-xl-5">
+            <div class="card chart-card">
+                <div class="card-header">
+                    <h6 class="mb-0"><i class="fas fa-circle-half-stroke me-2"></i>Output Codec Mix</h6>
+                </div>
+                <div class="card-body codec-mix-body">
+                    <svg class="codec-donut" id="codecDonut" viewBox="0 0 200 200"></svg>
+                    <div class="codec-legend" id="codecLegend"></div>
+                </div>
+            </div>
+        </div>
+        <div class="col-12 col-xl-7">
+            <div class="card chart-card">
+                <div class="card-header">
+                    <h6 class="mb-0"><i class="fas fa-network-wired me-2"></i>Per-Node Throughput</h6>
+                </div>
+                <div class="card-body">
+                    <div id="nodeThroughputContainer" class="node-throughput">
+                        <div class="text-muted small text-center py-4"><em>No encodes yet in this window.</em></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+@section Scripts {
+    <script type="module" src="~/js/dashboard/dashboard.js"></script>
+}

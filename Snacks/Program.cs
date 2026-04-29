@@ -141,6 +141,7 @@ var dbPath = Path.Combine(configDir, "snacks.db");
 builder.Services.AddDbContextFactory<SnacksDbContext>(options =>
     options.UseSqlite($"Data Source={dbPath}"));
 builder.Services.AddSingleton<MediaFileRepository>();
+builder.Services.AddSingleton<EncodeHistoryRepository>();
 
 builder.Services.AddSingleton<FfprobeService>();
 builder.Services.AddSingleton<FileService>();

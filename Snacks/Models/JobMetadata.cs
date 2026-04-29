@@ -53,4 +53,16 @@ public sealed class JobMetadata
     ///     protecting against network corruption that could produce invalid output.
     /// </summary>
     public string? SourceFileHash { get; set; }
+
+    /// <summary>
+    ///     The <see cref="HardwareDevice.DeviceId"/> the master allocated this
+    ///     job to (e.g. <c>"nvidia"</c>, <c>"intel"</c>, <c>"cpu"</c>). The
+    ///     worker honors this by overriding <see cref="EncoderOptions.HardwareAcceleration"/>
+    ///     so the encode lands on the requested slot's hardware.
+    ///
+    ///     <para>Null on requests from older masters that don't yet track
+    ///     per-device slots; the worker falls back to its existing auto-detect
+    ///     behaviour.</para>
+    /// </summary>
+    public string? DeviceId { get; set; }
 }

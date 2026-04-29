@@ -105,6 +105,11 @@ public sealed class ClusterAdminController : ControllerBase
             nodeId               = config.NodeId,
             localEncodingEnabled = config.LocalEncodingEnabled,
             selfCapabilities     = _clusterService.GetCapabilities(),
+            // Multi-slot self status: one ActiveJobInfo per local slot the
+            // master is currently encoding on. Mirrors the activeJobs[] shape
+            // surfaced on remote nodes so the dashboard renders the master's
+            // self-card with the same per-device chips and progress bars.
+            localActiveJobs      = _transcodingService.GetActiveLocalJobs(),
             localCompletedJobs   = _transcodingService.LocalCompletedJobs,
             localFailedJobs      = _transcodingService.LocalFailedJobs,
             nodeCount            = _clusterService.GetNodes().Count + 1,

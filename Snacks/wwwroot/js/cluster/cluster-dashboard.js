@@ -73,6 +73,7 @@ export class ClusterDashboard {
         this._nodeName      = null;
         this._localEncoding = true;
         this._selfCaps      = null;
+        this._selfActive    = [];   // ActiveJobInfo[] for the local machine's slots
         this._localDone     = 0;
         this._localFailed   = 0;
 
@@ -122,6 +123,30 @@ export class ClusterDashboard {
         this.loadStatus().then(() => this.render());
     }
 
+    /**
+     * `WorkItemUpdated` — when a local (non-remote) item flips into or out of
+     * Processing, the master's self-active-job list has changed. Coalesce
+     * refreshes through a debounce so a flurry of progress updates produces
+     * a single status fetch.
+     */
+    onWorkItemUpdated(workItem) {
+        if (!workItem || workItem.assignedNodeId) return;   // remote item — nodes update via WorkerUpdated
+        if (!this._enabled || this._role === 'standalone' && !this._nodeId) return;
+
+        // Local progress updates fire every couple of seconds; cheap render.
+        const local = this._selfActive.find(j => j.jobId === workItem.id);
+        if (local) {
+            local.progress = workItem.progress ?? local.progress;
+            local.fileName = workItem.fileName ?? local.fileName;
+            this.render();
+        }
+
+        // Status transitions (started, completed, failed) need a fresh
+        // server-side list. Debounce to avoid storming /status on a busy queue.
+        if (this._refreshHandle) clearTimeout(this._refreshHandle);
+        this._refreshHandle = setTimeout(() => this.loadStatus().then(() => this.render()), 500);
+    }
+
     /** `ClusterConfigChanged` — role / enabled flipped; repaint and notify dependents. */
     onClusterConfigChanged(config) {
         this._enabled = config.enabled;
@@ -149,9 +174,9 @@ export class ClusterDashboard {
             this._nodeId   = config.nodeId;
             this._nodeName = config.nodeName;
 
-            if (config.enabled && config.role !== 'standalone') {
-                await this.loadStatus();
-            }
+            // Load status in every mode so standalone users see their own
+            // self-card (per-device chips, active-jobs bars, hardware cog).
+            await this.loadStatus();
 
             this.render();
             this._updateBanner();
@@ -173,6 +198,7 @@ export class ClusterDashboard {
 
             this._localEncoding = status.localEncodingEnabled !== false;
             this._selfCaps      = status.selfCapabilities  || null;
+            this._selfActive    = status.localActiveJobs    || [];
             this._localDone     = status.localCompletedJobs || 0;
             this._localFailed   = status.localFailedJobs    || 0;
 
@@ -216,7 +242,11 @@ export class ClusterDashboard {
         const countBadge = document.getElementById('clusterNodeCount');
         if (!panel || !container) return;
 
-        const showPanel = this._enabled && this._role !== 'standalone';
+        // Show the panel any time we have a self-card to display. In
+        // cluster mode that includes remote nodes; in standalone mode it's
+        // just this machine — but the user still benefits from seeing
+        // per-device slot usage and the cog for tuning concurrency.
+        const showPanel = this._nodeId != null;
         panel.style.display = showPanel ? '' : 'none';
         if (!showPanel) return;
 
@@ -256,11 +286,13 @@ export class ClusterDashboard {
             ? this._selfCaps.gpuVendor.charAt(0).toUpperCase() + this._selfCaps.gpuVendor.slice(1)
             : 'CPU only';
         const selfOs     = this._selfCaps?.osPlatform || '';
-        const selfStatus = localPaused ? 'Paused' : 'Online';
+        const selfStatus = localPaused ? 'Paused' : (this._selfActive.length > 0 ? 'Busy' : 'Online');
         const selfColor  = STATUS_COLORS[selfStatus] || 'gray';
+        const devicesHtml = this._renderDeviceSummary(this._selfCaps, this._selfActive);
+        const jobsHtml    = this._renderActiveJobs(this._selfActive);
 
         return `
-            <div class="card hover-lift" style="min-width: 180px; max-width: 240px; flex: 1 1 200px;">
+            <div class="card hover-lift" style="min-width: 220px; max-width: 280px; flex: 1 1 240px;">
                 <div class="card-body p-2" style="overflow:hidden;">
                     <div class="d-flex align-items-center mb-1" style="min-width:0;">
                         <span class="flex-shrink-0" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${selfColor};margin-right:6px;"></span>
@@ -269,6 +301,8 @@ export class ClusterDashboard {
                     <div class="text-muted small">
                         <div>${escapeHtml(this._role)} &bull; ${escapeHtml(selfOs)}${selfGpu ? ' / ' + escapeHtml(selfGpu) : ''}</div>
                         <div style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(selfStatus)}</div>
+                        ${devicesHtml}
+                        ${jobsHtml}
                         <div class="mt-1">Jobs: ${this._localDone} done, ${this._localFailed} failed</div>
                         ${this._role === 'master' ? `
                         <div class="d-flex gap-1 mt-1">
@@ -279,8 +313,74 @@ export class ClusterDashboard {
                                 <i class="fas fa-cog"></i>
                             </button>
                         </div>` : ''}
+                        ${this._role === 'standalone' ? `
+                        <div class="d-flex gap-1 mt-1">
+                            <button class="btn btn-sm btn-outline-secondary cluster-node-settings flex-grow-1" data-node-id="${this._nodeId}" data-hostname="${escapeHtml(this._nodeName || 'This Machine')}" title="Hardware concurrency">
+                                <i class="fas fa-microchip me-1"></i>Hardware
+                            </button>
+                        </div>` : ''}
                     </div>
                 </div>
+            </div>`;
+    }
+
+    /**
+     * Renders the per-device slot summary that appears under the node's
+     * status line — one chip per device with a "used/capacity" count.
+     * Returns an empty string when the node hasn't reported any devices
+     * yet (older worker, or detection still running).
+     *
+     * @param {object|null} caps    The node's capabilities payload.
+     * @param {Array}        active The node's reported active jobs.
+     * @returns {string}
+     */
+    _renderDeviceSummary(caps, active) {
+        const devices = caps?.devices || [];
+        if (devices.length === 0) return '';
+
+        const used = {};
+        for (const j of (active || [])) {
+            if (!j.deviceId) continue;
+            used[j.deviceId] = (used[j.deviceId] || 0) + 1;
+        }
+
+        const chips = devices.map(d => {
+            const u = used[d.deviceId] || 0;
+            const cap = d.defaultConcurrency || 1;
+            const tone = u === 0 ? 'secondary' : (u >= cap ? 'warning' : 'info');
+            const label = (d.displayName || d.deviceId).split(' ')[0]; // tighten for the chip
+            return `<span class="badge bg-${tone} me-1" title="${escapeHtml(d.displayName || d.deviceId)}">${escapeHtml(label)} ${u}/${cap}</span>`;
+        }).join('');
+
+        return `<div class="mt-1" style="line-height:1.6;">${chips}</div>`;
+    }
+
+    /**
+     * Renders one progress block per active job on the node. Compact —
+     * filename + percentage + a thin progress bar — so two or three
+     * concurrent encodes still fit in the same card width.
+     *
+     * @param {Array} active
+     * @returns {string}
+     */
+    _renderActiveJobs(active) {
+        if (!active || active.length === 0) return '';
+        return `
+            <div class="mt-1">
+                ${active.map(j => `
+                    <div class="small" style="overflow:hidden;">
+                        <div class="d-flex justify-content-between" style="min-width:0;">
+                            <span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${escapeHtml(j.fileName || '')}">
+                                ${j.deviceId ? `<span class="text-muted">[${escapeHtml(j.deviceId)}]</span> ` : ''}
+                                ${escapeHtml(j.fileName || j.jobId)}
+                            </span>
+                            <span class="text-muted ms-1">${j.progress || 0}%</span>
+                        </div>
+                        <div class="progress" style="height:3px;">
+                            <div class="progress-bar" role="progressbar" style="width: ${j.progress || 0}%"></div>
+                        </div>
+                    </div>
+                `).join('')}
             </div>`;
     }
 
@@ -299,9 +399,12 @@ export class ClusterDashboard {
             : 'CPU only';
         const osInfo     = node.capabilities?.osPlatform || '';
         const canControl = this._role === 'master' && node.role === 'node';
+        const active     = node.activeJobs || [];
+        const devicesHtml = this._renderDeviceSummary(node.capabilities, active);
+        const jobsHtml    = this._renderActiveJobs(active);
 
         return `
-            <div class="card hover-lift" style="min-width: 180px; max-width: 240px; flex: 1 1 200px;">
+            <div class="card hover-lift" style="min-width: 220px; max-width: 280px; flex: 1 1 240px;">
                 <div class="card-body p-2" style="overflow:hidden;">
                     <div class="d-flex align-items-center mb-1" style="min-width:0;">
                         <span class="flex-shrink-0" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${statusColor};margin-right:6px;"></span>
@@ -310,6 +413,8 @@ export class ClusterDashboard {
                     <div class="text-muted small">
                         <div>${escapeHtml(node.role)} &bull; ${escapeHtml(osInfo)}${gpuInfo ? ' / ' + escapeHtml(gpuInfo) : ''}</div>
                         <div style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(statusName)}</div>
+                        ${devicesHtml}
+                        ${jobsHtml}
                         <div class="mt-1">Jobs: ${node.completedJobs || 0} done, ${node.failedJobs || 0} failed</div>
                         ${canControl ? `
                             <div class="d-flex gap-1 mt-1">
@@ -345,8 +450,11 @@ export class ClusterDashboard {
         });
 
         container.querySelectorAll('.cluster-node-settings').forEach(btn => {
-            btn.addEventListener('click', () =>
-                this._nodeOverride?.openNode(btn.dataset.nodeId, btn.dataset.hostname));
+            btn.addEventListener('click', () => {
+                const isSelf = btn.dataset.nodeId === this._nodeId;
+                const standalone = isSelf && this._role === 'standalone';
+                this._nodeOverride?.openNode(btn.dataset.nodeId, btn.dataset.hostname, { standalone });
+            });
         });
 
         document.getElementById('masterLocalPause')?.addEventListener('click', async () => {

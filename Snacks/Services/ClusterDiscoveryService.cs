@@ -566,7 +566,11 @@ public sealed class ClusterDiscoveryService
             IpAddress     = GetLocalIpAddress(),
             Port          = GetListeningPort(),
             Role          = _config.Role,
-            Status        = _transcodingService.GetActiveWorkItem() != null ? NodeStatus.Busy : NodeStatus.Online,
+            // Multi-slot worker: the master tracks per-device occupancy and
+            // can still dispatch when some slots are busy. We only mark
+            // "Online" — the master infers "Busy" itself from active-jobs
+            // count when every slot is full.
+            Status        = NodeStatus.Online,
             Version       = ClusterVersion,
             LastHeartbeat = DateTime.UtcNow,
             Capabilities  = GetCapabilities()
@@ -600,7 +604,13 @@ public sealed class ClusterDiscoveryService
                                    : RuntimeInformation.IsOSPlatform(OSPlatform.OSX)     ? "macOS"
                                    : "Linux",
             AvailableDiskSpaceBytes = diskSpace,
-            CanAcceptJobs          = _transcodingService.GetActiveWorkItem() == null
+            // CanAcceptJobs is now a coarse "any device free" hint; the master
+            // is the authoritative scheduler and uses per-device slot accounting.
+            // For legacy masters that still consult this single boolean, fall
+            // back to the singleton "any local job running" check so they keep
+            // their current dispatch behaviour.
+            CanAcceptJobs          = _transcodingService.GetActiveWorkItem() == null,
+            Devices                = _transcodingService.GetDetectedDevices(),
         };
     }
 

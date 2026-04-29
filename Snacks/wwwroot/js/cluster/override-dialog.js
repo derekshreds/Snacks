@@ -148,16 +148,27 @@ export class OverrideDialog {
     /**
      * Opens the dialog in per-node mode.
      *
+     * In master mode this edits the master's NodeSettings entry for the
+     * remote node; in standalone mode the same dialog edits the local
+     * machine's NodeSettings entry — only the Hardware Concurrency
+     * section is shown there since 4K dispatch rules and encoding
+     * overrides only fire during cluster dispatch (which standalone
+     * doesn't run).
+     *
      * @param {string} nodeId
      * @param {string} hostname Displayed in the title.
+     * @param {{standalone?: boolean}} [opts]
      */
-    async openNode(nodeId, hostname) {
+    async openNode(nodeId, hostname, opts = {}) {
+        const standalone = opts.standalone === true;
         this._activeFields = NODE_OVERRIDE_FIELDS;
         this._applyContextVisibility('node');
         this._resetForm();
 
         document.getElementById('nodeOnly4K').checked    = false;
         document.getElementById('nodeExclude4K').checked = false;
+
+        let savedDeviceSettings = {};
 
         try {
             const config = await clusterApi.getNodeSettings();
@@ -167,9 +178,21 @@ export class OverrideDialog {
                 document.getElementById('nodeOnly4K').checked    = ns.only4K    || false;
                 document.getElementById('nodeExclude4K').checked = ns.exclude4K || false;
                 if (ns.encodingOverrides) this._populateForm(ns.encodingOverrides);
+                if (ns.deviceSettings) savedDeviceSettings = ns.deviceSettings;
             }
         } catch (err) {
             console.error('Failed to load node settings', err);
+        }
+
+        // Resolve the node's detected hardware devices and render the per-device
+        // concurrency editor. The device list lives on the live cluster status,
+        // not in node-settings (which only stores user overrides).
+        try {
+            const devices = await this._loadNodeDevices(nodeId);
+            this._renderDeviceList(devices, savedDeviceSettings);
+        } catch (err) {
+            console.error('Failed to load node devices', err);
+            this._renderDeviceList([], savedDeviceSettings);
         }
 
         this._initToggles();
@@ -180,10 +203,14 @@ export class OverrideDialog {
         only4K.onchange = () => { if (only4K.checked) excl4K.checked = false; };
         excl4K.onchange = () => { if (excl4K.checked) only4K.checked = false; };
 
+        const titleHtml = standalone
+            ? `<i class="fas fa-microchip me-2"></i>Hardware Settings: ${escapeHtml(hostname)}`
+            : `<i class="fas fa-server me-2"></i>Node Settings: ${escapeHtml(hostname)}`;
+
         this._open(
-            `<i class="fas fa-server me-2"></i>Node Settings: ${escapeHtml(hostname)}`,
-            true,
-            () => this._saveNode(nodeId),
+            titleHtml,
+            { showNodeRules: !standalone, showHardware: true, showEncoding: !standalone },
+            () => this._saveNode(nodeId, { standalone }),
             () => this._deleteNode(nodeId),
         );
     }
@@ -193,18 +220,23 @@ export class OverrideDialog {
      *
      * Encoding overrides are only saved when at least one field has a
      * non-null value — an all-null payload would just thrash the server
-     * without changing behavior.
+     * without changing behavior. Hardware concurrency entries persist
+     * even at their defaults, since the user may have explicitly chosen
+     * "use the detected default" by leaving the slot count alone.
      *
      * @param {string} nodeId
      */
-    async _saveNode(nodeId) {
-        const overrides = this._readForm();
+    async _saveNode(nodeId, opts = {}) {
+        const standalone     = opts.standalone === true;
+        const overrides      = standalone ? {} : this._readForm();
+        const deviceSettings = this._readDeviceSettings();
 
         const settings = {
             nodeId,
-            only4K:            document.getElementById('nodeOnly4K').checked    || null,
-            exclude4K:         document.getElementById('nodeExclude4K').checked || null,
-            encodingOverrides: Object.values(overrides).some(v => v !== null) ? overrides : null,
+            only4K:            !standalone && document.getElementById('nodeOnly4K').checked    ? true : null,
+            exclude4K:         !standalone && document.getElementById('nodeExclude4K').checked ? true : null,
+            encodingOverrides: !standalone && Object.values(overrides).some(v => v !== null) ? overrides : null,
+            deviceSettings:    Object.keys(deviceSettings).length > 0 ? deviceSettings : null,
         };
 
         try {
@@ -214,6 +246,98 @@ export class OverrideDialog {
         } catch (err) {
             showToast('Error saving node settings: ' + err.message, 'danger');
         }
+    }
+
+    /**
+     * Looks up the detected hardware devices for a node.
+     *
+     * Master-side workers report devices on `selfCapabilities`; remote nodes
+     * carry them under `node.capabilities.devices`. We check both so a user
+     * can edit settings for any node from any other instance.
+     *
+     * @param {string} nodeId
+     * @returns {Promise<Array>}
+     */
+    async _loadNodeDevices(nodeId) {
+        const status = await clusterApi.getStatus();
+        if (status?.nodeId === nodeId)
+            return status.selfCapabilities?.devices || [];
+        const node = (status?.nodes || []).find(n => n.nodeId === nodeId);
+        return node?.capabilities?.devices || [];
+    }
+
+    /**
+     * Paints one row per detected device with an enable toggle and a
+     * slot-count input. Existing user overrides take precedence over the
+     * worker's defaults; a missing override falls back to the device's
+     * `defaultConcurrency`.
+     *
+     * @param {Array<{deviceId: string, displayName: string, defaultConcurrency: number, isHardware: boolean, supportedCodecs: string[]}>} devices
+     * @param {Object<string, {enabled?: boolean, maxConcurrency?: number}>} saved
+     */
+    _renderDeviceList(devices, saved) {
+        const container = document.getElementById('nodeDeviceList');
+        if (!container) return;
+
+        if (!devices || devices.length === 0) {
+            container.innerHTML = '<div class="text-muted small"><em>No devices reported. Run an encode or refresh to populate.</em></div>';
+            return;
+        }
+
+        container.innerHTML = devices.map(d => {
+            const cur     = saved?.[d.deviceId] || {};
+            const enabled = cur.enabled !== false;            // default: enabled
+            const max     = cur.maxConcurrency ?? d.defaultConcurrency ?? 1;
+            const codecs  = (d.supportedCodecs || []).join(', ').toUpperCase() || '—';
+            const badge   = d.isHardware ? 'success' : 'secondary';
+
+            return `
+                <div class="d-flex align-items-center mb-2 p-2 border rounded" data-device-id="${escapeHtml(d.deviceId)}">
+                    <div class="form-check form-switch me-3">
+                        <input class="form-check-input device-enabled" type="checkbox" id="dev_en_${escapeHtml(d.deviceId)}" ${enabled ? 'checked' : ''}>
+                    </div>
+                    <div class="flex-grow-1" style="min-width:0;">
+                        <div class="fw-bold" style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
+                            ${escapeHtml(d.displayName || d.deviceId)}
+                            <span class="badge bg-${badge} ms-1">${d.isHardware ? 'HW' : 'SW'}</span>
+                        </div>
+                        <small class="text-muted">Codecs: ${escapeHtml(codecs)} &middot; default ${d.defaultConcurrency || 1}</small>
+                    </div>
+                    <div class="ms-3" style="width: 110px;">
+                        <label class="small text-muted mb-1" for="dev_max_${escapeHtml(d.deviceId)}">Max slots</label>
+                        <input class="form-control form-control-sm device-max" type="number" min="0" max="16"
+                               id="dev_max_${escapeHtml(d.deviceId)}" value="${max}">
+                    </div>
+                </div>`;
+        }).join('');
+    }
+
+    /**
+     * Reads the device-list form state back into a server-shaped
+     * `deviceSettings` object. Only emits an entry when the user has made
+     * a non-default choice (disabled the device or set a non-default slot
+     * count) — keeps the persisted file from ballooning with no-ops.
+     *
+     * @returns {Object<string, {enabled: boolean, maxConcurrency: number|null}>}
+     */
+    _readDeviceSettings() {
+        const result    = {};
+        const container = document.getElementById('nodeDeviceList');
+        if (!container) return result;
+
+        container.querySelectorAll('[data-device-id]').forEach(row => {
+            const deviceId = row.dataset.deviceId;
+            const enabled  = row.querySelector('.device-enabled')?.checked ?? true;
+            const maxRaw   = row.querySelector('.device-max')?.value;
+            const max      = maxRaw === '' || maxRaw == null ? null : parseInt(maxRaw, 10);
+
+            // Only persist when user diverged from defaults. Anything else
+            // inherits worker-reported settings on every dispatch.
+            const diverged = !enabled || (Number.isInteger(max) && max >= 0);
+            if (diverged)
+                result[deviceId] = { enabled, maxConcurrency: Number.isInteger(max) ? max : null };
+        });
+        return result;
     }
 
     /**
@@ -331,9 +455,22 @@ export class OverrideDialog {
      * @param {Function} onSave         Save-button handler.
      * @param {Function} onReset        Reset-button handler.
      */
-    _open(titleHtml, showNodeRules, onSave, onReset) {
+    _open(titleHtml, sections, onSave, onReset) {
+        // Backward-compat: a boolean second arg means "show 4K node rules"
+        // (folder vs node distinction). The new shape is an object naming
+        // each toggleable section.
+        const cfg = typeof sections === 'boolean'
+            ? { showNodeRules: sections, showHardware: false, showEncoding: true }
+            : { showNodeRules: false, showHardware: false, showEncoding: true, ...sections };
+
         document.getElementById('overrideDialogTitle').innerHTML  = titleHtml;
-        document.getElementById('overrideNodeRules').style.display = showNodeRules ? '' : 'none';
+        document.getElementById('overrideNodeRules').style.display = cfg.showNodeRules ? '' : 'none';
+        const hwSection = document.getElementById('overrideHardwareConcurrency');
+        if (hwSection) hwSection.style.display = cfg.showHardware ? '' : 'none';
+        const encHeader = document.getElementById('overrideEncodingHeader');
+        const encFields = document.getElementById('overrideFields');
+        if (encHeader) encHeader.style.display = cfg.showEncoding ? '' : 'none';
+        if (encFields) encFields.style.display = cfg.showEncoding ? '' : 'none';
 
         // Replace save/reset buttons so each invocation gets clean handlers.
         const rewire = [

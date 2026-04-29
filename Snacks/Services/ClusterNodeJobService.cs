@@ -39,13 +39,48 @@ public sealed class ClusterNodeJobService
      *  Cross-Thread State
      ******************************************************************/
 
-    private volatile WorkItem?                _currentRemoteJob;
-    private volatile CancellationTokenSource? _remoteJobCts;
-    private volatile string?                  _completedJobId;
-    private volatile string?                  _receivingJobId;
-    private          DateTime                 _lastReceiveActivity;
-    private volatile bool                     _nodePaused;
-    private readonly object                   _jobStartLock = new();
+    /// <summary>
+    ///     One entry per in-flight encode. Each job is bound to a
+    ///     <see cref="HardwareDevice.DeviceId"/> slot the node consumed when
+    ///     accepting the work, and carries its own cancellation source so a
+    ///     master-issued cancel only kills that specific job — its peers on
+    ///     other devices keep encoding.
+    /// </summary>
+    private sealed class ActiveRemoteJob
+    {
+        public WorkItem                 Item     = null!;
+        public string                   DeviceId = "";
+        public CancellationTokenSource  Cts      = null!;
+    }
+
+    /// <summary> Active encodes keyed by job ID. Replaces the prior single <c>_currentRemoteJob</c>. </summary>
+    private readonly ConcurrentDictionary<string, ActiveRemoteJob> _activeJobs = new();
+
+    /// <summary>
+    ///     Job IDs whose encode has finished but whose output the master has not
+    ///     yet downloaded. Multi-entry so several completed jobs can sit in the
+    ///     "ready for download" state simultaneously.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, byte> _completedJobIds = new();
+
+    /// <summary>
+    ///     Job IDs currently receiving chunks from the master. Value is the UTC
+    ///     timestamp of the last chunk activity so <see cref="ExpireStaleReceiving"/>
+    ///     can prune dead uploads independently per-job.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, DateTime> _receivingJobIds = new();
+
+    /// <summary>
+    ///     Per-device slot semaphores. Initialised lazily on first use of a
+    ///     given device (capacity = the device's
+    ///     <see cref="HardwareDevice.DefaultConcurrency"/>). The master is the
+    ///     primary scheduler; this is the node's safety net, ensuring even a
+    ///     misbehaving master can never push more concurrent encodes onto a
+    ///     device than the worker is willing to run.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _deviceSlotLocks = new();
+
+    private volatile bool _nodePaused;
 
     private readonly ConcurrentDictionary<string, SemaphoreSlim>           _receiveLocks = new();
     private readonly ConcurrentDictionary<string, CancellationTokenSource> _receiveCts   = new();
@@ -127,25 +162,89 @@ public sealed class ClusterNodeJobService
     ///     recently-completed remote job tracked in memory.
     /// </summary>
     public bool IsProcessingRemoteJob() =>
-        _currentRemoteJob != null || _receivingJobId != null || _completedJobId != null;
+        !_activeJobs.IsEmpty || !_receivingJobIds.IsEmpty || !_completedJobIds.IsEmpty;
 
     /// <summary>
-    ///     Returns the current remote job ID spanning the active, receiving, and completed
-    ///     states, or <see langword="null"/> if no remote job is tracked.
+    ///     Legacy first-job accessor. Returns the ID of any one in-flight remote
+    ///     job — preferring active over receiving over completed — so old masters
+    ///     that read a single <c>currentJobId</c> field still see *some* tracked
+    ///     work. Multi-slot masters should consume <see cref="GetActiveJobs"/>.
     /// </summary>
-    /// <returns>The job ID, or <see langword="null"/>.</returns>
-    public string? GetCurrentRemoteJobId() =>
-        _currentRemoteJob?.Id ?? _receivingJobId ?? _completedJobId;
+    public string? GetCurrentRemoteJobId()
+    {
+        foreach (var kv in _activeJobs)        return kv.Key;
+        foreach (var kv in _receivingJobIds)   return kv.Key;
+        foreach (var kv in _completedJobIds)   return kv.Key;
+        return null;
+    }
 
-    /// <summary> Returns the encoding progress percentage of the current remote job. </summary>
-    /// <returns>A value from 0 to 100, or 0 if no job is active.</returns>
-    public int GetCurrentRemoteJobProgress() => _currentRemoteJob?.Progress ?? 0;
+    /// <summary>
+    ///     Legacy progress accessor. Returns the progress of any one in-flight
+    ///     active job, matching the singular ID returned by
+    ///     <see cref="GetCurrentRemoteJobId"/>.
+    /// </summary>
+    public int GetCurrentRemoteJobProgress()
+    {
+        foreach (var kv in _activeJobs) return kv.Value.Item.Progress;
+        return 0;
+    }
 
-    /// <summary> Returns the completed job ID if encoding finished but cleanup hasn't occurred yet. </summary>
-    public string? GetCompletedJobId() => _completedJobId;
+    /// <summary> Legacy first-completed-job accessor. </summary>
+    public string? GetCompletedJobId()
+    {
+        foreach (var kv in _completedJobIds) return kv.Key;
+        return null;
+    }
 
-    /// <summary> Returns the job ID currently being received via file transfer, or null. </summary>
-    public string? GetReceivingJobId() => _receivingJobId;
+    /// <summary> Legacy first-receiving-job accessor. </summary>
+    public string? GetReceivingJobId()
+    {
+        foreach (var kv in _receivingJobIds) return kv.Key;
+        return null;
+    }
+
+    /// <summary>
+    ///     Returns one <see cref="ActiveJobInfo"/> per occupied slot on this
+    ///     node. Multi-slot masters consume this in heartbeats to reconcile
+    ///     their optimistic per-device slot accounting against ground truth.
+    /// </summary>
+    public List<ActiveJobInfo> GetActiveJobs()
+    {
+        var list = new List<ActiveJobInfo>();
+        foreach (var kv in _activeJobs)
+        {
+            list.Add(new ActiveJobInfo
+            {
+                JobId    = kv.Key,
+                DeviceId = kv.Value.DeviceId,
+                FileName = kv.Value.Item.FileName,
+                Progress = kv.Value.Item.Progress,
+                Phase    = kv.Value.Item.Status == WorkItemStatus.Downloading ? "Downloading" : "Encoding",
+            });
+        }
+        foreach (var kv in _receivingJobIds)
+        {
+            // Receiving slots haven't acquired a device yet — surface them
+            // separately so the master can render an "Uploading" tile without
+            // double-counting against any device's slot pool.
+            if (_activeJobs.ContainsKey(kv.Key)) continue;
+            list.Add(new ActiveJobInfo
+            {
+                JobId    = kv.Key,
+                DeviceId = "",
+                FileName = null,
+                Progress = 0,
+                Phase    = "Receiving",
+            });
+        }
+        return list;
+    }
+
+    /// <summary> Snapshot of all completed-but-not-downloaded job IDs. </summary>
+    public List<string> GetCompletedJobIds() => _completedJobIds.Keys.ToList();
+
+    /// <summary> Snapshot of all receiving job IDs. </summary>
+    public List<string> GetReceivingJobIds() => _receivingJobIds.Keys.ToList();
 
     /// <summary>
     ///     Returns a per-job semaphore that serializes concurrent ReceiveFile requests.
@@ -173,38 +272,37 @@ public sealed class ClusterNodeJobService
     {
         _receiveLocks.TryRemove(jobId, out _);
         if (_receiveCts.TryRemove(jobId, out var cts)) cts.Dispose();
+        _receivingJobIds.TryRemove(jobId, out _);
     }
 
     /// <summary>
-    ///     Clears a stale receiving state if no chunks have arrived within the timeout.
-    ///     Called periodically from the heartbeat timer.
+    ///     Drops any receiving state whose last chunk activity is older than
+    ///     <paramref name="timeout"/>. Per-jobId so a stalled upload on one slot
+    ///     can be expired without disturbing healthy receives on other slots.
     /// </summary>
     public void ExpireStaleReceiving(TimeSpan timeout)
     {
-        if (_receivingJobId != null && _currentRemoteJob == null &&
-            (DateTime.UtcNow - _lastReceiveActivity) > timeout)
+        var cutoff = DateTime.UtcNow - timeout;
+        foreach (var kv in _receivingJobIds)
         {
-            var staleId = _receivingJobId;
-            _receivingJobId = null;
-            Console.WriteLine($"Cluster: Cleared stale receiving state for job {staleId} (no activity for {timeout.TotalSeconds:0}s)");
-            // Master is the source of truth for job lifecycle — don't broadcast a
-            // synthetic "Completed" here; it races with the master's own re-queue
-            // and dispatch messages and produces UI flicker.
+            if (_activeJobs.ContainsKey(kv.Key)) continue;            // already encoding — not stale
+            if (kv.Value > cutoff)              continue;             // recent activity
+            if (_receivingJobIds.TryRemove(kv.Key, out _))
+                Console.WriteLine($"Cluster: Cleared stale receiving state for job {kv.Key} (no activity for {timeout.TotalSeconds:0}s)");
+            // Master owns lifecycle messaging — no synthetic completion broadcast.
         }
     }
 
     /// <summary>
-    ///     Tracks which job ID is currently being received via file transfer. Used to
-    ///     report accurate node status during the upload phase. When a new job ID replaces
-    ///     an existing one (e.g. master restarted), the old item is marked completed in the UI.
+    ///     Records that <paramref name="jobId"/> is actively receiving chunks
+    ///     and stamps its last-activity time. Multi-slot safe: multiple jobs
+    ///     can be in the receiving state simultaneously.
     /// </summary>
-    /// <param name="jobId">The job ID being received, or <see langword="null"/> to clear.</param>
+    /// <param name="jobId">The job ID being received.</param>
     public void SetReceivingJob(string? jobId)
     {
-        _receivingJobId = jobId;
-        if (jobId != null) _lastReceiveActivity = DateTime.UtcNow;
-        // No synthetic completion broadcast for any displaced previous receivingJobId —
-        // master owns lifecycle messaging.
+        if (jobId == null) return;
+        _receivingJobIds[jobId] = DateTime.UtcNow;
     }
 
     /******************************************************************
@@ -212,103 +310,152 @@ public sealed class ClusterNodeJobService
      ******************************************************************/
 
     /// <summary>
-     ///     Starts autonomous encoding after a file upload completes.
-     ///     Validates the file exists, verifies its hash, and begins encoding in a background task.
-     ///     This replaces the two-phase commit (upload → offer → accept) with autonomous encoding.
-     /// </summary>
-     /// <param name="jobId">The job ID that was uploaded.</param>
-     /// <param name="metadata">The job metadata sent with the upload.</param>
-     /// <param name="filePath">The local path where the file was saved.</param>
-     /// <returns><see langword="true"/> if encoding was started; <see langword="false"/> otherwise.</returns>
+    ///     Starts autonomous encoding after a file upload completes.
+    ///     Validates the file, claims a device slot, and begins encoding in a background task.
+    ///     The slot to use is taken from <see cref="JobMetadata.DeviceId"/>; older masters
+    ///     that don't yet send a device hint fall back to the worker's primary GPU
+    ///     (or CPU if no GPU is detected).
+    /// </summary>
+    /// <param name="jobId">The job ID that was uploaded.</param>
+    /// <param name="metadata">The job metadata sent with the upload.</param>
+    /// <param name="filePath">The local path where the file was saved.</param>
+    /// <returns><see langword="true"/> if encoding was started; <see langword="false"/> otherwise.</returns>
     public async Task<(bool Started, string? RejectReason)> StartAutonomousEncodingAsync(string jobId, JobMetadata metadata, string filePath)
     {
         if (_nodePaused)
             return (false, "Node is paused");
 
-        // Lock the check-and-set to prevent concurrent uploads from racing past
-        // the _currentRemoteJob guard — without this, two ReceiveFile completions
-        // arriving back-to-back can both see null and start encoding simultaneously,
-        // overwhelming the hardware encoder.
-        lock (_jobStartLock)
-        {
-            if (_currentRemoteJob != null)
-                return (false, $"Already processing job {_currentRemoteJob.Id} ({_currentRemoteJob.FileName})");
+        // Resolve which device slot the master assigned. A null DeviceId means
+        // the master is older than this build — fall back to whichever device
+        // we'd pick by default (primary detected hardware, else CPU).
+        var deviceId = ResolveDeviceId(metadata.DeviceId);
+        if (deviceId == null)
+            return (false, $"Device {metadata.DeviceId} is not available on this worker");
 
-            // Claim the slot immediately so no other caller can race past
-            _currentRemoteJob = new WorkItem
-            {
-                Id       = jobId,
-                FileName = metadata.FileName,
-                Status   = WorkItemStatus.Processing
-            };
-        }
+        // Re-running the same job (e.g. master crash + recovery) shouldn't
+        // queue behind itself — we already hold the slot.
+        if (_activeJobs.ContainsKey(jobId))
+            return (false, $"Job {jobId} is already encoding on this node");
 
-        // Validation — if any check fails, release the slot
-        if (!File.Exists(filePath))
-        {
-            _currentRemoteJob = null;
-            return (false, $"File not found at {filePath}");
-        }
+        // Try to acquire one of the device's slots. If every slot is busy,
+        // reject — the master is the primary scheduler and shouldn't have
+        // over-dispatched, but this guard catches drift between its optimistic
+        // accounting and the node's actual state.
+        var slotLock = GetOrCreateDeviceSlotLock(deviceId);
+        if (!await slotLock.WaitAsync(0))
+            return (false, $"All {deviceId} slots are busy on this node");
 
-        // Check if we already have the encoded output — skip encoding
-        var existingOutput = GetOutputFileForJob(jobId);
-        if (existingOutput != null)
-        {
-            Console.WriteLine($"Cluster: Output already exists for {metadata.FileName} — skipping encode, ready for download");
-            _currentRemoteJob = null;
-            _completedJobId = jobId;
-            _receivingJobId = null;
-            return (true, null);
-        }
+        bool slotHandedOff = false;
 
-        // Verify uploaded file size matches expected — chunk hashes already
-        // guaranteed per-chunk integrity, so a size check is sufficient here.
-        var actualSize = new FileInfo(filePath).Length;
-        if (actualSize != metadata.FileSize)
-        {
-            _currentRemoteJob = null;
-            return (false, $"File size mismatch — expected {metadata.FileSize}, got {actualSize}");
-        }
-
-        // Verify the file isn't corrupt at byte 0 — the most common failure mode
-        // from interrupted chunk writes is null bytes at the start of the file.
         try
         {
-            var header = new byte[4];
-            using var checkStream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read);
-            var headerRead = await checkStream.ReadAsync(header);
-            if (headerRead >= 4 && header[0] == 0x00 && header[1] == 0x00 && header[2] == 0x00 && header[3] == 0x00)
+            if (!File.Exists(filePath))
+                return (false, $"File not found at {filePath}");
+
+            // Output already on disk (master crash + recovery) — short-circuit
+            // to the completed-jobs set so the master's download path picks it up.
+            var existingOutput = GetOutputFileForJob(jobId);
+            if (existingOutput != null)
             {
-                _currentRemoteJob = null;
-                return (false, $"File corrupt — first 4 bytes are 0x00000000 (expected container header). " +
-                    $"Size on disk: {actualSize}, expected: {metadata.FileSize}");
+                Console.WriteLine($"Cluster: Output already exists for {metadata.FileName} — skipping encode, ready for download");
+                _completedJobIds[jobId] = 0;
+                _receivingJobIds.TryRemove(jobId, out _);
+                return (true, null);
             }
+
+            var actualSize = new FileInfo(filePath).Length;
+            if (actualSize != metadata.FileSize)
+                return (false, $"File size mismatch — expected {metadata.FileSize}, got {actualSize}");
+
+            // Most common failure mode after an interrupted chunk write is a
+            // run of null bytes at the start of the file — catch it before we
+            // burn cycles on a doomed encode.
+            try
+            {
+                var header = new byte[4];
+                using var checkStream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+                var headerRead = await checkStream.ReadAsync(header);
+                if (headerRead >= 4 && header[0] == 0x00 && header[1] == 0x00 && header[2] == 0x00 && header[3] == 0x00)
+                    return (false, $"File corrupt — first 4 bytes are 0x00000000 (expected container header). " +
+                        $"Size on disk: {actualSize}, expected: {metadata.FileSize}");
+            }
+            catch { }
+
+            var workItem = new WorkItem
+            {
+                Id        = jobId,
+                FileName  = metadata.FileName,
+                Path      = filePath,
+                Size      = metadata.FileSize,
+                Bitrate   = metadata.Bitrate,
+                Length    = metadata.Duration,
+                IsHevc    = metadata.IsHevc,
+                Is4K      = metadata.Is4K,
+                Probe     = metadata.Probe,
+                Status    = WorkItemStatus.Processing,
+                StartedAt = DateTime.UtcNow,
+            };
+
+            var active = new ActiveRemoteJob
+            {
+                Item     = workItem,
+                DeviceId = deviceId,
+                Cts      = new CancellationTokenSource(),
+            };
+
+            // Register before launching so the very next heartbeat sees it.
+            _activeJobs[jobId] = active;
+            _receivingJobIds.TryRemove(jobId, out _);
+
+            // The slot stays held for the lifetime of the encode — the
+            // background task releases it in a finally block.
+            slotHandedOff = true;
+            _ = Task.Run(() => ExecuteRemoteJobAsync(active, metadata.Options, slotLock));
+
+            return (true, null);
         }
-        catch { }
-
-        // Replace the placeholder with the full work item
-        var workItem = new WorkItem
+        finally
         {
-            Id        = jobId,
-            FileName  = metadata.FileName,
-            Path      = filePath,
-            Size      = metadata.FileSize,
-            Bitrate   = metadata.Bitrate,
-            Length    = metadata.Duration,
-            IsHevc    = metadata.IsHevc,
-            Is4K      = metadata.Is4K,
-            Probe     = metadata.Probe,
-            Status    = WorkItemStatus.Processing,
-            StartedAt = DateTime.UtcNow
-        };
+            if (!slotHandedOff)
+                slotLock.Release();
+        }
+    }
 
-        _currentRemoteJob = workItem;
-        _receivingJobId   = null;
-        _remoteJobCts     = new CancellationTokenSource();
+    /// <summary>
+    ///     Picks the device slot to use for an incoming job. Honors the master's
+    ///     <see cref="JobMetadata.DeviceId"/> when set and present on this worker;
+    ///     otherwise falls back to the first detected hardware device (or CPU).
+    ///     Returns <see langword="null"/> if the master named a device the worker
+    ///     does not have.
+    /// </summary>
+    private string? ResolveDeviceId(string? requested)
+    {
+        var devices = _transcodingService.GetDetectedDevices();
+        if (devices.Count == 0)
+            return "cpu"; // detection hasn't completed; CPU is always safe
 
-        _ = Task.Run(() => ExecuteRemoteJobAsync(workItem, metadata.Options));
+        if (!string.IsNullOrEmpty(requested))
+            return devices.Any(d => d.DeviceId == requested) ? requested : null;
 
-        return (true, null);
+        // Older master — pick first hardware device, else CPU.
+        return devices.FirstOrDefault(d => d.IsHardware)?.DeviceId
+            ?? devices.First().DeviceId;
+    }
+
+    /// <summary>
+    ///     Lazily creates a slot semaphore for the given device, sized to the
+    ///     device's reported <see cref="HardwareDevice.DefaultConcurrency"/>.
+    ///     Same instance is returned for the same deviceId across calls so
+    ///     simultaneous offers contend on the same gate.
+    /// </summary>
+    private SemaphoreSlim GetOrCreateDeviceSlotLock(string deviceId)
+    {
+        return _deviceSlotLocks.GetOrAdd(deviceId, id =>
+        {
+            var device = _transcodingService.GetDetectedDevices().FirstOrDefault(d => d.DeviceId == id);
+            var capacity = Math.Max(1, device?.DefaultConcurrency ?? 1);
+            return new SemaphoreSlim(capacity, capacity);
+        });
     }
 
     /******************************************************************
@@ -316,16 +463,25 @@ public sealed class ClusterNodeJobService
      ******************************************************************/
 
     /// <summary>
-    ///     Runs the full encoding pipeline for a remote job: configures log and progress
-    ///     callbacks, invokes the transcoding service, and reports completion (or failure)
-    ///     to the master. On success the completed job is persisted so it can be retried
-    ///     on subsequent heartbeats until the master acknowledges receipt.
+    ///     Runs the full encoding pipeline for a remote job. Per-job state — work
+    ///     item, device assignment, cancellation source, slot semaphore — is
+    ///     scoped to the supplied <see cref="ActiveRemoteJob"/>; multiple
+    ///     instances of this method can run concurrently for different jobs on
+    ///     the same node, each owning a different device slot.
     /// </summary>
-    /// <param name="workItem">The work item describing the file to encode.</param>
+    /// <param name="active">The active job descriptor including work item, device, and CTS.</param>
     /// <param name="options">Encoder options dictating codec, quality, and hardware settings.</param>
-    private async Task ExecuteRemoteJobAsync(WorkItem workItem, EncoderOptions options)
+    /// <param name="slotLock">Device slot semaphore to release when the job finishes.</param>
+    private async Task ExecuteRemoteJobAsync(ActiveRemoteJob active, EncoderOptions options, SemaphoreSlim slotLock)
     {
+        var workItem  = active.Item;
         var masterUrl = ResolveMasterUrl();
+
+        // The master assigned this job to a specific device slot — pin the
+        // hardware acceleration to that device family so the encode lands
+        // where the scheduler intended (and not on whichever device "auto"
+        // would have picked locally). CPU jobs map to "none".
+        options.HardwareAcceleration = active.DeviceId == "cpu" ? "none" : active.DeviceId;
 
         var encodingSucceeded = false;
         try
@@ -335,23 +491,22 @@ public sealed class ClusterNodeJobService
             options.EncodeDirectory     = tempDir;
             options.DeleteOriginalFile  = false;
 
-            // Surface the mux-decision inputs as the worker received them — if the user
-            // ever sees these print as defaults while the master is configured otherwise,
-            // it points at a metadata-flow bug rather than a transcode-logic bug.
-            Console.WriteLine($"Cluster: Encoding {workItem.FileName} — " +
+            Console.WriteLine($"Cluster: Encoding {workItem.FileName} on {active.DeviceId} — " +
                 $"EncodingMode={options.EncodingMode}, MuxStreams={options.MuxStreams}, " +
                 $"Is4K={workItem.Is4K}, IsHevc={workItem.IsHevc}, Bitrate={workItem.Bitrate}kbps");
 
             // Pull the master's integration credentials before every encode so
             // KeepOriginalLanguage lookups and OCR on this worker use the master's
             // Sonarr / Radarr / TVDB / TMDb config, not whatever is cached locally.
-            await PullIntegrationsFromMasterAsync(_remoteJobCts?.Token ?? CancellationToken.None);
+            await PullIntegrationsFromMasterAsync(active.Cts.Token);
 
-            // Hook into log reporting to master — buffer and send every 2 seconds
+            // Per-job log buffer + reporter. Each concurrent encode keeps its
+            // own buffer and lastLogSend timestamp so cross-job log lines never
+            // mix into a single POST.
             var logBuffer   = new ConcurrentQueue<string>();
             var lastLogSend = DateTime.MinValue;
 
-            _transcodingService.SetLogCallback(async (id, message) =>
+            _transcodingService.SetLogCallback(workItem.Id, async (id, message) =>
             {
                 logBuffer.Enqueue(message);
 
@@ -369,7 +524,7 @@ public sealed class ClusterNodeJobService
                     var progressReport = new JobProgress
                     {
                         JobId    = id,
-                        Progress = _currentRemoteJob?.Progress ?? 0,
+                        Progress = workItem.Progress,
                         Phase    = "Encoding",
                         LogLine  = string.Join("\n", lines)
                     };
@@ -381,47 +536,38 @@ public sealed class ClusterNodeJobService
                 catch { }
             });
 
-            _transcodingService.SetProgressCallback(async (id, progress) =>
+            _transcodingService.SetProgressCallback(workItem.Id, async (id, progress) =>
             {
-                if (masterUrl != null)
+                if (masterUrl == null) return;
+                try
                 {
-                    try
+                    var client         = CreateAuthenticatedClient();
+                    var progressReport = new JobProgress
                     {
-                        var client         = CreateAuthenticatedClient();
-                        var progressReport = new JobProgress
-                        {
-                            JobId    = id,
-                            Progress = progress,
-                            Phase    = "Encoding"
-                        };
-                        var content = new StringContent(
-                            JsonSerializer.Serialize(progressReport, _jsonOptions),
-                            Encoding.UTF8, "application/json");
-                        await client.PostAsync($"{masterUrl}/api/cluster/jobs/{id}/progress", content);
-                    }
-                    catch { }
+                        JobId    = id,
+                        Progress = progress,
+                        Phase    = "Encoding"
+                    };
+                    var content = new StringContent(
+                        JsonSerializer.Serialize(progressReport, _jsonOptions),
+                        Encoding.UTF8, "application/json");
+                    await client.PostAsync($"{masterUrl}/api/cluster/jobs/{id}/progress", content);
                 }
+                catch { }
             });
 
-            await _transcodingService.ConvertVideoForRemoteAsync(
-                workItem, options, _remoteJobCts?.Token ?? CancellationToken.None);
+            await _transcodingService.ConvertVideoForRemoteAsync(workItem, options, active.Cts.Token);
             encodingSucceeded = true;
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Cluster: Remote job encoding failed: {ex.Message}");
+            Console.WriteLine($"Cluster: Remote job encoding failed for {workItem.Id}: {ex.Message}");
 
-            // Clean up node state BEFORE reporting failure to master — the master
-            // reacts immediately by marking the node online and dispatching new work.
-            // If we report first and clean up after, the new job's upload can arrive
-            // while _currentRemoteJob is still set, or worse, complete and start
-            // encoding concurrently with leftover retry processes.
-            _completedJobId = null;
-            _currentRemoteJob = null;
-            _remoteJobCts?.Dispose();
-            _remoteJobCts = null;
-            _transcodingService.SetProgressCallback(null);
-            _transcodingService.SetLogCallback(null);
+            // Tear down per-job state BEFORE reporting failure to master — the
+            // master reacts immediately by freeing this slot and dispatching new
+            // work. If we report first and clean up after, the next upload can
+            // arrive while we still hold the slot.
+            ReleaseJobState(workItem.Id, slotLock);
 
             if (masterUrl != null)
             {
@@ -438,33 +584,30 @@ public sealed class ClusterNodeJobService
             }
         }
 
-        // Check if encoding succeeded but the output was deleted (no savings case).
-        // ConvertAsync deletes the output when the encoded file isn't smaller than the
-        // original, so we need to detect this before reporting completion to the master.
+        // No-savings path: ConvertAsync deletes the output when it isn't smaller
+        // than the source. Detect that before reporting completion so the master
+        // skips the download phase.
         var noSavings = encodingSucceeded && GetOutputFileForJob(workItem.Id) == null;
         if (noSavings)
             Console.WriteLine($"Cluster: Encoding succeeded for {workItem.FileName} but no savings — will notify master to skip download");
 
         try
         {
-            if (encodingSucceeded && !noSavings && _currentRemoteJob != null)
+            if (encodingSucceeded && !noSavings)
             {
                 // Zero TransferProgress and set RemoteJobPhase so the UI renders
-                // the download bar from 0% instead of flashing Progress=100 through
-                // the encode-progress field.
-                _currentRemoteJob.Progress         = 100;
-                _currentRemoteJob.Status           = WorkItemStatus.Downloading;
-                _currentRemoteJob.RemoteJobPhase   = "Downloading";
-                _currentRemoteJob.TransferProgress = 0;
-                await _hubContext.Clients.All.SendAsync("WorkItemUpdated", _currentRemoteJob);
+                // the download bar from 0% instead of flashing Progress=100
+                // through the encode-progress field.
+                workItem.Progress         = 100;
+                workItem.Status           = WorkItemStatus.Downloading;
+                workItem.RemoteJobPhase   = "Downloading";
+                workItem.TransferProgress = 0;
+                await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
+
+                _completedJobIds[workItem.Id] = 0;
             }
 
-            _completedJobId = encodingSucceeded && !noSavings ? _currentRemoteJob?.Id : null;
-            _currentRemoteJob = null;
-            _remoteJobCts?.Dispose();
-            _remoteJobCts = null;
-            _transcodingService.SetProgressCallback(null);
-            _transcodingService.SetLogCallback(null);
+            ReleaseJobState(workItem.Id, slotLock);
         }
         catch { }
 
@@ -518,17 +661,34 @@ public sealed class ClusterNodeJobService
      ******************************************************************/
 
     /// <summary>
-    ///     Cancels a job running locally on this node. The encoding loop will catch the
-    ///     cancellation and clean up.
+    ///     Cancels a specific job running on this node. Looks up the per-job
+    ///     cancellation source by ID — peer jobs on other slots keep encoding.
     /// </summary>
     /// <param name="jobId">The ID of the job to cancel.</param>
     public void CancelRemoteJob(string jobId)
     {
-        if (_currentRemoteJob?.Id == jobId)
+        if (_activeJobs.TryGetValue(jobId, out var active))
         {
-            Console.WriteLine($"Cluster: Cancelling remote job {jobId}");
-            _remoteJobCts?.Cancel();
+            Console.WriteLine($"Cluster: Cancelling remote job {jobId} on {active.DeviceId}");
+            try { active.Cts.Cancel(); } catch { }
         }
+    }
+
+    /// <summary>
+    ///     Releases all per-job state for a finished or failed encode: removes
+    ///     the active-job entry, clears its callbacks on the transcoding
+    ///     service, disposes its CTS, and releases its device slot semaphore
+    ///     so the next dispatched job for that device can proceed. Idempotent.
+    /// </summary>
+    private void ReleaseJobState(string jobId, SemaphoreSlim slotLock)
+    {
+        if (_activeJobs.TryRemove(jobId, out var active))
+        {
+            try { active.Cts.Dispose(); } catch { }
+        }
+        _transcodingService.SetProgressCallback(jobId, null);
+        _transcodingService.SetLogCallback(jobId, null);
+        try { slotLock.Release(); } catch (SemaphoreFullException) { /* already released — idempotent */ }
     }
 
     /******************************************************************
@@ -555,7 +715,9 @@ public sealed class ClusterNodeJobService
                 {
                     JobId          = jobId,
                     MasterUrl      = masterUrl,
-                    OutputFileName = outputFileName ?? _currentRemoteJob?.FileName ?? "",
+                    OutputFileName = outputFileName
+                                  ?? (_activeJobs.TryGetValue(jobId, out var act) ? act.Item.FileName : null)
+                                  ?? "",
                     Timestamp      = DateTime.UtcNow
                 };
                 var json = JsonSerializer.Serialize(completions.Values, _jsonOptions);
@@ -714,8 +876,8 @@ public sealed class ClusterNodeJobService
     /// <param name="jobId">The job ID to clean up.</param>
     public void CleanupJobFiles(string jobId)
     {
-        if (_receivingJobId == jobId) _receivingJobId = null;
-        if (_completedJobId == jobId) _completedJobId = null;
+        _receivingJobIds.TryRemove(jobId, out _);
+        _completedJobIds.TryRemove(jobId, out _);
         RemoveReceiveLock(jobId);
 
         _transcodingService.RemoveWorkItem(jobId);
