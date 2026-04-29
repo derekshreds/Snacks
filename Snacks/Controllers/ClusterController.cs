@@ -118,14 +118,10 @@ public sealed class ClusterController : ControllerBase
             nodeId = config.NodeId,
             status,
             isPaused,
-            // Legacy single-slot fields — preserved so older masters that only
-            // read the first job still see a value.
-            currentJobId   = _clusterService.GetCurrentRemoteJobId(),
-            progress       = _clusterService.GetCurrentRemoteJobProgress(),
-            completedJobId = _clusterService.GetCompletedJobId(),
-            receivingJobId = _clusterService.GetReceivingJobId(),
-            // Multi-slot fields — newer masters reconcile their per-device slot
-            // accounting against these arrays.
+            // Per-slot tracking. activeJobs is one entry per occupied slot
+            // (worker is encoding right now); completedJobIds are jobs whose
+            // output is sitting on the worker waiting for the master to pull
+            // it; receivingJobIds are jobs whose source file is mid-upload.
             activeJobs      = _clusterService.GetActiveJobs(),
             completedJobIds = _clusterService.GetCompletedJobIds(),
             receivingJobIds = _clusterService.GetReceivingJobIds(),

@@ -41,23 +41,23 @@ public sealed class ClusterNode
     public WorkerCapabilities? Capabilities { get; set; }
 
     /// <summary>
-    ///     ID of the work item currently being processed by this node.
-    ///     Legacy single-slot field — derived from the first entry of
-    ///     <see cref="ActiveJobs"/> on multi-slot nodes. Null when idle.
+    ///     ID of the first occupied slot's job. Convenience accessor kept in
+    ///     sync with the head of <see cref="ActiveJobs"/> for UI bindings
+    ///     that want a single value; the authoritative per-slot list is
+    ///     <see cref="ActiveJobs"/>.
     /// </summary>
     public string? ActiveWorkItemId { get; set; }
 
-    /// <summary> Display name of the file currently being processed. </summary>
+    /// <summary> Display name of the file in the first occupied slot. </summary>
     public string? ActiveFileName { get; set; }
 
-    /// <summary> Encoding progress percentage (0–100) for the active work item. </summary>
+    /// <summary> Encoding progress percentage (0–100) for the first active job. </summary>
     public int ActiveProgress { get; set; }
 
     /// <summary>
-    ///     All in-flight remote jobs on this node, one entry per occupied slot.
-    ///     Maintained by the master from heartbeat reports plus optimistic
-    ///     book-keeping on dispatch. Empty for legacy single-slot nodes that do
-    ///     not report <see cref="WorkerCapabilities.Devices"/>.
+    ///     All in-flight remote jobs on this node, one entry per occupied
+    ///     slot. Maintained by the master from heartbeat reports plus
+    ///     optimistic book-keeping on dispatch.
     /// </summary>
     public List<ActiveJobInfo> ActiveJobs { get; set; } = new();
 
@@ -109,9 +109,6 @@ public sealed class WorkerCapabilities
     ///     <see cref="HardwareDevice.DefaultConcurrency"/> slots to the master's
     ///     dispatch pool, optionally overridden by
     ///     <see cref="NodeSettings.DeviceSettings"/>.
-    ///
-    ///     <para>Empty for legacy nodes — the master falls back to single-slot
-    ///     dispatch keyed off <see cref="GpuVendor"/> in that case.</para>
     /// </summary>
     public List<HardwareDevice> Devices { get; set; } = new();
 }

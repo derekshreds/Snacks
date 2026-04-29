@@ -165,45 +165,6 @@ public sealed class ClusterNodeJobService
         !_activeJobs.IsEmpty || !_receivingJobIds.IsEmpty || !_completedJobIds.IsEmpty;
 
     /// <summary>
-    ///     Legacy first-job accessor. Returns the ID of any one in-flight remote
-    ///     job — preferring active over receiving over completed — so old masters
-    ///     that read a single <c>currentJobId</c> field still see *some* tracked
-    ///     work. Multi-slot masters should consume <see cref="GetActiveJobs"/>.
-    /// </summary>
-    public string? GetCurrentRemoteJobId()
-    {
-        foreach (var kv in _activeJobs)        return kv.Key;
-        foreach (var kv in _receivingJobIds)   return kv.Key;
-        foreach (var kv in _completedJobIds)   return kv.Key;
-        return null;
-    }
-
-    /// <summary>
-    ///     Legacy progress accessor. Returns the progress of any one in-flight
-    ///     active job, matching the singular ID returned by
-    ///     <see cref="GetCurrentRemoteJobId"/>.
-    /// </summary>
-    public int GetCurrentRemoteJobProgress()
-    {
-        foreach (var kv in _activeJobs) return kv.Value.Item.Progress;
-        return 0;
-    }
-
-    /// <summary> Legacy first-completed-job accessor. </summary>
-    public string? GetCompletedJobId()
-    {
-        foreach (var kv in _completedJobIds) return kv.Key;
-        return null;
-    }
-
-    /// <summary> Legacy first-receiving-job accessor. </summary>
-    public string? GetReceivingJobId()
-    {
-        foreach (var kv in _receivingJobIds) return kv.Key;
-        return null;
-    }
-
-    /// <summary>
     ///     Returns one <see cref="ActiveJobInfo"/> per occupied slot on this
     ///     node. Multi-slot masters consume this in heartbeats to reconcile
     ///     their optimistic per-device slot accounting against ground truth.
