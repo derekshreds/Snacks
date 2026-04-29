@@ -6,8 +6,8 @@
  * because they cancel any in-progress encode.
  */
 
-import { clusterApi, appApi } from '../../api.js';
-import { showConfirmModal }   from '../../utils/modal-controller.js';
+import { clusterApi, appApi, dashboardApi } from '../../api.js';
+import { showConfirmModal }                 from '../../utils/modal-controller.js';
 
 
 // ---------------------------------------------------------------------------
@@ -74,13 +74,44 @@ async function restart() {
 
 
 // ---------------------------------------------------------------------------
+// Clear dashboard data
+// ---------------------------------------------------------------------------
+
+/**
+ * Wipes the encode-history ledger after explicit confirmation. The hero/
+ * device/codec/recent panels of the dashboard repaint via the SignalR
+ * `EncodeHistoryCleared` broadcast that the backend fires on success — no
+ * direct page refresh needed here.
+ */
+async function clearDashboard() {
+    const confirmed = await showConfirmModal(
+        'Clear dashboard data',
+        '<p>This permanently deletes every row in the encode-history ledger.</p>'
+        + '<p class="text-muted small mb-0">The dashboard will reset to zero. This does not affect '
+        + 'queued, in-progress, or completed work items, only the analytics history.</p>',
+        'Clear data',
+    );
+    if (!confirmed) return;
+
+    try {
+        const data = await dashboardApi.clearHistory();
+        const n = data?.deleted ?? 0;
+        showToast(`Cleared ${n} encode${n === 1 ? '' : 's'} from dashboard history`, 'success');
+    } catch (e) {
+        showToast('Clear failed: ' + e.message, 'danger');
+    }
+}
+
+
+// ---------------------------------------------------------------------------
 // Public entry points
 // ---------------------------------------------------------------------------
 
 /** Wires the panel's DOM controls. Safe to call once at startup. */
 export function initAdvancedPanel() {
-    document.getElementById('saveAdvancedCluster')?.addEventListener('click', saveTimings);
-    document.getElementById('restartAppBtn')      ?.addEventListener('click', restart);
+    document.getElementById('saveAdvancedCluster')   ?.addEventListener('click', saveTimings);
+    document.getElementById('restartAppBtn')         ?.addEventListener('click', restart);
+    document.getElementById('clearDashboardHistory') ?.addEventListener('click', clearDashboard);
 }
 
 /** Lazy data load, invoked when the settings modal is first opened. */

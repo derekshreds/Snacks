@@ -1,5 +1,7 @@
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.SignalR;
 using Snacks.Data;
+using Snacks.Hubs;
 using Snacks.Services;
 
 namespace Snacks.Controllers;
@@ -21,13 +23,18 @@ namespace Snacks.Controllers;
 /// </summary>
 public sealed class DashboardController : Controller
 {
-    private readonly EncodeHistoryRepository _history;
-    private readonly ClusterService          _cluster;
+    private readonly EncodeHistoryRepository      _history;
+    private readonly ClusterService               _cluster;
+    private readonly IHubContext<TranscodingHub>  _hub;
 
-    public DashboardController(EncodeHistoryRepository history, ClusterService cluster)
+    public DashboardController(
+        EncodeHistoryRepository history,
+        ClusterService cluster,
+        IHubContext<TranscodingHub> hub)
     {
         _history = history;
         _cluster = cluster;
+        _hub     = hub;
     }
 
     /// <summary> Renders the dashboard view at <c>/dashboard</c>. </summary>
@@ -111,6 +118,25 @@ public sealed class DashboardController : Controller
     }
 
     /// <summary>
+    ///     Wipes the encode-history ledger after the user explicitly confirms
+    ///     in the Advanced settings panel. On a worker, the request is
+    ///     proxied to the master (the worker's own ledger is empty by design);
+    ///     on a master/standalone the deletion runs locally and a SignalR
+    ///     <c>EncodeHistoryCleared</c> broadcast tells every connected client
+    ///     to refresh its dashboard view.
+    /// </summary>
+    [HttpDelete("/api/dashboard/history")]
+    public async Task<IActionResult> ClearHistory()
+    {
+        if (_cluster.IsNodeMode)
+            return await ProxyDeleteAsync("dashboard/history");
+
+        var deleted = await _history.ClearAllAsync();
+        await _hub.Clients.All.SendAsync("EncodeHistoryCleared");
+        return Ok(new { success = true, deleted });
+    }
+
+    /// <summary>
     ///     Worker-side proxy. Forwards a dashboard request to the master's
     ///     <c>/api/cluster/dashboard/*</c> mirror using the cluster shared
     ///     secret and streams the JSON response back to the calling browser.
@@ -141,6 +167,33 @@ public sealed class DashboardController : Controller
         {
             Console.WriteLine($"Dashboard: proxy to master failed for /api/cluster/{clusterPath}: {ex.Message}");
             return Content("[]", "application/json");
+        }
+    }
+
+    /// <summary>
+    ///     DELETE counterpart of <see cref="ProxyAsync"/>. Used to forward the
+    ///     "clear dashboard data" request from a worker to the master.
+    /// </summary>
+    private async Task<IActionResult> ProxyDeleteAsync(string clusterPath)
+    {
+        var masterUrl = _cluster.ResolveMasterUrl();
+        if (string.IsNullOrEmpty(masterUrl))
+            return StatusCode(503, new { success = false, error = "No master reachable" });
+
+        try
+        {
+            var client = _cluster.CreateClusterClient();
+            client.Timeout = TimeSpan.FromSeconds(15);
+            using var resp = await client.DeleteAsync($"{masterUrl}/api/cluster/{clusterPath}");
+            var body  = await resp.Content.ReadAsStringAsync();
+            var ctype = resp.Content.Headers.ContentType?.ToString() ?? "application/json";
+            Response.StatusCode = (int)resp.StatusCode;
+            return Content(body, ctype);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Dashboard: proxy DELETE to master failed for /api/cluster/{clusterPath}: {ex.Message}");
+            return StatusCode(502, new { success = false, error = ex.Message });
         }
     }
 }

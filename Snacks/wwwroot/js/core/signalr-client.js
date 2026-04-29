@@ -44,6 +44,7 @@ const KNOWN_EVENTS = Object.freeze([
     'ClusterNodePaused',
     'NodeSettingsChanged',
     'EncodeHistoryAdded',
+    'EncodeHistoryCleared',
 ]);
 
 

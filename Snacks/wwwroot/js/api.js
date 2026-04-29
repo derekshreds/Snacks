@@ -343,6 +343,26 @@ export const clusterApi = {
 
 
 // ---------------------------------------------------------------------------
+// Dashboard
+// ---------------------------------------------------------------------------
+
+/**
+ * Encode-history dashboard maintenance. The read paths each module hits
+ * directly (the dashboard page issues its own per-chart fetches); the only
+ * mutating action exposed here is the "wipe the ledger" escape hatch from
+ * the Advanced settings panel.
+ */
+export const dashboardApi = {
+    /**
+     * Wipes every row in the encode-history ledger. On a worker, the request
+     * is proxied to the master (workers don't own the ledger). The server
+     * broadcasts a SignalR event so connected dashboards refresh.
+     */
+    clearHistory: () => deleteJson('/api/dashboard/history'),
+};
+
+
+// ---------------------------------------------------------------------------
 // App lifecycle
 // ---------------------------------------------------------------------------
 

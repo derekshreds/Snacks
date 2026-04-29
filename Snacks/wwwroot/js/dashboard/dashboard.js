@@ -11,9 +11,8 @@
  * whenever a new row is appended, so the page stays live without polling.
  */
 
-import { escapeHtml }       from '../utils/dom.js';
-import { ConnectionStatus } from '../core/connection-status.js';
-import { PauseControl }     from '../queue/pause-control.js';
+import { escapeHtml }   from '../utils/dom.js';
+import { registerPage } from '../core/navigation.js';
 
 // ---------------------------------------------------------------------------
 // Color palette (matches site.css CSS variables)
@@ -565,62 +564,51 @@ async function refresh() {
 
 
 // ---------------------------------------------------------------------------
-// Wire up range buttons + SignalR live updates
+// Page lifecycle — mount/unmount driven by the SPA navigation shell
 // ---------------------------------------------------------------------------
 
-document.addEventListener('DOMContentLoaded', () => {
-    document.querySelectorAll('.range-btn').forEach(btn => {
-        btn.addEventListener('click', () => {
-            document.querySelectorAll('.range-btn').forEach(b => b.classList.remove('active'));
-            btn.classList.add('active');
-            currentRange = parseInt(btn.dataset.range, 10) || 30;
-            refresh();
-        });
-    });
+/**
+ * Listener for the cross-cutting "history changed" window event dispatched
+ * by main.js when SignalR reports an EncodeHistory add or clear. We refresh
+ * with a short debounce so a burst of completed encodes coalesces into one
+ * repaint.
+ */
+function onHistoryChanged() {
+    if (refreshTimer) clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(refresh, 600);
+}
 
-    // Wire the navbar's connection dot and pause button on this page too —
-    // they live in the shared layout so every page gets them, but only the
-    // queue page ran the bootstrap that hooked them up. Without this, the
-    // dashboard's nav stayed at "orange dot / blank text / unbound pause
-    // button" because no one was listening to SignalR's lifecycle here.
-    const connectionStatus = new ConnectionStatus();
-    const pauseControl     = new PauseControl();
-    pauseControl.init();   // fetches authoritative state and wires click
-
-    // The dashboard's live feed listens to the same hub the queue page uses.
-    // We hook into the SignalR client provided by the global signalR.min.js
-    // bundle and forward lifecycle to the indicator + pause control — so
-    // pause changes from the queue page (or another tab) show here too.
-    if (window.signalR) {
-        try {
-            const conn = new window.signalR.HubConnectionBuilder()
-                .withUrl('/transcodingHub')
-                .withAutomaticReconnect()
-                .build();
-
-            conn.onreconnecting(() => connectionStatus.setDisconnected());
-            conn.onreconnected (() => connectionStatus.setConnected());
-            conn.onclose       (() => connectionStatus.setDisconnected());
-
-            conn.on('EncodeHistoryAdded', () => {
-                if (refreshTimer) clearTimeout(refreshTimer);
-                refreshTimer = setTimeout(refresh, 600);
-            });
-            conn.on('ClusterNodePaused', (paused) => pauseControl.setFromRemote(paused));
-
-            conn.start()
-                .then(() => connectionStatus.setConnected())
-                .catch(err => {
-                    console.warn('Dashboard SignalR connect failed:', err);
-                    connectionStatus.setDisconnected();
-                });
-        } catch (err) {
-            console.warn('Dashboard SignalR setup failed:', err);
-            connectionStatus.setDisconnected();
-        }
-    } else {
-        connectionStatus.setDisconnected();
-    }
-
+/**
+ * Click handler for the range pills (7d/30d/90d/1y). Lives at the dashboard
+ * root via event delegation so we don't have to bind/unbind one listener per
+ * pill on every mount.
+ */
+function onRangeClick(e) {
+    const btn = e.target.closest('.range-btn');
+    if (!btn) return;
+    document.querySelectorAll('.range-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    currentRange = parseInt(btn.dataset.range, 10) || 30;
     refresh();
+}
+
+registerPage('dashboard', {
+    mount: () => {
+        // The dashboard root receives the delegated range-click listener.
+        // It's part of the page-content swap, so this listener disappears
+        // automatically on unmount when the DOM is replaced.
+        const root = document.querySelector('.dashboard-page');
+        root?.addEventListener('click', onRangeClick);
+
+        window.addEventListener('snacks:encode-history-changed', onHistoryChanged);
+
+        refresh();
+    },
+    unmount: () => {
+        window.removeEventListener('snacks:encode-history-changed', onHistoryChanged);
+        if (refreshTimer) {
+            clearTimeout(refreshTimer);
+            refreshTimer = null;
+        }
+    },
 });

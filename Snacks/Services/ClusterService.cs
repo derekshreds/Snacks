@@ -1408,9 +1408,13 @@ public sealed class ClusterService : IHostedService, IDisposable
             var encodeScope = await _stateTransitions.BeginAsync(workItem.Id, "Uploading", "Encoding");
             _activeTransitions[workItem.Id] = encodeScope;
 
-            workItem.Status          = WorkItemStatus.Processing;
-            workItem.RemoteJobPhase  = "Encoding";
+            workItem.Status           = WorkItemStatus.Processing;
+            workItem.RemoteJobPhase   = "Encoding";
             workItem.TransferProgress = 0;
+            // Stamp encode-start at the Uploading→Encoding handover so the
+            // history ledger's EncodeSeconds reflects actual encode wall time,
+            // not (now - CreatedAt) which would include queue-wait + upload.
+            workItem.StartedAt        = DateTime.UtcNow;
             await _mediaFileRepo.UpdateRemoteJobPhaseAsync(Path.GetFullPath(workItem.Path), "Encoding");
             await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
 
@@ -2743,6 +2747,11 @@ public sealed class ClusterService : IHostedService, IDisposable
                         workItem.AssignedNodeName = mediaFile.AssignedNodeName ?? "recovered";
                         workItem.RemoteJobPhase   = "Encoding";
                         workItem.ErrorMessage     = null;
+                        // Original encode start is unrecoverable here — the worker
+                        // is already mid-encode but its kickoff time wasn't
+                        // persisted. Stamp "now" so EncodeSeconds is at worst a
+                        // lower bound rather than the (much larger) queue age.
+                        workItem.StartedAt      ??= DateTime.UtcNow;
                         _remoteJobs[workItem.Id]  = workItem;
                         await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
                         continue;
@@ -2857,8 +2866,9 @@ public sealed class ClusterService : IHostedService, IDisposable
                                 // WAL: Uploading → Encoding (recovery path)
                                 var recEncScope = await _stateTransitions.BeginAsync(workItem.Id, "Uploading", "Encoding");
 
-                                workItem.RemoteJobPhase  = "Encoding";
+                                workItem.RemoteJobPhase   = "Encoding";
                                 workItem.TransferProgress = 0;
+                                workItem.StartedAt        = DateTime.UtcNow;
                                 await _mediaFileRepo.UpdateRemoteJobPhaseAsync(mediaFile.FilePath, "Encoding");
                                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
 

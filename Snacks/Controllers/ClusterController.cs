@@ -973,4 +973,19 @@ public sealed class ClusterController : ControllerBase
         return Ok(await _historyRepo.GetTopSavingsAsync(limit, days));
     }
 
+    /// <summary>
+    ///     Wipes the master's encode-history ledger. Invoked by a worker's
+    ///     Advanced settings tab when the user asks to clear dashboard data —
+    ///     the worker proxies the request here because the master is the only
+    ///     node that owns the ledger. Broadcasts <c>EncodeHistoryCleared</c>
+    ///     so every connected client refreshes its dashboard view.
+    /// </summary>
+    [HttpDelete("dashboard/history")]
+    public async Task<IActionResult> DashboardClearHistory()
+    {
+        var deleted = await _historyRepo.ClearAllAsync();
+        await _hubContext.Clients.All.SendAsync("EncodeHistoryCleared");
+        return Ok(new { success = true, deleted });
+    }
+
 }

@@ -201,6 +201,18 @@ public class EncodeHistoryRepository
     }
 
     /// <summary>
+    ///     Wipes every row in the encode-history ledger. Returns the number of
+    ///     rows deleted so callers can surface a confirmation toast. The ledger
+    ///     is append-only by design — this is the one escape hatch, used to
+    ///     reset the dashboard after stale or inflated data builds up.
+    /// </summary>
+    public async Task<int> ClearAllAsync()
+    {
+        using var context = await _contextFactory.CreateDbContextAsync();
+        return await context.EncodeHistory.ExecuteDeleteAsync();
+    }
+
+    /// <summary>
     ///     Top compression wins — encodes ordered by the largest absolute
     ///     bytes saved. Surfaces the most "look how much we shrunk this"
     ///     stories for the leaderboard.
