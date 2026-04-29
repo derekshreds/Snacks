@@ -163,7 +163,20 @@ export class QueueManager {
      * @param {object} workItem
      */
     updateItem(workItem) {
+        // Capture the previous status before overwriting so we can detect
+        // transitions (e.g. Pending → Processing) — used below to backfill
+        // the queued container only on the moment of dispatch, not on every
+        // progress tick within a transfer phase.
+        const prev          = this._workItems.get(workItem.id);
+        const prevStatus    = prev ? getStatusString(prev.status) : null;
+        const prevWasQueued = prev == null || !TRANSFER_STATUSES.includes(prevStatus);
+
         this._workItems.set(workItem.id, workItem);
+
+        // Off-page (e.g. user is on /dashboard): only keep the in-memory map
+        // current. The DOM will repaint from a fresh fetch when the queue
+        // page is re-mounted.
+        if (!document.getElementById('workItemsContainer')) return;
 
         const statusString = getStatusString(workItem.status);
         if (!TRANSFER_STATUSES.includes(statusString)) {
@@ -189,6 +202,13 @@ export class QueueManager {
         }
 
         this._renderItem({ ...workItem, status: statusString });
+
+        // Backfill the queued container on the *transition* into a
+        // transfer state — the item just left the Queued list and freed
+        // a slot. Use the queue-only refresh so the in-flight transfer
+        // cards in "Now Processing" aren't reconciled (which would
+        // recreate their progress bars and flicker mid-upload).
+        if (prevWasQueued) this._scheduleQueueRefresh();
     }
 
     /** Schedules a full refresh, throttled to at most once every {@link REFRESH_THROTTLE_MS}. */
@@ -201,14 +221,76 @@ export class QueueManager {
         }, REFRESH_THROTTLE_MS);
     }
 
+    /**
+     * Schedules a queued-container-only refresh. Used when an item is
+     * dispatched out of Pending: we want to backfill the freed slot with
+     * the next pending item, but reconciling the processing container
+     * would tear down and rebuild in-flight transfer cards (cancelling
+     * their progress bars). Throttled on the same handle so a burst of
+     * dispatches collapses into one fetch.
+     */
+    _scheduleQueueRefresh() {
+        if (this._refreshTimer) return;
+
+        this._refreshTimer = setTimeout(() => {
+            this._refreshTimer = null;
+            this._refreshQueueOnly();
+        }, REFRESH_THROTTLE_MS);
+    }
+
+    /**
+     * Re-fetches stats + the current queued page and reconciles ONLY the
+     * queued container. Leaves the "Now Processing" container untouched —
+     * SignalR `WorkItemUpdated` ticks keep those cards current via
+     * `updateWorkItemDom`.
+     */
+    async _refreshQueueOnly() {
+        if (!document.getElementById('workItemsContainer')) return;
+
+        try {
+            const skip = this._page * PAGE_SIZE;
+            const [stats, data] = await Promise.all([
+                queueApi.getStats(),
+                queueApi.getItems(PAGE_SIZE, skip, this._filter ?? undefined),
+            ]);
+
+            const queueItems = data.items;
+            this._total = data.total;
+
+            this._reconcileQueueContainer(queueItems);
+
+            if (queueItems.length === 0) {
+                const queueContainer = document.getElementById('workItemsContainer');
+                const msg = this._filter
+                    ? `No ${this._filter.toLowerCase()} items`
+                    : 'No files in queue';
+                queueContainer.innerHTML = `<div class="text-muted text-center py-4"><i class="fas fa-inbox fa-2x mb-2"></i><br>${msg}</div>`;
+            }
+
+            this._updateStatCounters(stats);
+            this._renderPagination();
+            this._renderFilterTabs(stats);
+        } catch (err) {
+            console.error('Error refreshing queue:', err);
+        }
+    }
+
 
     // ---- Load / render ----
 
     /**
      * Fetches the current page and the aggregate stats, reconciles both
      * containers, and repaints the pagination + filter strip.
+     *
+     * SPA shell: the queue containers only exist on the queue page. If the
+     * user is on /dashboard when SignalR fires a WorkItem update or a
+     * visibility-change tries to resync, bail out — the queue page's
+     * `mount` hook calls `loadItems()` again when the user returns, and
+     * the in-memory `_workItems` map is repopulated from that fetch.
      */
     async loadItems() {
+        if (!document.getElementById('workItemsContainer')) return;
+
         try {
             const skip = this._page * PAGE_SIZE;
 

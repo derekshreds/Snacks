@@ -36,23 +36,70 @@ public class TranscodingService
     /// <summary>Ensures only one local encoding job runs at a time.</summary>
     private readonly SemaphoreSlim _processingLock = new(1, 1);
 
-    /// <summary>Lock protecting access to <see cref="_activeProcess"/> and <see cref="_activeWorkItem"/>.</summary>
-    private readonly object _activeLock = new();
-
-    /// <summary>The currently running FFmpeg process, or <c>null</c> when idle.</summary>
-    private Process? _activeProcess;
+    /// <summary>
+    ///     Per-job state for an in-flight local encode. Each entry pins a
+    ///     work item to the device slot it consumed when scheduling started,
+    ///     plus the running ffmpeg <see cref="System.Diagnostics.Process"/>
+    ///     and a cancellation source that aborts not just ffmpeg but every
+    ///     auxiliary child process the encode has spawned (OCR, sidecar
+    ///     extraction, tessdata download).
+    /// </summary>
+    private sealed class ActiveLocalJob
+    {
+        public WorkItem                Item     = null!;
+        public CancellationTokenSource Cts      = null!;
+        public string                  DeviceId = "";
+        public Process?                Process;
+    }
 
     /// <summary>
-    ///     Cancellation source for the active local job. Cancelled by
-    ///     <see cref="CancelWorkItemAsync"/> to stop phases that run outside the ffmpeg
-    ///     process (OCR pre-pass, sidecar extraction, tessdata downloads) — killing
-    ///     <see cref="_activeProcess"/> isn't enough because those spawn their own
-    ///     child processes that aren't registered as the active one.
+    ///     All in-flight local encodes keyed by work-item ID. Replaces the
+    ///     prior single <c>_activeProcess</c>/<c>_activeWorkItem</c> pair so
+    ///     the master can run several encodes simultaneously, one per device
+    ///     slot.
     /// </summary>
-    private CancellationTokenSource? _activeJobCts;
+    private readonly ConcurrentDictionary<string, ActiveLocalJob> _activeLocalJobs = new();
 
-    /// <summary>The work item currently being encoded locally, or <c>null</c> when idle.</summary>
-    private WorkItem? _activeWorkItem;
+    /// <summary>Lock protecting per-job <see cref="ActiveLocalJob.Process"/> publication.</summary>
+    private readonly object _activeLock = new();
+
+    /// <summary>
+    ///     Wake signal raced against in-flight task completions inside the
+    ///     scheduler's <c>WhenAny</c> waits. Settings changes (per-device cap
+    ///     adjustments, enable toggles) trigger a wake so the scheduler
+    ///     re-evaluates its dispatch decision immediately instead of
+    ///     blocking on the currently running encode to finish first.
+    /// </summary>
+    private TaskCompletionSource _schedulerWake = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>
+    ///     Signals the scheduler to re-evaluate slot availability now.
+    ///     Idempotent — repeated calls before the scheduler observes the
+    ///     wake collapse into a single re-check.
+    /// </summary>
+    private void WakeScheduler()
+    {
+        var prev = Interlocked.Exchange(
+            ref _schedulerWake,
+            new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
+        prev.TrySetResult();
+    }
+
+    /// <summary>
+    ///     Awaits the next interesting event for the scheduler — either an
+    ///     in-flight encode finishing or an explicit wake (settings change).
+    ///     Falls back to a short poll when there are no in-flight tasks.
+    /// </summary>
+    private async Task WaitForSchedulerProgressAsync(List<Task> inflight)
+    {
+        var wake = _schedulerWake.Task;
+        if (inflight.Count == 0)
+        {
+            await Task.WhenAny(wake, Task.Delay(200));
+            return;
+        }
+        await Task.WhenAny(Task.WhenAny(inflight), wake);
+    }
 
     /// <summary>Whether the local processing loop is paused by user request.</summary>
     private volatile bool _isPaused = false;
@@ -63,11 +110,19 @@ public class TranscodingService
     /// <summary>The encoder options from the most recently started queue run. Used when resuming after unpause.</summary>
     private EncoderOptions? _lastOptions;
 
-    /// <summary>Optional callback to forward encoding progress to the master node.</summary>
-    private Func<string, int, Task>? _progressCallback;
+    /// <summary>
+    ///     Per-job callbacks to forward encoding progress to the master node.
+    ///     Keyed by work-item ID so concurrent encodes on a multi-slot worker
+    ///     route their progress back to their own job's reporter without
+    ///     racing on a shared field.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, Func<string, int, Task>> _progressCallbacks = new();
 
-    /// <summary>Optional callback to forward FFmpeg log lines to the master node.</summary>
-    private Func<string, string, Task>? _logCallback;
+    /// <summary>
+    ///     Per-job callbacks to forward FFmpeg log lines to the master node.
+    ///     Same per-jobId isolation rationale as <see cref="_progressCallbacks"/>.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, Func<string, string, Task>> _logCallbacks = new();
 
     /// <summary>Optional callback to cancel a remote job on a cluster node.</summary>
     private Func<string, string, Task>? _remoteJobCanceller;
@@ -77,6 +132,48 @@ public class TranscodingService
 
     /// <summary>Optional predicate to skip items for local processing (e.g. master excludes 4K).</summary>
     private Func<WorkItem, bool>? _shouldSkipLocal;
+
+    /// <summary>
+    ///     Resolves per-device settings for <em>this</em> machine when the
+    ///     master is encoding locally. Set by <see cref="ClusterService"/>
+    ///     based on <see cref="NodeSettings.DeviceSettings"/> stored under
+    ///     the master's own NodeId. <see langword="null"/> ⇒ no overrides;
+    ///     every device runs at its detected default concurrency.
+    /// </summary>
+    private Func<string, (bool Enabled, int? MaxOverride)>? _localDeviceSettingsProvider;
+
+    /// <summary>
+    ///     Registers (or clears) the per-device settings provider used by
+    ///     the multi-slot scheduler. The scheduler reads the provider on
+    ///     <em>every</em> dispatch decision — there's no cached slot pool —
+    ///     so a cap raised from 1 to 2 takes effect on the very next
+    ///     iteration without leaking phantom tokens. After updating the
+    ///     provider, we kick the queue runner so a previously-blocked
+    ///     scheduler picks up the new headroom immediately rather than
+    ///     waiting for the next event.
+    /// </summary>
+    public void SetLocalDeviceSettingsProvider(Func<string, (bool Enabled, int? MaxOverride)>? provider)
+    {
+        _localDeviceSettingsProvider = provider;
+
+        // Wake the running scheduler so it re-evaluates dispatch immediately
+        // — without this, raising a cap from 1 → 2 mid-run only takes effect
+        // after the currently running encode completes, because the
+        // scheduler is parked in WhenAny(inflight).
+        WakeScheduler();
+
+        // Also kick off ProcessQueueAsync in case no scheduler is running
+        // (queue was idle waiting for an enable). Idempotent — the lock
+        // bails early if a scheduler is already alive.
+        if (_lastOptions != null && !_isPaused && !_localEncodingPaused)
+        {
+            _ = Task.Run(async () =>
+            {
+                try { await ProcessQueueAsync(_lastOptions); }
+                catch (Exception ex) { Console.WriteLine($"ProcessQueueAsync after settings change failed: {ex.Message}"); }
+            });
+        }
+    }
 
     /// <summary>Local encoding job counters.</summary>
     private int _localCompletedJobs;
@@ -149,6 +246,24 @@ public class TranscodingService
     ///     Initializes the service and eagerly starts hardware acceleration detection in the
     ///     background so that the first queue item does not pay the detection cost.
     /// </summary>
+    private readonly EncodeHistoryRepository? _encodeHistoryRepo;
+
+    /// <summary>
+    ///     The master's own (NodeId, Hostname) for stamping local encode-history
+    ///     rows. Set by <see cref="ClusterService"/> at startup so the dashboard
+    ///     can attribute "encoded on this machine" without depending on
+    ///     cluster-mode specifics.
+    /// </summary>
+    private (string NodeId, string Hostname) _localNodeIdentity = ("local", Environment.MachineName);
+
+    /// <summary> Updates the local-node identity used when stamping encode-history rows. </summary>
+    public void SetLocalNodeIdentity(string nodeId, string hostname)
+    {
+        _localNodeIdentity = (
+            string.IsNullOrEmpty(nodeId) ? "local" : nodeId,
+            string.IsNullOrEmpty(hostname) ? Environment.MachineName : hostname);
+    }
+
     public TranscodingService(
         FileService fileService,
         FfprobeService ffprobeService,
@@ -156,7 +271,8 @@ public class TranscodingService
         MediaFileRepository mediaFileRepo,
         NotificationService? notificationService = null,
         IntegrationService? integrationService = null,
-        SubtitleExtractionService? subtitleExtractionService = null)
+        SubtitleExtractionService? subtitleExtractionService = null,
+        EncodeHistoryRepository? encodeHistoryRepo = null)
     {
         _fileService               = fileService;
         _ffprobeService            = ffprobeService;
@@ -165,6 +281,7 @@ public class TranscodingService
         _notificationService       = notificationService;
         _integrationService        = integrationService;
         _subtitleExtractionService = subtitleExtractionService;
+        _encodeHistoryRepo         = encodeHistoryRepo;
         _ffmpegPath          = Environment.GetEnvironmentVariable("FFMPEG_PATH") ?? "ffmpeg";
 
         _ = Task.Run(async () =>
@@ -187,10 +304,16 @@ public class TranscodingService
     /// </summary>
     private async Task LogAsync(string workItemId, string message)
     {
+        // Any log line is a sign of life — refresh LastUpdatedAt so the watchdog
+        // doesn't kill jobs that are emitting output but no formal progress ticks
+        // (e.g. crop-detect, OCR pre-pass, hardware-accel probing).
+        if (_workItems.TryGetValue(workItemId, out var logItem))
+            logItem.Touch();
+
         await _hubContext.Clients.All.SendAsync("TranscodingLog", workItemId, message);
 
-        if (_logCallback != null)
-            _ = _logCallback(workItemId, message);
+        if (_logCallbacks.TryGetValue(workItemId, out var logCb))
+            _ = logCb(workItemId, message);
 
         // Log files are named after the source video so they can be matched by eye when browsing the logs directory.
         try
@@ -945,7 +1068,7 @@ public class TranscodingService
 
         // Diagnostic log — if cancel ever seems to "not work", this line tells us exactly
         // which branch fired and what the item's state was going in.
-        Console.WriteLine($"Cancel: id={id} status={workItem.Status} assignedNode={workItem.AssignedNodeId ?? "<none>"} isActiveLocal={_activeWorkItem?.Id == id}");
+        Console.WriteLine($"Cancel: id={id} status={workItem.Status} assignedNode={workItem.AssignedNodeId ?? "<none>"} isActiveLocal={_activeLocalJobs.ContainsKey(id)}");
 
         if (workItem.Status == WorkItemStatus.Pending)
         {
@@ -966,12 +1089,13 @@ public class TranscodingService
             await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
             await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Cancelled);
         }
-        else if (workItem.Status == WorkItemStatus.Processing && _activeWorkItem?.Id == id)
+        else if (workItem.Status == WorkItemStatus.Processing && _activeLocalJobs.ContainsKey(id))
         {
-            // Cancel the token first so phases that aren't backed by _activeProcess
-            // (OCR pre-pass, sidecar extraction, tessdata downloads) stop too.
-            CancelActiveJobCts();
-            await KillActiveProcess(workItem, "Encoding cancelled by user.");
+            // Cancel the per-job token first so phases that aren't backed by
+            // ffmpeg (OCR pre-pass, sidecar extraction, tessdata downloads)
+            // stop too — peer encodes on other slots aren't affected.
+            CancelLocalJobCts(id);
+            await KillJobProcess(id, "Encoding cancelled by user.");
             workItem.Status = WorkItemStatus.Cancelled;
             workItem.CompletedAt = DateTime.UtcNow;
             await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
@@ -990,11 +1114,63 @@ public class TranscodingService
         }
     }
 
-    private void CancelActiveJobCts()
+    /// <summary> Cancels a single local job's CTS without touching its peers. </summary>
+    private void CancelLocalJobCts(string jobId)
     {
-        CancellationTokenSource? cts;
-        lock (_activeLock) { cts = _activeJobCts; }
-        try { cts?.Cancel(); } catch { /* already disposed */ }
+        if (_activeLocalJobs.TryGetValue(jobId, out var active))
+        {
+            try { active.Cts.Cancel(); } catch { /* already disposed */ }
+        }
+    }
+
+    /// <summary>
+    ///     Builds and persists an <see cref="EncodeHistory"/> row for a
+    ///     completed local encode. Caller has already verified the encode
+    ///     succeeded (didn't fail / cancel). Outcome is auto-classified by
+    ///     comparing the encoded output size against the source.
+    /// </summary>
+    private async Task RecordLocalEncodeHistoryAsync(WorkItem workItem, EncoderOptions options, string deviceId)
+    {
+        if (_encodeHistoryRepo == null) return;
+        try
+        {
+            var encodedSize = workItem.OutputSize ?? 0;
+            var noSavings   = encodedSize == 0 || encodedSize >= workItem.Size;
+            var encodeStart = workItem.StartedAt ?? workItem.CreatedAt;
+            var srcCodec    = workItem.Probe?.Streams?.FirstOrDefault(s => s.CodecType == "video")?.CodecName ?? "";
+
+            var record = new EncodeHistory
+            {
+                JobId               = workItem.Id,
+                FilePath            = workItem.Path,
+                FileName            = workItem.FileName,
+                OriginalSizeBytes   = workItem.Size,
+                EncodedSizeBytes    = noSavings ? 0 : encodedSize,
+                BytesSaved          = noSavings ? 0 : Math.Max(0, workItem.Size - encodedSize),
+                OriginalCodec       = srcCodec,
+                EncodedCodec        = options.Codec,
+                OriginalBitrateKbps = workItem.Bitrate,
+                EncodedBitrateKbps  = workItem.Length > 0 && encodedSize > 0
+                    ? (long)(encodedSize * 8.0 / 1024.0 / workItem.Length)
+                    : 0,
+                DurationSeconds     = workItem.Length,
+                EncodeSeconds       = (DateTime.UtcNow - encodeStart).TotalSeconds,
+                DeviceId            = string.IsNullOrEmpty(deviceId) ? "cpu" : deviceId,
+                NodeId              = _localNodeIdentity.NodeId,
+                NodeHostname        = _localNodeIdentity.Hostname,
+                WasRemote           = false,
+                Is4K                = workItem.Is4K,
+                StartedAt           = encodeStart,
+                CompletedAt         = DateTime.UtcNow,
+                Outcome             = noSavings ? "NoSavings" : "Completed",
+            };
+            await _encodeHistoryRepo.RecordAsync(record);
+            await _hubContext.Clients.All.SendAsync("EncodeHistoryAdded", record);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"EncodeHistory: local record failed for {workItem.Id}: {ex.Message}");
+        }
     }
 
     /// <summary>
@@ -1026,10 +1202,10 @@ public class TranscodingService
             await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
             await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Unseen);
         }
-        else if (workItem.Status == WorkItemStatus.Processing && _activeWorkItem?.Id == id)
+        else if (workItem.Status == WorkItemStatus.Processing && _activeLocalJobs.ContainsKey(id))
         {
-            CancelActiveJobCts();
-            await KillActiveProcess(workItem, "Encoding stopped by user — will retry later.");
+            CancelLocalJobCts(id);
+            await KillJobProcess(id, "Encoding stopped by user — will retry later.");
             workItem.Status = WorkItemStatus.Stopped;
             workItem.CompletedAt = DateTime.UtcNow;
             await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
@@ -1064,36 +1240,65 @@ public class TranscodingService
             _workItems.TryRemove(existing.Id, out _);
     }
 
-    /// <summary>Kills the active FFmpeg process and logs the reason. Safe to call when no process is running.</summary>
-    private async Task KillActiveProcess(WorkItem workItem, string logMessage)
+    /// <summary>
+    ///     Kills the FFmpeg process for a specific local job and logs the
+    ///     reason. Safe to call when no process is running for that job (e.g.
+    ///     ffmpeg has already exited or hasn't spawned yet for this slot).
+    ///     Other in-flight jobs on different slots are untouched.
+    /// </summary>
+    private async Task KillJobProcess(string jobId, string logMessage)
     {
         try
         {
             Process? proc;
-            lock (_activeLock) { proc = _activeProcess; }
+            lock (_activeLock)
+            {
+                proc = _activeLocalJobs.TryGetValue(jobId, out var active) ? active.Process : null;
+            }
             if (proc != null && !proc.HasExited)
             {
                 proc.Kill(entireProcessTree: true);
-                await LogAsync(workItem.Id, logMessage);
+                await LogAsync(jobId, logMessage);
             }
         }
         catch (Exception ex)
         {
-            await LogAsync(workItem.Id, $"Error killing process: {ex.Message}");
+            await LogAsync(jobId, $"Error killing process: {ex.Message}");
         }
     }
 
     /// <summary>
-    ///     Main queue processing loop. Dequeues items one at a time and encodes them locally.
-    ///     Stops if the queue is paused or local encoding is suspended for cluster dispatch.
-    ///     The <see cref="_processingLock"/> semaphore guarantees only one instance runs at a time.
+    ///     Multi-slot queue scheduler. Loops over the pending queue acquiring
+    ///     per-device slots, spawns each eligible item as its own encode task,
+    ///     and exits only when the queue is empty <em>and</em> all in-flight
+    ///     encodes have completed. <see cref="_processingLock"/> still gates
+    ///     re-entry so multiple callers (settings save, retry, unpause) don't
+    ///     race a second scheduler.
+    ///
+    ///     <para>Each item is encoded with a <em>cloned</em>
+    ///     <see cref="EncoderOptions"/> whose <see cref="EncoderOptions.HardwareAcceleration"/>
+    ///     is pinned to the chosen slot's device family — the user's "auto"
+    ///     stays a hint for slot selection, but the actual ffmpeg invocation
+    ///     gets a concrete device so two simultaneous encodes don't both
+    ///     auto-resolve to the same NVENC card and starve.</para>
     /// </summary>
     private async Task ProcessQueueAsync(EncoderOptions options)
     {
         if (!await _processingLock.WaitAsync(100))
-            return; // Already processing
+        {
+            // A scheduler is already running. Nudge it so it re-checks the
+            // queue + per-device caps right now instead of staying parked
+            // in WhenAny(inflight) until the currently running encode
+            // finishes. Without this, adding new items (or raising a cap)
+            // mid-run only takes effect after the running encode completes
+            // — which surfaces as "I have 2 slots, only 1 fills".
+            WakeScheduler();
+            return;
+        }
 
         _lastOptions = options;
+
+        var inflight = new List<Task>();
 
         try
         {
@@ -1106,30 +1311,99 @@ public class TranscodingService
                 }
 
                 // When local encoding is paused (master delegating to nodes),
-                // leave items in the queue for the cluster dispatch loop
+                // leave items in the queue for the cluster dispatch loop. Wait
+                // for any in-flight encodes that are still finishing before we
+                // exit so the scheduler cleans up cleanly.
                 if (_localEncodingPaused)
                     break;
 
-                WorkItem? workItem = null;
+                // Reap completed inflight tasks before checking for queue-empty exit.
+                inflight.RemoveAll(t => t.IsCompleted);
+
+                bool queueEmpty;
                 lock (_queueLock)
                 {
-                    // Remove cancelled/stopped items
                     _workQueue.RemoveAll(w => w.Status is WorkItemStatus.Cancelled or WorkItemStatus.Stopped);
-
-                    // LINQ: first pending item that passes the local skip predicate
-                    workItem = _workQueue.FirstOrDefault(w =>
+                    queueEmpty = !_workQueue.Any(w =>
                         w.Status == WorkItemStatus.Pending &&
                         (_shouldSkipLocal == null || !_shouldSkipLocal(w)));
-
-                    if (workItem == null) break;
-                    _workQueue.Remove(workItem);
                 }
 
-                // Clone from _lastOptions so settings changes take effect on the next item.
-                // _lastOptions gets updated when the user saves new settings.
+                if (queueEmpty && inflight.Count == 0) break;
+
+                // Queue is empty but encodes are still finishing — wait for
+                // one to drain or for an explicit wake (settings change)
+                // before re-checking.
+                if (queueEmpty)
+                {
+                    await WaitForSchedulerProgressAsync(inflight);
+                    continue;
+                }
+
+                // Pick a device that has free capacity right now. The check
+                // reads the current count of in-flight encodes per device
+                // and the user's current cap from the settings provider, so
+                // a cap change applied while we're looping takes effect on
+                // the very next iteration with no semaphore rebuilding.
                 var current = _lastOptions ?? options;
-                await ProcessWorkItemAsync(workItem, current.Clone());
+                var deviceId = TryAcquireLocalDeviceSlot(current);
+                if (deviceId == null)
+                {
+                    // No slot free yet — wait for an inflight to finish OR a
+                    // settings-change wake. Without the wake, raising the cap
+                    // mid-run would only take effect after the running encode
+                    // finished, defeating the user's "let two run at once"
+                    // intent.
+                    await WaitForSchedulerProgressAsync(inflight);
+                    continue;
+                }
+
+                // Pick the next pending item this device can encode.
+                WorkItem? workItem;
+                lock (_queueLock)
+                {
+                    workItem = _workQueue.FirstOrDefault(w =>
+                        w.Status == WorkItemStatus.Pending &&
+                        (_shouldSkipLocal == null || !_shouldSkipLocal(w)) &&
+                        DeviceCanEncode(deviceId, w, current));
+                    if (workItem != null) _workQueue.Remove(workItem);
+                }
+
+                if (workItem == null)
+                {
+                    // No item fits this device right now. Wait for inflight
+                    // progress or settings-wake before reconsidering.
+                    await WaitForSchedulerProgressAsync(inflight);
+                    continue;
+                }
+
+                // Clone options so the per-job HW pin doesn't leak into the
+                // shared instance, and so a settings change after dispatch
+                // can't mutate the encode mid-run.
+                var perJobOptions = current.Clone();
+                perJobOptions.HardwareAcceleration = deviceId == "cpu" ? "none" : deviceId;
+
+                // Pre-register the active job synchronously before spawning so
+                // the scheduler's next iteration counts it against the device's
+                // cap without a race window.
+                var active = new ActiveLocalJob
+                {
+                    Item     = workItem,
+                    Cts      = new CancellationTokenSource(),
+                    DeviceId = deviceId,
+                };
+                _activeLocalJobs[workItem.Id] = active;
+                workItem.DispatchedDeviceId = deviceId;
+
+                var jobTask = ProcessWorkItemAsync(workItem, perJobOptions, active);
+                inflight.Add(jobTask);
             }
+
+            // Drain remaining inflight before releasing the scheduler lock so
+            // a follow-up ProcessQueueAsync call can't reschedule items that
+            // are still finishing on disk.
+            if (inflight.Count > 0)
+                await Task.WhenAll(inflight.Select(t => t.ContinueWith(_ => { }, TaskScheduler.Default)));
         }
         finally
         {
@@ -1138,17 +1412,104 @@ public class TranscodingService
     }
 
     /// <summary>
-    ///     Transitions a work item to Processing, runs the conversion, and handles success/failure outcomes.
-    ///     On cancellation, cleans up the partial output file. On failure, increments the DB failure count.
+    ///     Returns the first device with free capacity for an in-flight encode,
+    ///     or <see langword="null"/> if every device is disabled, codec-mismatched,
+    ///     or already at its user-configured concurrency cap. Capacity is computed
+    ///     from <see cref="_activeLocalJobs"/> live — no cached semaphores — so a
+    ///     cap raised mid-run unlocks the next slot on the very next call.
+    ///
+    ///     <para>CPU rules:
+    ///     <list type="bullet">
+    ///         <item><c>none</c> (Software): CPU is the only acceptable slot.</item>
+    ///         <item><c>auto</c> on a machine with no hardware encoders: CPU is the auto-fallback.</item>
+    ///         <item>Anything else: CPU is excluded so jobs queue rather than spilling onto a slow software encode.</item>
+    ///     </list>
+    ///     The CPU slot is hidden from the override dialog and pinned to a
+    ///     single concurrent encode regardless of any stale per-node setting.</para>
     /// </summary>
-    private async Task ProcessWorkItemAsync(WorkItem workItem, EncoderOptions options)
+    private string? TryAcquireLocalDeviceSlot(EncoderOptions options)
     {
-        var jobCts = new CancellationTokenSource();
-        lock (_activeLock)
+        var devices = GetDetectedDevices();
+        if (devices.Count == 0) return null;
+
+        var hwPref = (options.HardwareAcceleration ?? "auto").ToLowerInvariant();
+        bool hasHardware = devices.Any(d => d.DeviceId != "cpu");
+
+        foreach (var device in devices)
         {
-            _activeWorkItem = workItem;
-            _activeJobCts   = jobCts;
+            bool isCpu = device.DeviceId == "cpu";
+
+            // Hardware-vs-CPU gating.
+            if (hwPref == "none" && !isCpu) continue;                          // Software ⇒ CPU only
+            if (hwPref != "none" && hwPref != "auto" && isCpu) continue;       // Specific vendor ⇒ never CPU
+            if (hwPref == "auto" && isCpu && hasHardware) continue;            // Auto with HW ⇒ never CPU
+
+            // Specific-vendor preference must match the device family exactly.
+            if (hwPref != "auto" && hwPref != "none"
+                && !string.Equals(hwPref, device.DeviceId, StringComparison.OrdinalIgnoreCase)) continue;
+
+            int cap;
+            if (isCpu)
+            {
+                // CPU slot is hidden from the user and capped at 1.
+                cap = 1;
+            }
+            else
+            {
+                var (enabled, maxOverride) = _localDeviceSettingsProvider?.Invoke(device.DeviceId)
+                    ?? (true, (int?)null);
+                if (!enabled) continue;
+                cap = Math.Max(0, maxOverride ?? device.DefaultConcurrency);
+                if (cap == 0) continue;
+            }
+
+            // Live count from the active-jobs map. This is the source of
+            // truth for slot occupancy, so changing the user's cap takes
+            // effect on the next iteration with zero state churn.
+            var inUse = 0;
+            foreach (var kv in _activeLocalJobs)
+                if (kv.Value.DeviceId == device.DeviceId) inUse++;
+
+            if (inUse < cap) return device.DeviceId;
         }
+        return null;
+    }
+
+    /// <summary>
+    ///     <see langword="true"/> if a local device can encode the work item under
+    ///     the current options. Validates codec support: hardware devices may
+    ///     not advertise every codec, but CPU always does. Wraps the codec
+    ///     name aliasing the rest of the codebase uses (h265/hevc, h264/avc).
+    /// </summary>
+    private bool DeviceCanEncode(string deviceId, WorkItem workItem, EncoderOptions options)
+    {
+        var device = GetDetectedDevices().FirstOrDefault(d => d.DeviceId == deviceId);
+        if (device == null) return deviceId == "cpu"; // CPU always works as a fallback
+
+        var codec = (options.Codec ?? "").ToLowerInvariant();
+        var key   = codec switch
+        {
+            "hevc" or "h265" => "h265",
+            "avc"  or "h264" => "h264",
+            "av1"            => "av1",
+            _                => codec,
+        };
+        if (string.IsNullOrEmpty(key)) return true; // unknown codec — let ffmpeg decide
+        return device.SupportedCodecs.Any(c => c.Equals(key, StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
+    ///     Transitions a work item to Processing, runs the conversion bound to
+    ///     the supplied <see cref="ActiveLocalJob"/>, and handles success /
+    ///     failure outcomes. The active-jobs registry entry is removed in the
+    ///     finally block so the next iteration of <see cref="ProcessQueueAsync"/>
+    ///     sees the slot as free.
+    ///     On cancellation, cleans up the partial output file. On failure,
+    ///     increments the DB failure count.
+    /// </summary>
+    private async Task ProcessWorkItemAsync(WorkItem workItem, EncoderOptions options, ActiveLocalJob active)
+    {
+
         try
         {
             workItem.Status = WorkItemStatus.Processing;
@@ -1168,7 +1529,38 @@ public class TranscodingService
                     workItem.Length = _ffprobeService.DurationStringToSeconds(workItem.Probe.Format.Duration);
             }
 
-            await ConvertVideoAsync(workItem, options, cancellationToken: jobCts.Token);
+            // Per-job watchdog: aborts the job if no log line, status change, or progress
+            // tick has refreshed LastUpdatedAt for 15 minutes. Defends against hangs in
+            // pre-encode stages (hardware-accel detection, FFprobe, crop-detect) that
+            // wouldn't be caught by FFmpeg's own no-output stall detection.
+            using var watchdogCts = new CancellationTokenSource();
+            var watchdogTask = Task.Run(async () =>
+            {
+                try
+                {
+                    while (!watchdogCts.IsCancellationRequested)
+                    {
+                        await Task.Delay(TimeSpan.FromSeconds(30), watchdogCts.Token);
+                        if ((DateTime.UtcNow - workItem.LastUpdatedAt) > TimeSpan.FromMinutes(15))
+                        {
+                            await LogAsync(workItem.Id, "Watchdog: no progress for 15 min — aborting job");
+                            active.Cts.Cancel();
+                            return;
+                        }
+                    }
+                }
+                catch (OperationCanceledException) { }
+            });
+
+            try
+            {
+                await ConvertVideoAsync(workItem, options, cancellationToken: active.Cts.Token);
+            }
+            finally
+            {
+                watchdogCts.Cancel();
+                try { await watchdogTask; } catch { }
+            }
 
             // ConvertVideoAsync's internal fail paths (e.g. truncation detection) call
             // MarkWorkItemFailed and return without throwing. Don't overwrite Failed status
@@ -1188,6 +1580,14 @@ public class TranscodingService
                     if (_integrationService != null)
                         _ = _integrationService.TriggerRescansAsync(workItem.Path);
                 }
+
+                // Append to the analytics ledger. Failure is non-fatal — the
+                // dashboard is best-effort. We classify by encoded vs original
+                // size: if encoded >= original, ConvertVideoAsync discarded
+                // the output and the row records "NoSavings" so the dashboard
+                // still attributes the encode time/device-utilization but
+                // doesn't credit savings.
+                _ = RecordLocalEncodeHistoryAsync(workItem, options, active.DeviceId);
             }
         }
         catch (OperationCanceledException)
@@ -1209,13 +1609,8 @@ public class TranscodingService
         }
         finally
         {
-            lock (_activeLock)
-            {
-                _activeWorkItem = null;
-                _activeProcess = null;
-                _activeJobCts  = null;
-            }
-            jobCts.Dispose();
+            _activeLocalJobs.TryRemove(workItem.Id, out _);
+            try { active.Cts.Dispose(); } catch { }
         }
 
         await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
@@ -2155,17 +2550,50 @@ public class TranscodingService
     }
 
     private string? _detectedHardware = null;
+    private List<HardwareDevice>? _detectedDevices = null;
+
+    /// <summary>
+    ///     All devices default to a single concurrent encode. Users opt in to
+    ///     parallelism per-device via the dashboard's hardware-concurrency
+    ///     editor — the safe default avoids surprising a fresh install with a
+    ///     burst of simultaneous encodes that thrashes the GPU.
+    /// </summary>
+    private static int DefaultConcurrencyFor(string deviceId) => 1;
+
+    /// <summary>
+    ///     Builds the CPU encode device entry. CPU is exposed alongside the
+    ///     hardware encoders as a peer option (not labelled "software") — it
+    ///     has its own concurrency knob, its own slot pool, and its own row
+    ///     on the dashboard. Auto-fallback when an HW encoder fails is a
+    ///     separate path inside ffmpeg invocation; no UI surface needed.
+    /// </summary>
+    private static HardwareDevice MakeCpuDevice() => new()
+    {
+        DeviceId           = "cpu",
+        DisplayName        = "CPU",
+        SupportedCodecs    = new() { "h264", "h265", "av1" },
+        Encoders           = new() { "libx264", "libx265", "libsvtav1" },
+        DefaultConcurrency = DefaultConcurrencyFor("cpu"),
+        IsHardware         = true,
+    };
 
     /// <summary>
     ///     Detects available hardware acceleration by testing encoders.
-    ///     Result is cached after first detection.
+    ///     Populates both the legacy primary <see cref="_detectedHardware"/> string
+    ///     and the full <see cref="_detectedDevices"/> list. Result is cached after
+    ///     first detection — subsequent calls short-circuit.
     /// </summary>
     private async Task<string> DetectHardwareAccelerationAsync()
     {
         if (_detectedHardware != null)
             return _detectedHardware;
 
-        // Windows GPU detection
+        var devices = new List<HardwareDevice>();
+
+        // Windows GPU detection — probe all vendors so a laptop with an Intel iGPU
+        // *and* an NVIDIA dGPU reports both, instead of stopping at whichever
+        // matches first. The cluster scheduler needs the full picture to dispatch
+        // simultaneous jobs across families.
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
             Console.WriteLine("Auto-detect: Running on Windows, testing GPU encoders...");
@@ -2173,80 +2601,185 @@ public class TranscodingService
             if (await TestEncoderAsync("-hwaccel cuda", "hevc_nvenc"))
             {
                 Console.WriteLine("Auto-detect: NVIDIA NVENC available");
-                _detectedHardware = "nvidia";
-                return _detectedHardware;
+                bool h264 = await TestEncoderAsync("-hwaccel cuda", "h264_nvenc");
+                bool av1  = await TestEncoderAsync("-hwaccel cuda", "av1_nvenc");
+                devices.Add(new HardwareDevice
+                {
+                    DeviceId           = "nvidia",
+                    DisplayName        = "NVIDIA NVENC",
+                    SupportedCodecs    = BuildSupportedCodecs(true, h264, av1),
+                    Encoders           = BuildNvidiaEncoders(true, h264, av1),
+                    DefaultConcurrency = DefaultConcurrencyFor("nvidia"),
+                    IsHardware         = true,
+                });
             }
 
             if (await TestEncoderAsync("-hwaccel qsv -qsv_device auto", "hevc_qsv"))
             {
                 Console.WriteLine("Auto-detect: Intel QSV available");
-                _detectedHardware = "intel";
-                return _detectedHardware;
+                bool h264 = await TestEncoderAsync("-hwaccel qsv -qsv_device auto", "h264_qsv");
+                bool av1  = await TestEncoderAsync("-hwaccel qsv -qsv_device auto", "av1_qsv");
+                devices.Add(new HardwareDevice
+                {
+                    DeviceId           = "intel",
+                    DisplayName        = "Intel QSV",
+                    SupportedCodecs    = BuildSupportedCodecs(true, h264, av1),
+                    Encoders           = BuildIntelEncoders(true, h264, av1, qsv: true),
+                    DefaultConcurrency = DefaultConcurrencyFor("intel"),
+                    IsHardware         = true,
+                });
             }
 
             if (await TestEncoderAsync("-hwaccel auto", "hevc_amf"))
             {
                 Console.WriteLine("Auto-detect: AMD AMF available");
-                _detectedHardware = "amd";
-                return _detectedHardware;
+                bool h264 = await TestEncoderAsync("-hwaccel auto", "h264_amf");
+                bool av1  = await TestEncoderAsync("-hwaccel auto", "av1_amf");
+                devices.Add(new HardwareDevice
+                {
+                    DeviceId           = "amd",
+                    DisplayName        = "AMD AMF",
+                    SupportedCodecs    = BuildSupportedCodecs(true, h264, av1),
+                    Encoders           = BuildAmdEncoders(true, h264, av1, amf: true),
+                    DefaultConcurrency = DefaultConcurrencyFor("amd"),
+                    IsHardware         = true,
+                });
             }
-
-            Console.WriteLine("Auto-detect: No hardware acceleration available on Windows, using software");
-            _detectedHardware = "none";
-            return _detectedHardware;
         }
-
         // macOS GPU detection (VideoToolbox — works on both Apple Silicon and Intel Macs).
-        if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+        else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
         {
             Console.WriteLine("Auto-detect: Running on macOS, testing VideoToolbox...");
             if (await TestEncoderAsync("-hwaccel videotoolbox", "hevc_videotoolbox"))
             {
                 Console.WriteLine("Auto-detect: VideoToolbox available");
-                _detectedHardware = "apple";
-                return _detectedHardware;
-            }
-            Console.WriteLine("Auto-detect: VideoToolbox unavailable, using software");
-            _detectedHardware = "none";
-            return _detectedHardware;
-        }
-
-        // Linux: Log VAAPI diagnostics
-        await LogVaapiInfoAsync();
-
-        // Test VAAPI (Intel and AMD GPUs on Linux)
-        // Try both iHD and i965 drivers — QNAP systems may need either one
-        if (File.Exists("/dev/dri/renderD128"))
-        {
-            var driversToTry = new[] { "iHD", "i965" };
-            foreach (var driver in driversToTry)
-            {
-                Console.WriteLine($"Auto-detect: Trying VAAPI with {driver} driver...");
-                Environment.SetEnvironmentVariable("LIBVA_DRIVER_NAME", driver);
-
-                var hwInit = "-init_hw_device vaapi=hw:/dev/dri/renderD128 -filter_hw_device hw";
-                bool hevcOk = await TestEncoderAsync(hwInit, "hevc_vaapi");
-                bool h264Ok = await TestEncoderAsync(hwInit, "h264_vaapi");
-
-                if (hevcOk || h264Ok)
+                bool h264 = await TestEncoderAsync("-hwaccel videotoolbox", "h264_videotoolbox");
+                devices.Add(new HardwareDevice
                 {
-                    Console.WriteLine($"Auto-detect: VAAPI available with {driver} driver (hevc={hevcOk}, h264={h264Ok})");
-                    _detectedHardware = "intel";
-                    return _detectedHardware;
+                    DeviceId           = "apple",
+                    DisplayName        = "Apple VideoToolbox",
+                    SupportedCodecs    = BuildSupportedCodecs(true, h264, av1: false),
+                    Encoders           = BuildAppleEncoders(true, h264),
+                    DefaultConcurrency = DefaultConcurrencyFor("apple"),
+                    IsHardware         = true,
+                });
+            }
+        }
+        else
+        {
+            // Linux
+            await LogVaapiInfoAsync();
+
+            // VAAPI (Intel iGPU and AMD GPUs on Linux) — probe both drivers.
+            if (File.Exists("/dev/dri/renderD128"))
+            {
+                var driversToTry = new[] { "iHD", "i965" };
+                foreach (var driver in driversToTry)
+                {
+                    Console.WriteLine($"Auto-detect: Trying VAAPI with {driver} driver...");
+                    Environment.SetEnvironmentVariable("LIBVA_DRIVER_NAME", driver);
+
+                    var hwInit = "-init_hw_device vaapi=hw:/dev/dri/renderD128 -filter_hw_device hw";
+                    bool hevcOk = await TestEncoderAsync(hwInit, "hevc_vaapi");
+                    bool h264Ok = await TestEncoderAsync(hwInit, "h264_vaapi");
+                    bool av1Ok  = await TestEncoderAsync(hwInit, "av1_vaapi");
+
+                    if (hevcOk || h264Ok || av1Ok)
+                    {
+                        Console.WriteLine($"Auto-detect: VAAPI available with {driver} driver (hevc={hevcOk}, h264={h264Ok}, av1={av1Ok})");
+                        devices.Add(new HardwareDevice
+                        {
+                            DeviceId           = "intel",
+                            DisplayName        = "Intel VAAPI",
+                            SupportedCodecs    = BuildSupportedCodecs(hevcOk, h264Ok, av1Ok),
+                            Encoders           = BuildIntelEncoders(hevcOk, h264Ok, av1Ok, qsv: false),
+                            DefaultConcurrency = DefaultConcurrencyFor("intel"),
+                            IsHardware         = true,
+                        });
+                        break;
+                    }
                 }
             }
+
+            if (await TestEncoderAsync("-hwaccel cuda", "hevc_nvenc"))
+            {
+                Console.WriteLine("Auto-detect: NVIDIA NVENC available");
+                bool h264 = await TestEncoderAsync("-hwaccel cuda", "h264_nvenc");
+                bool av1  = await TestEncoderAsync("-hwaccel cuda", "av1_nvenc");
+                devices.Add(new HardwareDevice
+                {
+                    DeviceId           = "nvidia",
+                    DisplayName        = "NVIDIA NVENC",
+                    SupportedCodecs    = BuildSupportedCodecs(true, h264, av1),
+                    Encoders           = BuildNvidiaEncoders(true, h264, av1),
+                    DefaultConcurrency = DefaultConcurrencyFor("nvidia"),
+                    IsHardware         = true,
+                });
+            }
         }
 
-        if (await TestEncoderAsync("-hwaccel cuda", "hevc_nvenc"))
-        {
-            Console.WriteLine("Auto-detect: NVIDIA NVENC available");
-            _detectedHardware = "nvidia";
-            return _detectedHardware;
-        }
+        // Always add a CPU device so the master has a fallback slot pool — every
+        // worker can software-encode regardless of GPU presence.
+        devices.Add(MakeCpuDevice());
 
-        Console.WriteLine("Auto-detect: No hardware acceleration available, using software");
-        _detectedHardware = "none";
+        _detectedDevices = devices;
+
+        // Legacy primary: first hardware device, else "none". Preserves the
+        // original auto-resolution semantics for callers that haven't yet
+        // moved to the per-device API.
+        var primary = devices.FirstOrDefault(d => d.IsHardware);
+        _detectedHardware = primary?.DeviceId ?? "none";
+
+        if (primary == null)
+            Console.WriteLine("Auto-detect: No hardware acceleration available, using software");
+
         return _detectedHardware;
+    }
+
+    private static List<string> BuildSupportedCodecs(bool h265, bool h264, bool av1)
+    {
+        var list = new List<string>();
+        if (h264) list.Add("h264");
+        if (h265) list.Add("h265");
+        if (av1)  list.Add("av1");
+        return list;
+    }
+
+    private static List<string> BuildNvidiaEncoders(bool h265, bool h264, bool av1)
+    {
+        var list = new List<string>();
+        if (h264) list.Add("h264_nvenc");
+        if (h265) list.Add("hevc_nvenc");
+        if (av1)  list.Add("av1_nvenc");
+        return list;
+    }
+
+    private static List<string> BuildIntelEncoders(bool h265, bool h264, bool av1, bool qsv)
+    {
+        var suffix = qsv ? "_qsv" : "_vaapi";
+        var list = new List<string>();
+        if (h264) list.Add("h264" + suffix);
+        if (h265) list.Add("hevc" + suffix);
+        if (av1)  list.Add("av1"  + suffix);
+        return list;
+    }
+
+    private static List<string> BuildAmdEncoders(bool h265, bool h264, bool av1, bool amf)
+    {
+        var suffix = amf ? "_amf" : "_vaapi";
+        var list = new List<string>();
+        if (h264) list.Add("h264" + suffix);
+        if (h265) list.Add("hevc" + suffix);
+        if (av1)  list.Add("av1"  + suffix);
+        return list;
+    }
+
+    private static List<string> BuildAppleEncoders(bool h265, bool h264)
+    {
+        var list = new List<string>();
+        if (h264) list.Add("h264_videotoolbox");
+        if (h265) list.Add("hevc_videotoolbox");
+        return list;
     }
 
     /// <summary>
@@ -3071,7 +3604,14 @@ public class TranscodingService
         };
 
         var process = new Process { StartInfo = processStartInfo };
-        lock (_activeLock) { _activeProcess = process; }
+        // Publish the process under the work item's ID so cancel/stop can
+        // find this specific encode without affecting peers running on other
+        // device slots. The earlier _activeProcess singleton is gone.
+        lock (_activeLock)
+        {
+            if (_activeLocalJobs.TryGetValue(workItem.Id, out var slot))
+                slot.Process = process;
+        }
         var errorOutput = new ConcurrentQueue<string>();
         var lastProgressUpdate = DateTime.MinValue;
         var lastActivity = DateTime.UtcNow;
@@ -3126,8 +3666,8 @@ public class TranscodingService
                                                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
                                                 await LogAsync(workItem.Id, $"FFmpeg: {line}");
 
-                                                if (_progressCallback != null)
-                                                    _ = _progressCallback(workItem.Id, progress);
+                                                if (_progressCallbacks.TryGetValue(workItem.Id, out var progressCb))
+                                                    _ = progressCb(workItem.Id, progress);
                                             }
                                         }
                                     }
@@ -3195,7 +3735,10 @@ public class TranscodingService
         try { await stderrTask; } catch { }
         try { await stdoutTask; } catch { }
 
-        lock (_activeLock) { _activeProcess = null; }
+        lock (_activeLock)
+        {
+            if (_activeLocalJobs.TryGetValue(workItem.Id, out var slot)) slot.Process = null;
+        }
 
         if (workItem.Status is WorkItemStatus.Cancelled or WorkItemStatus.Stopped)
         {
@@ -3362,7 +3905,39 @@ public class TranscodingService
     }
 
     /// <summary>Returns the work item currently being encoded locally, or <c>null</c> when idle.</summary>
-    public WorkItem? GetActiveWorkItem() => _activeWorkItem;
+    /// <summary>
+    ///     Legacy first-active accessor. Returns any one in-flight local
+    ///     encode for callers that pre-date multi-slot scheduling. Multi-slot
+    ///     callers should use <see cref="GetActiveLocalJobs"/>.
+    /// </summary>
+    public WorkItem? GetActiveWorkItem()
+    {
+        foreach (var kv in _activeLocalJobs) return kv.Value.Item;
+        return null;
+    }
+
+    /// <summary>
+    ///     Returns one <see cref="ActiveJobInfo"/> per in-flight local encode,
+    ///     mirroring the shape of <see cref="ClusterNodeJobService.GetActiveJobs"/>
+    ///     so the dashboard can render the master's self-card with the same
+    ///     per-device chips and per-job progress bars used for remote nodes.
+    /// </summary>
+    public List<ActiveJobInfo> GetActiveLocalJobs()
+    {
+        var list = new List<ActiveJobInfo>();
+        foreach (var kv in _activeLocalJobs)
+        {
+            list.Add(new ActiveJobInfo
+            {
+                JobId    = kv.Key,
+                DeviceId = kv.Value.DeviceId,
+                FileName = kv.Value.Item.FileName,
+                Progress = kv.Value.Item.Progress,
+                Phase    = "Encoding",
+            });
+        }
+        return list;
+    }
 
     /// <summary>Returns the encoder options from the most recently started queue run.</summary>
     public EncoderOptions? GetLastOptions() => _lastOptions;
@@ -3397,18 +3972,48 @@ public class TranscodingService
     /// <summary>Returns the detected hardware acceleration type (e.g., <c>"nvidia"</c>, <c>"intel"</c>, <c>"none"</c>), or <c>null</c> if detection hasn't completed.</summary>
     public string? GetDetectedHardware() => _detectedHardware;
 
-    /// <summary>Sets the callback invoked on each progress update when running as a cluster node.</summary>
-    /// <param name="callback">Delegate receiving (workItemId, progressPercent).</param>
-    public void SetProgressCallback(Func<string, int, Task>? callback)
+    /// <summary>
+    ///     Returns every hardware encode device this worker can drive,
+    ///     including a CPU fallback. Empty until <see cref="DetectHardwareAccelerationAsync"/>
+    ///     has finished its initial probe.
+    /// </summary>
+    public List<HardwareDevice> GetDetectedDevices() =>
+        _detectedDevices?.Select(d => CloneHardwareDevice(d)).ToList() ?? new();
+
+    private static HardwareDevice CloneHardwareDevice(HardwareDevice src) => new()
     {
-        _progressCallback = callback;
+        DeviceId           = src.DeviceId,
+        DisplayName        = src.DisplayName,
+        SupportedCodecs    = new List<string>(src.SupportedCodecs),
+        Encoders           = new List<string>(src.Encoders),
+        DefaultConcurrency = src.DefaultConcurrency,
+        IsHardware         = src.IsHardware,
+    };
+
+    /// <summary>
+    ///     Registers a per-job progress callback for forwarding progress to the master.
+    ///     Pass <see langword="null"/> to clear the callback for that specific job.
+    ///     Per-jobId so concurrent encodes don't clobber each other's reporters.
+    /// </summary>
+    /// <param name="jobId">The work item ID this callback applies to.</param>
+    /// <param name="callback">Delegate receiving (workItemId, progressPercent), or null to remove.</param>
+    public void SetProgressCallback(string jobId, Func<string, int, Task>? callback)
+    {
+        if (callback == null) _progressCallbacks.TryRemove(jobId, out _);
+        else                  _progressCallbacks[jobId] = callback;
     }
 
-    /// <summary>Sets the callback invoked for each FFmpeg log line when running as a cluster node.</summary>
-    /// <param name="callback">Delegate receiving (workItemId, logLine).</param>
-    public void SetLogCallback(Func<string, string, Task>? callback)
+    /// <summary>
+    ///     Registers a per-job log callback for forwarding FFmpeg lines to the master.
+    ///     Pass <see langword="null"/> to clear the callback for that specific job.
+    ///     Per-jobId so concurrent encodes don't clobber each other's log streams.
+    /// </summary>
+    /// <param name="jobId">The work item ID this callback applies to.</param>
+    /// <param name="callback">Delegate receiving (workItemId, logLine), or null to remove.</param>
+    public void SetLogCallback(string jobId, Func<string, string, Task>? callback)
     {
-        _logCallback = callback;
+        if (callback == null) _logCallbacks.TryRemove(jobId, out _);
+        else                  _logCallbacks[jobId] = callback;
     }
 
     /// <summary>Sets the callback used by the cluster service to cancel a remote job on a specific node.</summary>
@@ -3449,43 +4054,32 @@ public class TranscodingService
     {
         Console.WriteLine("Cluster: Stopping all processing and clearing queue...");
 
-        WorkItem? activeItem;
-        Process? activeProc;
-        lock (_activeLock)
+        // Snapshot every active local job, kill its ffmpeg, mark Stopped,
+        // and unregister so a follow-up ProcessQueueAsync starts clean.
+        var snapshot = _activeLocalJobs.Values.ToList();
+        foreach (var active in snapshot)
         {
-            activeItem = _activeWorkItem;
-            activeProc = _activeProcess;
-        }
+            try { active.Cts.Cancel(); } catch { }
 
-        if (activeItem != null && activeProc != null)
-        {
-            try
+            Process? proc;
+            lock (_activeLock) { proc = active.Process; }
+            if (proc != null)
             {
-                if (!activeProc.HasExited)
-                    activeProc.Kill(entireProcessTree: true);
+                try { if (!proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
             }
-            catch { }
 
             if (_lastOptions != null)
             {
-                var outputPath = GetOutputPath(activeItem, _lastOptions);
-                try
-                {
-                    if (File.Exists(outputPath))
-                        await _fileService.FileDeleteAsync(outputPath);
-                }
-                catch { }
+                var outputPath = GetOutputPath(active.Item, _lastOptions);
+                try { if (File.Exists(outputPath)) await _fileService.FileDeleteAsync(outputPath); } catch { }
             }
 
-            activeItem.Status = WorkItemStatus.Stopped;
-            activeItem.CompletedAt = DateTime.UtcNow;
-            await _hubContext.Clients.All.SendAsync("WorkItemUpdated", activeItem);
-            await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(activeItem.Path), MediaFileStatus.Unseen);
-            lock (_activeLock)
-            {
-                _activeWorkItem = null;
-                _activeProcess = null;
-            }
+            active.Item.Status      = WorkItemStatus.Stopped;
+            active.Item.CompletedAt = DateTime.UtcNow;
+            await _hubContext.Clients.All.SendAsync("WorkItemUpdated", active.Item);
+            try { await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(active.Item.Path), MediaFileStatus.Unseen); } catch { }
+
+            _activeLocalJobs.TryRemove(active.Item.Id, out _);
         }
 
         List<WorkItem> pendingItems;
@@ -3571,27 +4165,24 @@ public class TranscodingService
     {
         Console.WriteLine("TranscodingService: Clearing all in-memory state...");
 
-        // Kill active FFmpeg process
-        WorkItem? activeItem;
-        Process? activeProc;
-        lock (_activeLock)
-        {
-            activeItem = _activeWorkItem;
-            activeProc = _activeProcess;
-            _activeWorkItem = null;
-            _activeProcess = null;
-        }
+        // Snapshot then clear so reentrancy from ProcessWorkItemAsync's
+        // finally block is harmless (TryRemove on an empty dict is a no-op).
+        var snapshot = _activeLocalJobs.Values.ToList();
+        _activeLocalJobs.Clear();
 
-        if (activeProc != null)
+        foreach (var active in snapshot)
         {
-            try { if (!activeProc.HasExited) activeProc.Kill(entireProcessTree: true); } catch { }
-        }
+            try { active.Cts.Cancel(); } catch { }
+            Process? proc;
+            lock (_activeLock) { proc = active.Process; }
+            if (proc != null)
+            {
+                try { if (!proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
+            }
 
-        if (activeItem != null)
-        {
-            activeItem.Status = WorkItemStatus.Stopped;
-            activeItem.CompletedAt = DateTime.UtcNow;
-            await _hubContext.Clients.All.SendAsync("WorkItemUpdated", activeItem);
+            active.Item.Status      = WorkItemStatus.Stopped;
+            active.Item.CompletedAt = DateTime.UtcNow;
+            await _hubContext.Clients.All.SendAsync("WorkItemUpdated", active.Item);
         }
 
         // Clear queue and work items

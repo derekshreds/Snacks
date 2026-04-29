@@ -22,6 +22,8 @@
             <div class="navbar-collapse collapse">
                 <ul class="navbar-nav ms-auto align-items-sm-center">
                     <li class="nav-item d-flex align-items-center py-2 py-sm-0">
+                        <a class="btn btn-outline-secondary btn-sm me-2" href="/" data-spa-link title="Queue"><i class="fas fa-list-ul"></i><span class="d-none d-md-inline ms-1">Queue</span></a>
+                        <a class="btn btn-outline-secondary btn-sm me-2" href="/dashboard" data-spa-link title="Dashboard"><i class="fas fa-chart-line"></i><span class="d-none d-md-inline ms-1">Dashboard</span></a>
                         <button class="btn btn-outline-secondary btn-sm me-2" id="pauseResumeBtn" title="Pause/Resume Queue"><i class="fas fa-pause" id="pauseResumeIcon"></i></button>
                         <button class="btn btn-outline-secondary btn-sm me-2" id="openSettingsBtn"><i class="fas fa-cog"></i></button>
                         <button class="btn btn-primary btn-sm" id="openLibraryBtn"><i class="fas fa-folder-plus me-1"></i><span class="d-none d-sm-inline">Browse Library</span><span class="d-sm-none">Library</span></button>
@@ -38,21 +40,30 @@
     </nav>
 
     <main class="container main-content">
-        @RenderBody()
+        @*
+            Page-specific content. The SPA shell in main.js swaps this element's
+            innerHTML on navigation, leaving the navbar, modals, and SignalR
+            connection alive across pages.
+        *@
+        <div id="page-content" data-page="@(ViewData["Page"] as string ?? "")">
+            @RenderBody()
+        </div>
     </main>
 
     <footer class="footer mt-auto py-3 border-top">
         <div class="container text-center">
             <span class="text-muted">
                 <img src="~/images/snacks.ico" alt="Snacks" style="height: 18px; width: 18px;" class="me-2">
-                <a href="https://snacksvideo.com" target="_blank" class="text-muted text-decoration-none"><strong>Snacks</strong></a> - v2.6.0 &copy; @DateTime.Now.Year - <a href="https://technobitch.com" target="_blank" class="text-muted text-decoration-none">Derek Morris</a>
+                <a href="https://snacksvideo.com" target="_blank" class="text-muted text-decoration-none"><strong>Snacks</strong></a> - v2.7.0 &copy; @DateTime.Now.Year - <a href="https://technobitch.com" target="_blank" class="text-muted text-decoration-none">Derek Morris</a>
             </span>
         </div>
     </footer>
 
+    @await Html.PartialAsync("_AppModals")
+
     <script src="~/lib/bootstrap.bundle.min.js"></script>
     <script src="~/lib/signalr.min.js"></script>
     <script src="~/js/site.js"></script>
-    @await RenderSectionAsync("Scripts", required: false)
+    <script type="module" src="~/js/main.js"></script>
 </body>
 </html>

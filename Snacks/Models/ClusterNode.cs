@@ -41,16 +41,25 @@ public sealed class ClusterNode
     public WorkerCapabilities? Capabilities { get; set; }
 
     /// <summary>
-    ///     ID of the work item currently being processed by this node.
-    ///     Null when idle.
+    ///     ID of the first occupied slot's job. Convenience accessor kept in
+    ///     sync with the head of <see cref="ActiveJobs"/> for UI bindings
+    ///     that want a single value; the authoritative per-slot list is
+    ///     <see cref="ActiveJobs"/>.
     /// </summary>
     public string? ActiveWorkItemId { get; set; }
 
-    /// <summary> Display name of the file currently being processed. </summary>
+    /// <summary> Display name of the file in the first occupied slot. </summary>
     public string? ActiveFileName { get; set; }
 
-    /// <summary> Encoding progress percentage (0–100) for the active work item. </summary>
+    /// <summary> Encoding progress percentage (0–100) for the first active job. </summary>
     public int ActiveProgress { get; set; }
+
+    /// <summary>
+    ///     All in-flight remote jobs on this node, one entry per occupied
+    ///     slot. Maintained by the master from heartbeat reports plus
+    ///     optimistic book-keeping on dispatch.
+    /// </summary>
+    public List<ActiveJobInfo> ActiveJobs { get; set; } = new();
 
     /// <summary> Total number of jobs successfully completed by this node. </summary>
     public int CompletedJobs { get; set; }
@@ -93,6 +102,15 @@ public sealed class WorkerCapabilities
     ///     False when busy, paused, or processing a remote job.
     /// </summary>
     public bool CanAcceptJobs { get; set; } = true;
+
+    /// <summary>
+    ///     Hardware devices this node can drive concurrently. One entry per
+    ///     vendor family the worker detected. Each device contributes its
+    ///     <see cref="HardwareDevice.DefaultConcurrency"/> slots to the master's
+    ///     dispatch pool, optionally overridden by
+    ///     <see cref="NodeSettings.DeviceSettings"/>.
+    /// </summary>
+    public List<HardwareDevice> Devices { get; set; } = new();
 }
 
 /// <summary> Operational status of a cluster node. </summary>

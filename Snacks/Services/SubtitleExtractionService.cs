@@ -66,48 +66,62 @@ public sealed class SubtitleExtractionService
 
         // Disambiguate same-language tracks by suffixing .2, .3, … on collision.
         var langCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-        foreach (var spec in specs)
+
+        // Acquired lazily on the first bitmap stream and released after the loop,
+        // so two parallel encodes don't drive the shared Tesseract engines at the
+        // same time. Text streams skip the lock since ffmpeg handles them directly.
+        IDisposable? ocrSlot = null;
+        try
         {
-            langCounts.TryGetValue(spec.Lang, out int seen);
-            langCounts[spec.Lang] = seen + 1;
-            string suffix  = seen == 0 ? "" : $".{seen + 1}";
+            foreach (var spec in specs)
+            {
+                langCounts.TryGetValue(spec.Lang, out int seen);
+                langCounts[spec.Lang] = seen + 1;
+                string suffix  = seen == 0 ? "" : $".{seen + 1}";
 
-            // OCR output is always .srt — the native OCR path can't produce styled ASS.
-            string outFmt   = spec.IsBitmap ? "srt" : fmt;
-            // Plex & Jellyfin prefer ISO 639-2/B 3-letter codes in sidecar filenames
-            // (Movie.eng.srt). Fall back to whatever tag the source carried when the
-            // language isn't in LanguageMatcher's table.
-            string langCode = LanguageMatcher.ToThreeLetterB(spec.Lang) ?? spec.Lang;
-            string outPath  = $"{sidecarBase}.{langCode}{suffix}.{outFmt}";
+                // OCR output is always .srt — the native OCR path can't produce styled ASS.
+                string outFmt   = spec.IsBitmap ? "srt" : fmt;
+                // Plex & Jellyfin prefer ISO 639-2/B 3-letter codes in sidecar filenames
+                // (Movie.eng.srt). Fall back to whatever tag the source carried when the
+                // language isn't in LanguageMatcher's table.
+                string langCode = LanguageMatcher.ToThreeLetterB(spec.Lang) ?? spec.Lang;
+                string outPath  = $"{sidecarBase}.{langCode}{suffix}.{outFmt}";
 
-            try
-            {
-                if (spec.IsBitmap)
+                try
                 {
-                    var produced = await _ocr.ConvertBitmapToSrtAsync(
-                        inputPath, spec.StreamIndex, spec.Lang, spec.CodecName, outPath, log, ct);
-                    if (!string.IsNullOrEmpty(produced))
-                        written.Add(produced);
+                    if (spec.IsBitmap)
+                    {
+                        ocrSlot ??= await _ocr.AcquireOcrSlotAsync(
+                            Path.GetFileName(inputPath), log, ct);
+                        var produced = await _ocr.ConvertBitmapToSrtAsync(
+                            inputPath, spec.StreamIndex, spec.Lang, spec.CodecName, outPath, log, ct);
+                        if (!string.IsNullOrEmpty(produced))
+                            written.Add(produced);
+                    }
+                    else
+                    {
+                        await ExtractTextStreamAsync(inputPath, spec.StreamIndex, outFmt, outPath, log, ct);
+                        if (File.Exists(outPath)) written.Add(outPath);
+                    }
                 }
-                else
+                catch (OperationCanceledException)
                 {
-                    await ExtractTextStreamAsync(inputPath, spec.StreamIndex, outFmt, outPath, log, ct);
-                    if (File.Exists(outPath)) written.Add(outPath);
+                    // Partial sidecar sets are worse than none — delete the completed ones so a
+                    // retry starts from a clean state instead of the user thinking they have the
+                    // full set from a prior run.
+                    foreach (var p in written)
+                        try { if (File.Exists(p)) File.Delete(p); } catch { }
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    await log($"Sidecar extraction failed for stream {spec.StreamIndex} ({spec.Lang}): {ex.Message}");
                 }
             }
-            catch (OperationCanceledException)
-            {
-                // Partial sidecar sets are worse than none — delete the completed ones so a
-                // retry starts from a clean state instead of the user thinking they have the
-                // full set from a prior run.
-                foreach (var p in written)
-                    try { if (File.Exists(p)) File.Delete(p); } catch { }
-                throw;
-            }
-            catch (Exception ex)
-            {
-                await log($"Sidecar extraction failed for stream {spec.StreamIndex} ({spec.Lang}): {ex.Message}");
-            }
+        }
+        finally
+        {
+            ocrSlot?.Dispose();
         }
 
         await log($"Sidecar extraction: wrote {written.Count} file(s).");
@@ -147,6 +161,11 @@ public sealed class SubtitleExtractionService
         Directory.CreateDirectory(tmpDir);
         var results    = new List<OcrMuxResult>();
         var langCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+        // Held for the entire bitmap pass so a parallel encode's OCR work waits
+        // until this movie's tracks are all done.
+        using var ocrSlot = await _ocr.AcquireOcrSlotAsync(
+            Path.GetFileName(inputPath), log, ct);
 
         foreach (var spec in bitmapSpecs)
         {

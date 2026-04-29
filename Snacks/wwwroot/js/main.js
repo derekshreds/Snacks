@@ -1,22 +1,26 @@
 /**
  * Frontend composition root.
  *
- * This file is the single place that knows how every other frontend module
- * fits together. It:
+ * Layout in the new SPA shell:
  *
- *   1. Constructs the shared controllers (modal controller, SignalR client,
- *      connection-status indicator).
- *   2. Builds domain components bottom-up so each can receive its dependencies
- *      via constructor injection (no hidden globals).
- *   3. Binds DOM events (no data fetches — those happen in step 4).
- *   4. Kicks off initial data loads.
- *   5. Wires the settings-modal shell: opening, auto-save, sidecar visibility.
- *   6. Wires SignalR hub events to the components that care about them.
- *   7. Handles tab-visibility changes (iOS Safari suspends WebSockets when
- *      backgrounded — retry + resync when the tab comes back).
- *   8. Exposes a small legacy-compat surface on `window.transcodingManager`
- *      so any remaining inline `onclick="..."` handlers in razor partials
- *      keep working during the migration.
+ *   1. Build shared services that live for the whole session — modal
+ *      controller, SignalR client, connection-status indicator, settings
+ *      modal wiring. These belong to the navbar/modals in `_Layout.cshtml`
+ *      and DO NOT get torn down on page navigation.
+ *
+ *   2. Build per-page components (queue manager, library browser, etc.)
+ *      and register them as page lifecycle hooks via `registerPage()`.
+ *      The navigation shell calls `mount`/`unmount` as the user moves
+ *      between pages.
+ *
+ *   3. Wire SignalR events into the components that care about them.
+ *      Subscriptions stay live across navigation; component handlers
+ *      defensively no-op when their DOM isn't currently mounted.
+ *
+ *   4. Start SignalR + initialize the navigation shell.
+ *
+ * The composition root is the only place that knows how the modules fit
+ * together.
  */
 
 
@@ -26,6 +30,7 @@
 
 import { SignalRClient }        from './core/signalr-client.js';
 import { ConnectionStatus }     from './core/connection-status.js';
+import { initNavigation, registerPage } from './core/navigation.js';
 
 import { initModalController, showConfirmModal } from './utils/modal-controller.js';
 import { escapeHtml }           from './utils/dom.js';
@@ -55,6 +60,11 @@ import { initExclusionPanel,     loadExclusionPanel }     from './settings/panel
 import { initAdvancedPanel,      loadAdvancedPanel }      from './settings/panels/advanced-panel.js';
 import { initNodeSyncPanel,      loadNodeSyncPanel }      from './settings/panels/node-sync-panel.js';
 
+// Side-effect import: dashboard.js calls `registerPage('dashboard', ...)` at
+// module load time so the navigation shell finds it when the user lands on
+// (or navigates to) /dashboard.
+import './dashboard/dashboard.js';
+
 
 // ---------------------------------------------------------------------------
 // Legacy globals
@@ -75,14 +85,21 @@ if (typeof window !== 'undefined') {
 
 document.addEventListener('DOMContentLoaded', () => {
 
-    // 1. Global shared controllers.
+    // The login page reuses the layout (so the navbar still renders), but
+    // the user isn't authenticated yet — no point connecting SignalR or
+    // hitting the protected APIs. Bail out early so the login screen stays
+    // quiet.
+    const initialPage = document.getElementById('page-content')?.dataset.page;
+    if (initialPage === 'login') return;
+
+    // 1. Global shared controllers (live forever — owned by the layout).
     initModalController();
 
     const connectionStatus = new ConnectionStatus();
     const signalR          = new SignalRClient();
 
 
-    // 2. Build components bottom-up so each can receive its dependencies.
+    // 2. Build shared components bottom-up.
 
     // Leaf components first.
     const logViewer    = new LogViewer();
@@ -127,9 +144,9 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
 
-    // 3. Initialize (bind DOM events). No data fetches here — those happen in step 4.
+    // 3. Bind shared (non-page) DOM. These DOM nodes live in the layout/modals,
+    //    so they exist on every page and are bound exactly once.
     pauseControl.init();
-    queueManager.init();
     library.init();
     analyzeModal.init();
     autoScan.init();
@@ -146,7 +163,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initNodeSyncPanel();
 
 
-    // 4. Initial data loads.
+    // 4. Initial data loads (shared — not page-specific).
     restoreEncoderOptions('settings');
     autoScan.load();
     clusterDashboard.load();
@@ -208,7 +225,28 @@ document.addEventListener('DOMContentLoaded', () => {
     setTimeout(syncSidecar, 200);
 
 
-    // 6. Wire SignalR hub events to component methods.
+    // 6. Page lifecycle registration.
+    //    The queue page binds its DOM the first time it mounts and idempotently
+    //    rebinds on every subsequent mount — its DOM is fresh after each SPA
+    //    swap. The unmount hook is intentionally empty: queue state should
+    //    survive navigation so SignalR-driven changes still update if the user
+    //    pops back, and re-rendering on mount picks up anything missed.
+    registerPage('queue', {
+        mount: () => {
+            queueManager.init();
+            queueManager.loadItems();
+            // The cluster panel and node-mode banner DOM only exist on the
+            // queue page. The dashboard module has the worker list cached
+            // in memory from its initial load, so we just need to repaint
+            // it into the freshly-mounted markup — no extra network call.
+            clusterDashboard.redraw();
+        },
+    });
+
+
+    // 7. Wire SignalR hub events.
+    //    Subscriptions live for the whole session; component handlers no-op
+    //    defensively when their DOM isn't currently mounted.
 
     signalR.onOpen(() => {
         connectionStatus.setConnected();
@@ -218,7 +256,13 @@ document.addEventListener('DOMContentLoaded', () => {
     signalR.onClose(() => connectionStatus.setDisconnected());
 
     signalR.on('WorkItemAdded',     (wi)      => queueManager.addItem(wi));
-    signalR.on('WorkItemUpdated',   (wi)      => queueManager.updateItem(wi));
+    signalR.on('WorkItemUpdated',   (wi)      => {
+        queueManager.updateItem(wi);
+        // The dashboard self-card mirrors the master's own slot occupancy;
+        // refresh it on local-job transitions so chips and per-job bars stay
+        // in sync as encodes start, progress, and finish.
+        clusterDashboard.onWorkItemUpdated?.(wi);
+    });
     signalR.on('TranscodingLog',    (id, msg) => logViewer.appendLine(id, msg));
 
     signalR.on('AutoScanCompleted', (newFiles) => {
@@ -240,11 +284,18 @@ document.addEventListener('DOMContentLoaded', () => {
     signalR.on('HardwareDetected',     ()       => clusterDashboard.onHardwareDetected());
     signalR.on('ClusterConfigChanged', (config) => clusterDashboard.onClusterConfigChanged(config));
     signalR.on('ClusterNodePaused',    (paused) => pauseControl.setFromRemote(paused));
+    signalR.on('NodeSettingsChanged',  (config) => clusterDashboard.onNodeSettingsChanged?.(config));
+
+    // Dashboard listens for these via window events dispatched from main.js so
+    // its module doesn't need to know about the SignalR client directly. This
+    // keeps the dashboard a pure consumer of the page-content DOM.
+    signalR.on('EncodeHistoryAdded',   () => window.dispatchEvent(new CustomEvent('snacks:encode-history-changed')));
+    signalR.on('EncodeHistoryCleared', () => window.dispatchEvent(new CustomEvent('snacks:encode-history-changed')));
 
     signalR.start();
 
 
-    // 7. Tab-visibility handling.
+    // 8. Tab-visibility handling.
     //    iOS Safari suspends WebSockets when the tab is backgrounded; when
     //    it comes back we may need to reconnect and always need to resync
     //    the queue in case we missed updates.
@@ -258,9 +309,11 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
 
-    // 8. Legacy inline-handler compatibility.
-    //    Exposes the queue manager on `window` for any remaining
-    //    `onclick="transcodingManager.foo()"` references in razor partials.
+    // 9. SPA navigation. Mount the initial page and intercept future link clicks.
+    initNavigation();
+
+
+    // 10. Legacy inline-handler compatibility.
     window.transcodingManager = {
         getEncoderOptions,
         restoreSettings:         (p = 'settings') => restoreEncoderOptions(p),

@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.SignalR;
+using Snacks.Data;
 using Snacks.Hubs;
 using Snacks.Models;
 using Snacks.Services;
@@ -35,14 +36,18 @@ public sealed class ClusterController : ControllerBase
     /// <param name="clusterService"> The cluster coordination service. </param>
     /// <param name="integrationService"> Source of master-side integration credentials served to workers. </param>
     /// <param name="hubContext"> SignalR hub context for pushing transfer progress to the UI. </param>
+    private readonly EncodeHistoryRepository      _historyRepo;
+
     public ClusterController(
         ClusterService clusterService,
         IntegrationService integrationService,
-        IHubContext<TranscodingHub> hubContext)
+        IHubContext<TranscodingHub> hubContext,
+        EncodeHistoryRepository historyRepo)
     {
         _clusterService     = clusterService;
         _integrationService = integrationService;
         _hubContext         = hubContext;
+        _historyRepo        = historyRepo;
     }
 
     /******************************************************************
@@ -113,11 +118,14 @@ public sealed class ClusterController : ControllerBase
             nodeId = config.NodeId,
             status,
             isPaused,
-            currentJobId = _clusterService.GetCurrentRemoteJobId(),
-            progress = _clusterService.GetCurrentRemoteJobProgress(),
-            completedJobId = _clusterService.GetCompletedJobId(),
-            receivingJobId = _clusterService.GetReceivingJobId(),
-            diskSpace = capabilities.AvailableDiskSpaceBytes,
+            // Per-slot tracking. activeJobs is one entry per occupied slot
+            // (worker is encoding right now); completedJobIds are jobs whose
+            // output is sitting on the worker waiting for the master to pull
+            // it; receivingJobIds are jobs whose source file is mid-upload.
+            activeJobs      = _clusterService.GetActiveJobs(),
+            completedJobIds = _clusterService.GetCompletedJobIds(),
+            receivingJobIds = _clusterService.GetReceivingJobIds(),
+            diskSpace       = capabilities.AvailableDiskSpaceBytes,
             capabilities
         });
     }
@@ -497,6 +505,10 @@ public sealed class ClusterController : ControllerBase
             if (long.TryParse(totalSizeHeader, out var totalSize) && totalSize > 0)
             {
                 var percent = (int)(fileSize * 100 / totalSize);
+                // assignedNodeName is intentionally omitted: this broadcast goes
+                // to the worker's own hub, where the work item is being processed
+                // locally. The "Processing on remote node X" badge would mislabel
+                // it (the worker is the processor, not "master").
                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", new
                 {
                     id = jobId,
@@ -505,7 +517,6 @@ public sealed class ClusterController : ControllerBase
                     progress = 0,
                     remoteJobPhase = "Uploading",
                     transferProgress = percent,
-                    assignedNodeName = "master",
                     size = totalSize,
                     bitrate,
                     length = duration,
@@ -539,8 +550,51 @@ public sealed class ClusterController : ControllerBase
 
                     var (started, rejectReason) = await _clusterService.StartAutonomousEncodingAsync(jobId, metadata, filePath);
 
-                    if (!started)
+                    if (started)
                     {
+                        // Replace the synthetic 100% Uploading frame with a clean
+                        // Processing/Encoding handover so the worker's local UI
+                        // doesn't stay stuck at "Uploading 100%" through the OCR
+                        // pre-pass — there is no other broadcast on the worker's
+                        // hub for this job until encode completion otherwise.
+                        // assignedNodeName is intentionally omitted: this worker
+                        // is processing the job locally, so the "Processing on
+                        // remote node X" badge would mislabel it.
+                        await _hubContext.Clients.All.SendAsync("WorkItemUpdated", new
+                        {
+                            id               = jobId,
+                            fileName,
+                            status           = WorkItemStatus.Processing,
+                            progress         = 0,
+                            remoteJobPhase   = "Encoding",
+                            transferProgress = 0,
+                            size             = totalSize,
+                            bitrate,
+                            length           = duration,
+                            createdAt        = DateTime.UtcNow
+                        });
+                    }
+                    else
+                    {
+                        // Clear the synthetic 100% Uploading card we broadcast above —
+                        // encoding will never start for this id, so no follow-up
+                        // WorkItemUpdated would ever overwrite it. A non-transfer status
+                        // also trips the UI's throttled refresh, which reconciles the
+                        // orphan against the server's authoritative work-item list.
+                        await _hubContext.Clients.All.SendAsync("WorkItemUpdated", new
+                        {
+                            id               = jobId,
+                            fileName,
+                            status           = WorkItemStatus.Cancelled,
+                            progress         = 0,
+                            remoteJobPhase   = (string?)null,
+                            transferProgress = 0,
+                            completedAt      = DateTime.UtcNow,
+                            size             = 0L,
+                            bitrate          = 0L,
+                            length           = 0.0,
+                            createdAt        = DateTime.UtcNow
+                        });
                         return StatusCode(503, new { error = $"Node rejected encoding: {rejectReason}", size = fileSize });
                     }
                 }
@@ -690,6 +744,9 @@ public sealed class ClusterController : ControllerBase
         var chunkHash = Convert.ToHexString(incrementalHash.GetHashAndReset()).ToLower();
 
         var percent = totalSize > 0 ? (int)((offset + length) * 100 / totalSize) : 0;
+        // assignedNodeName is intentionally omitted: this broadcast goes to the
+        // worker's own hub, where the work item was processed locally. The
+        // "Processing on remote node X" badge would mislabel the source node.
         await _hubContext.Clients.All.SendAsync("WorkItemUpdated", new
         {
             id = jobId,
@@ -698,7 +755,6 @@ public sealed class ClusterController : ControllerBase
             progress = 100,
             remoteJobPhase = "Downloading",
             transferProgress = percent,
-            assignedNodeName = "master",
             size = totalSize,
             bitrate = 0L,
             length = 0.0,
@@ -852,6 +908,84 @@ public sealed class ClusterController : ControllerBase
         catch (IOException)                 { return false; }
         catch (JsonException)               { return false; }
         catch (UnauthorizedAccessException) { return false; }
+    }
+
+    /******************************************************************
+     *  Dashboard mirror (RPC for worker dashboards)
+     *
+     *  Workers running in node mode have an empty local encode-history
+     *  ledger — every completed encode is persisted on the master only.
+     *  These endpoints surface the master's aggregations over the cluster
+     *  shared-secret channel so a worker's <c>/api/dashboard/*</c> handlers
+     *  can proxy through and render the same numbers a master would.
+     *
+     *  Endpoint shapes mirror <see cref="DashboardController"/> exactly.
+     ******************************************************************/
+
+    /// <summary> Lifetime totals for the hero strip. </summary>
+    [HttpGet("dashboard/summary")]
+    public async Task<IActionResult> DashboardSummary()
+        => Ok(await _historyRepo.GetSummaryAsync());
+
+    /// <summary> Daily savings rollup for the time-series chart. </summary>
+    [HttpGet("dashboard/savings-over-time")]
+    public async Task<IActionResult> DashboardSavingsOverTime([FromQuery] int days = 30)
+    {
+        days = Math.Clamp(days, 1, 365);
+        return Ok(await _historyRepo.GetSavingsOverTimeAsync(days));
+    }
+
+    /// <summary> Per-device totals for the device utilization stripe. </summary>
+    [HttpGet("dashboard/device-utilization")]
+    public async Task<IActionResult> DashboardDeviceUtilization([FromQuery] int days = 30)
+    {
+        days = Math.Clamp(days, 1, 365);
+        return Ok(await _historyRepo.GetDeviceUtilizationAsync(days));
+    }
+
+    /// <summary> Output codec mix donut data. </summary>
+    [HttpGet("dashboard/codec-mix")]
+    public async Task<IActionResult> DashboardCodecMix([FromQuery] int days = 30)
+    {
+        days = Math.Clamp(days, 1, 365);
+        return Ok(await _historyRepo.GetCodecMixAsync(days));
+    }
+
+    /// <summary> Per-node throughput leaderboard. </summary>
+    [HttpGet("dashboard/node-throughput")]
+    public async Task<IActionResult> DashboardNodeThroughput([FromQuery] int days = 30)
+    {
+        days = Math.Clamp(days, 1, 365);
+        return Ok(await _historyRepo.GetNodeThroughputAsync(days));
+    }
+
+    /// <summary> Most recent N completed encodes. </summary>
+    [HttpGet("dashboard/recent")]
+    public async Task<IActionResult> DashboardRecent([FromQuery] int limit = 25)
+        => Ok(await _historyRepo.GetRecentAsync(limit));
+
+    /// <summary> Top compression wins. </summary>
+    [HttpGet("dashboard/top-savings")]
+    public async Task<IActionResult> DashboardTopSavings([FromQuery] int limit = 10, [FromQuery] int days = 365)
+    {
+        limit = Math.Clamp(limit, 1, 100);
+        days  = Math.Clamp(days, 1, 365);
+        return Ok(await _historyRepo.GetTopSavingsAsync(limit, days));
+    }
+
+    /// <summary>
+    ///     Wipes the master's encode-history ledger. Invoked by a worker's
+    ///     Advanced settings tab when the user asks to clear dashboard data —
+    ///     the worker proxies the request here because the master is the only
+    ///     node that owns the ledger. Broadcasts <c>EncodeHistoryCleared</c>
+    ///     so every connected client refreshes its dashboard view.
+    /// </summary>
+    [HttpDelete("dashboard/history")]
+    public async Task<IActionResult> DashboardClearHistory()
+    {
+        var deleted = await _historyRepo.ClearAllAsync();
+        await _hubContext.Clients.All.SendAsync("EncodeHistoryCleared");
+        return Ok(new { success = true, deleted });
     }
 
 }

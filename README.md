@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-2.6.0-8b5cf6?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-2.7.0-8b5cf6?style=flat-square" alt="Version">
   <img src="https://img.shields.io/badge/.NET-10.0-512bd4?style=flat-square" alt=".NET 10">
   <img src="https://img.shields.io/badge/Electron-41-47848f?style=flat-square" alt="Electron">
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License">
@@ -410,5 +410,5 @@ Creates a self-contained `.dmg` at `electron-app/dist/` with the .NET runtime, F
 ---
 
 <p align="center">
-  <strong>Snacks</strong> v2.6.0 &copy; 2026 Derek Morris
+  <strong>Snacks</strong> v2.7.0 &copy; 2026 Derek Morris
 </p>

@@ -73,8 +73,18 @@ export class ClusterDashboard {
         this._nodeName      = null;
         this._localEncoding = true;
         this._selfCaps      = null;
+        this._selfActive    = [];   // ActiveJobInfo[] for the local machine's slots
         this._localDone     = 0;
         this._localFailed   = 0;
+
+        /**
+         * Per-node settings keyed by NodeId, mirroring the server-side
+         * NodeSettingsConfig. Used to derive the *effective* per-device
+         * concurrency cap when rendering chips so user overrides show up
+         * the moment the user saves them, not on the next reload.
+         * @type {Object<string, {deviceSettings?: Object<string, {enabled?: boolean, maxConcurrency?: number|null}>}>}
+         */
+        this._nodeSettings = {};
 
         this._nodeOverride         = nodeOverrideDialog;
         this._onClusterModeChange  = onClusterModeChanged ?? (() => {});
@@ -122,6 +132,30 @@ export class ClusterDashboard {
         this.loadStatus().then(() => this.render());
     }
 
+    /**
+     * `WorkItemUpdated` — when a local (non-remote) item flips into or out of
+     * Processing, the master's self-active-job list has changed. Coalesce
+     * refreshes through a debounce so a flurry of progress updates produces
+     * a single status fetch.
+     */
+    onWorkItemUpdated(workItem) {
+        if (!workItem || workItem.assignedNodeId) return;   // remote item — nodes update via WorkerUpdated
+        if (!this._enabled || this._role === 'standalone' && !this._nodeId) return;
+
+        // Local progress updates fire every couple of seconds; cheap render.
+        const local = this._selfActive.find(j => j.jobId === workItem.id);
+        if (local) {
+            local.progress = workItem.progress ?? local.progress;
+            local.fileName = workItem.fileName ?? local.fileName;
+            this.render();
+        }
+
+        // Status transitions (started, completed, failed) need a fresh
+        // server-side list. Debounce to avoid storming /status on a busy queue.
+        if (this._refreshHandle) clearTimeout(this._refreshHandle);
+        this._refreshHandle = setTimeout(() => this.loadStatus().then(() => this.render()), 500);
+    }
+
     /** `ClusterConfigChanged` — role / enabled flipped; repaint and notify dependents. */
     onClusterConfigChanged(config) {
         this._enabled = config.enabled;
@@ -130,6 +164,16 @@ export class ClusterDashboard {
         this.render();
         this._updateBanner();
         this._onClusterModeChange(this._enabled, this._role);
+    }
+
+    /**
+     * `NodeSettingsChanged` — server pushed an updated NodeSettings config
+     * (the user saved/deleted a node's overrides). Cache the new settings
+     * and re-render so per-device chip caps reflect the change immediately.
+     */
+    onNodeSettingsChanged(config) {
+        this._nodeSettings = (config && config.nodes) ? config.nodes : {};
+        this.render();
     }
 
 
@@ -149,9 +193,9 @@ export class ClusterDashboard {
             this._nodeId   = config.nodeId;
             this._nodeName = config.nodeName;
 
-            if (config.enabled && config.role !== 'standalone') {
-                await this.loadStatus();
-            }
+            // Load status in every mode so standalone users see their own
+            // self-card (per-device chips, active-jobs bars, hardware cog).
+            await this.loadStatus();
 
             this.render();
             this._updateBanner();
@@ -169,10 +213,19 @@ export class ClusterDashboard {
      */
     async loadStatus() {
         try {
+            // Pull node settings alongside status so the very first render
+            // already has per-device caps applied (overrides take precedence
+            // over the worker-reported defaults).
+            const settingsPromise = clusterApi.getNodeSettings()
+                .then(cfg => { this._nodeSettings = cfg?.nodes || {}; })
+                .catch(() => { /* falls back to defaults */ });
+
             const status = await clusterApi.getStatus();
+            await settingsPromise;
 
             this._localEncoding = status.localEncodingEnabled !== false;
             this._selfCaps      = status.selfCapabilities  || null;
+            this._selfActive    = status.localActiveJobs    || [];
             this._localDone     = status.localCompletedJobs || 0;
             this._localFailed   = status.localFailedJobs    || 0;
 
@@ -216,7 +269,11 @@ export class ClusterDashboard {
         const countBadge = document.getElementById('clusterNodeCount');
         if (!panel || !container) return;
 
-        const showPanel = this._enabled && this._role !== 'standalone';
+        // Show the panel any time we have a self-card to display. In
+        // cluster mode that includes remote nodes; in standalone mode it's
+        // just this machine — but the user still benefits from seeing
+        // per-device slot usage and the cog for tuning concurrency.
+        const showPanel = this._nodeId != null;
         panel.style.display = showPanel ? '' : 'none';
         if (!showPanel) return;
 
@@ -256,13 +313,15 @@ export class ClusterDashboard {
             ? this._selfCaps.gpuVendor.charAt(0).toUpperCase() + this._selfCaps.gpuVendor.slice(1)
             : 'CPU only';
         const selfOs     = this._selfCaps?.osPlatform || '';
-        const selfStatus = localPaused ? 'Paused' : 'Online';
+        const selfStatus = localPaused ? 'Paused' : (this._selfActive.length > 0 ? 'Busy' : 'Online');
         const selfColor  = STATUS_COLORS[selfStatus] || 'gray';
+        const devicesHtml = this._renderDeviceSummary(this._nodeId, this._selfCaps, this._selfActive);
 
         return `
-            <div class="card hover-lift" style="min-width: 180px; max-width: 240px; flex: 1 1 200px;">
-                <div class="card-body p-2" style="overflow:hidden;">
-                    <div class="d-flex align-items-center mb-1" style="min-width:0;">
+            <div class="card hover-lift cluster-card" style="min-width: 240px; max-width: 300px; flex: 1 1 260px;">
+                <div class="card-body p-2 cluster-card-body">
+                    ${devicesHtml}
+                    <div class="d-flex align-items-center mb-1 cluster-card-title" style="min-width:0;">
                         <span class="flex-shrink-0" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${selfColor};margin-right:6px;"></span>
                         <strong style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(this._nodeName || 'This Machine')}</strong>
                     </div>
@@ -279,9 +338,65 @@ export class ClusterDashboard {
                                 <i class="fas fa-cog"></i>
                             </button>
                         </div>` : ''}
+                        ${this._role === 'standalone' ? `
+                        <div class="d-flex gap-1 mt-1">
+                            <button class="btn btn-sm btn-outline-secondary cluster-node-settings flex-grow-1" data-node-id="${this._nodeId}" data-hostname="${escapeHtml(this._nodeName || 'This Machine')}" title="Hardware concurrency">
+                                <i class="fas fa-microchip me-1"></i>Hardware
+                            </button>
+                        </div>` : ''}
                     </div>
                 </div>
             </div>`;
+    }
+
+    /**
+     * Renders the per-device slot summary as a vertical stack of chips
+     * pinned to the top-right of a node card. Each chip shows
+     * "DEVICE used/cap" — capacity is the user's per-device override (from
+     * NodeSettings) when present, otherwise the worker-reported default.
+     * Returns an empty string when no devices have been reported yet.
+     *
+     * @param {string}        nodeId  The NodeId for resolving overrides.
+     * @param {object|null}   caps    The node's capabilities payload.
+     * @param {Array}         active  The node's reported active jobs.
+     * @returns {string}
+     */
+    _renderDeviceSummary(nodeId, caps, active) {
+        const devices = caps?.devices || [];
+        if (devices.length === 0) return '';
+
+        const used = {};
+        for (const j of (active || [])) {
+            if (!j.deviceId) continue;
+            used[j.deviceId] = (used[j.deviceId] || 0) + 1;
+        }
+
+        const overrides = this._nodeSettings?.[nodeId]?.deviceSettings || {};
+
+        // The chips advertise hardware encoder utilization. CPU is the
+        // implicit fallback and doesn't earn its own chip — it would just
+        // appear on every card and dilute the signal. CPU usage is still
+        // visible in the active-jobs list (prefixed with "[cpu]") and CPU
+        // concurrency is still tunable in the override dialog.
+        const hwDevices = devices.filter(d => d.deviceId !== 'cpu');
+        if (hwDevices.length === 0) return '';
+
+        const chips = hwDevices.map(d => {
+            const cur = overrides[d.deviceId] || {};
+            const enabled = cur.enabled !== false;
+            const cap = enabled
+                ? (Number.isInteger(cur.maxConcurrency) ? cur.maxConcurrency : (d.defaultConcurrency || 1))
+                : 0;
+            const u = used[d.deviceId] || 0;
+
+            const state = !enabled ? 'off'
+                        : (u === 0 ? 'idle' : (u >= cap ? 'full' : 'busy'));
+            const label = (d.deviceId || '').toUpperCase();
+
+            return `<span class="device-chip-mini state-${state}" title="${escapeHtml(d.displayName || d.deviceId)}${enabled ? '' : ' (disabled)'}">${escapeHtml(label)} ${u}/${cap}</span>`;
+        }).join('');
+
+        return `<div class="cluster-card-chips">${chips}</div>`;
     }
 
     /**
@@ -299,11 +414,14 @@ export class ClusterDashboard {
             : 'CPU only';
         const osInfo     = node.capabilities?.osPlatform || '';
         const canControl = this._role === 'master' && node.role === 'node';
+        const active     = node.activeJobs || [];
+        const devicesHtml = this._renderDeviceSummary(node.nodeId, node.capabilities, active);
 
         return `
-            <div class="card hover-lift" style="min-width: 180px; max-width: 240px; flex: 1 1 200px;">
-                <div class="card-body p-2" style="overflow:hidden;">
-                    <div class="d-flex align-items-center mb-1" style="min-width:0;">
+            <div class="card hover-lift cluster-card" style="min-width: 240px; max-width: 300px; flex: 1 1 260px;">
+                <div class="card-body p-2 cluster-card-body">
+                    ${devicesHtml}
+                    <div class="d-flex align-items-center mb-1 cluster-card-title" style="min-width:0;">
                         <span class="flex-shrink-0" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${statusColor};margin-right:6px;"></span>
                         <strong style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(node.hostname)}</strong>
                     </div>
@@ -345,8 +463,11 @@ export class ClusterDashboard {
         });
 
         container.querySelectorAll('.cluster-node-settings').forEach(btn => {
-            btn.addEventListener('click', () =>
-                this._nodeOverride?.openNode(btn.dataset.nodeId, btn.dataset.hostname));
+            btn.addEventListener('click', () => {
+                const isSelf = btn.dataset.nodeId === this._nodeId;
+                const standalone = isSelf && this._role === 'standalone';
+                this._nodeOverride?.openNode(btn.dataset.nodeId, btn.dataset.hostname, { standalone });
+            });
         });
 
         document.getElementById('masterLocalPause')?.addEventListener('click', async () => {
@@ -358,6 +479,18 @@ export class ClusterDashboard {
                 showToast('Error: ' + err.message, 'danger');
             }
         });
+    }
+
+    /**
+     * Repaints both the cluster panel and the node-mode banner from
+     * cached in-memory state, without re-fetching from the server. Used by
+     * the SPA shell when the queue page is re-mounted: the old DOM was
+     * thrown out during navigation, but the dashboard's worker/role state
+     * is still here, so we just need to draw it into the fresh DOM.
+     */
+    redraw() {
+        this.render();
+        this._updateBanner();
     }
 
     /**

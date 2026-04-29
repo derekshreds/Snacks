@@ -25,6 +25,15 @@ public class SnacksDbContext : DbContext
     /// </summary>
     public DbSet<StateTransition> StateTransitions => Set<StateTransition>();
 
+    /// <summary>
+    ///     Append-only ledger of completed encodes. Powers the analytics
+    ///     dashboard (savings totals, per-device utilization, codec mix,
+    ///     recent-encodes table). Independent from <see cref="MediaFiles"/>;
+    ///     a row is written every time a job finishes successfully, even if
+    ///     the same file is re-encoded later.
+    /// </summary>
+    public DbSet<EncodeHistory> EncodeHistory => Set<EncodeHistory>();
+
     /// <summary> Creates a new context with the specified database options. </summary>
     public SnacksDbContext(DbContextOptions<SnacksDbContext> options) : base(options) { }
 
@@ -80,6 +89,33 @@ public class SnacksDbContext : DbContext
 
             // Composite index covers the recovery query that filters by work item and completion flag.
             entity.HasIndex(e => new { e.WorkItemId, e.Completed });
+        });
+
+
+        /******************************************************************
+         *  EncodeHistory Configuration
+         ******************************************************************/
+
+        modelBuilder.Entity<EncodeHistory>(entity =>
+        {
+            entity.HasKey(e => e.Id);
+
+            entity.Property(e => e.JobId).IsRequired().HasMaxLength(64);
+            entity.Property(e => e.FilePath).IsRequired().HasMaxLength(1024);
+            entity.Property(e => e.FileName).IsRequired().HasMaxLength(512);
+            entity.Property(e => e.OriginalCodec).HasMaxLength(32);
+            entity.Property(e => e.EncodedCodec).HasMaxLength(32);
+            entity.Property(e => e.DeviceId).HasMaxLength(32);
+            entity.Property(e => e.NodeId).HasMaxLength(64);
+            entity.Property(e => e.NodeHostname).HasMaxLength(128);
+            entity.Property(e => e.Outcome).HasMaxLength(16);
+
+            // Time-series queries (savings-over-time, recent encodes) all key off
+            // CompletedAt; index it so the dashboard's date-range scans don't
+            // table-scan the whole ledger.
+            entity.HasIndex(e => e.CompletedAt);
+            // Per-device aggregations group on (DeviceId, CompletedAt).
+            entity.HasIndex(e => new { e.DeviceId, e.CompletedAt });
         });
     }
 }

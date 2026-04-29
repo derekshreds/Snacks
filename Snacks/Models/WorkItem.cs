@@ -78,7 +78,9 @@ public sealed class WorkItem
         set
         {
             if (IsTerminal(_status) && IsActive(value)) return;
+            if (_status == value) return;
             _status = value;
+            LastUpdatedAt = DateTime.UtcNow;
         }
     }
 
@@ -90,11 +92,21 @@ public sealed class WorkItem
                                                           or WorkItemStatus.Downloading
                                                           or WorkItemStatus.Processing;
 
+    private int _progress;
+
     /// <summary>
     ///     Encoding progress percentage (0–100).
     ///     For remote jobs, this reflects the node's reported progress.
     /// </summary>
-    public int Progress { get; set; } = 0;
+    public int Progress
+    {
+        get => _progress;
+        set
+        {
+            _progress = value;
+            LastUpdatedAt = DateTime.UtcNow;
+        }
+    }
 
     /// <summary> Human-readable error message if the job failed. </summary>
     public string? ErrorMessage { get; set; }
@@ -123,11 +135,21 @@ public sealed class WorkItem
     /// </summary>
     public string? RemoteJobPhase { get; set; }
 
+    private int _transferProgress;
+
     /// <summary>
     ///     Transfer progress percentage (0–100) for uploads and downloads.
     ///     Separate from <see cref="Progress"/> which tracks encoding progress.
     /// </summary>
-    public int TransferProgress { get; set; }
+    public int TransferProgress
+    {
+        get => _transferProgress;
+        set
+        {
+            _transferProgress = value;
+            LastUpdatedAt = DateTime.UtcNow;
+        }
+    }
 
     /// <summary>
     ///     Number of times this job has failed on remote nodes.
@@ -135,8 +157,29 @@ public sealed class WorkItem
     /// </summary>
     public int RemoteFailureCount { get; set; }
 
+    /// <summary>
+    ///     UTC timestamp of the last activity on this work item — bumped on every status change,
+    ///     progress update, transfer-progress update, log line, and remote progress packet.
+    ///     Used by the stuck-item watchdog and the per-job watchdog to detect items that have
+    ///     gone silent and need rescuing.
+    /// </summary>
+    /// <remarks> In-memory only; deliberately not persisted to the database. </remarks>
+    public DateTime LastUpdatedAt { get; set; } = DateTime.UtcNow;
+
+    /// <summary> Bumps <see cref="LastUpdatedAt"/> to mark the item as having recent activity. </summary>
+    public void Touch() => LastUpdatedAt = DateTime.UtcNow;
+
     /// <summary> Convenience property — <see langword="true" /> if this job is assigned to a remote node. </summary>
     public bool IsRemote => AssignedNodeId != null;
+
+    /// <summary>
+    ///     The hardware device family (<c>"nvidia"</c>, <c>"intel"</c>,
+    ///     <c>"cpu"</c>, ...) the master picked when scheduling this job.
+    ///     Captured at dispatch time so the encode-history ledger and the
+    ///     dashboard's per-device analytics can attribute the work even
+    ///     after the slot has been released. Null until scheduled.
+    /// </summary>
+    public string? DispatchedDeviceId { get; set; }
 }
 
 /// <summary> Lifecycle states for a <see cref="WorkItem"/>. </summary>
