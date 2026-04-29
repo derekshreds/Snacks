@@ -316,7 +316,6 @@ export class ClusterDashboard {
         const selfStatus = localPaused ? 'Paused' : (this._selfActive.length > 0 ? 'Busy' : 'Online');
         const selfColor  = STATUS_COLORS[selfStatus] || 'gray';
         const devicesHtml = this._renderDeviceSummary(this._nodeId, this._selfCaps, this._selfActive);
-        const jobsHtml    = this._renderActiveJobs(this._selfActive);
 
         return `
             <div class="card hover-lift cluster-card" style="min-width: 240px; max-width: 300px; flex: 1 1 260px;">
@@ -329,7 +328,6 @@ export class ClusterDashboard {
                     <div class="text-muted small">
                         <div>${escapeHtml(this._role)} &bull; ${escapeHtml(selfOs)}${selfGpu ? ' / ' + escapeHtml(selfGpu) : ''}</div>
                         <div style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(selfStatus)}</div>
-                        ${jobsHtml}
                         <div class="mt-1">Jobs: ${this._localDone} done, ${this._localFailed} failed</div>
                         ${this._role === 'master' ? `
                         <div class="d-flex gap-1 mt-1">
@@ -402,35 +400,6 @@ export class ClusterDashboard {
     }
 
     /**
-     * Renders one progress block per active job on the node. Compact —
-     * filename + percentage + a thin progress bar — so two or three
-     * concurrent encodes still fit in the same card width.
-     *
-     * @param {Array} active
-     * @returns {string}
-     */
-    _renderActiveJobs(active) {
-        if (!active || active.length === 0) return '';
-        return `
-            <div class="mt-1">
-                ${active.map(j => `
-                    <div class="small" style="overflow:hidden;">
-                        <div class="d-flex justify-content-between" style="min-width:0;">
-                            <span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${escapeHtml(j.fileName || '')}">
-                                ${j.deviceId ? `<span class="text-muted">[${escapeHtml(j.deviceId)}]</span> ` : ''}
-                                ${escapeHtml(j.fileName || j.jobId)}
-                            </span>
-                            <span class="text-muted ms-1">${j.progress || 0}%</span>
-                        </div>
-                        <div class="progress" style="height:3px;">
-                            <div class="progress-bar" role="progressbar" style="width: ${j.progress || 0}%"></div>
-                        </div>
-                    </div>
-                `).join('')}
-            </div>`;
-    }
-
-    /**
      * Returns the HTML for a remote-node card. Master-only controls only
      * render when our local role is master.
      *
@@ -447,7 +416,6 @@ export class ClusterDashboard {
         const canControl = this._role === 'master' && node.role === 'node';
         const active     = node.activeJobs || [];
         const devicesHtml = this._renderDeviceSummary(node.nodeId, node.capabilities, active);
-        const jobsHtml    = this._renderActiveJobs(active);
 
         return `
             <div class="card hover-lift cluster-card" style="min-width: 240px; max-width: 300px; flex: 1 1 260px;">
@@ -460,7 +428,6 @@ export class ClusterDashboard {
                     <div class="text-muted small">
                         <div>${escapeHtml(node.role)} &bull; ${escapeHtml(osInfo)}${gpuInfo ? ' / ' + escapeHtml(gpuInfo) : ''}</div>
                         <div style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(statusName)}</div>
-                        ${jobsHtml}
                         <div class="mt-1">Jobs: ${node.completedJobs || 0} done, ${node.failedJobs || 0} failed</div>
                         ${canControl ? `
                             <div class="d-flex gap-1 mt-1">
