@@ -386,6 +386,31 @@ public sealed class ClusterService : IHostedService, IDisposable
     public bool IsMasterMode => _config.Enabled && _config.Role == "master";
 
     /// <summary>
+    ///     Resolves the connected master's base URL — explicit
+    ///     <see cref="ClusterConfig.MasterUrl"/> first, then any registered
+    ///     master node from the discovery registry. Returns <see langword="null"/>
+    ///     when this instance has no master to talk to (standalone, master,
+    ///     or a node that hasn't completed handshake).
+    /// </summary>
+    public string? ResolveMasterUrl()
+    {
+        var explicitUrl = _config.MasterUrl?.TrimEnd('/');
+        if (!string.IsNullOrEmpty(explicitUrl)) return explicitUrl;
+
+        var masterNode = _nodes.Values.FirstOrDefault(n => n.Role == "master");
+        return masterNode != null
+            ? $"{(_config.UseHttps ? "https" : "http")}://{masterNode.IpAddress}:{masterNode.Port}"
+            : null;
+    }
+
+    /// <summary>
+    ///     Creates an HTTP client authenticated with the cluster shared
+    ///     secret. Convenience wrapper used by the worker dashboard proxy
+    ///     so callers don't need a direct reference to the discovery service.
+    /// </summary>
+    public HttpClient CreateClusterClient() => _discovery.CreateAuthenticatedClient();
+
+    /// <summary>
     ///     Whether this instance should originate external-facing side effects
     ///     (webhooks, Plex/Jellyfin rescans, etc.). True for standalone and master;
     ///     false for dedicated worker nodes so each event fires exactly once cluster-wide.

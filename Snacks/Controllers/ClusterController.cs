@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.SignalR;
+using Snacks.Data;
 using Snacks.Hubs;
 using Snacks.Models;
 using Snacks.Services;
@@ -35,14 +36,18 @@ public sealed class ClusterController : ControllerBase
     /// <param name="clusterService"> The cluster coordination service. </param>
     /// <param name="integrationService"> Source of master-side integration credentials served to workers. </param>
     /// <param name="hubContext"> SignalR hub context for pushing transfer progress to the UI. </param>
+    private readonly EncodeHistoryRepository      _historyRepo;
+
     public ClusterController(
         ClusterService clusterService,
         IntegrationService integrationService,
-        IHubContext<TranscodingHub> hubContext)
+        IHubContext<TranscodingHub> hubContext,
+        EncodeHistoryRepository historyRepo)
     {
         _clusterService     = clusterService;
         _integrationService = integrationService;
         _hubContext         = hubContext;
+        _historyRepo        = historyRepo;
     }
 
     /******************************************************************
@@ -878,6 +883,69 @@ public sealed class ClusterController : ControllerBase
         catch (IOException)                 { return false; }
         catch (JsonException)               { return false; }
         catch (UnauthorizedAccessException) { return false; }
+    }
+
+    /******************************************************************
+     *  Dashboard mirror (RPC for worker dashboards)
+     *
+     *  Workers running in node mode have an empty local encode-history
+     *  ledger — every completed encode is persisted on the master only.
+     *  These endpoints surface the master's aggregations over the cluster
+     *  shared-secret channel so a worker's <c>/api/dashboard/*</c> handlers
+     *  can proxy through and render the same numbers a master would.
+     *
+     *  Endpoint shapes mirror <see cref="DashboardController"/> exactly.
+     ******************************************************************/
+
+    /// <summary> Lifetime totals for the hero strip. </summary>
+    [HttpGet("dashboard/summary")]
+    public async Task<IActionResult> DashboardSummary()
+        => Ok(await _historyRepo.GetSummaryAsync());
+
+    /// <summary> Daily savings rollup for the time-series chart. </summary>
+    [HttpGet("dashboard/savings-over-time")]
+    public async Task<IActionResult> DashboardSavingsOverTime([FromQuery] int days = 30)
+    {
+        days = Math.Clamp(days, 1, 365);
+        return Ok(await _historyRepo.GetSavingsOverTimeAsync(days));
+    }
+
+    /// <summary> Per-device totals for the device utilization stripe. </summary>
+    [HttpGet("dashboard/device-utilization")]
+    public async Task<IActionResult> DashboardDeviceUtilization([FromQuery] int days = 30)
+    {
+        days = Math.Clamp(days, 1, 365);
+        return Ok(await _historyRepo.GetDeviceUtilizationAsync(days));
+    }
+
+    /// <summary> Output codec mix donut data. </summary>
+    [HttpGet("dashboard/codec-mix")]
+    public async Task<IActionResult> DashboardCodecMix([FromQuery] int days = 30)
+    {
+        days = Math.Clamp(days, 1, 365);
+        return Ok(await _historyRepo.GetCodecMixAsync(days));
+    }
+
+    /// <summary> Per-node throughput leaderboard. </summary>
+    [HttpGet("dashboard/node-throughput")]
+    public async Task<IActionResult> DashboardNodeThroughput([FromQuery] int days = 30)
+    {
+        days = Math.Clamp(days, 1, 365);
+        return Ok(await _historyRepo.GetNodeThroughputAsync(days));
+    }
+
+    /// <summary> Most recent N completed encodes. </summary>
+    [HttpGet("dashboard/recent")]
+    public async Task<IActionResult> DashboardRecent([FromQuery] int limit = 25)
+        => Ok(await _historyRepo.GetRecentAsync(limit));
+
+    /// <summary> Top compression wins. </summary>
+    [HttpGet("dashboard/top-savings")]
+    public async Task<IActionResult> DashboardTopSavings([FromQuery] int limit = 10, [FromQuery] int days = 365)
+    {
+        limit = Math.Clamp(limit, 1, 100);
+        days  = Math.Clamp(days, 1, 365);
+        return Ok(await _historyRepo.GetTopSavingsAsync(limit, days));
     }
 
 }

@@ -63,6 +63,44 @@ public class TranscodingService
     /// <summary>Lock protecting per-job <see cref="ActiveLocalJob.Process"/> publication.</summary>
     private readonly object _activeLock = new();
 
+    /// <summary>
+    ///     Wake signal raced against in-flight task completions inside the
+    ///     scheduler's <c>WhenAny</c> waits. Settings changes (per-device cap
+    ///     adjustments, enable toggles) trigger a wake so the scheduler
+    ///     re-evaluates its dispatch decision immediately instead of
+    ///     blocking on the currently running encode to finish first.
+    /// </summary>
+    private TaskCompletionSource _schedulerWake = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>
+    ///     Signals the scheduler to re-evaluate slot availability now.
+    ///     Idempotent — repeated calls before the scheduler observes the
+    ///     wake collapse into a single re-check.
+    /// </summary>
+    private void WakeScheduler()
+    {
+        var prev = Interlocked.Exchange(
+            ref _schedulerWake,
+            new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
+        prev.TrySetResult();
+    }
+
+    /// <summary>
+    ///     Awaits the next interesting event for the scheduler — either an
+    ///     in-flight encode finishing or an explicit wake (settings change).
+    ///     Falls back to a short poll when there are no in-flight tasks.
+    /// </summary>
+    private async Task WaitForSchedulerProgressAsync(List<Task> inflight)
+    {
+        var wake = _schedulerWake.Task;
+        if (inflight.Count == 0)
+        {
+            await Task.WhenAny(wake, Task.Delay(200));
+            return;
+        }
+        await Task.WhenAny(Task.WhenAny(inflight), wake);
+    }
+
     /// <summary>Whether the local processing loop is paused by user request.</summary>
     private volatile bool _isPaused = false;
 
@@ -117,6 +155,16 @@ public class TranscodingService
     public void SetLocalDeviceSettingsProvider(Func<string, (bool Enabled, int? MaxOverride)>? provider)
     {
         _localDeviceSettingsProvider = provider;
+
+        // Wake the running scheduler so it re-evaluates dispatch immediately
+        // — without this, raising a cap from 1 → 2 mid-run only takes effect
+        // after the currently running encode completes, because the
+        // scheduler is parked in WhenAny(inflight).
+        WakeScheduler();
+
+        // Also kick off ProcessQueueAsync in case no scheduler is running
+        // (queue was idle waiting for an enable). Idempotent — the lock
+        // bails early if a scheduler is already alive.
         if (_lastOptions != null && !_isPaused && !_localEncodingPaused)
         {
             _ = Task.Run(async () =>
@@ -1231,7 +1279,16 @@ public class TranscodingService
     private async Task ProcessQueueAsync(EncoderOptions options)
     {
         if (!await _processingLock.WaitAsync(100))
-            return; // Already scheduling
+        {
+            // A scheduler is already running. Nudge it so it re-checks the
+            // queue + per-device caps right now instead of staying parked
+            // in WhenAny(inflight) until the currently running encode
+            // finishes. Without this, adding new items (or raising a cap)
+            // mid-run only takes effect after the running encode completes
+            // — which surfaces as "I have 2 slots, only 1 fills".
+            WakeScheduler();
+            return;
+        }
 
         _lastOptions = options;
 
@@ -1269,12 +1326,11 @@ public class TranscodingService
                 if (queueEmpty && inflight.Count == 0) break;
 
                 // Queue is empty but encodes are still finishing — wait for
-                // one to drain before re-checking; nothing to schedule and
-                // nothing to spin on. New items added during the wait are
-                // picked up on the next iteration.
+                // one to drain or for an explicit wake (settings change)
+                // before re-checking.
                 if (queueEmpty)
                 {
-                    await Task.WhenAny(inflight);
+                    await WaitForSchedulerProgressAsync(inflight);
                     continue;
                 }
 
@@ -1287,10 +1343,12 @@ public class TranscodingService
                 var deviceId = TryAcquireLocalDeviceSlot(current);
                 if (deviceId == null)
                 {
-                    if (inflight.Count > 0)
-                        await Task.WhenAny(inflight);
-                    else
-                        await Task.Delay(200);   // No slots and no inflight — devices disabled or unsupported codec; back off briefly
+                    // No slot free yet — wait for an inflight to finish OR a
+                    // settings-change wake. Without the wake, raising the cap
+                    // mid-run would only take effect after the running encode
+                    // finished, defeating the user's "let two run at once"
+                    // intent.
+                    await WaitForSchedulerProgressAsync(inflight);
                     continue;
                 }
 
@@ -1308,11 +1366,8 @@ public class TranscodingService
                 if (workItem == null)
                 {
                     // No item fits this device right now. Wait for inflight
-                    // progress before reconsidering.
-                    if (inflight.Count > 0)
-                        await Task.WhenAny(inflight);
-                    else
-                        await Task.Delay(200);
+                    // progress or settings-wake before reconsidering.
+                    await WaitForSchedulerProgressAsync(inflight);
                     continue;
                 }
 
