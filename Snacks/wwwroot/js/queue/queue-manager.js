@@ -165,6 +165,11 @@ export class QueueManager {
     updateItem(workItem) {
         this._workItems.set(workItem.id, workItem);
 
+        // Off-page (e.g. user is on /dashboard): only keep the in-memory map
+        // current. The DOM will repaint from a fresh fetch when the queue
+        // page is re-mounted.
+        if (!document.getElementById('workItemsContainer')) return;
+
         const statusString = getStatusString(workItem.status);
         if (!TRANSFER_STATUSES.includes(statusString)) {
             this._scheduleRefresh();
@@ -189,6 +194,12 @@ export class QueueManager {
         }
 
         this._renderItem({ ...workItem, status: statusString });
+
+        // The card just moved out of the Queued container into Processing,
+        // freeing a slot on the current page. Schedule a throttled refresh
+        // so the next Pending item is fetched in to fill the gap. The
+        // throttle absorbs bursts when several items dispatch back-to-back.
+        this._scheduleRefresh();
     }
 
     /** Schedules a full refresh, throttled to at most once every {@link REFRESH_THROTTLE_MS}. */
@@ -207,8 +218,16 @@ export class QueueManager {
     /**
      * Fetches the current page and the aggregate stats, reconciles both
      * containers, and repaints the pagination + filter strip.
+     *
+     * SPA shell: the queue containers only exist on the queue page. If the
+     * user is on /dashboard when SignalR fires a WorkItem update or a
+     * visibility-change tries to resync, bail out — the queue page's
+     * `mount` hook calls `loadItems()` again when the user returns, and
+     * the in-memory `_workItems` map is repopulated from that fetch.
      */
     async loadItems() {
+        if (!document.getElementById('workItemsContainer')) return;
+
         try {
             const skip = this._page * PAGE_SIZE;
 
