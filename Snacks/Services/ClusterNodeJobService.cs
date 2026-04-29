@@ -71,14 +71,22 @@ public sealed class ClusterNodeJobService
     private readonly ConcurrentDictionary<string, DateTime> _receivingJobIds = new();
 
     /// <summary>
-    ///     Per-device slot semaphores. Initialised lazily on first use of a
-    ///     given device (capacity = the device's
-    ///     <see cref="HardwareDevice.DefaultConcurrency"/>). The master is the
-    ///     primary scheduler; this is the node's safety net, ensuring even a
-    ///     misbehaving master can never push more concurrent encodes onto a
-    ///     device than the worker is willing to run.
+    ///     Per-device slot pools. Tracks active slot count against a max
+    ///     capacity that grows on demand to honor the master's effective
+    ///     concurrency setting (<see cref="JobMetadata.DeviceMaxConcurrency"/>).
+    ///     The master is the primary scheduler; this is the node's safety net,
+    ///     ensuring even a misbehaving master can never push more concurrent
+    ///     encodes onto a device than the worker is willing to run — but
+    ///     unlike a fixed-size <see cref="SemaphoreSlim"/>, it can't silently
+    ///     reject a job the master legitimately scheduled under a higher cap.
     /// </summary>
-    private readonly ConcurrentDictionary<string, SemaphoreSlim> _deviceSlotLocks = new();
+    private sealed class DeviceSlotPool
+    {
+        public int Used;
+        public int Max;
+        public readonly object Lock = new();
+    }
+    private readonly ConcurrentDictionary<string, DeviceSlotPool> _deviceSlotPools = new();
 
     private volatile bool _nodePaused;
 
@@ -301,9 +309,11 @@ public sealed class ClusterNodeJobService
         // Try to acquire one of the device's slots. If every slot is busy,
         // reject — the master is the primary scheduler and shouldn't have
         // over-dispatched, but this guard catches drift between its optimistic
-        // accounting and the node's actual state.
-        var slotLock = GetOrCreateDeviceSlotLock(deviceId);
-        if (!await slotLock.WaitAsync(0))
+        // accounting and the node's actual state. The pool's cap grows to honor
+        // the master's effective concurrency, so a legitimate higher dispatch
+        // doesn't get rejected by a stale fixed-size semaphore.
+        var slotPool = GetOrCreateDeviceSlotPool(deviceId, metadata.DeviceMaxConcurrency);
+        if (!TryAcquireSlot(slotPool))
             return (false, $"All {deviceId} slots are busy on this node");
 
         bool slotHandedOff = false;
@@ -371,14 +381,14 @@ public sealed class ClusterNodeJobService
             // The slot stays held for the lifetime of the encode — the
             // background task releases it in a finally block.
             slotHandedOff = true;
-            _ = Task.Run(() => ExecuteRemoteJobAsync(active, metadata.Options, slotLock));
+            _ = Task.Run(() => ExecuteRemoteJobAsync(active, metadata.Options, slotPool));
 
             return (true, null);
         }
         finally
         {
             if (!slotHandedOff)
-                slotLock.Release();
+                ReleaseSlot(slotPool);
         }
     }
 
@@ -404,19 +414,52 @@ public sealed class ClusterNodeJobService
     }
 
     /// <summary>
-    ///     Lazily creates a slot semaphore for the given device, sized to the
-    ///     device's reported <see cref="HardwareDevice.DefaultConcurrency"/>.
-    ///     Same instance is returned for the same deviceId across calls so
-    ///     simultaneous offers contend on the same gate.
+    ///     Lazily creates a slot pool for the given device. Initial capacity
+    ///     comes from the master's <paramref name="masterMax"/> hint when
+    ///     supplied, falling back to the device's reported
+    ///     <see cref="HardwareDevice.DefaultConcurrency"/> for legacy masters.
+    ///     If the same device is later asked to honor a larger cap, the pool
+    ///     grows to match — never shrinks below the current high-water Max so
+    ///     in-flight jobs never lose a reservation.
     /// </summary>
-    private SemaphoreSlim GetOrCreateDeviceSlotLock(string deviceId)
+    private DeviceSlotPool GetOrCreateDeviceSlotPool(string deviceId, int? masterMax)
     {
-        return _deviceSlotLocks.GetOrAdd(deviceId, id =>
+        var pool = _deviceSlotPools.GetOrAdd(deviceId, id =>
         {
             var device = _transcodingService.GetDetectedDevices().FirstOrDefault(d => d.DeviceId == id);
-            var capacity = Math.Max(1, device?.DefaultConcurrency ?? 1);
-            return new SemaphoreSlim(capacity, capacity);
+            var capacity = Math.Max(1, masterMax ?? device?.DefaultConcurrency ?? 1);
+            return new DeviceSlotPool { Max = capacity };
         });
+
+        if (masterMax.HasValue)
+        {
+            lock (pool.Lock)
+            {
+                if (masterMax.Value > pool.Max) pool.Max = masterMax.Value;
+            }
+        }
+
+        return pool;
+    }
+
+    /// <summary> Attempts to claim a slot from the pool. <see langword="false"/> when full. </summary>
+    private static bool TryAcquireSlot(DeviceSlotPool pool)
+    {
+        lock (pool.Lock)
+        {
+            if (pool.Used >= pool.Max) return false;
+            pool.Used++;
+            return true;
+        }
+    }
+
+    /// <summary> Returns a slot to the pool. Idempotent against double-release via the floor. </summary>
+    private static void ReleaseSlot(DeviceSlotPool pool)
+    {
+        lock (pool.Lock)
+        {
+            if (pool.Used > 0) pool.Used--;
+        }
     }
 
     /******************************************************************
@@ -432,8 +475,8 @@ public sealed class ClusterNodeJobService
     /// </summary>
     /// <param name="active">The active job descriptor including work item, device, and CTS.</param>
     /// <param name="options">Encoder options dictating codec, quality, and hardware settings.</param>
-    /// <param name="slotLock">Device slot semaphore to release when the job finishes.</param>
-    private async Task ExecuteRemoteJobAsync(ActiveRemoteJob active, EncoderOptions options, SemaphoreSlim slotLock)
+    /// <param name="slotPool">Device slot pool to release the claimed slot back to when the job finishes.</param>
+    private async Task ExecuteRemoteJobAsync(ActiveRemoteJob active, EncoderOptions options, DeviceSlotPool slotPool)
     {
         var workItem  = active.Item;
         var masterUrl = ResolveMasterUrl();
@@ -528,7 +571,7 @@ public sealed class ClusterNodeJobService
             // master reacts immediately by freeing this slot and dispatching new
             // work. If we report first and clean up after, the next upload can
             // arrive while we still hold the slot.
-            ReleaseJobState(workItem.Id, slotLock);
+            ReleaseJobState(workItem.Id, slotPool);
 
             if (masterUrl != null)
             {
@@ -568,7 +611,7 @@ public sealed class ClusterNodeJobService
                 _completedJobIds[workItem.Id] = 0;
             }
 
-            ReleaseJobState(workItem.Id, slotLock);
+            ReleaseJobState(workItem.Id, slotPool);
         }
         catch { }
 
@@ -638,10 +681,10 @@ public sealed class ClusterNodeJobService
     /// <summary>
     ///     Releases all per-job state for a finished or failed encode: removes
     ///     the active-job entry, clears its callbacks on the transcoding
-    ///     service, disposes its CTS, and releases its device slot semaphore
+    ///     service, disposes its CTS, and returns its device slot to the pool
     ///     so the next dispatched job for that device can proceed. Idempotent.
     /// </summary>
-    private void ReleaseJobState(string jobId, SemaphoreSlim slotLock)
+    private void ReleaseJobState(string jobId, DeviceSlotPool slotPool)
     {
         if (_activeJobs.TryRemove(jobId, out var active))
         {
@@ -649,7 +692,7 @@ public sealed class ClusterNodeJobService
         }
         _transcodingService.SetProgressCallback(jobId, null);
         _transcodingService.SetLogCallback(jobId, null);
-        try { slotLock.Release(); } catch (SemaphoreFullException) { /* already released — idempotent */ }
+        ReleaseSlot(slotPool);
     }
 
     /******************************************************************

@@ -65,4 +65,16 @@ public sealed class JobMetadata
     ///     behaviour.</para>
     /// </summary>
     public string? DeviceId { get; set; }
+
+    /// <summary>
+    ///     Effective slot capacity the master is using for the chosen device on
+    ///     this worker (i.e. the user's per-node <c>MaxConcurrency</c> override
+    ///     when set, otherwise the device's reported <c>DefaultConcurrency</c>).
+    ///     The worker's slot pool grows to honor this so its safety-net cap
+    ///     never silently rejects a job the master legitimately scheduled.
+    ///
+    ///     <para>Null on requests from older masters; the worker falls back to
+    ///     <c>DefaultConcurrency</c> for sizing.</para>
+    /// </summary>
+    public int? DeviceMaxConcurrency { get; set; }
 }

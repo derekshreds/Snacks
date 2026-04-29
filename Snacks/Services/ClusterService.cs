@@ -1299,6 +1299,19 @@ public sealed class ClusterService : IHostedService, IDisposable
             if (workItem.Probe == null)
                 workItem.Probe = await _ffprobeService.ProbeAsync(workItem.Path, jobCts.Token);
 
+            // Resolve the master's effective slot capacity for the chosen device so
+            // the worker can grow its slot pool to match. Without this, a user's
+            // MaxConcurrency override above the device's hardcoded DefaultConcurrency
+            // would let the master dispatch N parallel jobs while the worker's
+            // semaphore silently caps at 1 — handoff after upload would 503.
+            int? deviceMaxConcurrency = null;
+            if (!string.IsNullOrEmpty(deviceId))
+            {
+                var dev = node.Capabilities?.Devices?.FirstOrDefault(d => d.DeviceId == deviceId);
+                if (dev != null)
+                    deviceMaxConcurrency = EffectiveDeviceCapacity(node, dev);
+            }
+
             // Build metadata for autonomous encoding on the worker
             var metadata = new JobMetadata
             {
@@ -1312,7 +1325,8 @@ public sealed class ClusterService : IHostedService, IDisposable
                 IsHevc   = workItem.IsHevc,
                 Is4K     = workItem.Is4K,
                 // Empty deviceId for legacy nodes — they auto-pick on the worker side.
-                DeviceId = string.IsNullOrEmpty(deviceId) ? null : deviceId,
+                DeviceId             = string.IsNullOrEmpty(deviceId) ? null : deviceId,
+                DeviceMaxConcurrency = deviceMaxConcurrency,
             };
 
             var client = _discovery.CreateAuthenticatedClient();
