@@ -547,7 +547,29 @@ public sealed class ClusterController : ControllerBase
 
                     var (started, rejectReason) = await _clusterService.StartAutonomousEncodingAsync(jobId, metadata, filePath);
 
-                    if (!started)
+                    if (started)
+                    {
+                        // Replace the synthetic 100% Uploading frame with a clean
+                        // Processing/Encoding handover so the worker's local UI
+                        // doesn't stay stuck at "Uploading 100%" through the OCR
+                        // pre-pass — there is no other broadcast on the worker's
+                        // hub for this job until encode completion otherwise.
+                        await _hubContext.Clients.All.SendAsync("WorkItemUpdated", new
+                        {
+                            id               = jobId,
+                            fileName,
+                            status           = WorkItemStatus.Processing,
+                            progress         = 0,
+                            remoteJobPhase   = "Encoding",
+                            transferProgress = 0,
+                            assignedNodeName = "master",
+                            size             = totalSize,
+                            bitrate,
+                            length           = duration,
+                            createdAt        = DateTime.UtcNow
+                        });
+                    }
+                    else
                     {
                         // Clear the synthetic 100% Uploading card we broadcast above —
                         // encoding will never start for this id, so no follow-up

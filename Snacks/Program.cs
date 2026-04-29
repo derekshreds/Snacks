@@ -101,12 +101,16 @@ builder.Services.AddControllersWithViews()
         options.JsonSerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.CamelCase;
         options.JsonSerializerOptions.PropertyNameCaseInsensitive = true;
         options.JsonSerializerOptions.WriteIndented = true;
+        options.JsonSerializerOptions.Converters.Add(new Snacks.Json.UtcDateTimeConverter());
+        options.JsonSerializerOptions.Converters.Add(new Snacks.Json.NullableUtcDateTimeConverter());
     });
 
 builder.Services.AddSignalR()
     .AddJsonProtocol(options =>
     {
         options.PayloadSerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.CamelCase;
+        options.PayloadSerializerOptions.Converters.Add(new Snacks.Json.UtcDateTimeConverter());
+        options.PayloadSerializerOptions.Converters.Add(new Snacks.Json.NullableUtcDateTimeConverter());
     });
 
 // Database — SQLite with WAL mode for crash resilience.

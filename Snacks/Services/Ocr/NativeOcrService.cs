@@ -31,11 +31,54 @@ public sealed class NativeOcrService
     private readonly Dictionary<string, SubtitleSpellChecker>  _spellCheckerCache = new(StringComparer.Ordinal);
     private readonly SemaphoreSlim                             _engineLock        = new(1, 1);
 
+    // Process-wide OCR slot. Multi-slot encoding can run several jobs in parallel
+    // on a single node, but Tesseract's engine state isn't safe to drive
+    // concurrently and the OCR pipeline runs one cue at a time anyway. Serializing
+    // at the movie level (caller holds the slot for the full pass) avoids cross-job
+    // engine corruption and keeps log output coherent.
+    private readonly SemaphoreSlim _ocrSlot = new(1, 1);
+    private string?                _ocrSlotHolder;
+
     public NativeOcrService(TessdataResolver tessdataResolver)
     {
         ArgumentNullException.ThrowIfNull(tessdataResolver);
         _tessdataResolver = tessdataResolver;
         _ffmpegPath       = Environment.GetEnvironmentVariable("FFMPEG_PATH") ?? "ffmpeg";
+    }
+
+    /// <summary>
+    ///     Acquires the node-wide OCR slot. The returned <see cref="IDisposable"/>
+    ///     releases it when disposed. Callers should hold it across all bitmap
+    ///     OCR work for a single movie so a parallel encode's OCR pass waits its
+    ///     turn instead of racing on the cached Tesseract engines.
+    /// </summary>
+    /// <param name="holderLabel"> Friendly label (typically the file name) used in
+    ///     the "waiting for OCR" log line on the next caller. </param>
+    /// <param name="log"> Async logger; receives a "queued behind {current}" line
+    ///     when the slot is contended. </param>
+    public async Task<IDisposable> AcquireOcrSlotAsync(
+        string holderLabel, Func<string,Task> log, CancellationToken ct)
+    {
+        if (_ocrSlot.CurrentCount == 0)
+            await log($"OCR: waiting for node OCR slot — currently busy with '{_ocrSlotHolder ?? "another job"}'");
+
+        await _ocrSlot.WaitAsync(ct);
+        _ocrSlotHolder = holderLabel;
+        return new OcrSlotReleaser(this);
+    }
+
+    private sealed class OcrSlotReleaser : IDisposable
+    {
+        private readonly NativeOcrService _svc;
+        private bool _disposed;
+        public OcrSlotReleaser(NativeOcrService svc) { _svc = svc; }
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            _svc._ocrSlotHolder = null;
+            _svc._ocrSlot.Release();
+        }
     }
 
     /// <summary>
