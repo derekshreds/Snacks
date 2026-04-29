@@ -77,6 +77,15 @@ export class ClusterDashboard {
         this._localDone     = 0;
         this._localFailed   = 0;
 
+        /**
+         * Per-node settings keyed by NodeId, mirroring the server-side
+         * NodeSettingsConfig. Used to derive the *effective* per-device
+         * concurrency cap when rendering chips so user overrides show up
+         * the moment the user saves them, not on the next reload.
+         * @type {Object<string, {deviceSettings?: Object<string, {enabled?: boolean, maxConcurrency?: number|null}>}>}
+         */
+        this._nodeSettings = {};
+
         this._nodeOverride         = nodeOverrideDialog;
         this._onClusterModeChange  = onClusterModeChanged ?? (() => {});
     }
@@ -157,6 +166,16 @@ export class ClusterDashboard {
         this._onClusterModeChange(this._enabled, this._role);
     }
 
+    /**
+     * `NodeSettingsChanged` — server pushed an updated NodeSettings config
+     * (the user saved/deleted a node's overrides). Cache the new settings
+     * and re-render so per-device chip caps reflect the change immediately.
+     */
+    onNodeSettingsChanged(config) {
+        this._nodeSettings = (config && config.nodes) ? config.nodes : {};
+        this.render();
+    }
+
 
     // ---- Initial load / refresh ----
 
@@ -194,7 +213,15 @@ export class ClusterDashboard {
      */
     async loadStatus() {
         try {
+            // Pull node settings alongside status so the very first render
+            // already has per-device caps applied (overrides take precedence
+            // over the worker-reported defaults).
+            const settingsPromise = clusterApi.getNodeSettings()
+                .then(cfg => { this._nodeSettings = cfg?.nodes || {}; })
+                .catch(() => { /* falls back to defaults */ });
+
             const status = await clusterApi.getStatus();
+            await settingsPromise;
 
             this._localEncoding = status.localEncodingEnabled !== false;
             this._selfCaps      = status.selfCapabilities  || null;
@@ -288,20 +315,20 @@ export class ClusterDashboard {
         const selfOs     = this._selfCaps?.osPlatform || '';
         const selfStatus = localPaused ? 'Paused' : (this._selfActive.length > 0 ? 'Busy' : 'Online');
         const selfColor  = STATUS_COLORS[selfStatus] || 'gray';
-        const devicesHtml = this._renderDeviceSummary(this._selfCaps, this._selfActive);
+        const devicesHtml = this._renderDeviceSummary(this._nodeId, this._selfCaps, this._selfActive);
         const jobsHtml    = this._renderActiveJobs(this._selfActive);
 
         return `
-            <div class="card hover-lift" style="min-width: 220px; max-width: 280px; flex: 1 1 240px;">
-                <div class="card-body p-2" style="overflow:hidden;">
-                    <div class="d-flex align-items-center mb-1" style="min-width:0;">
+            <div class="card hover-lift cluster-card" style="min-width: 240px; max-width: 300px; flex: 1 1 260px;">
+                <div class="card-body p-2 cluster-card-body">
+                    ${devicesHtml}
+                    <div class="d-flex align-items-center mb-1 cluster-card-title" style="min-width:0;">
                         <span class="flex-shrink-0" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${selfColor};margin-right:6px;"></span>
                         <strong style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(this._nodeName || 'This Machine')}</strong>
                     </div>
                     <div class="text-muted small">
                         <div>${escapeHtml(this._role)} &bull; ${escapeHtml(selfOs)}${selfGpu ? ' / ' + escapeHtml(selfGpu) : ''}</div>
                         <div style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(selfStatus)}</div>
-                        ${devicesHtml}
                         ${jobsHtml}
                         <div class="mt-1">Jobs: ${this._localDone} done, ${this._localFailed} failed</div>
                         ${this._role === 'master' ? `
@@ -325,16 +352,18 @@ export class ClusterDashboard {
     }
 
     /**
-     * Renders the per-device slot summary that appears under the node's
-     * status line — one chip per device with a "used/capacity" count.
-     * Returns an empty string when the node hasn't reported any devices
-     * yet (older worker, or detection still running).
+     * Renders the per-device slot summary as a vertical stack of chips
+     * pinned to the top-right of a node card. Each chip shows
+     * "DEVICE used/cap" — capacity is the user's per-device override (from
+     * NodeSettings) when present, otherwise the worker-reported default.
+     * Returns an empty string when no devices have been reported yet.
      *
-     * @param {object|null} caps    The node's capabilities payload.
-     * @param {Array}        active The node's reported active jobs.
+     * @param {string}        nodeId  The NodeId for resolving overrides.
+     * @param {object|null}   caps    The node's capabilities payload.
+     * @param {Array}         active  The node's reported active jobs.
      * @returns {string}
      */
-    _renderDeviceSummary(caps, active) {
+    _renderDeviceSummary(nodeId, caps, active) {
         const devices = caps?.devices || [];
         if (devices.length === 0) return '';
 
@@ -344,15 +373,32 @@ export class ClusterDashboard {
             used[j.deviceId] = (used[j.deviceId] || 0) + 1;
         }
 
-        const chips = devices.map(d => {
+        const overrides = this._nodeSettings?.[nodeId]?.deviceSettings || {};
+
+        // The chips advertise hardware encoder utilization. CPU is the
+        // implicit fallback and doesn't earn its own chip — it would just
+        // appear on every card and dilute the signal. CPU usage is still
+        // visible in the active-jobs list (prefixed with "[cpu]") and CPU
+        // concurrency is still tunable in the override dialog.
+        const hwDevices = devices.filter(d => d.deviceId !== 'cpu');
+        if (hwDevices.length === 0) return '';
+
+        const chips = hwDevices.map(d => {
+            const cur = overrides[d.deviceId] || {};
+            const enabled = cur.enabled !== false;
+            const cap = enabled
+                ? (Number.isInteger(cur.maxConcurrency) ? cur.maxConcurrency : (d.defaultConcurrency || 1))
+                : 0;
             const u = used[d.deviceId] || 0;
-            const cap = d.defaultConcurrency || 1;
-            const tone = u === 0 ? 'secondary' : (u >= cap ? 'warning' : 'info');
-            const label = (d.displayName || d.deviceId).split(' ')[0]; // tighten for the chip
-            return `<span class="badge bg-${tone} me-1" title="${escapeHtml(d.displayName || d.deviceId)}">${escapeHtml(label)} ${u}/${cap}</span>`;
+
+            const state = !enabled ? 'off'
+                        : (u === 0 ? 'idle' : (u >= cap ? 'full' : 'busy'));
+            const label = (d.deviceId || '').toUpperCase();
+
+            return `<span class="device-chip-mini state-${state}" title="${escapeHtml(d.displayName || d.deviceId)}${enabled ? '' : ' (disabled)'}">${escapeHtml(label)} ${u}/${cap}</span>`;
         }).join('');
 
-        return `<div class="mt-1" style="line-height:1.6;">${chips}</div>`;
+        return `<div class="cluster-card-chips">${chips}</div>`;
     }
 
     /**
@@ -400,20 +446,20 @@ export class ClusterDashboard {
         const osInfo     = node.capabilities?.osPlatform || '';
         const canControl = this._role === 'master' && node.role === 'node';
         const active     = node.activeJobs || [];
-        const devicesHtml = this._renderDeviceSummary(node.capabilities, active);
+        const devicesHtml = this._renderDeviceSummary(node.nodeId, node.capabilities, active);
         const jobsHtml    = this._renderActiveJobs(active);
 
         return `
-            <div class="card hover-lift" style="min-width: 220px; max-width: 280px; flex: 1 1 240px;">
-                <div class="card-body p-2" style="overflow:hidden;">
-                    <div class="d-flex align-items-center mb-1" style="min-width:0;">
+            <div class="card hover-lift cluster-card" style="min-width: 240px; max-width: 300px; flex: 1 1 260px;">
+                <div class="card-body p-2 cluster-card-body">
+                    ${devicesHtml}
+                    <div class="d-flex align-items-center mb-1 cluster-card-title" style="min-width:0;">
                         <span class="flex-shrink-0" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${statusColor};margin-right:6px;"></span>
                         <strong style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(node.hostname)}</strong>
                     </div>
                     <div class="text-muted small">
                         <div>${escapeHtml(node.role)} &bull; ${escapeHtml(osInfo)}${gpuInfo ? ' / ' + escapeHtml(gpuInfo) : ''}</div>
                         <div style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(statusName)}</div>
-                        ${devicesHtml}
                         ${jobsHtml}
                         <div class="mt-1">Jobs: ${node.completedJobs || 0} done, ${node.failedJobs || 0} failed</div>
                         ${canControl ? `

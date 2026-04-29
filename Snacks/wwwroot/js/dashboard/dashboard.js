@@ -11,7 +11,9 @@
  * whenever a new row is appended, so the page stays live without polling.
  */
 
-import { escapeHtml } from '../utils/dom.js';
+import { escapeHtml }       from '../utils/dom.js';
+import { ConnectionStatus } from '../core/connection-status.js';
+import { PauseControl }     from '../queue/pause-control.js';
 
 // ---------------------------------------------------------------------------
 // Color palette (matches site.css CSS variables)
@@ -576,23 +578,48 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     });
 
-    // Live updates: every time a new EncodeHistory row is appended on the
-    // server, push a debounced refresh so the dashboard reflects new work
-    // without the user having to reload.
+    // Wire the navbar's connection dot and pause button on this page too —
+    // they live in the shared layout so every page gets them, but only the
+    // queue page ran the bootstrap that hooked them up. Without this, the
+    // dashboard's nav stayed at "orange dot / blank text / unbound pause
+    // button" because no one was listening to SignalR's lifecycle here.
+    const connectionStatus = new ConnectionStatus();
+    const pauseControl     = new PauseControl();
+    pauseControl.init();   // fetches authoritative state and wires click
+
+    // The dashboard's live feed listens to the same hub the queue page uses.
+    // We hook into the SignalR client provided by the global signalR.min.js
+    // bundle and forward lifecycle to the indicator + pause control — so
+    // pause changes from the queue page (or another tab) show here too.
     if (window.signalR) {
         try {
             const conn = new window.signalR.HubConnectionBuilder()
                 .withUrl('/transcodingHub')
                 .withAutomaticReconnect()
                 .build();
+
+            conn.onreconnecting(() => connectionStatus.setDisconnected());
+            conn.onreconnected (() => connectionStatus.setConnected());
+            conn.onclose       (() => connectionStatus.setDisconnected());
+
             conn.on('EncodeHistoryAdded', () => {
                 if (refreshTimer) clearTimeout(refreshTimer);
                 refreshTimer = setTimeout(refresh, 600);
             });
-            conn.start().catch(err => console.warn('Dashboard SignalR connect failed:', err));
+            conn.on('ClusterNodePaused', (paused) => pauseControl.setFromRemote(paused));
+
+            conn.start()
+                .then(() => connectionStatus.setConnected())
+                .catch(err => {
+                    console.warn('Dashboard SignalR connect failed:', err);
+                    connectionStatus.setDisconnected();
+                });
         } catch (err) {
             console.warn('Dashboard SignalR setup failed:', err);
+            connectionStatus.setDisconnected();
         }
+    } else {
+        connectionStatus.setDisconnected();
     }
 
     refresh();

@@ -2138,9 +2138,17 @@ public sealed class ClusterService : IHostedService, IDisposable
     ///     Effective slot capacity for a (node, device) pair: the user's
     ///     <see cref="DeviceConcurrencySetting.MaxConcurrency"/> override if set,
     ///     otherwise the worker's reported <see cref="HardwareDevice.DefaultConcurrency"/>.
+    ///
+    ///     <para>The CPU slot is exempt from user overrides — it's hidden
+    ///     from the override dialog and pinned to a single concurrent encode.
+    ///     CPU exists only as a destination for explicit "Software" jobs, so
+    ///     no benefit comes from running multiple software encodes in
+    ///     parallel; the CPU would just thrash.</para>
     /// </summary>
     private int EffectiveDeviceCapacity(ClusterNode node, HardwareDevice device)
     {
+        if (device.DeviceId == "cpu") return 1;
+
         var ns = GetNodeSettings(node.NodeId);
         if (ns?.DeviceSettings != null
             && ns.DeviceSettings.TryGetValue(device.DeviceId, out var s)
@@ -2331,27 +2339,35 @@ public sealed class ClusterService : IHostedService, IDisposable
         if (!device.SupportedCodecs.Any(c => c.Equals(codecKey, StringComparison.OrdinalIgnoreCase)))
             return -50;
 
-        // Hardware preference: explicit vendor demands a hardware device of
-        // that family; "none" demands CPU; "auto" prefers hardware.
+        // CPU is reserved for explicit "Software" jobs and for "auto" jobs
+        // on nodes that have no hardware encoder at all. Under "auto" with
+        // detected hardware, or any specific-vendor preference, CPU is
+        // excluded outright — we'd rather queue a job than silently spend
+        // it on a slow software encode while a GPU sits idle. The
+        // "no hardware on this node" check is per-node, so a CPU-only
+        // worker still pulls "auto" jobs.
         var hw = options.HardwareAcceleration?.ToLower() ?? "auto";
+        bool isCpu = device.DeviceId == "cpu";
+        bool nodeHasHardware = node.Capabilities?.Devices?.Any(d => d.DeviceId != "cpu") == true;
+
+        if (hw == "none" && !isCpu) return -50;                             // software-only ⇒ CPU only
+        if (hw != "none" && hw != "auto" && isCpu) return -50;              // specific vendor ⇒ never CPU
+        if (hw == "auto" && isCpu && nodeHasHardware) return -50;           // auto with HW ⇒ never CPU
+        if (hw != "none" && !isCpu && !string.Equals(device.DeviceId, hw, StringComparison.OrdinalIgnoreCase)
+            && hw != "auto") return -50;                                    // specific vendor ⇒ wrong family
+
         int score = 1;
-        switch (hw)
+        if (hw == "none")
         {
-            case "auto":
-                score += device.IsHardware ? 8 : 1;
-                break;
-            case "none":
-                if (device.IsHardware) return -50;
-                score += 6;
-                break;
-            default:
-                if (string.Equals(device.DeviceId, hw, StringComparison.OrdinalIgnoreCase))
-                    score += 12;
-                else if (device.IsHardware)
-                    score += 1;        // wrong vendor — small bonus over CPU but losing to a match
-                else
-                    score -= 5;        // user wants HW; CPU is a poor fit
-                break;
+            score += 6;        // CPU is the only valid pick here
+        }
+        else if (hw == "auto")
+        {
+            score += isCpu ? 5 : 8;   // CPU is the auto-fallback when no HW exists
+        }
+        else if (string.Equals(device.DeviceId, hw, StringComparison.OrdinalIgnoreCase))
+        {
+            score += 12;       // exact match on a specific vendor pref
         }
 
         // Spread load: lightly prefer slots on devices with more headroom so
@@ -2968,6 +2984,7 @@ public sealed class ClusterService : IHostedService, IDisposable
         PersistNodeSettings();
         UpdateLocalSkipPredicate();
         UpdateLocalDeviceSettingsProvider();
+        OnNodeSettingsMutated();
     }
 
     /// <summary> Removes settings for a node and persists to disk. </summary>
@@ -2977,6 +2994,33 @@ public sealed class ClusterService : IHostedService, IDisposable
         PersistNodeSettings();
         UpdateLocalSkipPredicate();
         UpdateLocalDeviceSettingsProvider();
+        OnNodeSettingsMutated();
+    }
+
+    /// <summary>
+    ///     Common post-save hook: pushes the new settings to every connected
+    ///     dashboard so chip caps reflect the change live, and kicks an
+    ///     immediate cluster dispatch so a freshly raised cap fills the new
+    ///     slot without waiting for the next timer tick. The local scheduler
+    ///     is woken from inside <see cref="TranscodingService.SetLocalDeviceSettingsProvider"/>.
+    /// </summary>
+    private void OnNodeSettingsMutated()
+    {
+        // Broadcast the full per-node config — small payload, simplifies the
+        // client (no diffing required).
+        _ = _hubContext.Clients.All.SendAsync("NodeSettingsChanged", _nodeSettingsConfig);
+
+        // Kick cluster dispatch so a raised cap on a remote node fills its
+        // new slot now rather than at the next timer tick. RunDispatchAsync
+        // is guarded by _dispatchLock and is a no-op if already running.
+        if (IsMasterMode)
+        {
+            _ = Task.Run(async () =>
+            {
+                try { await RunDispatchAsync(); }
+                catch (Exception ex) { Console.WriteLine($"Cluster: dispatch after settings change failed: {ex.Message}"); }
+            });
+        }
     }
 
     /// <summary>

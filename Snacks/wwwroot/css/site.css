@@ -1507,6 +1507,79 @@ footer a.text-muted:hover {
 }
 
 /* ===========================
+   Cluster Card Hardware Chips
+   =========================== */
+.cluster-card .cluster-card-body {
+    position: relative;
+    overflow: hidden;
+}
+
+/* Top-right chip stack — chips don't push card content down because they're
+   absolutely positioned. The title row reserves space via padding-right so
+   hostnames truncate cleanly instead of running under the chips. */
+.cluster-card-chips {
+    position: absolute;
+    top: 0.45rem;
+    right: 0.45rem;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    align-items: flex-end;
+    z-index: 1;
+    pointer-events: none;
+    max-width: 55%;
+}
+
+.cluster-card-title {
+    padding-right: 4.5rem;       /* Room for the chip stack */
+}
+
+.device-chip-mini {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    font-size: 0.62rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    padding: 0.12rem 0.4rem;
+    border-radius: 999px;
+    border: 1px solid var(--border-color);
+    background: var(--bg-elevated);
+    color: var(--text-secondary);
+    white-space: nowrap;
+    pointer-events: auto;        /* tooltips need hover */
+    line-height: 1.2;
+    font-variant-numeric: tabular-nums;
+    transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.device-chip-mini.state-idle {
+    /* No active jobs — muted slate. */
+    color: var(--text-muted);
+    background: rgba(255, 255, 255, 0.02);
+}
+.device-chip-mini.state-busy {
+    /* Some slots in use, headroom available — primary brand glow. */
+    color: #c4b5fd;
+    background: rgba(139, 92, 246, 0.16);
+    border-color: rgba(139, 92, 246, 0.45);
+    box-shadow: 0 0 6px rgba(139, 92, 246, 0.25);
+}
+.device-chip-mini.state-full {
+    /* Saturated — warm amber so it reads "running flat out" at a glance. */
+    color: #fcd34d;
+    background: rgba(245, 158, 11, 0.18);
+    border-color: rgba(245, 158, 11, 0.5);
+    box-shadow: 0 0 6px rgba(245, 158, 11, 0.25);
+}
+.device-chip-mini.state-off {
+    /* User-disabled — strikethrough cue without making it disappear. */
+    color: var(--text-muted);
+    opacity: 0.55;
+    text-decoration: line-through;
+}
+
+/* ===========================
    Dashboard Page
    =========================== */
 .dashboard-page .range-btn { min-width: 3rem; }

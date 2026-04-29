@@ -96,17 +96,6 @@ public class TranscodingService
     private Func<WorkItem, bool>? _shouldSkipLocal;
 
     /// <summary>
-    ///     Per-device slot semaphores for local encoding. Indexed by
-    ///     <see cref="HardwareDevice.DeviceId"/>; sized to the device's
-    ///     <see cref="HardwareDevice.DefaultConcurrency"/> unless the user
-    ///     overrode it via <see cref="NodeSettings.DeviceSettings"/>. The
-    ///     stored max lets us detect a settings change and rebuild the
-    ///     semaphore (in-flight tokens release into the discarded instance,
-    ///     which is functionally a no-op since the slot count is reset).
-    /// </summary>
-    private readonly ConcurrentDictionary<string, (SemaphoreSlim Sem, int Max)> _localDeviceSlots = new();
-
-    /// <summary>
     ///     Resolves per-device settings for <em>this</em> machine when the
     ///     master is encoding locally. Set by <see cref="ClusterService"/>
     ///     based on <see cref="NodeSettings.DeviceSettings"/> stored under
@@ -117,17 +106,25 @@ public class TranscodingService
 
     /// <summary>
     ///     Registers (or clears) the per-device settings provider used by
-    ///     the multi-slot scheduler. Called by <see cref="ClusterService"/>
-    ///     whenever <c>node-settings.json</c> is loaded or saved so a user's
-    ///     concurrency / enable changes apply on the next slot acquisition.
+    ///     the multi-slot scheduler. The scheduler reads the provider on
+    ///     <em>every</em> dispatch decision — there's no cached slot pool —
+    ///     so a cap raised from 1 to 2 takes effect on the very next
+    ///     iteration without leaking phantom tokens. After updating the
+    ///     provider, we kick the queue runner so a previously-blocked
+    ///     scheduler picks up the new headroom immediately rather than
+    ///     waiting for the next event.
     /// </summary>
     public void SetLocalDeviceSettingsProvider(Func<string, (bool Enabled, int? MaxOverride)>? provider)
     {
         _localDeviceSettingsProvider = provider;
-        // Drop cached semaphores so the next ProcessQueueAsync iteration
-        // sizes them from the new provider. In-flight tokens release into
-        // the orphaned semaphore harmlessly.
-        _localDeviceSlots.Clear();
+        if (_lastOptions != null && !_isPaused && !_localEncodingPaused)
+        {
+            _ = Task.Run(async () =>
+            {
+                try { await ProcessQueueAsync(_lastOptions); }
+                catch (Exception ex) { Console.WriteLine($"ProcessQueueAsync after settings change failed: {ex.Message}"); }
+            });
+        }
     }
 
     /// <summary>Local encoding job counters.</summary>
@@ -1281,11 +1278,14 @@ public class TranscodingService
                     continue;
                 }
 
-                // Try to grab a free local device slot. If none are free we
-                // wait for an in-flight encode to finish before re-checking.
+                // Pick a device that has free capacity right now. The check
+                // reads the current count of in-flight encodes per device
+                // and the user's current cap from the settings provider, so
+                // a cap change applied while we're looping takes effect on
+                // the very next iteration with no semaphore rebuilding.
                 var current = _lastOptions ?? options;
-                var slot = TryAcquireLocalDeviceSlot(current);
-                if (slot == null)
+                var deviceId = TryAcquireLocalDeviceSlot(current);
+                if (deviceId == null)
                 {
                     if (inflight.Count > 0)
                         await Task.WhenAny(inflight);
@@ -1294,24 +1294,21 @@ public class TranscodingService
                     continue;
                 }
 
-                // Pick the next pending item this slot's device can encode.
+                // Pick the next pending item this device can encode.
                 WorkItem? workItem;
                 lock (_queueLock)
                 {
                     workItem = _workQueue.FirstOrDefault(w =>
                         w.Status == WorkItemStatus.Pending &&
                         (_shouldSkipLocal == null || !_shouldSkipLocal(w)) &&
-                        DeviceCanEncode(slot.Value.DeviceId, w, current));
+                        DeviceCanEncode(deviceId, w, current));
                     if (workItem != null) _workQueue.Remove(workItem);
                 }
 
                 if (workItem == null)
                 {
-                    // No item fits this device right now (e.g. CPU is the only
-                    // free device but the user has the queue full of NVENC-only
-                    // jobs). Release the slot and wait for inflight progress
-                    // before reconsidering.
-                    ReleaseLocalDeviceSlot(slot.Value);
+                    // No item fits this device right now. Wait for inflight
+                    // progress before reconsidering.
                     if (inflight.Count > 0)
                         await Task.WhenAny(inflight);
                     else
@@ -1323,9 +1320,21 @@ public class TranscodingService
                 // shared instance, and so a settings change after dispatch
                 // can't mutate the encode mid-run.
                 var perJobOptions = current.Clone();
-                perJobOptions.HardwareAcceleration = slot.Value.DeviceId == "cpu" ? "none" : slot.Value.DeviceId;
+                perJobOptions.HardwareAcceleration = deviceId == "cpu" ? "none" : deviceId;
 
-                var jobTask = ProcessWorkItemAsync(workItem, perJobOptions, slot.Value);
+                // Pre-register the active job synchronously before spawning so
+                // the scheduler's next iteration counts it against the device's
+                // cap without a race window.
+                var active = new ActiveLocalJob
+                {
+                    Item     = workItem,
+                    Cts      = new CancellationTokenSource(),
+                    DeviceId = deviceId,
+                };
+                _activeLocalJobs[workItem.Id] = active;
+                workItem.DispatchedDeviceId = deviceId;
+
+                var jobTask = ProcessWorkItemAsync(workItem, perJobOptions, active);
                 inflight.Add(jobTask);
             }
 
@@ -1342,49 +1351,67 @@ public class TranscodingService
     }
 
     /// <summary>
-    ///     Tries to acquire a free local device slot, scanning detected devices
-    ///     in detection order (hardware before CPU). Honors the user's per-device
-    ///     enable / max-concurrency overrides. Returns <see langword="null"/>
-    ///     when every device is either disabled or fully booked.
+    ///     Returns the first device with free capacity for an in-flight encode,
+    ///     or <see langword="null"/> if every device is disabled, codec-mismatched,
+    ///     or already at its user-configured concurrency cap. Capacity is computed
+    ///     from <see cref="_activeLocalJobs"/> live — no cached semaphores — so a
+    ///     cap raised mid-run unlocks the next slot on the very next call.
+    ///
+    ///     <para>CPU rules:
+    ///     <list type="bullet">
+    ///         <item><c>none</c> (Software): CPU is the only acceptable slot.</item>
+    ///         <item><c>auto</c> on a machine with no hardware encoders: CPU is the auto-fallback.</item>
+    ///         <item>Anything else: CPU is excluded so jobs queue rather than spilling onto a slow software encode.</item>
+    ///     </list>
+    ///     The CPU slot is hidden from the override dialog and pinned to a
+    ///     single concurrent encode regardless of any stale per-node setting.</para>
     /// </summary>
-    private (string DeviceId, SemaphoreSlim Sem)? TryAcquireLocalDeviceSlot(EncoderOptions options)
+    private string? TryAcquireLocalDeviceSlot(EncoderOptions options)
     {
         var devices = GetDetectedDevices();
         if (devices.Count == 0) return null;
 
-        // Honor an explicit user preference: "none" means CPU only, an
-        // explicit vendor name means only that device family. "auto" lets
-        // the scheduler hop devices freely.
         var hwPref = (options.HardwareAcceleration ?? "auto").ToLowerInvariant();
+        bool hasHardware = devices.Any(d => d.DeviceId != "cpu");
 
         foreach (var device in devices)
         {
-            if (hwPref == "none" && device.IsHardware)         continue;
+            bool isCpu = device.DeviceId == "cpu";
+
+            // Hardware-vs-CPU gating.
+            if (hwPref == "none" && !isCpu) continue;                          // Software ⇒ CPU only
+            if (hwPref != "none" && hwPref != "auto" && isCpu) continue;       // Specific vendor ⇒ never CPU
+            if (hwPref == "auto" && isCpu && hasHardware) continue;            // Auto with HW ⇒ never CPU
+
+            // Specific-vendor preference must match the device family exactly.
             if (hwPref != "auto" && hwPref != "none"
                 && !string.Equals(hwPref, device.DeviceId, StringComparison.OrdinalIgnoreCase)) continue;
 
-            var (enabled, maxOverride) = _localDeviceSettingsProvider?.Invoke(device.DeviceId)
-                ?? (true, (int?)null);
-            if (!enabled) continue;
-            int cap = Math.Max(0, maxOverride ?? device.DefaultConcurrency);
-            if (cap == 0) continue;
+            int cap;
+            if (isCpu)
+            {
+                // CPU slot is hidden from the user and capped at 1.
+                cap = 1;
+            }
+            else
+            {
+                var (enabled, maxOverride) = _localDeviceSettingsProvider?.Invoke(device.DeviceId)
+                    ?? (true, (int?)null);
+                if (!enabled) continue;
+                cap = Math.Max(0, maxOverride ?? device.DefaultConcurrency);
+                if (cap == 0) continue;
+            }
 
-            // Re-create the semaphore if the user changed capacity since last use.
-            var slot = _localDeviceSlots.AddOrUpdate(
-                device.DeviceId,
-                _ => (new SemaphoreSlim(cap, cap), cap),
-                (_, prev) => prev.Max == cap ? prev : (new SemaphoreSlim(cap, cap), cap));
+            // Live count from the active-jobs map. This is the source of
+            // truth for slot occupancy, so changing the user's cap takes
+            // effect on the next iteration with zero state churn.
+            var inUse = 0;
+            foreach (var kv in _activeLocalJobs)
+                if (kv.Value.DeviceId == device.DeviceId) inUse++;
 
-            if (slot.Sem.Wait(0))
-                return (device.DeviceId, slot.Sem);
+            if (inUse < cap) return device.DeviceId;
         }
         return null;
-    }
-
-    /// <summary> Releases a previously acquired local device slot. </summary>
-    private static void ReleaseLocalDeviceSlot((string DeviceId, SemaphoreSlim Sem) slot)
-    {
-        try { slot.Sem.Release(); } catch (SemaphoreFullException) { /* idempotent */ }
     }
 
     /// <summary>
@@ -1412,22 +1439,15 @@ public class TranscodingService
 
     /// <summary>
     ///     Transitions a work item to Processing, runs the conversion bound to
-    ///     the supplied device slot, and handles success / failure outcomes.
-    ///     The slot is released in the finally block so the next iteration of
-    ///     <see cref="ProcessQueueAsync"/> can pick this device up.
+    ///     the supplied <see cref="ActiveLocalJob"/>, and handles success /
+    ///     failure outcomes. The active-jobs registry entry is removed in the
+    ///     finally block so the next iteration of <see cref="ProcessQueueAsync"/>
+    ///     sees the slot as free.
     ///     On cancellation, cleans up the partial output file. On failure,
     ///     increments the DB failure count.
     /// </summary>
-    private async Task ProcessWorkItemAsync(WorkItem workItem, EncoderOptions options, (string DeviceId, SemaphoreSlim Sem) slot)
+    private async Task ProcessWorkItemAsync(WorkItem workItem, EncoderOptions options, ActiveLocalJob active)
     {
-        var active = new ActiveLocalJob
-        {
-            Item     = workItem,
-            Cts      = new CancellationTokenSource(),
-            DeviceId = slot.DeviceId,
-        };
-        _activeLocalJobs[workItem.Id] = active;
-        workItem.DispatchedDeviceId = slot.DeviceId;
 
         try
         {
@@ -1499,7 +1519,6 @@ public class TranscodingService
         {
             _activeLocalJobs.TryRemove(workItem.Id, out _);
             try { active.Cts.Dispose(); } catch { }
-            ReleaseLocalDeviceSlot(slot);
         }
 
         await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
@@ -2442,34 +2461,28 @@ public class TranscodingService
     private List<HardwareDevice>? _detectedDevices = null;
 
     /// <summary>
-    ///     Default slot capacities applied when a device is freshly detected. NVIDIA
-    ///     exposes multiple NVENC sessions on consumer cards (driver patch lifts the
-    ///     2-session cap on most modern GPUs); QSV/AMF/VideoToolbox stick to a single
-    ///     simultaneous encode by default. CPU defaults to a quarter of logical cores
-    ///     so a saturated machine still has headroom for ffmpeg's internal threading.
+    ///     All devices default to a single concurrent encode. Users opt in to
+    ///     parallelism per-device via the dashboard's hardware-concurrency
+    ///     editor — the safe default avoids surprising a fresh install with a
+    ///     burst of simultaneous encodes that thrashes the GPU.
     /// </summary>
-    private static int DefaultConcurrencyFor(string deviceId) => deviceId switch
-    {
-        "nvidia" => 2,
-        "intel"  => 1,
-        "amd"    => 1,
-        "apple"  => 1,
-        "cpu"    => Math.Max(1, Environment.ProcessorCount / 4),
-        _        => 1,
-    };
+    private static int DefaultConcurrencyFor(string deviceId) => 1;
 
     /// <summary>
-    ///     Builds a software-encode <see cref="HardwareDevice"/> entry. Always present
-    ///     so a worker without any GPU still has a slot pool the master can dispatch to.
+    ///     Builds the CPU encode device entry. CPU is exposed alongside the
+    ///     hardware encoders as a peer option (not labelled "software") — it
+    ///     has its own concurrency knob, its own slot pool, and its own row
+    ///     on the dashboard. Auto-fallback when an HW encoder fails is a
+    ///     separate path inside ffmpeg invocation; no UI surface needed.
     /// </summary>
     private static HardwareDevice MakeCpuDevice() => new()
     {
         DeviceId           = "cpu",
-        DisplayName        = "CPU (software)",
+        DisplayName        = "CPU",
         SupportedCodecs    = new() { "h264", "h265", "av1" },
         Encoders           = new() { "libx264", "libx265", "libsvtav1" },
         DefaultConcurrency = DefaultConcurrencyFor("cpu"),
-        IsHardware         = false,
+        IsHardware         = true,
     };
 
     /// <summary>

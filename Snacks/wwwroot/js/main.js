@@ -246,6 +246,7 @@ document.addEventListener('DOMContentLoaded', () => {
     signalR.on('HardwareDetected',     ()       => clusterDashboard.onHardwareDetected());
     signalR.on('ClusterConfigChanged', (config) => clusterDashboard.onClusterConfigChanged(config));
     signalR.on('ClusterNodePaused',    (paused) => pauseControl.setFromRemote(paused));
+    signalR.on('NodeSettingsChanged',  (config) => clusterDashboard.onNodeSettingsChanged?.(config));
 
     signalR.start();
 

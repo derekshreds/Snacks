@@ -255,15 +255,24 @@ export class OverrideDialog {
      * carry them under `node.capabilities.devices`. We check both so a user
      * can edit settings for any node from any other instance.
      *
+     * <p>The CPU "device" is filtered out — it's a software-only fallback
+     * slot, hardcoded to a single concurrent encode and only ever used when
+     * the encoder preference is explicitly "Software". Showing it here
+     * would invite users to tune a knob that has no real effect.</p>
+     *
      * @param {string} nodeId
      * @returns {Promise<Array>}
      */
     async _loadNodeDevices(nodeId) {
         const status = await clusterApi.getStatus();
+        let devices;
         if (status?.nodeId === nodeId)
-            return status.selfCapabilities?.devices || [];
-        const node = (status?.nodes || []).find(n => n.nodeId === nodeId);
-        return node?.capabilities?.devices || [];
+            devices = status.selfCapabilities?.devices || [];
+        else {
+            const node = (status?.nodes || []).find(n => n.nodeId === nodeId);
+            devices = node?.capabilities?.devices || [];
+        }
+        return devices.filter(d => d.deviceId !== 'cpu');
     }
 
     /**
@@ -289,7 +298,6 @@ export class OverrideDialog {
             const enabled = cur.enabled !== false;            // default: enabled
             const max     = cur.maxConcurrency ?? d.defaultConcurrency ?? 1;
             const codecs  = (d.supportedCodecs || []).join(', ').toUpperCase() || '—';
-            const badge   = d.isHardware ? 'success' : 'secondary';
 
             return `
                 <div class="d-flex align-items-center mb-2 p-2 border rounded" data-device-id="${escapeHtml(d.deviceId)}">
@@ -299,9 +307,8 @@ export class OverrideDialog {
                     <div class="flex-grow-1" style="min-width:0;">
                         <div class="fw-bold" style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
                             ${escapeHtml(d.displayName || d.deviceId)}
-                            <span class="badge bg-${badge} ms-1">${d.isHardware ? 'HW' : 'SW'}</span>
                         </div>
-                        <small class="text-muted">Codecs: ${escapeHtml(codecs)} &middot; default ${d.defaultConcurrency || 1}</small>
+                        <small class="text-muted">Codecs: ${escapeHtml(codecs)}</small>
                     </div>
                     <div class="ms-3" style="width: 110px;">
                         <label class="small text-muted mb-1" for="dev_max_${escapeHtml(d.deviceId)}">Max slots</label>
