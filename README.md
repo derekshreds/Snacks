@@ -103,6 +103,20 @@ services:
 
 ---
 
+### Option 1b: Unraid
+
+An Unraid Community Applications template ships in [`unraid/snacks.xml`](unraid/snacks.xml).
+
+In Unraid: **Docker** → **Add Container** → paste this URL into the **Template** field at the top:
+
+```
+https://raw.githubusercontent.com/derekshreds/Snacks/master/unraid/snacks.xml
+```
+
+Adjust the *Media Library* path (default `/mnt/user/Media`) and apply. Web UI at `http://YOUR-UNRAID-IP:6767`. See [`unraid/README.md`](unraid/README.md) for NVIDIA setup.
+
+---
+
 ### Option 2: Windows Desktop App
 
 Snacks can run as a standalone desktop app with native GPU acceleration.

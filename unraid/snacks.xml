@@ -1,0 +1,40 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>Snacks</Name>
+  <Repository>derekshreds/snacks-docker:latest</Repository>
+  <Registry>https://hub.docker.com/r/derekshreds/snacks-docker</Registry>
+  <Network>host</Network>
+  <MyIP/>
+  <Shell>bash</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/derekshreds/Snacks/issues</Support>
+  <Project>https://github.com/derekshreds/Snacks</Project>
+  <Overview>
+    Automated video library encoder. Batch transcode your entire library with hardware acceleration (Intel QSV/VAAPI, NVIDIA NVENC, AMD VAAPI/AMF) to H.265, H.264, or AV1. Persistent SQLite database tracks file state across restarts. Smart filtering skips files that already meet quality targets. Optional cluster mode distributes encoding across multiple nodes on your LAN.
+
+    Network is set to host so the cluster's UDP broadcast discovery can reach the LAN — bridge mode would silently break it. Web UI listens on port 6767.
+
+    Hardware acceleration: pass /dev/dri (the default device template entry below) for Intel iGPU. For NVIDIA, install the Nvidia-Driver plugin and set Extra Parameters to "--runtime=nvidia" with NVIDIA_VISIBLE_DEVICES=all.
+  </Overview>
+  <Category>MediaApp:Video Tools:Utilities</Category>
+  <WebUI>http://[IP]:[PORT:6767]/</WebUI>
+  <TemplateURL/>
+  <Icon>https://raw.githubusercontent.com/derekshreds/Snacks/master/electron-app/icons/snacks.png</Icon>
+  <ExtraParams/>
+  <PostArgs/>
+  <CPUset/>
+  <DateInstalled/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires/>
+  <Config Name="WebUI" Target="6767" Default="6767" Mode="tcp" Description="Snacks web interface. Host networking is required for cluster discovery, so this is informational only — Unraid will not bind it." Type="Port" Display="always-hide" Required="false" Mask="false">6767</Config>
+  <Config Name="Media Library" Target="/app/work/uploads" Default="/mnt/user/Media" Mode="rw" Description="Path to your video library. Snacks reads originals here and (optionally) writes encoded files back in place." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/Media</Config>
+  <Config Name="Config" Target="/app/work/config" Default="/mnt/user/appdata/snacks/config" Mode="rw" Description="Persists settings.json and the SQLite database across container updates." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/snacks/config</Config>
+  <Config Name="Logs" Target="/app/work/logs" Default="/mnt/user/appdata/snacks/logs" Mode="rw" Description="Per-encode FFmpeg log files." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/snacks/logs</Config>
+  <Config Name="Intel/AMD GPU (/dev/dri)" Target="/dev/dri" Default="/dev/dri" Mode="" Description="Pass through Intel iGPU or AMD GPU for VAAPI/QSV hardware acceleration. Remove this entry if your server has no compatible GPU." Type="Device" Display="always" Required="false" Mask="false">/dev/dri</Config>
+  <Config Name="ASPNETCORE_ENVIRONMENT" Target="ASPNETCORE_ENVIRONMENT" Default="Production" Mode="" Description="ASP.NET Core environment. Leave as Production." Type="Variable" Display="advanced-hide" Required="false" Mask="false">Production</Config>
+  <Config Name="SNACKS_WORK_DIR" Target="SNACKS_WORK_DIR" Default="/app/work" Mode="" Description="Internal working directory inside the container. Do not change unless you know what you're doing." Type="Variable" Display="advanced-hide" Required="false" Mask="false">/app/work</Config>
+  <Config Name="FFMPEG_PATH" Target="FFMPEG_PATH" Default="/usr/lib/jellyfin-ffmpeg/ffmpeg" Mode="" Description="Path to the bundled jellyfin-ffmpeg binary. Do not change." Type="Variable" Display="advanced-hide" Required="false" Mask="false">/usr/lib/jellyfin-ffmpeg/ffmpeg</Config>
+  <Config Name="FFPROBE_PATH" Target="FFPROBE_PATH" Default="/usr/lib/jellyfin-ffmpeg/ffprobe" Mode="" Description="Path to the bundled jellyfin-ffmpeg ffprobe binary. Do not change." Type="Variable" Display="advanced-hide" Required="false" Mask="false">/usr/lib/jellyfin-ffmpeg/ffprobe</Config>
+  <Config Name="LIBVA_DRIVER_NAME" Target="LIBVA_DRIVER_NAME" Default="" Mode="" Description="Optional VAAPI driver override. Leave blank for auto-detect (tries iHD then i965). Set to 'iHD' for modern Intel (Gen9+), 'i965' for older Intel." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+</Container>
