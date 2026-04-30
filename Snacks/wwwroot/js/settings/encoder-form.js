@@ -48,6 +48,83 @@ function el(prefix, suffix) {
 
 
 // ---------------------------------------------------------------------------
+// Audio output rows (row editor for AudioOutputs)
+// ---------------------------------------------------------------------------
+
+/**
+ * Reads the current audio-output rows out of the row container into an array of
+ * {Codec, Layout, BitrateKbps} entries. Empty/missing container returns [].
+ *
+ * @param {string} prefix
+ * @returns {Array<{Codec:string, Layout:string, BitrateKbps:number}>}
+ */
+function readAudioOutputs(prefix) {
+    const root = el(prefix, 'AudioOutputs');
+    if (!root) return [];
+
+    return Array.from(root.querySelectorAll('[data-audio-output-row]')).map(row => ({
+        Codec:       row.querySelector('[data-field="Codec"]')?.value       ?? 'aac',
+        Layout:      row.querySelector('[data-field="Layout"]')?.value      ?? 'Source',
+        BitrateKbps: parseInt(row.querySelector('[data-field="BitrateKbps"]')?.value, 10) || 0,
+    }));
+}
+
+/**
+ * Renders one new audio-output row from the template inside the row container.
+ * Fills the row with the provided profile values, or codec/layout defaults.
+ *
+ * @param {string} prefix
+ * @param {{Codec?:string, Layout?:string, BitrateKbps?:number}} [profile]
+ */
+function appendAudioOutputRow(prefix, profile = {}) {
+    const root = el(prefix, 'AudioOutputs');
+    const tpl  = document.getElementById(`${prefix}AudioOutputRowTemplate`);
+    if (!root || !tpl) return;
+
+    const row = tpl.content.firstElementChild.cloneNode(true);
+    if (profile.Codec)            row.querySelector('[data-field="Codec"]').value       = profile.Codec;
+    if (profile.Layout)           row.querySelector('[data-field="Layout"]').value      = profile.Layout;
+    if (profile.BitrateKbps != null) row.querySelector('[data-field="BitrateKbps"]').value = profile.BitrateKbps;
+
+    row.querySelector('[data-audio-output-remove]').addEventListener('click', () => row.remove());
+    root.appendChild(row);
+}
+
+/**
+ * Replaces all rows in the audio-outputs editor with one row per saved profile.
+ * No rows are rendered when `profiles` is empty — that's the "preserve only" config.
+ *
+ * @param {string} prefix
+ * @param {Array<object>} profiles
+ */
+function setAudioOutputs(prefix, profiles) {
+    const root = el(prefix, 'AudioOutputs');
+    if (!root) return;
+    root.replaceChildren();
+    for (const p of (profiles || [])) {
+        appendAudioOutputRow(prefix, {
+            Codec:       p.Codec       ?? p.codec,
+            Layout:      p.Layout      ?? p.layout,
+            BitrateKbps: p.BitrateKbps ?? p.bitrateKbps ?? 0,
+        });
+    }
+}
+
+/**
+ * Wires up the "+ Add output" button so each click appends a fresh row.
+ * Idempotent — repeated calls don't double-bind.
+ *
+ * @param {string} prefix
+ */
+function ensureAudioOutputAddBound(prefix) {
+    const btn = el(prefix, 'AudioOutputsAdd');
+    if (!btn || btn.dataset.bound === '1') return;
+    btn.dataset.bound = '1';
+    btn.addEventListener('click', () => appendAudioOutputRow(prefix));
+}
+
+
+// ---------------------------------------------------------------------------
 // Read: getEncoderOptions
 // ---------------------------------------------------------------------------
 
@@ -95,7 +172,6 @@ export function getEncoderOptions(prefix = 'settings') {
 
         // Bitrate + skip policy.
         TargetBitrate:          num('TargetBitrate', 3500),
-        TwoChannelAudio:        bool('TwoChannelAudio'),
         RemoveBlackBorders:     bool('RemoveBlackBorders'),
         DeleteOriginalFile:     bool('DeleteOriginalFile'),
         RetryOnFail:            bool('RetryOnFail', true),
@@ -112,8 +188,8 @@ export function getEncoderOptions(prefix = 'settings') {
         AudioLanguagesToKeep:     chips('AudioLanguagesToKeep') ?? ['en'],
         KeepOriginalLanguage:     bool('KeepOriginalLanguage'),
         OriginalLanguageProvider: str('OriginalLanguageProvider', 'None'),
-        AudioCodec:               str('AudioCodec', 'copy'),
-        AudioBitrateKbps:         num('AudioBitrateKbps', 192),
+        PreserveOriginalAudio:    bool('PreserveOriginalAudio', true),
+        AudioOutputs:             readAudioOutputs(prefix),
 
         // Subtitles.
         SubtitleLanguagesToKeep:      chips('SubtitleLanguagesToKeep') ?? ['en'],
@@ -192,7 +268,6 @@ export async function restoreEncoderOptions(prefix = 'settings') {
 
         // Bitrate + skip policy.
         set('TargetBitrate',          pick('TargetBitrate'));
-        set('TwoChannelAudio',        pick('TwoChannelAudio'));
         set('RemoveBlackBorders',     pick('RemoveBlackBorders'));
         set('DeleteOriginalFile',     pick('DeleteOriginalFile'));
         set('RetryOnFail',            pick('RetryOnFail'));
@@ -208,8 +283,15 @@ export async function restoreEncoderOptions(prefix = 'settings') {
         // Audio.
         set('KeepOriginalLanguage',     pick('KeepOriginalLanguage'));
         set('OriginalLanguageProvider', pick('OriginalLanguageProvider') || 'None');
-        set('AudioCodec',               pick('AudioCodec')               || 'copy');
-        set('AudioBitrateKbps',         pick('AudioBitrateKbps')          ?? 192);
+
+        // PreserveOriginalAudio defaults to true (the old "AudioCodec=copy" default behavior).
+        // Settings that come back from the server have already been migrated server-side, so
+        // we just trust the value here and only fall back to true when it's missing entirely.
+        const preserve = pick('PreserveOriginalAudio');
+        set('PreserveOriginalAudio', preserve === undefined ? true : !!preserve);
+
+        ensureAudioOutputAddBound(prefix);
+        setAudioOutputs(prefix, pick('AudioOutputs') ?? []);
 
         // Subtitles.
         set('ExtractSubtitlesToSidecar',    pick('ExtractSubtitlesToSidecar'));

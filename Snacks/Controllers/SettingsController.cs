@@ -54,15 +54,24 @@ public sealed class SettingsController : ControllerBase
             if (!System.IO.File.Exists(candidate)) continue;
             try
             {
-                var json = System.IO.File.ReadAllText(candidate);
-                return Content(json, "application/json");
+                var json   = System.IO.File.ReadAllText(candidate);
+                var parsed = JsonSerializer.Deserialize<EncoderOptions>(json, _jsonOptions);
+                if (parsed == null) continue;
+
+                // Normalize legacy audio fields into the new PreserveOriginalAudio + AudioOutputs
+                // shape so the UI doesn't have to handle two shapes when restoring the form.
+                parsed.ApplyLegacyAudioMigration();
+                return new JsonResult(parsed);
             }
             catch
             {
                 Console.WriteLine($"Settings file corrupted: {candidate}");
             }
         }
-        return new JsonResult(new EncoderOptions());
+
+        var defaults = new EncoderOptions();
+        defaults.ApplyLegacyAudioMigration();
+        return new JsonResult(defaults);
     }
 
     /// <summary>
@@ -92,7 +101,11 @@ public sealed class SettingsController : ControllerBase
             try
             {
                 parsed = JsonSerializer.Deserialize<EncoderOptions>(json, _jsonOptions);
-                if (parsed != null) _transcodingService.UpdateOptions(parsed);
+                if (parsed != null)
+                {
+                    parsed.ApplyLegacyAudioMigration();
+                    _transcodingService.UpdateOptions(parsed);
+                }
             }
             catch
             {

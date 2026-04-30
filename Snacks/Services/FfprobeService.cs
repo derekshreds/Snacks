@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Text;
 using System.Text.RegularExpressions;
+using Stream = Snacks.Models.Stream;
 
 namespace Snacks.Services;
 
@@ -116,92 +117,319 @@ public class FfprobeService
     }
 
     /// <summary>
-    ///     Returns the FFmpeg <c>-map</c> and audio codec arguments for the selected audio streams.
-    ///     Filters commentary tracks when a language keep-list is active.
+    ///     Per-codec spec used by the audio planner. Encapsulates the FFmpeg encoder name,
+    ///     bitrate emission style, channel ceiling, and container compatibility for each
+    ///     supported output codec.
+    /// </summary>
+    private sealed record AudioCodecSpec(
+        string Encoder,
+        AudioBitrateStyle BitrateStyle,
+        int    DefaultBitrateKbps,
+        int    MaxChannels,
+        bool   AllowedInMp4);
+
+    private enum AudioBitrateStyle { Cbr, OpusVbr, None }
+
+    /// <summary>
+    ///     Codec-name → spec table consulted by the planner. Keys are lower-case logical names
+    ///     (the same strings the UI dropdown emits). Adding a new codec is a single-row change here
+    ///     plus a UI option.
+    /// </summary>
+    private static readonly Dictionary<string, AudioCodecSpec> _codecSpecs = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["aac"]  = new("aac",      AudioBitrateStyle.Cbr,     192, 8, true),
+        ["ac3"]  = new("ac3",      AudioBitrateStyle.Cbr,     448, 6, true),
+        ["eac3"] = new("eac3",     AudioBitrateStyle.Cbr,     384, 8, true),
+        ["opus"] = new("libopus",  AudioBitrateStyle.OpusVbr, 192, 8, false),
+    };
+
+    /// <summary>
+    ///     FFmpeg-channel-count for each layout name in
+    ///     <see cref="AudioOutputProfile.Layout"/>. <c>null</c> means "keep source layout"
+    ///     (no <c>-ac</c> flag is emitted).
+    /// </summary>
+    private static int? LayoutToChannels(string layout) => layout?.Trim().ToLowerInvariant() switch
+    {
+        "mono"   => 1,
+        "stereo" => 2,
+        "5.1"    => 6,
+        "7.1"    => 8,
+        _        => null, // "Source" or unrecognized → no -ac flag
+    };
+
+    /// <summary>
+    ///     Quality ranking for source codec tie-breaking when multiple sources can satisfy
+    ///     a re-encode target. Higher = preferred. Lossless sources rank above lossy sources
+    ///     so a 5.1 TrueHD beats a 5.1 AC3 as the encode source.
+    /// </summary>
+    private static int SourceCodecQuality(string? codec) => (codec ?? "").ToLowerInvariant() switch
+    {
+        "flac" or "truehd" or "mlp" or "alac" or "pcm_s16le" or "pcm_s24le" => 4,
+        "dts" or "dtshd"                                                    => 3,
+        "eac3"                                                              => 2,
+        "ac3"                                                               => 2,
+        "aac" or "opus" or "vorbis" or "mp3"                                => 1,
+        _                                                                   => 0,
+    };
+
+    /// <summary>
+    ///     Plans the audio portion of an FFmpeg command from the user's
+    ///     <see cref="EncoderOptions.PreserveOriginalAudio"/> + <see cref="EncoderOptions.AudioOutputs"/>
+    ///     configuration. For each kept language, every output profile produces either a
+    ///     pass-through (when a source track already matches codec+layout) or a re-encode from
+    ///     the best matching source track. Never reduces a kept language to zero output streams —
+    ///     if no requested output can be satisfied, the highest-channel source is force-copied
+    ///     so the language survives.
     /// </summary>
     /// <param name="probe">The ffprobe analysis of the source file.</param>
     /// <param name="languagesToKeep">
-    ///     2-letter ISO codes to retain. Empty or null keeps every audio stream. Matching accepts
-    ///     the track's tag in any of its common forms (2-letter, 3-letter, or English name).
+    ///     2-letter ISO codes to retain. Empty or null keeps every audio stream. Matches via
+    ///     <see cref="LanguageMatcher.Matches"/> (handles 2/3-letter and English name forms).
     /// </param>
-    /// <param name="audioCodec">
-    ///     User-selected codec: <c>"copy"</c>, <c>"aac"</c>, <c>"eac3"</c>, or <c>"opus"</c>.
-    ///     "copy" is silently upgraded to AAC re-encode when <paramref name="twoChannels"/> is set
-    ///     (you can't downmix a copied stream) or when the container is MP4 (which doesn't carry
-    ///     every source format).
+    /// <param name="preserveOriginalAudio">
+    ///     When <see langword="true"/>, every kept source track is copied through alongside
+    ///     any encoded variants in <paramref name="audioOutputs"/>.
     /// </param>
-    /// <param name="audioBitrateKbps">Target bitrate for re-encoded audio. Ignored when the effective codec is copy.</param>
-    /// <param name="twoChannels">When <c>true</c>, audio is downmixed to 2-channel stereo.</param>
-    /// <param name="isMatroska">When <c>false</c> (MP4), copy is disallowed — falls back to AAC re-encode.</param>
-    /// <returns>FFmpeg stream mapping and codec arguments for audio, or an empty string if no audio streams exist.</returns>
+    /// <param name="audioOutputs">Encoded variants to emit per kept language, or <see langword="null"/>/empty for none.</param>
+    /// <param name="isMatroska">
+    ///     When <see langword="false"/> (MP4 output), codecs that can't be muxed into MP4 fall back to AAC,
+    ///     and source tracks the container can't carry are re-encoded rather than copied.
+    /// </param>
+    /// <param name="warnings">Receives one entry per fallback/clamp/skipped-profile event so callers can surface them in the per-job log.</param>
+    /// <returns>FFmpeg map + per-output-stream codec arguments. Empty string when the source has no audio streams.</returns>
     public string MapAudio(
-        ProbeResult               probe,
-        IReadOnlyList<string>?    languagesToKeep,
-        string                    audioCodec,
-        int                       audioBitrateKbps,
-        bool                      twoChannels,
-        bool                      isMatroska)
+        ProbeResult                       probe,
+        IReadOnlyList<string>?            languagesToKeep,
+        bool                              preserveOriginalAudio,
+        IReadOnlyList<AudioOutputProfile>? audioOutputs,
+        bool                              isMatroska,
+        out List<string>                  warnings)
     {
         ArgumentNullException.ThrowIfNull(probe);
+        warnings = new List<string>();
 
         var audioStreams = probe.Streams.Where(s => s.CodecType == "audio").ToList();
-        if (!audioStreams.Any()) return "";
+        if (audioStreams.Count == 0) return "";
 
-        // Resolve the effective codec. "copy" is degraded to AAC when the config
-        // asks for something copy can't satisfy (downmix, MP4 container).
-        var effectiveCodec = ResolveAudioCodec(audioCodec, twoChannels, isMatroska);
-        var codecArgs      = BuildAudioCodecArgs(effectiveCodec, audioBitrateKbps, twoChannels);
+        // Group source tracks by language bucket. A language bucket is either one of the
+        // user's keep-codes (matched via LanguageMatcher) or — when no keep-list is set —
+        // one bucket per distinct language tag present on the source. Commentary tracks
+        // are dropped at the source level so they never seed an encode target.
+        var keepList = languagesToKeep is { Count: > 0 } ? languagesToKeep : null;
+        var buckets  = new List<(string Bucket, List<Stream> Sources)>();
 
-        if (languagesToKeep != null && languagesToKeep.Count > 0)
+        bool IsCommentary(Stream s) =>
+            s.Tags?.Title != null && s.Tags.Title.ToLower().Contains("comm");
+
+        if (keepList != null)
         {
-            var filtered = audioStreams
-                .Where(s => LanguageMatcher.Matches(s.Tags?.Language, s.Tags?.Title, languagesToKeep)
-                    && (s.Tags?.Title == null || !s.Tags.Title.ToLower().Contains("comm")))
-                .ToList();
-
-            if (filtered.Any())
+            foreach (var lang in keepList)
             {
-                var maps = string.Join(" ", filtered.Select(s => $"-map 0:{s.Index}"));
-                return $"{maps} {codecArgs}";
+                var sources = audioStreams
+                    .Where(s => LanguageMatcher.Matches(s.Tags?.Language, s.Tags?.Title, new[] { lang })
+                             && !IsCommentary(s))
+                    .ToList();
+                if (sources.Count > 0) buckets.Add((lang, sources));
+            }
+        }
+        else
+        {
+            // No keep-list: bucket by the source's own language tag (or "und" for unknowns)
+            // so we still apply per-language fan-out + safeguards.
+            foreach (var grp in audioStreams
+                .Where(s => !IsCommentary(s))
+                .GroupBy(s => (s.Tags?.Language ?? "und").ToLowerInvariant()))
+            {
+                buckets.Add((grp.Key, grp.ToList()));
             }
         }
 
-        return $"-map 0:a {codecArgs}";
+        if (buckets.Count == 0) return "";
+
+        var profiles = (audioOutputs ?? Array.Empty<AudioOutputProfile>())
+            .Where(p => !string.IsNullOrWhiteSpace(p.Codec))
+            .ToList();
+
+        var maps         = new StringBuilder();   // -map 0:N tokens
+        var codecArgs    = new StringBuilder();   // -c:a:N / -b:a:N / -ac:a:N tokens
+        int outIndex     = 0;                     // running output-audio-stream index
+
+        foreach (var (bucket, sources) in buckets)
+        {
+            // Plan first, emit second. The plan phase classifies each profile as either a
+            // dedup-to-copy (against an existing source track) or a re-encode, then the emit
+            // phase writes copies before re-encodes so output stream order matches user
+            // expectation ("the original is the default").
+            var copySourceIndices = new HashSet<int>();
+            var reencodes         = new List<(int srcIndex, string codec, int channels, int bitrateKbps)>();
+
+            foreach (var profile in profiles)
+            {
+                int? targetCh = LayoutToChannels(profile.Layout);
+
+                // Dedup-to-copy: a source track whose codec+channels already match this output?
+                Stream? exactMatch = sources
+                    .Where(s => string.Equals(s.CodecName, profile.Codec, StringComparison.OrdinalIgnoreCase)
+                             && (targetCh == null || s.Channels == targetCh.Value))
+                    .OrderByDescending(s => s.Channels)
+                    .FirstOrDefault();
+
+                if (exactMatch != null)
+                {
+                    copySourceIndices.Add(exactMatch.Index);
+                    continue;
+                }
+
+                // No exact match — pick the best source to re-encode from. Sources must have
+                // at least the requested channel count (no upmix); prefer highest channels,
+                // then highest-quality source codec.
+                var minCh = targetCh ?? 0;
+                var candidate = sources
+                    .Where(s => s.Channels >= minCh)
+                    .OrderByDescending(s => s.Channels)
+                    .ThenByDescending(s => SourceCodecQuality(s.CodecName))
+                    .FirstOrDefault();
+
+                if (candidate == null)
+                {
+                    warnings.Add(
+                        $"Audio: profile {profile.Codec} {profile.Layout} skipped for language '{bucket}' — " +
+                        $"no source track with {minCh}+ channels.");
+                    continue;
+                }
+
+                int encodeCh = targetCh ?? candidate.Channels;
+                var resolved = ResolveAudioCodec(profile.Codec, encodeCh, isMatroska, warnings);
+                reencodes.Add((candidate.Index, resolved.codec, resolved.channels, profile.BitrateKbps));
+            }
+
+            // PreserveOriginal: every kept source not already covered by a dedup is copied.
+            if (preserveOriginalAudio)
+            {
+                foreach (var src in sources) copySourceIndices.Add(src.Index);
+            }
+
+            // Empty-language safeguard: never let a kept language vanish entirely.
+            if (copySourceIndices.Count == 0 && reencodes.Count == 0)
+            {
+                var fallback = sources.OrderByDescending(s => s.Channels).First();
+                warnings.Add(
+                    $"Audio: language '{bucket}' had no satisfiable output profiles — passing source track #{fallback.Index} through unchanged.");
+                copySourceIndices.Add(fallback.Index);
+            }
+
+            // -- Emit copies first (in source-index order). ----------------------------
+            foreach (var srcIndex in copySourceIndices.OrderBy(i => i))
+            {
+                var src = sources.First(s => s.Index == srcIndex);
+
+                if (!isMatroska && !ContainerCanCopySource(src.CodecName))
+                {
+                    warnings.Add(
+                        $"Audio: source track #{src.Index} ({src.CodecName}) cannot be copied to MP4 — re-encoding to AAC.");
+                    var fallback = ResolveAudioCodec("aac", src.Channels, isMatroska, warnings);
+                    maps.Append($"-map 0:{src.Index} ");
+                    codecArgs.Append(BuildAudioCodecArgs(fallback.codec, fallback.channels, 0, outIndex)).Append(' ');
+                }
+                else
+                {
+                    maps.Append($"-map 0:{src.Index} ");
+                    codecArgs.Append($"-c:a:{outIndex} copy ");
+                }
+                outIndex++;
+            }
+
+            // -- Then emit re-encodes in profile order. --------------------------------
+            foreach (var re in reencodes)
+            {
+                maps.Append($"-map 0:{re.srcIndex} ");
+                codecArgs.Append(BuildAudioCodecArgs(re.codec, re.channels, re.bitrateKbps, outIndex)).Append(' ');
+                outIndex++;
+            }
+        }
+
+        if (outIndex == 0) return "";
+        return (maps.ToString() + codecArgs.ToString()).TrimEnd();
     }
 
     /// <summary>
-    ///     Resolves the user-selected audio codec to what FFmpeg will actually run.
-    ///     Downgrades <c>"copy"</c> to AAC when the rest of the config can't satisfy copy
-    ///     (a downmix request or an MP4 container with unsupported source codecs).
+    ///     Resolves a requested codec + channel count into what FFmpeg will actually run,
+    ///     given the output container. Falls back to AAC when the codec is unknown or
+    ///     unsupported by the container, and clamps channel count to the codec's ceiling.
+    ///     Each fallback/clamp appends a human-readable line to <paramref name="warnings"/>.
     /// </summary>
-    private static string ResolveAudioCodec(string requested, bool twoChannels, bool isMatroska)
+    private static (string codec, int channels) ResolveAudioCodec(
+        string                  requested,
+        int                     channels,
+        bool                    isMatroska,
+        List<string>            warnings)
     {
         var codec = (requested ?? "").Trim().ToLowerInvariant();
-        if (codec is not ("copy" or "aac" or "eac3" or "opus")) codec = "aac";
 
-        // Copy can't downmix, and MP4 can't carry every codec — fall back to AAC.
-        if (codec == "copy" && (twoChannels || !isMatroska)) codec = "aac";
-        return codec;
+        if (!_codecSpecs.TryGetValue(codec, out var spec))
+        {
+            warnings.Add($"Audio: unknown codec '{requested}' — falling back to AAC.");
+            codec = "aac";
+            spec  = _codecSpecs["aac"];
+        }
+
+        if (!isMatroska && !spec.AllowedInMp4)
+        {
+            warnings.Add($"Audio: codec '{codec}' is not supported in MP4 — falling back to AAC.");
+            codec = "aac";
+            spec  = _codecSpecs["aac"];
+        }
+
+        if (channels > spec.MaxChannels)
+        {
+            warnings.Add($"Audio: codec '{codec}' supports up to {spec.MaxChannels} channels; clamping from {channels}.");
+            channels = spec.MaxChannels;
+        }
+
+        return (codec, channels);
     }
 
     /// <summary>
-    ///     Builds the <c>-c:a ...</c> flag set for the resolved codec, including
-    ///     bitrate/VBR flags and the downmix flag when <paramref name="twoChannels"/>.
+    ///     Builds per-output-stream FFmpeg flags for a given codec/channel/bitrate target.
+    ///     The output-stream index is baked into <c>-c:a:N</c>, <c>-b:a:N</c>, etc., so
+    ///     callers can interleave many audio outputs in a single command.
     /// </summary>
-    private static string BuildAudioCodecArgs(string codec, int bitrateKbps, bool twoChannels)
+    private static string BuildAudioCodecArgs(string codec, int channels, int bitrateKbps, int outIndex)
     {
-        var downmix = twoChannels ? " -ac 2" : "";
-        var br      = bitrateKbps > 0 ? bitrateKbps : 192;
+        if (!_codecSpecs.TryGetValue(codec, out var spec)) spec = _codecSpecs["aac"];
 
-        return codec switch
+        var sb = new StringBuilder();
+        sb.Append($"-c:a:{outIndex} {spec.Encoder}");
+
+        var br = bitrateKbps > 0 ? bitrateKbps : spec.DefaultBitrateKbps;
+        switch (spec.BitrateStyle)
         {
-            "copy" => "-c:a copy",
-            "aac"  => $"-c:a aac  -b:a {br}k{downmix}",
-            "eac3" => $"-c:a eac3 -b:a {br}k{downmix}",
-            "opus" => $"-c:a libopus -b:a {br}k -vbr on{downmix}",
-            _      => $"-c:a aac -b:a {br}k{downmix}",
-        };
+            case AudioBitrateStyle.Cbr:
+                sb.Append($" -b:a:{outIndex} {br}k");
+                break;
+            case AudioBitrateStyle.OpusVbr:
+                sb.Append($" -b:a:{outIndex} {br}k -vbr:a:{outIndex} on");
+                break;
+            case AudioBitrateStyle.None:
+                break;
+        }
+
+        if (channels > 0) sb.Append($" -ac:a:{outIndex} {channels}");
+        return sb.ToString();
     }
+
+    /// <summary>
+    ///     Whether MP4 can stream-copy a source audio codec. Used during pass-through to
+    ///     decide between <c>-c:a copy</c> and a re-encode fallback. Matroska is permissive
+    ///     enough that we don't gate copies for it.
+    /// </summary>
+    private static bool ContainerCanCopySource(string? sourceCodec) =>
+        (sourceCodec ?? "").ToLowerInvariant() switch
+        {
+            "aac" or "ac3" or "eac3" or "mp3" or "alac" => true,
+            // truehd, dts, dtshd, flac, opus, pcm_*: not safe to copy into MP4
+            _ => false,
+        };
 
     /// <summary> Bitmap subtitle codecs that can cause FFmpeg to hang — always excluded. </summary>
     internal static readonly HashSet<string> _bitmapSubCodecs = new(StringComparer.OrdinalIgnoreCase)

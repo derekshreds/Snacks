@@ -1842,14 +1842,17 @@ public class TranscodingService
             $"{_ffprobeService.MapVideo(workItem.Probe!)} -c:v {encoder} {presetFlag}{vfFlag}";
 
         // On a mux pass that excludes audio (MuxStreams.Subtitles), keep every audio track as-is:
-        // empty language list = keep all, "copy" codec = no re-encode, no downmix.
+        // empty language list = keep all, preserve-only profile = no re-encode.
         string audioFlags = _ffprobeService.MapAudio(
             workItem.Probe!,
             doAudioWork ? options.AudioLanguagesToKeep : new List<string>(),
-            doAudioWork ? options.AudioCodec : "copy",
-            options.AudioBitrateKbps,
-            doAudioWork && options.TwoChannelAudio,
-            options.Format == "mkv") + " ";
+            doAudioWork ? options.PreserveOriginalAudio : true,
+            doAudioWork ? options.AudioOutputs : null,
+            options.Format == "mkv",
+            out var audioWarnings) + " ";
+
+        foreach (var w in audioWarnings)
+            await LogAsync(workItem.Id, w);
 
         string varFlags = options.Format == "mkv" ? "-max_muxing_queue_size 9999 " : "-movflags +faststart -max_muxing_queue_size 9999 ";
 
@@ -2135,36 +2138,50 @@ public class TranscodingService
 
     /// <summary>
     ///     Returns <see langword="true"/> when audio settings would change the output
-    ///     (language drop, codec re-encode, or downmix) versus a straight stream copy.
+    ///     (language drop, dropped source on Preserve=off, or any output profile that would
+    ///     emit a re-encode) versus a straight stream copy. Used to decide mux-pass eligibility.
     /// </summary>
     private static bool HasAudioWork(EncoderOptions options, IReadOnlyList<AudioStreamSummary> audioStreams)
     {
         if (audioStreams.Count == 0) return false;
 
         // Language filter would drop at least one track?
+        IReadOnlyList<AudioStreamSummary> kept = audioStreams;
         if (options.AudioLanguagesToKeep is { Count: > 0 } audLangs)
         {
-            var kept = audioStreams
+            var filtered = audioStreams
                 .Where(s => LanguageMatcher.Matches(s.Language, s.Title, audLangs))
                 .ToList();
-            if (kept.Count < audioStreams.Count) return true;
-            audioStreams = kept;
+            if (filtered.Count < audioStreams.Count) return true;
+            kept = filtered;
         }
 
-        // Codec re-encode on any surviving track?
-        if (!string.IsNullOrEmpty(options.AudioCodec)
-            && !options.AudioCodec.Equals("copy", StringComparison.OrdinalIgnoreCase))
-        {
-            foreach (var s in audioStreams)
-                if (!string.Equals(s.CodecName, options.AudioCodec, StringComparison.OrdinalIgnoreCase))
-                    return true;
-        }
+        // Preserve=off means at least one source track will be dropped (the planner only
+        // emits encoded outputs unless its safeguard kicks in) — that's audio work.
+        if (!options.PreserveOriginalAudio) return true;
 
-        // Downmix would reduce channels on any surviving track?
-        if (options.TwoChannelAudio)
+        // With Preserve=on, any output profile that wouldn't dedupe-to-copy against an
+        // existing source is a re-encode and therefore audio work. Codec name + channel
+        // count are enough since dedup uses exactly those two fields.
+        if (options.AudioOutputs is { Count: > 0 } profiles)
         {
-            foreach (var s in audioStreams)
-                if (s.Channels > 2) return true;
+            foreach (var p in profiles)
+            {
+                int? targetCh = p.Layout?.Trim().ToLowerInvariant() switch
+                {
+                    "mono"   => 1,
+                    "stereo" => 2,
+                    "5.1"    => 6,
+                    "7.1"    => 8,
+                    _        => null,
+                };
+
+                bool deduped = kept.Any(s =>
+                    string.Equals(s.CodecName, p.Codec, StringComparison.OrdinalIgnoreCase)
+                    && (targetCh == null || s.Channels == targetCh.Value));
+
+                if (!deduped) return true;
+            }
         }
 
         return false;
