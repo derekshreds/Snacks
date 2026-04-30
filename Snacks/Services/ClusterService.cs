@@ -2367,19 +2367,23 @@ public sealed class ClusterService : IHostedService, IDisposable
             return -50;
 
         // CPU is reserved for explicit "Software" jobs and for "auto" jobs
-        // on nodes that have no hardware encoder at all. Under "auto" with
-        // detected hardware, or any specific-vendor preference, CPU is
-        // excluded outright — we'd rather queue a job than silently spend
-        // it on a slow software encode while a GPU sits idle. The
-        // "no hardware on this node" check is per-node, so a CPU-only
-        // worker still pulls "auto" jobs.
+        // on nodes that have no usable hardware encoder for the requested
+        // codec. Under "auto" with hardware that can do the codec, or any
+        // specific-vendor preference, CPU is excluded outright — we'd rather
+        // queue a job than silently spend it on a slow software encode while
+        // a GPU sits idle. "Usable" means present, enabled, and capable of
+        // the requested codec — an Intel iGPU without AV1 encode shouldn't
+        // lock out the CPU on an AV1 job, otherwise the node deadlocks.
         var hw = options.HardwareAcceleration?.ToLower() ?? "auto";
         bool isCpu = device.DeviceId == "cpu";
-        bool nodeHasHardware = node.Capabilities?.Devices?.Any(d => d.DeviceId != "cpu") == true;
+        bool nodeHasUsableHardware = node.Capabilities?.Devices?.Any(d =>
+            d.DeviceId != "cpu"
+            && IsDeviceEnabled(node, d.DeviceId)
+            && d.SupportedCodecs.Any(c => c.Equals(codecKey, StringComparison.OrdinalIgnoreCase))) == true;
 
         if (hw == "none" && !isCpu) return -50;                             // software-only ⇒ CPU only
         if (hw != "none" && hw != "auto" && isCpu) return -50;              // specific vendor ⇒ never CPU
-        if (hw == "auto" && isCpu && nodeHasHardware) return -50;           // auto with HW ⇒ never CPU
+        if (hw == "auto" && isCpu && nodeHasUsableHardware) return -50;     // auto + usable HW ⇒ never CPU
         if (hw != "none" && !isCpu && !string.Equals(device.DeviceId, hw, StringComparison.OrdinalIgnoreCase)
             && hw != "auto") return -50;                                    // specific vendor ⇒ wrong family
 
