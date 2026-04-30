@@ -6,8 +6,8 @@
  * because they cancel any in-progress encode.
  */
 
-import { clusterApi, appApi, dashboardApi } from '../../api.js';
-import { showConfirmModal }                 from '../../utils/modal-controller.js';
+import { clusterApi, appApi, dashboardApi, queueApi } from '../../api.js';
+import { showConfirmModal }                           from '../../utils/modal-controller.js';
 
 
 // ---------------------------------------------------------------------------
@@ -104,6 +104,42 @@ async function clearDashboard() {
 
 
 // ---------------------------------------------------------------------------
+// Remove failed items
+// ---------------------------------------------------------------------------
+
+/**
+ * Deletes every Failed row from the database after explicit confirmation.
+ * Items whose source file still exists on disk are re-discovered as Unseen
+ * by the next library scan and re-evaluated against the current encoder
+ * settings. Items whose source has already been replaced (the bogus
+ * "Source file was removed during encoding" backlog) simply stay gone —
+ * the encoded output continues to live at its destination path. No video
+ * files are touched.
+ */
+async function removeFailed() {
+    const confirmed = await showConfirmModal(
+        'Remove failed items',
+        '<p>Delete every failed item from the database. They will be re-discovered '
+        + 'on the next library scan if their source file is still present.</p>'
+        + '<p class="text-muted small mb-0">This does not delete any video files. '
+        + 'Items that were misreported as failed but already encoded will simply '
+        + 'not be re-picked up — their original source no longer exists for the '
+        + 'scanner to find, and the encoded output remains in place.</p>',
+        'Remove failed',
+    );
+    if (!confirmed) return;
+
+    try {
+        const data = await queueApi.removeFailed();
+        const n = data?.deleted ?? 0;
+        showToast(`Removed ${n} failed item${n === 1 ? '' : 's'} from database`, 'success');
+    } catch (e) {
+        showToast('Remove failed: ' + e.message, 'danger');
+    }
+}
+
+
+// ---------------------------------------------------------------------------
 // Public entry points
 // ---------------------------------------------------------------------------
 
@@ -112,6 +148,7 @@ export function initAdvancedPanel() {
     document.getElementById('saveAdvancedCluster')   ?.addEventListener('click', saveTimings);
     document.getElementById('restartAppBtn')         ?.addEventListener('click', restart);
     document.getElementById('clearDashboardHistory') ?.addEventListener('click', clearDashboard);
+    document.getElementById('removeFailedFiles')     ?.addEventListener('click', removeFailed);
 }
 
 /** Lazy data load, invoked when the settings modal is first opened. */

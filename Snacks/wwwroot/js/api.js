@@ -133,6 +133,9 @@ export const queueApi = {
     /** Fetches the list of items that are currently in a failed state. */
     getFailed: ()         => getJson('/api/queue/failed'),
 
+    /** Deletes every Failed row from the database. Source files are untouched. */
+    removeFailed: ()      => deleteJson('/api/queue/failed'),
+
     /** Sets the queue pause state. */
     setPaused: (paused)   => postJson('/api/queue/paused', { paused }),
 

@@ -286,6 +286,22 @@ public class MediaFileRepository
                 .ToListAsync();
         }
 
+        /// <summary>
+        ///     Deletes every <see cref="MediaFile" /> row whose status is
+        ///     <see cref="MediaFileStatus.Failed" />. The next library scan re-discovers
+        ///     any source file still on disk as <see cref="MediaFileStatus.Unseen" />,
+        ///     giving the user a one-click recovery path for legitimate failures and
+        ///     for the bogus "Source file was removed during encoding" backlog.
+        /// </summary>
+        /// <returns>The number of rows deleted.</returns>
+        public async Task<int> DeleteAllFailedAsync()
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            return await context.MediaFiles
+                .Where(f => f.Status == MediaFileStatus.Failed)
+                .ExecuteDeleteAsync();
+        }
+
         #endregion
 
         #region Reset & Maintenance

@@ -1118,6 +1118,24 @@ public sealed class ClusterService : IHostedService, IDisposable
                 bool masterExcludes4K = masterNs?.Exclude4K == true;
                 bool masterOnly4K     = masterNs?.Only4K == true;
 
+                // Snapshot every source path that's currently in flight on a
+                // remote worker (assigned + uploading + downloading). The
+                // dispatcher already de-duplicates by WorkItem.Id; this closes
+                // the same-path-different-Id variant where two distinct work
+                // items pointing at the same source file can race through
+                // FinalizeCompletionAsync and have the second one trip the
+                // source-existence check after the first one replaces the
+                // original.
+                var inFlightPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var rj in _remoteJobs.Values)
+                    inFlightPaths.Add(Path.GetFullPath(rj.Path));
+                foreach (var uploadId in _activeUploads.Keys)
+                {
+                    var uploadItem = _transcodingService.GetWorkItem(uploadId);
+                    if (uploadItem != null)
+                        inFlightPaths.Add(Path.GetFullPath(uploadItem.Path));
+                }
+
                 var workItem = _transcodingService.DequeueForRemoteProcessing(item =>
                 {
                     // Master's 4K preference only hogs an item type when no worker
@@ -1126,6 +1144,12 @@ public sealed class ClusterService : IHostedService, IDisposable
                     // the queue. When a worker can take the type, load-share instead.
                     if (masterExcludes4K && !item.Is4K && !anyNon4KWorker) return false;
                     if (masterOnly4K     &&  item.Is4K && !any4KWorker)    return false;
+
+                    // Skip items whose source path is already being processed
+                    // by another in-flight job — same-path double dispatch is
+                    // what produces "Source file was removed during encoding"
+                    // when the first job replaces the source under the second.
+                    if (inFlightPaths.Contains(Path.GetFullPath(item.Path))) return false;
 
                     return item.Is4K ? any4KWorker : anyNon4KWorker;
                 });
@@ -1849,6 +1873,18 @@ public sealed class ClusterService : IHostedService, IDisposable
     /// <summary>Finalizes a successfully validated output.</summary>
     private async Task FinalizeCompletionAsync(string jobId, WorkItem workItem, string outputPath, EncoderOptions options, string nodeBaseUrl)
     {
+        // Remove from in-flight tracking BEFORE any side effect that mutates
+        // shared state observable to other completion paths. HandleRemoteCompletion
+        // below deletes the source file; if jobId stayed in _remoteJobs through
+        // that step, a heartbeat-driven re-fire of HandleRemoteCompletionAsync
+        // (or a delayed RetryDownloadAsync, or a worker's persisted-completion
+        // re-POST) could enter the source-existence check against a path the
+        // master itself just deleted, marking the work item failed even though
+        // encoding succeeded.
+        _remoteJobs.TryRemove(jobId, out _);
+        _downloadRetryCounts.TryRemove(jobId, out _);
+        _downloadRetryCounts.TryRemove($"_validation_{jobId}", out _);
+
         // WAL: Downloading → Completed
         var completeScope = await _stateTransitions.BeginAsync(jobId, "Downloading", "Completed");
 
@@ -1882,9 +1918,6 @@ public sealed class ClusterService : IHostedService, IDisposable
             }
         }
 
-        _remoteJobs.TryRemove(jobId, out _);
-        _downloadRetryCounts.TryRemove(jobId, out _);
-        _downloadRetryCounts.TryRemove($"_validation_{jobId}", out _);
         if (_jobCts.TryRemove(jobId, out var completedCts))
             completedCts.Dispose();
         Console.WriteLine($"Cluster: Remote job {workItem.FileName} completed successfully");

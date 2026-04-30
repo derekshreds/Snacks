@@ -187,6 +187,16 @@ export class AutoScanPanel {
     // ---- Mutations ----
 
     async _removeDirectory(path) {
+        const confirmed = await showConfirmModal(
+            'Remove watched folder',
+            `<p>Stop watching <code>${escapeHtml(path)}</code>?</p>`
+            + '<p class="text-muted small mb-0">Files already in the queue or '
+            + 'completed history are unaffected. The folder is just removed from '
+            + 'the auto-scan list — nothing on disk is changed.</p>',
+            'Remove',
+        );
+        if (!confirmed) return;
+
         try {
             await autoScanApi.removeDir(path);
             await this.load(false);
