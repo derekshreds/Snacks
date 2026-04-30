@@ -382,6 +382,41 @@ public class MediaFileRepository
         }
 
         /// <summary>
+        ///     Reverse of <see cref="ReevaluateSkippedAsync"/>: re-evaluates every <see cref="MediaFileStatus.Unseen" />
+        ///     row against the supplied predicate. Files for which <paramref name="shouldBeSkipped" /> returns
+        ///     <see langword="true" /> are flipped back to <see cref="MediaFileStatus.Skipped" />. Used when encoder
+        ///     settings change in the "no longer needs encoding" direction — e.g., the user added an audio output
+        ///     that re-queued a batch of files, then removed it. Without this method, those files stay queued.
+        /// </summary>
+        /// <param name="shouldBeSkipped">
+        ///     Pure predicate over the DB-stored fields (no probing). Return <see langword="true" /> to flip
+        ///     the row back to Skipped, <see langword="false" /> to leave it Unseen.
+        /// </param>
+        /// <returns> The number of rows whose status was flipped. </returns>
+        public async Task<int> ReevaluateUnseenAsync(Func<MediaFile, bool> shouldBeSkipped)
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            // Only consider rows we have enough data on to make a decision. A null AudioStreams /
+            // SubtitleStreams blob means the file was scanned before stream-summary persistence
+            // existed; we can't safely re-evaluate without re-probing, so leave it for the next scan.
+            var unseen = await context.MediaFiles
+                .Where(f => f.Status == MediaFileStatus.Unseen
+                         && (f.AudioStreams != null || f.SubtitleStreams != null))
+                .ToListAsync();
+
+            int flipped = 0;
+            foreach (var mf in unseen)
+            {
+                if (!shouldBeSkipped(mf)) continue;
+                mf.Status = MediaFileStatus.Skipped;
+                flipped++;
+            }
+
+            if (flipped > 0) await SaveChangesWithRetryAsync(context);
+            return flipped;
+        }
+
+        /// <summary>
         ///     Resets a single file to <see cref="MediaFileStatus.Unseen" /> and clears its failure fields.
         ///     Used when a file has changed on disk or needs to be retried after a failure.
         /// </summary>

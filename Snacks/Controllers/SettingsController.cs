@@ -112,9 +112,13 @@ public sealed class SettingsController : ControllerBase
                 /* non-fatal — in-memory options retain their previous values */
             }
 
-            int requeued = 0;
+            int requeued  = 0;
+            int reskipped = 0;
+            int dequeued  = 0;
             if (parsed != null)
             {
+                // Direction A: settings change made files newly eligible for encoding.
+                // Flip Skipped → Unseen so the next scan picks them up.
                 // Legacy rows scanned before the stream-summary columns existed have null
                 // AudioStreams/SubtitleStreams — we can't fully re-evaluate them, so flip
                 // them to Unseen to force a re-probe on the next scan.
@@ -122,9 +126,19 @@ public sealed class SettingsController : ControllerBase
                     mf.AudioStreams != null || mf.SubtitleStreams != null
                         ? TranscodingService.WouldSkipUnderOptions(mf, parsed)
                         : false);
+
+                // Direction B: settings change made previously-eligible files no longer
+                // need encoding (e.g., user added an audio output that re-queued a batch,
+                // then removed it). Flip Unseen → Skipped, and drop matching Pending items
+                // from the in-memory queue so they don't get encoded under settings the
+                // user just reverted. Active jobs are left alone — too late to cancel
+                // safely; the user can stop them via the queue UI if needed.
+                reskipped = await _mediaFileRepo.ReevaluateUnseenAsync(mf =>
+                    TranscodingService.WouldSkipUnderOptions(mf, parsed));
+                dequeued = await _transcodingService.RemoveSettingsObsoletedQueueItemsAsync(parsed);
             }
 
-            return new JsonResult(new { success = true, requeued });
+            return new JsonResult(new { success = true, requeued, reskipped, dequeued });
         }
         catch (Exception ex)
         {

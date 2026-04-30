@@ -4027,6 +4027,92 @@ public class TranscodingService
     public void UpdateOptions(EncoderOptions options) => _lastOptions = options;
 
     /// <summary>
+    ///     Removes <see cref="WorkItemStatus.Pending"/> items from the local queue that no
+    ///     longer need encoding under <paramref name="newOptions"/> — the inverse of the
+    ///     scan-time skip ladder. Used by the settings-save flow when the user changes a
+    ///     setting in the "no longer needs encoding" direction (e.g., adds an audio output
+    ///     that re-queues a batch, then removes it). Without this, those items keep running
+    ///     even though the setting that made them eligible has been reverted.
+    ///
+    ///     Active jobs (<see cref="WorkItemStatus.Processing"/>, etc.) are left alone — they
+    ///     either finish or get cancelled explicitly. Remote-assigned items are also left
+    ///     alone since they're not in <c>_workQueue</c> anymore (they're in worker hands).
+    /// </summary>
+    /// <param name="newOptions">The just-saved encoder options to evaluate against.</param>
+    /// <returns>The number of pending items removed from the queue.</returns>
+    public async Task<int> RemoveSettingsObsoletedQueueItemsAsync(EncoderOptions newOptions)
+    {
+        ArgumentNullException.ThrowIfNull(newOptions);
+
+        // Step 1: snapshot the candidate (id, path) pairs under the queue lock. We don't
+        // remove yet — the DB lookup that decides "is this still needed?" is async and
+        // can't run under a lock. Holding the snapshot's ids lets us re-find the items
+        // in step 3 and verify they're still Pending before removal.
+        List<(string Id, string Path)> candidates;
+        lock (_queueLock)
+        {
+            candidates = _workQueue
+                .Where(w => w.Status == WorkItemStatus.Pending)
+                .Select(w => (w.Id, w.Path))
+                .ToList();
+        }
+        if (candidates.Count == 0) return 0;
+
+        // Step 2: re-evaluate each candidate against the new options using its cached
+        // MediaFile row. Items missing the row or the per-track summaries are left alone
+        // (conservative: the next scan re-probes them).
+        var idsToRemove = new HashSet<string>();
+        foreach (var (id, path) in candidates)
+        {
+            var normalizedPath = Path.GetFullPath(path);
+            var mf = await _mediaFileRepo.GetByPathAsync(normalizedPath);
+            if (mf == null) continue;
+            if (mf.AudioStreams == null && mf.SubtitleStreams == null) continue;
+
+            if (WouldSkipUnderOptions(mf, newOptions)) idsToRemove.Add(id);
+        }
+        if (idsToRemove.Count == 0) return 0;
+
+        // Step 3: remove the matching items from the queue under the lock. Re-check status
+        // because a concurrent picker may have dequeued an item between steps 1 and 3.
+        var removed = new List<WorkItem>();
+        lock (_queueLock)
+        {
+            for (int i = _workQueue.Count - 1; i >= 0; i--)
+            {
+                var item = _workQueue[i];
+                if (!idsToRemove.Contains(item.Id))           continue;
+                if (item.Status != WorkItemStatus.Pending)    continue;
+
+                _workQueue.RemoveAt(i);
+                removed.Add(item);
+            }
+        }
+        if (removed.Count == 0) return 0;
+
+        // Step 4: drop from the work-item registry, notify the UI, and persist the
+        // MediaFile transition to Skipped so the next scan respects the reverted setting.
+        foreach (var item in removed)
+        {
+            _workItems.TryRemove(item.Id, out _);
+            item.Status = WorkItemStatus.Cancelled;
+            try
+            {
+                await _hubContext.Clients.All.SendAsync("WorkItemRemoved", item.Id);
+            }
+            catch { /* SignalR failures are non-fatal — the next page refresh corrects state */ }
+            try
+            {
+                await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(item.Path), MediaFileStatus.Skipped);
+            }
+            catch { /* DB failures don't block queue cleanup; next scan corrects via WouldSkipUnderOptions */ }
+        }
+
+        Console.WriteLine($"Settings change: dropped {removed.Count} now-obsolete pending queue item(s).");
+        return removed.Count;
+    }
+
+    /// <summary>
     ///     Suspends or resumes the local processing loop. When suspended, pending items remain
     ///     in the queue for the cluster dispatch loop to assign to remote nodes instead.
     /// </summary>
