@@ -1854,8 +1854,6 @@ public class TranscodingService
         foreach (var w in audioWarnings)
             await LogAsync(workItem.Id, w);
 
-        string varFlags = options.Format == "mkv" ? "-max_muxing_queue_size 9999 " : "-movflags +faststart -max_muxing_queue_size 9999 ";
-
         string outputPath = GetOutputPath(workItem, options);
         string inputPath = workItem.Path;
 
@@ -2020,8 +2018,9 @@ public class TranscodingService
 
         // -analyzeduration and -probesize handle files with many streams (e.g. 30+ PGS subtitle tracks)
         string analyzeFlags = "-analyzeduration 10M -probesize 50M ";
-        string command = $"{initFlags} {analyzeFlags}-i \"{inputPath}\" {extraInputs}{videoFlags}{compressionFlags}{audioFlags}{subtitleFlags}" +
-                        $"{varFlags}-f {(options.Format == "mkv" ? "matroska" : "mp4")} \"{outputPath}\"";
+        string command = BuildFfmpegCommand(
+            options.Format, initFlags, analyzeFlags, inputPath, extraInputs,
+            videoFlags, compressionFlags, audioFlags, subtitleFlags, outputPath);
 
         await LogAsync(workItem.Id, $"Converting {workItem.FileName}");
         await LogAsync(workItem.Id, $"Command: ffmpeg {command}");
@@ -2432,7 +2431,47 @@ public class TranscodingService
     ///     4K content uses the configured multiplier; source bitrate is always respected as an upper cap.
     /// </summary>
     /// <returns>A tuple of (targetBitrate, minBitrate, maxBitrate, videoCopy).</returns>
-    private (string target, string min, string max, bool copy) CalculateBitrates(WorkItem workItem, EncoderOptions options)
+    /// <summary>
+    ///     Assembles the final ffmpeg command string from the per-section flag fragments
+    ///     produced upstream. The format toggles two things: the container muxer
+    ///     (<c>matroska</c> vs <c>mp4</c>) and the variable flags (MP4 needs
+    ///     <c>-movflags +faststart</c>; MKV doesn't). Extracted from
+    ///     <c>ConvertVideoAsync</c> so the wire format can be unit-tested without
+    ///     spinning up the encode pipeline.
+    /// </summary>
+    /// <param name="format">"mkv" or "mp4". Anything else is treated as MP4.</param>
+    /// <param name="initFlags">Hardware init flags (from <see cref="GetInitFlags"/>).</param>
+    /// <param name="analyzeFlags">Probe-size / analyze-duration flags.</param>
+    /// <param name="inputPath">Source file path. Quoted into the command.</param>
+    /// <param name="extraInputs">Additional <c>-i</c> arguments for OCR-mux SRT inputs, or <c>""</c>.</param>
+    /// <param name="videoFlags">Video map + codec args.</param>
+    /// <param name="compressionFlags">Rate-control / preset / quality flags.</param>
+    /// <param name="audioFlags">Audio map + per-output-stream codec args.</param>
+    /// <param name="subtitleFlags">Subtitle map + codec args (or <c>-sn</c>).</param>
+    /// <param name="outputPath">Destination file path. Quoted into the command.</param>
+    /// <returns>The full ffmpeg argument string (without the leading <c>ffmpeg</c> binary name).</returns>
+    internal static string BuildFfmpegCommand(
+        string format,
+        string initFlags,
+        string analyzeFlags,
+        string inputPath,
+        string extraInputs,
+        string videoFlags,
+        string compressionFlags,
+        string audioFlags,
+        string subtitleFlags,
+        string outputPath)
+    {
+        bool isMkv      = string.Equals(format, "mkv", StringComparison.OrdinalIgnoreCase);
+        string varFlags = isMkv
+            ? "-max_muxing_queue_size 9999 "
+            : "-movflags +faststart -max_muxing_queue_size 9999 ";
+        string muxer = isMkv ? "matroska" : "mp4";
+
+        return $"{initFlags} {analyzeFlags}-i \"{inputPath}\" {extraInputs}{videoFlags}{compressionFlags}{audioFlags}{subtitleFlags}{varFlags}-f {muxer} \"{outputPath}\"";
+    }
+
+    internal static (string target, string min, string max, bool copy) CalculateBitrates(WorkItem workItem, EncoderOptions options)
     {
         bool videoCopy = false;
         string targetBitrate, minBitrate, maxBitrate;
@@ -2448,7 +2487,9 @@ public class TranscodingService
             int multiplier = Math.Clamp(options.FourKBitrateMultiplier, 2, 8);
             int hdBitrate = options.TargetBitrate * multiplier;
 
-            if (workItem.Bitrate < hdBitrate + 700 && !workItem.IsHevc)
+            // Bitrate>0 gates the compression branch: a probe that returned no source
+            // bitrate would otherwise produce 0k targets, which ffmpeg refuses.
+            if (workItem.Bitrate > 0 && workItem.Bitrate < hdBitrate + 700 && !workItem.IsHevc)
             {
                 // Low-bitrate 4K H.264 — compress to 70% like non-4K
                 targetBitrate = $"{(int)(workItem.Bitrate * 0.7)}k";
@@ -2462,7 +2503,7 @@ public class TranscodingService
                 maxBitrate = $"{hdBitrate + 500}k";
             }
         }
-        else if (workItem.Bitrate < options.TargetBitrate + 700 && !workItem.IsHevc)
+        else if (workItem.Bitrate > 0 && workItem.Bitrate < options.TargetBitrate + 700 && !workItem.IsHevc)
         {
             targetBitrate = $"{(int)(workItem.Bitrate * 0.7)}k";
             minBitrate = $"{(int)(workItem.Bitrate * 0.6)}k";
@@ -2521,7 +2562,7 @@ public class TranscodingService
     ///     <see cref="VideoFilterBuilder"/> keeps this form verbatim for the SW
     ///     hwupload path the user has chosen for all HW encoders.
     /// </summary>
-    private static string? ComputeScaleExpr(WorkItem workItem, EncoderOptions options)
+    internal static string? ComputeScaleExpr(WorkItem workItem, EncoderOptions options)
     {
         var policy = options.DownscalePolicy;
         if (!IsDownscalePolicyActive(policy)) return null;
@@ -2547,7 +2588,7 @@ public class TranscodingService
     ///     skips VAAPI calibration — uses a fixed CQP since filter activation typically
     ///     already implies bitrate guesswork is acceptable for an exceptional case.
     /// </summary>
-    private static string GetForcedReencodeCompressionFlags(string encoder, bool useVaapi, bool isSvtAv1,
+    internal static string GetForcedReencodeCompressionFlags(string encoder, bool useVaapi, bool isSvtAv1,
         string targetBitrate, string minBitrate, string maxBitrate, bool useConservativeHwFlags)
     {
         int maxBitrateVal = int.Parse(maxBitrate.TrimEnd('k'));
@@ -2947,7 +2988,7 @@ public class TranscodingService
     ///     Returns <c>true</c> if the source video codec is supported by VAAPI hardware decoding
     ///     on Elkhart Lake (J6412) hardware (h264, hevc, mpeg2, vp8, vp9, mjpeg).
     /// </summary>
-    private static bool CanVaapiDecode(ProbeResult? probe)
+    internal static bool CanVaapiDecode(ProbeResult? probe)
     {
         var codec = probe?.Streams?.FirstOrDefault(s => s.CodecType == "video")?.CodecName;
         // J6412 (Elkhart Lake) VAAPI decode: h264, hevc, mpeg2, vp8, vp9, jpeg

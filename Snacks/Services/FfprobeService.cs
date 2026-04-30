@@ -433,7 +433,7 @@ public class FfprobeService
     ///     decide between <c>-c:a copy</c> and a re-encode fallback. Matroska is permissive
     ///     enough that we don't gate copies for it.
     /// </summary>
-    private static bool ContainerCanCopySource(string? sourceCodec) =>
+    internal static bool ContainerCanCopySource(string? sourceCodec) =>
         (sourceCodec ?? "").ToLowerInvariant() switch
         {
             "aac" or "ac3" or "eac3" or "mp3" or "alac" => true,
