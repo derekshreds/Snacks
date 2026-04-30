@@ -218,8 +218,7 @@ public class FfprobeService
         var keepList = languagesToKeep is { Count: > 0 } ? languagesToKeep : null;
         var buckets  = new List<(string Bucket, List<Stream> Sources)>();
 
-        bool IsCommentary(Stream s) =>
-            s.Tags?.Title != null && s.Tags.Title.ToLower().Contains("comm");
+        bool IsCommentary(Stream s) => IsCommentaryTitle(s.Tags?.Title);
 
         if (keepList != null)
         {
@@ -417,6 +416,17 @@ public class FfprobeService
         if (channels > 0) sb.Append($" -ac:a:{outIndex} {channels}");
         return sb.ToString();
     }
+
+    /// <summary>
+    ///     Whether a track title looks like a commentary track. Loose substring match
+    ///     ("comm") is intentional — real-world commentary tracks ship with titles like
+    ///     "Director Comm", "Comm Track", "Filmmaker Commentary", etc., and a stricter
+    ///     match would let some slip through. The rule is "commentary is always dropped"
+    ///     so both <see cref="MapAudio"/> and <c>TranscodingService.HasAudioWork</c>
+    ///     consult this helper to stay aligned.
+    /// </summary>
+    internal static bool IsCommentaryTitle(string? title) =>
+        title != null && title.ToLowerInvariant().Contains("comm");
 
     /// <summary>
     ///     Whether MP4 can stream-copy a source audio codec. Used during pass-through to

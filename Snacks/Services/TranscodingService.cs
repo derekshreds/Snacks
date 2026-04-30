@@ -447,8 +447,8 @@ public class TranscodingService
             };
 
             // Don't add items that already meet the requirements.
-            bool targetIsHevc = options.Encoder.Contains("265");
-            bool targetIsAv1 = options.Encoder.Contains("av1") || options.Encoder.Contains("svt");
+            bool targetIsHevc = options.Encoder.Contains("265", StringComparison.OrdinalIgnoreCase);
+            bool targetIsAv1 = options.Encoder.Contains("av1", StringComparison.OrdinalIgnoreCase) || options.Encoder.Contains("svt", StringComparison.OrdinalIgnoreCase);
             bool isAv1 = sourceCodec == "av1";
             bool alreadyTargetCodec = targetIsAv1 ? isAv1 : (targetIsHevc ? isHevc : !isHevc);
             bool isHighDef = probe.Streams.Any(s => s.CodecType == "video" && s.Width > 1920);
@@ -807,8 +807,8 @@ public class TranscodingService
             result.Height = height;
             result.Duration = length;
 
-            bool targetIsHevc = options.Encoder.Contains("265");
-            bool targetIsAv1 = options.Encoder.Contains("av1") || options.Encoder.Contains("svt");
+            bool targetIsHevc = options.Encoder.Contains("265", StringComparison.OrdinalIgnoreCase);
+            bool targetIsAv1 = options.Encoder.Contains("av1", StringComparison.OrdinalIgnoreCase) || options.Encoder.Contains("svt", StringComparison.OrdinalIgnoreCase);
             bool alreadyTargetCodec = targetIsAv1 ? isAv1 : (targetIsHevc ? isHevc : !isHevc);
             bool isHighDef = width > 1920;
             result.Is4K = isHighDef;
@@ -2138,10 +2138,13 @@ public class TranscodingService
 
     /// <summary>
     ///     Returns <see langword="true"/> when audio settings would change the output
-    ///     (language drop, dropped source on Preserve=off, or any output profile that would
-    ///     emit a re-encode) versus a straight stream copy. Used to decide mux-pass eligibility.
+    ///     (language drop, commentary drop, dropped source on Preserve=off, or any output
+    ///     profile that would emit a re-encode) versus a straight stream copy. Used to
+    ///     decide mux-pass eligibility — must agree with <see cref="FfprobeService.MapAudio"/>
+    ///     about which source tracks survive, otherwise files with droppable tracks slip
+    ///     through the no-op skip gate without being processed.
     /// </summary>
-    private static bool HasAudioWork(EncoderOptions options, IReadOnlyList<AudioStreamSummary> audioStreams)
+    internal static bool HasAudioWork(EncoderOptions options, IReadOnlyList<AudioStreamSummary> audioStreams)
     {
         if (audioStreams.Count == 0) return false;
 
@@ -2155,6 +2158,12 @@ public class TranscodingService
             if (filtered.Count < audioStreams.Count) return true;
             kept = filtered;
         }
+
+        // Commentary tracks are unconditionally dropped by the planner (see
+        // FfprobeService.IsCommentaryTitle). If any survived the language filter,
+        // running the planner would change the output — that's audio work.
+        foreach (var s in kept)
+            if (FfprobeService.IsCommentaryTitle(s.Title)) return true;
 
         // Preserve=off means at least one source track will be dropped (the planner only
         // emits encoded outputs unless its safeguard kicks in) — that's audio work.
@@ -2191,7 +2200,7 @@ public class TranscodingService
     ///     Returns <see langword="true"/> when subtitle settings would change the output
     ///     (language drop, sidecar extraction, or OCR of bitmap subs) versus a straight copy.
     /// </summary>
-    private static bool HasSubtitleWork(EncoderOptions options, IReadOnlyList<SubtitleStreamSummary> subStreams)
+    internal static bool HasSubtitleWork(EncoderOptions options, IReadOnlyList<SubtitleStreamSummary> subStreams)
     {
         if (subStreams.Count == 0) return false;
 
@@ -2276,7 +2285,7 @@ public class TranscodingService
     ///     a skip-ladder rung in <see cref="AddFileAsync"/> so we don't run ffmpeg just to produce
     ///     a near-identical output.
     /// </summary>
-    private static bool WouldEncodeBeNoOp(
+    internal static bool WouldEncodeBeNoOp(
         EncoderOptions options,
         long bitrate,
         bool isHevc,
@@ -2306,7 +2315,7 @@ public class TranscodingService
     ///     analyze preview's Copy-vs-Queue prediction, since an active filter forces a re-encode
     ///     even when bitrate logic would otherwise have chosen <c>videoCopy</c>.
     /// </summary>
-    private static bool HasActiveFilter(EncoderOptions options, int sourceHeight, bool isHdr)
+    internal static bool HasActiveFilter(EncoderOptions options, int sourceHeight, bool isHdr)
     {
         if (options.RemoveBlackBorders)                       return true;
         if (WouldDownscale(options, sourceHeight))            return true;
@@ -2319,7 +2328,7 @@ public class TranscodingService
     ///     for a source of the given height. Mirrors <see cref="ComputeScaleExpr"/>'s decision
     ///     without producing an FFmpeg expression.
     /// </summary>
-    private static bool WouldDownscale(EncoderOptions options, int sourceHeight)
+    internal static bool WouldDownscale(EncoderOptions options, int sourceHeight)
     {
         if (!IsDownscalePolicyActive(options.DownscalePolicy)) return false;
         if (sourceHeight <= 0)                                 return false;
@@ -2353,8 +2362,8 @@ public class TranscodingService
         if (options.EncodingMode == EncodingMode.MuxOnly) return true;
 
         // Codec match — mirrors the scan-phase `alreadyTargetCodec` computation.
-        bool targetIsHevc = options.Encoder.Contains("265");
-        bool targetIsAv1  = options.Encoder.Contains("av1") || options.Encoder.Contains("svt");
+        bool targetIsHevc = options.Encoder.Contains("265", StringComparison.OrdinalIgnoreCase);
+        bool targetIsAv1  = options.Encoder.Contains("av1", StringComparison.OrdinalIgnoreCase) || options.Encoder.Contains("svt", StringComparison.OrdinalIgnoreCase);
         bool sourceIsAv1  = string.Equals(mf.Codec, "av1", StringComparison.OrdinalIgnoreCase);
         bool alreadyTargetCodec = targetIsAv1 ? sourceIsAv1
                                 : targetIsHevc ? mf.IsHevc
@@ -2395,13 +2404,13 @@ public class TranscodingService
     ///     4K multiplier when applicable). Used at encode time to decide whether a configured
     ///     <see cref="EncodingMode.Hybrid"/> should trigger a video-copy mux pass.
     /// </summary>
-    private static bool MeetsBitrateTarget(WorkItem workItem, EncoderOptions options)
+    internal static bool MeetsBitrateTarget(WorkItem workItem, EncoderOptions options)
     {
         if (workItem.Bitrate <= 0 || workItem.Probe == null) return false;
 
         var videoStream = workItem.Probe.Streams.FirstOrDefault(s => s.CodecType == "video");
-        bool targetIsHevc = options.Encoder.Contains("265");
-        bool targetIsAv1  = options.Encoder.Contains("av1") || options.Encoder.Contains("svt");
+        bool targetIsHevc = options.Encoder.Contains("265", StringComparison.OrdinalIgnoreCase);
+        bool targetIsAv1  = options.Encoder.Contains("av1", StringComparison.OrdinalIgnoreCase) || options.Encoder.Contains("svt", StringComparison.OrdinalIgnoreCase);
         bool sourceIsAv1  = string.Equals(videoStream?.CodecName, "av1", StringComparison.OrdinalIgnoreCase);
         bool alreadyTargetCodec = targetIsAv1 ? sourceIsAv1
                                 : targetIsHevc ? workItem.IsHevc
@@ -2484,18 +2493,18 @@ public class TranscodingService
     ///     no longer qualifies as 4K (≤ 1440p). Used to skip the 4K bitrate multiplier
     ///     so a 4K→1080p downscale doesn't get allocated a 4K-sized bitrate budget.
     /// </summary>
-    private static bool WillDownscaleBelow4K(EncoderOptions options)
+    internal static bool WillDownscaleBelow4K(EncoderOptions options)
     {
         if (!IsDownscalePolicyActive(options.DownscalePolicy)) return false;
         return ResolveDownscaleHeight(options.DownscaleTarget) <= 1440;
     }
 
-    private static bool IsDownscalePolicyActive(string policy) =>
+    internal static bool IsDownscalePolicyActive(string policy) =>
         string.Equals(policy, "Always",      StringComparison.OrdinalIgnoreCase)
         || string.Equals(policy, "CapAtTarget", StringComparison.OrdinalIgnoreCase)
         || string.Equals(policy, "IfLarger",    StringComparison.OrdinalIgnoreCase);
 
-    private static int ResolveDownscaleHeight(string target) => target switch
+    internal static int ResolveDownscaleHeight(string target) => target switch
     {
         "4K"    => 2160,
         "2160p" => 2160,
@@ -2951,7 +2960,7 @@ public class TranscodingService
     ///     When <paramref name="hwDecode"/> is <c>false</c>, initializes the VAAPI device but skips
     ///     forcing hardware decode (software decode + VAAPI encode mode).
     /// </summary>
-    private string GetInitFlags(string hardwareAcceleration, bool hwDecode = true)
+    internal static string GetInitFlags(string hardwareAcceleration, bool hwDecode = true)
     {
         bool isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
 
@@ -2974,12 +2983,18 @@ public class TranscodingService
     ///     Maps the user's encoder preference and hardware acceleration setting to the
     ///     concrete FFmpeg encoder name (e.g., <c>"hevc_vaapi"</c>, <c>"hevc_nvenc"</c>, <c>"libx265"</c>).
     /// </summary>
-    private string GetEncoder(EncoderOptions options)
+    internal static string GetEncoder(EncoderOptions options)
     {
         bool isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
-        bool isAv1 = options.Encoder.Contains("av1") || options.Encoder.Contains("svt");
-        bool isH265 = !isAv1 && options.Encoder.Contains("265");
-        bool isH264 = !isAv1 && options.Encoder.Contains("264");
+        // Case-insensitive: Encoder can come from settings.json or per-folder overrides
+        // where casing isn't enforced; the UI's ENCODER_MAP is lowercase but external
+        // entry points aren't, and a non-matching codec string silently falls through
+        // to passing the raw value to ffmpeg.
+        var encoder = options.Encoder ?? "";
+        bool isAv1  = encoder.Contains("av1", StringComparison.OrdinalIgnoreCase)
+                   || encoder.Contains("svt", StringComparison.OrdinalIgnoreCase);
+        bool isH265 = !isAv1 && encoder.Contains("265", StringComparison.OrdinalIgnoreCase);
+        bool isH264 = !isAv1 && encoder.Contains("264", StringComparison.OrdinalIgnoreCase);
 
         return options.HardwareAcceleration.ToLower() switch
         {
@@ -3008,7 +3023,7 @@ public class TranscodingService
             "apple" when isAv1 => "libsvtav1",
             "apple" when isH265 => "hevc_videotoolbox",
             "apple" when isH264 => "h264_videotoolbox",
-            _ => options.Encoder
+            _ => encoder
         };
     }
 
@@ -3016,10 +3031,13 @@ public class TranscodingService
     ///     Returns the software fallback encoder for the user's codec preference.
     ///     Used when the requested hardware encoder isn't available on the system.
     /// </summary>
-    private static string GetSoftwareFallbackEncoder(EncoderOptions options)
+    internal static string GetSoftwareFallbackEncoder(EncoderOptions options)
     {
-        bool isAv1 = options.Encoder.Contains("av1") || options.Encoder.Contains("svt");
-        bool isH264 = !isAv1 && options.Encoder.Contains("264");
+        // Case-insensitive — same reason as GetEncoder above.
+        var encoder = options.Encoder ?? "";
+        bool isAv1  = encoder.Contains("av1", StringComparison.OrdinalIgnoreCase)
+                   || encoder.Contains("svt", StringComparison.OrdinalIgnoreCase);
+        bool isH264 = !isAv1 && encoder.Contains("264", StringComparison.OrdinalIgnoreCase);
         if (isAv1) return "libsvtav1";
         if (isH264) return "libx264";
         return "libx265";
@@ -3031,7 +3049,7 @@ public class TranscodingService
     ///     SVT-AV1's range so a user who picks "slow" in the UI actually gets slower
     ///     encodes on AV1 too. Unknown values fall back to 6 (matches the prior hardcode).
     /// </summary>
-    private static int MapSvtAv1Preset(string preset) => (preset ?? "").ToLowerInvariant() switch
+    internal static int MapSvtAv1Preset(string preset) => (preset ?? "").ToLowerInvariant() switch
     {
         "veryslow" => 2,
         "slow"     => 4,
@@ -3903,7 +3921,9 @@ public class TranscodingService
             workItem.Progress = 0;
             await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
             // Use the correct software encoder for the target codec
-            bool isAv1Target = options.Encoder.Contains("av1") || options.Encoder.Contains("svt") || options.Codec == "av1";
+            bool isAv1Target = options.Encoder.Contains("av1", StringComparison.OrdinalIgnoreCase)
+                            || options.Encoder.Contains("svt", StringComparison.OrdinalIgnoreCase)
+                            || string.Equals(options.Codec, "av1", StringComparison.OrdinalIgnoreCase);
             options.Encoder = isAv1Target ? "libsvtav1" : "libx265";
             options.HardwareAcceleration = "none";
             await ConvertVideoAsync(workItem, options,
