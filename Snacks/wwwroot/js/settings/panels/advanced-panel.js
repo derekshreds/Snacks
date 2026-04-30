@@ -6,8 +6,8 @@
  * because they cancel any in-progress encode.
  */
 
-import { clusterApi, appApi, dashboardApi, queueApi } from '../../api.js';
-import { showConfirmModal }                           from '../../utils/modal-controller.js';
+import { clusterApi, appApi, dashboardApi, queueApi, settingsApi } from '../../api.js';
+import { showConfirmModal }                                        from '../../utils/modal-controller.js';
 
 
 // ---------------------------------------------------------------------------
@@ -140,6 +140,71 @@ async function removeFailed() {
 
 
 // ---------------------------------------------------------------------------
+// Re-evaluate queue against current settings
+// ---------------------------------------------------------------------------
+
+/**
+ * Calls `POST /api/settings/reevaluate` and surfaces the result via toast.
+ *
+ * The server holds a process-wide lock so only one walk runs at a time.
+ * Mirroring that here, the button disables itself for the duration of the
+ * round-trip and re-enables in the `finally` block — even if the network
+ * call throws or the server returns 409 ("a walk is already in progress").
+ *
+ * The dataset.busy guard handles the rapid-double-click case before the
+ * first request even hits the wire, so we don't burn an extra HTTP round
+ * trip just to be told "already running".
+ */
+async function reevaluateQueue() {
+    const btn = document.getElementById('reevaluateQueueBtn');
+    if (!btn) return;
+    if (btn.dataset.busy === '1') return;
+
+    btn.dataset.busy = '1';
+    btn.disabled     = true;
+    const originalHtml = btn.innerHTML;
+    btn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i> Re-evaluating…';
+
+    try {
+        const data = await settingsApi.reevaluate();
+        if (data?.success === false) {
+            // Server-side rejection (e.g. no settings file). Body is JSON, not an error.
+            showToast(data.error || 'Re-evaluation failed', 'warning');
+            return;
+        }
+
+        const requeued  = data?.requeued  ?? 0;
+        const reskipped = data?.reskipped ?? 0;
+        const dequeued  = data?.dequeued  ?? 0;
+
+        if (requeued + reskipped + dequeued === 0) {
+            showToast('Re-evaluation complete — no changes needed.', 'info');
+        } else {
+            const parts = [];
+            if (requeued)  parts.push(`${requeued} re-queued`);
+            if (reskipped) parts.push(`${reskipped} re-skipped`);
+            if (dequeued)  parts.push(`${dequeued} dropped from queue`);
+            showToast(`Re-evaluation complete — ${parts.join(', ')}.`, 'success');
+        }
+    } catch (e) {
+        // postJson throws "POST <url> → <status>" on any non-2xx. Detect the
+        // 409 the server emits when a walk is already in progress and message
+        // the user accordingly; everything else is an unexpected failure.
+        const msg = String(e?.message ?? '');
+        if (msg.includes('→ 409')) {
+            showToast('A re-evaluation is already in progress. Try again in a moment.', 'warning');
+        } else {
+            showToast('Re-evaluation failed: ' + msg, 'danger');
+        }
+    } finally {
+        btn.dataset.busy = '';
+        btn.disabled     = false;
+        btn.innerHTML    = originalHtml;
+    }
+}
+
+
+// ---------------------------------------------------------------------------
 // Public entry points
 // ---------------------------------------------------------------------------
 
@@ -149,6 +214,7 @@ export function initAdvancedPanel() {
     document.getElementById('restartAppBtn')         ?.addEventListener('click', restart);
     document.getElementById('clearDashboardHistory') ?.addEventListener('click', clearDashboard);
     document.getElementById('removeFailedFiles')     ?.addEventListener('click', removeFailed);
+    document.getElementById('reevaluateQueueBtn')    ?.addEventListener('click', reevaluateQueue);
 }
 
 /** Lazy data load, invoked when the settings modal is first opened. */

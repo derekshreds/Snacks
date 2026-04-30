@@ -58,9 +58,7 @@ public sealed class SettingsController : ControllerBase
                 var parsed = JsonSerializer.Deserialize<EncoderOptions>(json, _jsonOptions);
                 if (parsed == null) continue;
 
-                // Normalize legacy audio fields into the new PreserveOriginalAudio + AudioOutputs
-                // shape so the UI doesn't have to handle two shapes when restoring the form.
-                parsed.ApplyLegacyAudioMigration();
+                MigrateLegacyAudioIfNeeded(parsed, json);
                 return new JsonResult(parsed);
             }
             catch
@@ -69,21 +67,63 @@ public sealed class SettingsController : ControllerBase
             }
         }
 
-        var defaults = new EncoderOptions();
-        defaults.ApplyLegacyAudioMigration();
-        return new JsonResult(defaults);
+        // Fresh install / no saved file — defaults are already in the new shape, no migration.
+        return new JsonResult(new EncoderOptions());
+    }
+
+    /// <summary>
+    ///     Runs <see cref="EncoderOptions.ApplyLegacyAudioMigration"/> only when the on-disk
+    ///     JSON predates the new audio shape — i.e., it carries no <c>PreserveOriginalAudio</c>
+    ///     and no <c>AudioOutputs</c> keys. Once the user's saved file contains the new shape
+    ///     (even an empty <c>AudioOutputs</c> array), their settings are authoritative and we
+    ///     never re-apply migration over their explicit choices. This is what fixes the
+    ///     "delete all rows → AAC keeps coming back" loop: after the user saves with the new
+    ///     shape, migration is permanently a no-op for that file.
+    /// </summary>
+    internal static void MigrateLegacyAudioIfNeeded(EncoderOptions parsed, string rawJson)
+    {
+        if (HasNewAudioShape(rawJson)) return;
+        parsed.ApplyLegacyAudioMigration();
+    }
+
+    /// <summary>
+    ///     Returns <see langword="true"/> when the raw JSON carries either
+    ///     <c>PreserveOriginalAudio</c> or <c>AudioOutputs</c> at the top level (case-insensitive).
+    ///     Either key's presence means the file was written by the new audio form, even if the
+    ///     value is the empty default — and migration must respect that.
+    /// </summary>
+    internal static bool HasNewAudioShape(string rawJson)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(rawJson);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object) return false;
+
+            foreach (var prop in doc.RootElement.EnumerateObject())
+            {
+                if (string.Equals(prop.Name, "PreserveOriginalAudio", StringComparison.OrdinalIgnoreCase)) return true;
+                if (string.Equals(prop.Name, "AudioOutputs",          StringComparison.OrdinalIgnoreCase)) return true;
+            }
+            return false;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     /// <summary>
     ///     Persists updated encoder settings using an atomic write-then-rename. The previous
-    ///     file is retained as <c>.bak</c>. Also updates the in-memory options on the
-    ///     transcoding service and re-evaluates previously-skipped files — any whose skip
-    ///     decision would no longer hold under the new options are flipped to Unseen so
-    ///     the next scan picks them up.
+    ///     file is retained as <c>.bak</c>. Updates the in-memory options on the transcoding
+    ///     service so subsequent encodes pick up the change. Library re-evaluation (flipping
+    ///     skipped/unseen rows under the new options, dropping now-obsolete pending items) is
+    ///     intentionally NOT run here — it's a heavyweight DB + queue walk that doesn't belong
+    ///     on every keystroke of an auto-saving form. Users trigger it manually via the
+    ///     Re-evaluate Queue button on the Advanced settings panel.
     /// </summary>
     /// <param name="settings"> The raw JSON settings document to persist. </param>
     [HttpPost]
-    public async Task<IActionResult> Save([FromBody] JsonElement settings)
+    public IActionResult Save([FromBody] JsonElement settings)
     {
         try
         {
@@ -97,13 +137,12 @@ public sealed class SettingsController : ControllerBase
                 System.IO.File.Copy(path, backup, overwrite: true);
             System.IO.File.Move(temp, path, overwrite: true);
 
-            EncoderOptions? parsed = null;
             try
             {
-                parsed = JsonSerializer.Deserialize<EncoderOptions>(json, _jsonOptions);
+                var parsed = JsonSerializer.Deserialize<EncoderOptions>(json, _jsonOptions);
                 if (parsed != null)
                 {
-                    parsed.ApplyLegacyAudioMigration();
+                    MigrateLegacyAudioIfNeeded(parsed, json);
                     _transcodingService.UpdateOptions(parsed);
                 }
             }
@@ -112,31 +151,75 @@ public sealed class SettingsController : ControllerBase
                 /* non-fatal — in-memory options retain their previous values */
             }
 
-            int requeued  = 0;
-            int reskipped = 0;
-            int dequeued  = 0;
-            if (parsed != null)
-            {
-                // Direction A: settings change made files newly eligible for encoding.
-                // Flip Skipped → Unseen so the next scan picks them up.
-                // Legacy rows scanned before the stream-summary columns existed have null
-                // AudioStreams/SubtitleStreams — we can't fully re-evaluate them, so flip
-                // them to Unseen to force a re-probe on the next scan.
-                requeued = await _mediaFileRepo.ReevaluateSkippedAsync(mf =>
-                    mf.AudioStreams != null || mf.SubtitleStreams != null
-                        ? TranscodingService.WouldSkipUnderOptions(mf, parsed)
-                        : false);
+            return new JsonResult(new { success = true });
+        }
+        catch (Exception ex)
+        {
+            return BadRequest(ex.Message);
+        }
+    }
 
-                // Direction B: settings change made previously-eligible files no longer
-                // need encoding (e.g., user added an audio output that re-queued a batch,
-                // then removed it). Flip Unseen → Skipped, and drop matching Pending items
-                // from the in-memory queue so they don't get encoded under settings the
-                // user just reverted. Active jobs are left alone — too late to cancel
-                // safely; the user can stop them via the queue UI if needed.
-                reskipped = await _mediaFileRepo.ReevaluateUnseenAsync(mf =>
-                    TranscodingService.WouldSkipUnderOptions(mf, parsed));
-                dequeued = await _transcodingService.RemoveSettingsObsoletedQueueItemsAsync(parsed);
+    /******************************************************************
+     *  Manual queue re-evaluation
+     ******************************************************************/
+
+    /// <summary>
+    ///     Concurrency guard for <see cref="Reevaluate"/>. <see cref="SemaphoreSlim"/> with
+    ///     capacity 1 — a second request while one is in-flight is rejected with HTTP 409.
+    ///     Static so the lock spans every controller instance for this process; each request
+    ///     gets a fresh controller via DI but the gate is process-wide.
+    /// </summary>
+    private static readonly SemaphoreSlim _reevaluateLock = new(1, 1);
+
+    /// <summary>
+    ///     Walks the persisted media-file rows and the in-memory work queue, flipping skipped
+    ///     and unseen rows according to the current encoder options and dropping any pending
+    ///     items that no longer need encoding. This is the inverse-direction-aware version of
+    ///     what used to run on every settings save.
+    ///
+    ///     Concurrent requests are rejected with HTTP 409 rather than queued or coalesced —
+    ///     the operation is idempotent at the per-row level, but two simultaneous walks would
+    ///     race on the queue mutation and waste DB work. The user-facing behavior is "the
+    ///     button disables itself, you can click it again when it finishes."
+    /// </summary>
+    [HttpPost("reevaluate")]
+    public async Task<IActionResult> Reevaluate()
+    {
+        if (!await _reevaluateLock.WaitAsync(0))
+        {
+            return StatusCode(StatusCodes.Status409Conflict, new
+            {
+                success = false,
+                error   = "A re-evaluation is already in progress. Please wait for it to finish.",
+            });
+        }
+
+        try
+        {
+            EncoderOptions? options = LoadOptions();
+            if (options == null)
+            {
+                return new JsonResult(new
+                {
+                    success  = false,
+                    error    = "No saved settings found.",
+                });
             }
+
+            // Direction A: files newly eligible under current settings (Skipped → Unseen).
+            // Legacy rows without stream summaries are kicked back to Unseen too so the
+            // next scan re-probes them.
+            int requeued = await _mediaFileRepo.ReevaluateSkippedAsync(mf =>
+                mf.AudioStreams != null || mf.SubtitleStreams != null
+                    ? TranscodingService.WouldSkipUnderOptions(mf, options)
+                    : false);
+
+            // Direction B: files no longer eligible (Unseen → Skipped).
+            int reskipped = await _mediaFileRepo.ReevaluateUnseenAsync(mf =>
+                TranscodingService.WouldSkipUnderOptions(mf, options));
+
+            // Drop pending queue items that current settings would skip.
+            int dequeued = await _transcodingService.RemoveSettingsObsoletedQueueItemsAsync(options);
 
             return new JsonResult(new { success = true, requeued, reskipped, dequeued });
         }
@@ -144,6 +227,37 @@ public sealed class SettingsController : ControllerBase
         {
             return BadRequest(ex.Message);
         }
+        finally
+        {
+            _reevaluateLock.Release();
+        }
+    }
+
+    /// <summary>
+    ///     Reads the persisted settings from disk into an <see cref="EncoderOptions"/>,
+    ///     applying the legacy audio migration only when the file pre-dates the new shape.
+    ///     Mirrors the read path in <see cref="Get"/> — kept as a private helper so the
+    ///     re-evaluate endpoint and the GET endpoint always see the same shape.
+    /// </summary>
+    private EncoderOptions? LoadOptions()
+    {
+        var path   = GetSettingsPath();
+        var backup = path + ".bak";
+
+        foreach (var candidate in new[] { path, backup })
+        {
+            if (!System.IO.File.Exists(candidate)) continue;
+            try
+            {
+                var json   = System.IO.File.ReadAllText(candidate);
+                var parsed = JsonSerializer.Deserialize<EncoderOptions>(json, _jsonOptions);
+                if (parsed == null) continue;
+                MigrateLegacyAudioIfNeeded(parsed, json);
+                return parsed;
+            }
+            catch { /* fall through to backup or default */ }
+        }
+        return null;
     }
 
     /******************************************************************

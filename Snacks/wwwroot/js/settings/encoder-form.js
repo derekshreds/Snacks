@@ -143,7 +143,14 @@ function appendAudioOutputRow(prefix, profile = {}) {
         bitrateIn.dataset.lastDefault = next;
     });
 
-    row.querySelector('[data-audio-output-remove]').addEventListener('click', () => row.remove());
+    // Removing the row is a structural change to the form — clicks don't bubble
+    // 'change' / 'input' events, so the settings modal's auto-save listener
+    // wouldn't fire. Without this dispatch, deleting a row would only update the
+    // DOM and the next page load would re-render the row from disk.
+    row.querySelector('[data-audio-output-remove]').addEventListener('click', () => {
+        row.remove();
+        root.dispatchEvent(new Event('change', { bubbles: true }));
+    });
     root.appendChild(row);
 }
 
@@ -177,7 +184,14 @@ function ensureAudioOutputAddBound(prefix) {
     const btn = el(prefix, 'AudioOutputsAdd');
     if (!btn || btn.dataset.bound === '1') return;
     btn.dataset.bound = '1';
-    btn.addEventListener('click', () => appendAudioOutputRow(prefix));
+    btn.addEventListener('click', () => {
+        appendAudioOutputRow(prefix);
+        // Same reason as row-removal: the structural change doesn't fire 'change'
+        // on its own, so the settings modal's auto-save wouldn't pick it up. Defaults
+        // (AAC / Source / 192) are a valid state, persist them immediately.
+        const root = el(prefix, 'AudioOutputs');
+        root?.dispatchEvent(new Event('change', { bubbles: true }));
+    });
 }
 
 

@@ -154,6 +154,9 @@ function ovrAppendAudioRow(profile = {}) {
         bitrateIn.dataset.lastDefault = next;
     });
 
+    // The override dialog has its own save flow (the Save button at the bottom),
+    // so we don't need to dispatch a change event here — but keeping the row
+    // structure pure DOM lets the operator preview the rows before committing.
     row.querySelector('[data-audio-output-remove]').addEventListener('click', () => row.remove());
     root.appendChild(row);
 }

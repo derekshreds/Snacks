@@ -83,6 +83,16 @@ export const settingsApi = {
 
     /** Persists the supplied encoder settings object. */
     save: (options) => postJson('/api/settings', options),
+
+    /**
+     * Triggers a server-side re-evaluation of every library row + the local queue
+     * against the current persisted settings. The server holds a process-wide lock,
+     * so a second call while one is in progress returns HTTP 409 — callers should
+     * disable the trigger button until the response comes back.
+     *
+     * @returns {Promise<{success: boolean, requeued?: number, reskipped?: number, dequeued?: number, error?: string}>}
+     */
+    reevaluate: () => postJson('/api/settings/reevaluate'),
 };
 
 
