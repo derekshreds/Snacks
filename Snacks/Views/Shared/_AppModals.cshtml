@@ -323,24 +323,10 @@
             <div class="row g-2">
                 <div class="col-md-6">
                     <div class="form-check mb-2" data-context="folder,node">
-                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_AudioCodec" data-field="AudioCodec">
-                        <label class="form-check-label" for="ovr_AudioCodec">Audio Codec</label>
-                        <select class="form-select form-select-sm mt-1" id="ovrAudioCodec" disabled>
-                            <option value="copy">Copy (no re-encode)</option><option value="aac">AAC</option><option value="eac3">E-AC3</option><option value="opus">Opus</option>
-                        </select>
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_PreserveOriginalAudio" data-field="PreserveOriginalAudio">
+                        <label class="form-check-label" for="ovr_PreserveOriginalAudio">Preserve Original Audio Tracks</label>
+                        <div class="form-check form-switch mt-1"><input class="form-check-input" type="checkbox" id="ovrPreserveOriginalAudio" disabled></div>
                     </div>
-                    <div class="form-check mb-2" data-context="folder,node">
-                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_AudioBitrateKbps" data-field="AudioBitrateKbps">
-                        <label class="form-check-label" for="ovr_AudioBitrateKbps">Audio Bitrate (kbps)</label>
-                        <input type="number" class="form-control form-control-sm mt-1" id="ovrAudioBitrateKbps" min="32" max="1536" step="16" value="192" disabled>
-                    </div>
-                    <div class="form-check mb-2" data-context="folder,node">
-                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_TwoChannelAudio" data-field="TwoChannelAudio">
-                        <label class="form-check-label" for="ovr_TwoChannelAudio">Downmix to Stereo</label>
-                        <div class="form-check form-switch mt-1"><input class="form-check-input" type="checkbox" id="ovrTwoChannelAudio" disabled></div>
-                    </div>
-                </div>
-                <div class="col-md-6">
                     <div class="form-check mb-2" data-context="folder,node">
                         <input class="form-check-input override-toggle" type="checkbox" id="ovr_KeepOriginalLanguage" data-field="KeepOriginalLanguage">
                         <label class="form-check-label" for="ovr_KeepOriginalLanguage">Auto-keep Original Language</label>
@@ -356,7 +342,49 @@
                         </select>
                     </div>
                 </div>
+                <div class="col-md-6">
+                    <div class="form-check mb-2" data-context="folder,node">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_AudioOutputs" data-field="AudioOutputs">
+                        <label class="form-check-label" for="ovr_AudioOutputs">Audio Output Formats</label>
+                        <div class="form-text">Per-language fan-out. The override fully replaces the base list — leave empty + Preserve on for "remux only".</div>
+                        <div id="ovrAudioOutputs" class="audio-outputs mt-1" style="opacity:0.5; pointer-events:none;"></div>
+                        <button type="button" class="btn btn-sm btn-outline-primary mt-2" id="ovrAudioOutputsAdd" disabled>
+                            <i class="fas fa-plus"></i> Add output
+                        </button>
+                    </div>
+                </div>
             </div>
+
+            <template id="ovrAudioOutputRowTemplate">
+                <div class="audio-output-row d-flex align-items-end gap-2 mb-2" data-audio-output-row>
+                    <div class="flex-fill">
+                        <label class="form-label form-label-sm mb-1">Codec</label>
+                        <select class="form-select form-select-sm" data-field="Codec">
+                            <option value="aac">AAC</option>
+                            <option value="ac3">AC3</option>
+                            <option value="eac3">E-AC3</option>
+                            <option value="opus">Opus</option>
+                        </select>
+                    </div>
+                    <div class="flex-fill">
+                        <label class="form-label form-label-sm mb-1">Layout</label>
+                        <select class="form-select form-select-sm" data-field="Layout">
+                            <option value="Source">Source (keep)</option>
+                            <option value="Mono">Mono (1.0)</option>
+                            <option value="Stereo">Stereo (2.0)</option>
+                            <option value="5.1">5.1 surround</option>
+                            <option value="7.1">7.1 surround</option>
+                        </select>
+                    </div>
+                    <div style="width: 7rem;">
+                        <label class="form-label form-label-sm mb-1">Bitrate (kbps)</label>
+                        <input type="number" class="form-control form-control-sm" data-field="BitrateKbps" min="0" max="1536" step="16" value="192">
+                    </div>
+                    <button type="button" class="btn btn-sm btn-outline-danger" data-audio-output-remove title="Remove output">
+                        <i class="fas fa-trash"></i>
+                    </button>
+                </div>
+            </template>
 
             </div>
 

@@ -52,6 +52,34 @@ function el(prefix, suffix) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Per-codec bitrate defaults — must agree with FfprobeService._codecSpecs on
+ * the server. When a row is added or its codec is changed, the bitrate input
+ * auto-fills to the new codec's default so users see "192" / "448" rather than
+ * a confusing "0" sentinel that means "use codec default".
+ *
+ * Keep these in sync with the C# defaults in
+ * `Snacks/Services/FfprobeService.cs:_codecSpecs`.
+ */
+export const AUDIO_CODEC_BITRATE_DEFAULTS = Object.freeze({
+    aac:  192,
+    ac3:  448,
+    eac3: 384,
+    opus: 192,
+});
+
+/**
+ * Returns the codec's default bitrate, falling back to AAC's 192 for any
+ * unknown codec string. Lower-cases the input so callers don't have to.
+ *
+ * @param {string} codec
+ * @returns {number}
+ */
+export function defaultBitrateForCodec(codec) {
+    const key = (codec ?? '').trim().toLowerCase();
+    return AUDIO_CODEC_BITRATE_DEFAULTS[key] ?? 192;
+}
+
+/**
  * Reads the current audio-output rows out of the row container into an array of
  * {Codec, Layout, BitrateKbps} entries. Empty/missing container returns [].
  *
@@ -73,6 +101,13 @@ function readAudioOutputs(prefix) {
  * Renders one new audio-output row from the template inside the row container.
  * Fills the row with the provided profile values, or codec/layout defaults.
  *
+ * Bitrate defaulting:
+ *  - If `profile.BitrateKbps` is a positive number, use it verbatim (this is
+ *    a saved row being restored — respect what the user picked).
+ *  - Otherwise pre-fill with the codec's default bitrate from
+ *    {@link AUDIO_CODEC_BITRATE_DEFAULTS} so a fresh row shows "192" / "448"
+ *    rather than the bare "0" sentinel.
+ *
  * @param {string} prefix
  * @param {{Codec?:string, Layout?:string, BitrateKbps?:number}} [profile]
  */
@@ -81,10 +116,32 @@ function appendAudioOutputRow(prefix, profile = {}) {
     const tpl  = document.getElementById(`${prefix}AudioOutputRowTemplate`);
     if (!root || !tpl) return;
 
-    const row = tpl.content.firstElementChild.cloneNode(true);
-    if (profile.Codec)            row.querySelector('[data-field="Codec"]').value       = profile.Codec;
-    if (profile.Layout)           row.querySelector('[data-field="Layout"]').value      = profile.Layout;
-    if (profile.BitrateKbps != null) row.querySelector('[data-field="BitrateKbps"]').value = profile.BitrateKbps;
+    const row       = tpl.content.firstElementChild.cloneNode(true);
+    const codecSel  = row.querySelector('[data-field="Codec"]');
+    const layoutSel = row.querySelector('[data-field="Layout"]');
+    const bitrateIn = row.querySelector('[data-field="BitrateKbps"]');
+
+    if (profile.Codec)  codecSel.value  = profile.Codec;
+    if (profile.Layout) layoutSel.value = profile.Layout;
+
+    bitrateIn.value = (profile.BitrateKbps && profile.BitrateKbps > 0)
+        ? profile.BitrateKbps
+        : defaultBitrateForCodec(codecSel.value);
+
+    // When the user swaps codec, refresh the bitrate to the new codec's default.
+    // The old codec's default goes in `dataset.lastDefault` so we can detect "user
+    // hasn't manually edited" — if so, clobbering is safe; if they've typed a
+    // custom value, leave it alone so we don't lose it on every codec change.
+    bitrateIn.dataset.lastDefault = bitrateIn.value;
+    codecSel.addEventListener('change', () => {
+        const next = defaultBitrateForCodec(codecSel.value);
+        // Only auto-update if the user hasn't deviated from the previous default.
+        // String compare to handle the empty-input edge case cleanly.
+        if (bitrateIn.value === bitrateIn.dataset.lastDefault || bitrateIn.value === '' || bitrateIn.value === '0') {
+            bitrateIn.value = next;
+        }
+        bitrateIn.dataset.lastDefault = next;
+    });
 
     row.querySelector('[data-audio-output-remove]').addEventListener('click', () => row.remove());
     root.appendChild(row);

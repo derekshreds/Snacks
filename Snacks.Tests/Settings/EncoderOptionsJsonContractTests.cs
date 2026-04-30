@@ -279,4 +279,83 @@ public sealed class EncoderOptionsJsonContractTests
         parsed.PreserveOriginalAudio.Should().BeTrue();
         parsed.AudioOutputs.Should().BeEmpty();
     }
+
+
+    // =====================================================================
+    //  Auto-population on legacy → new-shape upgrade. The full sequence the
+    //  UI relies on:
+    //    1. User had {AudioCodec=aac, TwoChannelAudio=true, AudioBitrateKbps=192}
+    //    2. SettingsController.Get reads the file, calls ApplyLegacyAudioMigration.
+    //    3. The serialized response carries the migrated AudioOutputs.
+    //    4. encoder-form.js setAudioOutputs renders one row per profile.
+    //  This pinning test catches a regression that breaks the auto-population
+    //  the user expects after upgrade — e.g., the migration getting skipped,
+    //  the layout mapping flipping, or the bitrate not flowing through.
+    // =====================================================================
+
+    public static IEnumerable<object?[]> AutoPopulationRows() => new[]
+    {
+        // (legacyJson, expectedPreserve, expectedRowCount, expectedCodec, expectedLayout, expectedBitrate)
+        new object?[]
+        {
+            """{"AudioCodec":"aac","TwoChannelAudio":true,"AudioBitrateKbps":192}""",
+            false, 1, "aac",  "Stereo", 192,
+        },
+        new object?[]
+        {
+            """{"AudioCodec":"aac","TwoChannelAudio":false,"AudioBitrateKbps":256}""",
+            false, 1, "aac",  "Source", 256,
+        },
+        new object?[]
+        {
+            """{"AudioCodec":"eac3","TwoChannelAudio":false,"AudioBitrateKbps":384}""",
+            false, 1, "eac3", "Source", 384,
+        },
+        new object?[]
+        {
+            """{"AudioCodec":"opus","TwoChannelAudio":true,"AudioBitrateKbps":160}""",
+            false, 1, "opus", "Stereo", 160,
+        },
+        new object?[]
+        {
+            """{"AudioCodec":"copy"}""",
+            true, 0, null, null, 0,
+        },
+        new object?[]
+        {
+            // Empty/missing AudioCodec is treated as copy.
+            """{"Format":"mkv"}""",
+            true, 0, null, null, 0,
+        },
+    };
+
+    [Theory]
+    [MemberData(nameof(AutoPopulationRows))]
+    public void Legacy_settings_auto_populate_into_new_shape_for_UI_restoration(
+        string  legacyJson,
+        bool    expectedPreserve,
+        int     expectedRowCount,
+        string? expectedCodec,
+        string? expectedLayout,
+        int     expectedBitrate)
+    {
+        var parsed = JsonSerializer.Deserialize<EncoderOptions>(legacyJson, Opts);
+        parsed.Should().NotBeNull();
+        parsed!.ApplyLegacyAudioMigration();
+
+        // Re-serialize so we exercise the wire shape the JS reader actually consumes.
+        var rehydrated = JsonSerializer.Deserialize<EncoderOptions>(
+            JsonSerializer.Serialize(parsed, Opts), Opts);
+        rehydrated.Should().NotBeNull();
+
+        rehydrated!.PreserveOriginalAudio.Should().Be(expectedPreserve);
+        rehydrated.AudioOutputs.Should().HaveCount(expectedRowCount);
+
+        if (expectedRowCount > 0)
+        {
+            rehydrated.AudioOutputs[0].Codec.Should().Be(expectedCodec);
+            rehydrated.AudioOutputs[0].Layout.Should().Be(expectedLayout);
+            rehydrated.AudioOutputs[0].BitrateKbps.Should().Be(expectedBitrate);
+        }
+    }
 }
