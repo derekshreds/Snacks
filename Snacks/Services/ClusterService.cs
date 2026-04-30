@@ -3001,13 +3001,33 @@ public sealed class ClusterService : IHostedService, IDisposable
 
         try
         {
-            var orig = await _integrationService.LookupOriginalLanguageAsync(
-                originalPath, clone.OriginalLanguageProvider, ct);
+            // Cache-first: if the local-side scan / re-eval already resolved this file's
+            // original language, reuse the persisted value instead of re-hitting the
+            // integration provider. Same contract as TranscodingService.ResolveOriginalLanguageAsync.
+            var normalizedPath = Path.GetFullPath(originalPath);
+            var dbFile = await _mediaFileRepo.GetByPathAsync(normalizedPath);
+
+            string? orig = !string.IsNullOrWhiteSpace(dbFile?.OriginalLanguage)
+                ? dbFile!.OriginalLanguage
+                : await _integrationService.LookupOriginalLanguageAsync(
+                    originalPath, clone.OriginalLanguageProvider, ct);
+
             if (!string.IsNullOrEmpty(orig))
             {
                 if (!clone.AudioLanguagesToKeep.Contains(orig))    clone.AudioLanguagesToKeep.Add(orig);
                 if (!clone.SubtitleLanguagesToKeep.Contains(orig)) clone.SubtitleLanguagesToKeep.Add(orig);
                 Console.WriteLine($"Cluster: Pre-resolved original language '{orig}' for {Path.GetFileName(originalPath)}");
+
+                // Persist newly resolved values so subsequent scans / re-evals / local
+                // dispatches are cache hits, matching what the local TranscodingService
+                // paths do.
+                if (dbFile != null
+                    && !string.Equals(dbFile.OriginalLanguage, orig, StringComparison.OrdinalIgnoreCase))
+                {
+                    dbFile.OriginalLanguage = orig;
+                    try { await _mediaFileRepo.UpsertAsync(dbFile); }
+                    catch { /* DB blip; next scan will retry the persistence */ }
+                }
             }
         }
         catch (OperationCanceledException) { throw; }

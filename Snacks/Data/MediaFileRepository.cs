@@ -135,6 +135,10 @@ public class MediaFileRepository
                 // summaries that the Mux re-evaluation still needs.
                 if (file.AudioStreams    != null) existing.AudioStreams    = file.AudioStreams;
                 if (file.SubtitleStreams != null) existing.SubtitleStreams = file.SubtitleStreams;
+                // Same null-aware policy: a re-scan that didn't run a fresh language lookup
+                // (KeepOriginalLanguage off, no integration provider, or transient network
+                // failure) shouldn't wipe a value that was successfully resolved earlier.
+                if (file.OriginalLanguage != null) existing.OriginalLanguage = file.OriginalLanguage;
             }
             else
             {

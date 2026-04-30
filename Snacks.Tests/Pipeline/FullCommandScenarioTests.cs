@@ -428,7 +428,7 @@ public sealed class FullCommandScenarioTests
     //  Pin that the init-flag string composes correctly into the command.
     // =====================================================================
 
-    [Fact]
+    [LinuxOnlyFact]
     public void Scenario_vaapi_sw_decode_hw_encode_init_flags_compose()
     {
         var probe = new ProbeBuilder()
@@ -513,7 +513,7 @@ public sealed class FullCommandScenarioTests
     //  decode active, VAAPI rate-control path.
     // =====================================================================
 
-    [Fact]
+    [LinuxOnlyFact]
     public void Scenario_AMD_VAAPI_hevc_with_hwaccel_decode_MKV()
     {
         var probe = new ProbeBuilder()

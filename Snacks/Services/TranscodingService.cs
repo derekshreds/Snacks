@@ -478,6 +478,14 @@ public class TranscodingService
                 }
             }
 
+            // Resolve original language eagerly so every skip-ladder predicate sees the same
+            // effective keep lists that ConvertVideoAsync would build at encode time. Cached
+            // on MediaFile.OriginalLanguage so re-scans avoid re-querying the integration
+            // provider, and so WouldSkipUnderOptions / AnalyzeFileAsync can stay in sync.
+            var dbFile = await _mediaFileRepo.GetByPathAsync(normalizedPath);
+            string? originalLanguage = await ResolveOriginalLanguageAsync(filePath, options, dbFile, cancellationToken);
+            var effectiveOptions = WithOriginalLanguageMerged(options, originalLanguage);
+
             async Task MarkSkippedInDb()
             {
                 await _mediaFileRepo.UpsertAsync(new MediaFile
@@ -502,25 +510,26 @@ public class TranscodingService
                     // whether to flip this file back to Unseen without a re-probe.
                     AudioStreams    = MuxStreamSummary.Serialize(ProjectAudioSummaries(probe)),
                     SubtitleStreams = MuxStreamSummary.Serialize(ProjectSubtitleSummaries(probe)),
+                    OriginalLanguage = originalLanguage,
                 });
             }
 
             // Bypass the skip gate only when a non-Transcode mode has actual work to do on
             // this file. A pointless remux of a file that already matches every audio/subtitle
             // setting is never what the user wants.
-            bool hasMuxableWork = HasMuxableWork(options, probe);
-            bool bypassSkip     = options.EncodingMode != EncodingMode.Transcode && hasMuxableWork;
+            bool hasMuxableWork = HasMuxableWork(effectiveOptions, probe);
+            bool bypassSkip     = effectiveOptions.EncodingMode != EncodingMode.Transcode && hasMuxableWork;
 
             // MuxOnly: video is never re-encoded, so a file with no muxable audio/sub work
             // has nothing to do — skip it unconditionally, even if it's above the bitrate target.
-            if (options.EncodingMode == EncodingMode.MuxOnly && !hasMuxableWork)
+            if (effectiveOptions.EncodingMode == EncodingMode.MuxOnly && !hasMuxableWork)
             {
                 Console.WriteLine($"Skipping {workItem.FileName}: MuxOnly mode, no audio/subtitle work");
                 await MarkSkippedInDb();
                 return workItem.Id;
             }
 
-            if (options.Skip4K && isHighDef)
+            if (effectiveOptions.Skip4K && isHighDef)
             {
                 Console.WriteLine($"Skipping {workItem.FileName}: 4K video (Skip 4K enabled)");
                 await MarkSkippedInDb();
@@ -528,16 +537,16 @@ public class TranscodingService
             }
 
             string targetCodecLabel = targetIsAv1 ? "AV1" : (isHevc ? "HEVC" : "H.264");
-            double skipMultiplier = 1.0 + (Math.Clamp(options.SkipPercentAboveTarget, 0, 100) / 100.0);
-            if (alreadyTargetCodec && bitrate > 0 && bitrate <= options.TargetBitrate * skipMultiplier && !isHighDef && !bypassSkip)
+            double skipMultiplier = 1.0 + (Math.Clamp(effectiveOptions.SkipPercentAboveTarget, 0, 100) / 100.0);
+            if (alreadyTargetCodec && bitrate > 0 && bitrate <= effectiveOptions.TargetBitrate * skipMultiplier && !isHighDef && !bypassSkip)
             {
-                Console.WriteLine($"Skipping {workItem.FileName}: already {targetCodecLabel} at {bitrate}kbps (target {options.TargetBitrate}kbps, skip threshold {skipMultiplier:P0})");
+                Console.WriteLine($"Skipping {workItem.FileName}: already {targetCodecLabel} at {bitrate}kbps (target {effectiveOptions.TargetBitrate}kbps, skip threshold {skipMultiplier:P0})");
                 await MarkSkippedInDb();
                 return workItem.Id;
             }
 
-            int fourKMultiplier = Math.Clamp(options.FourKBitrateMultiplier, 2, 8);
-            int fourKTarget = options.TargetBitrate * fourKMultiplier;
+            int fourKMultiplier = Math.Clamp(effectiveOptions.FourKBitrateMultiplier, 2, 8);
+            int fourKTarget = effectiveOptions.TargetBitrate * fourKMultiplier;
             if (alreadyTargetCodec && isHighDef && bitrate > 0 && bitrate <= fourKTarget * skipMultiplier && !bypassSkip)
             {
                 Console.WriteLine($"Skipping {workItem.FileName}: already {targetCodecLabel} 4K at {bitrate}kbps (4K target {fourKTarget}kbps)");
@@ -547,10 +556,10 @@ public class TranscodingService
 
             // Skip low-bitrate non-HEVC files when using VAAPI CQP — it can't target specific bitrates.
             // Check both explicit VAAPI selection and "auto" (which resolves to VAAPI on Linux NAS).
-            bool isVaapiMode = IsVaapiAcceleration(options.HardwareAcceleration) ||
-                (options.HardwareAcceleration.Equals("auto", StringComparison.OrdinalIgnoreCase) &&
+            bool isVaapiMode = IsVaapiAcceleration(effectiveOptions.HardwareAcceleration) ||
+                (effectiveOptions.HardwareAcceleration.Equals("auto", StringComparison.OrdinalIgnoreCase) &&
                     _detectedHardware != null && IsVaapiAcceleration(_detectedHardware));
-            if (isVaapiMode && !isHevc && targetIsHevc && bitrate > 0 && bitrate <= options.TargetBitrate && !isHighDef && !bypassSkip)
+            if (isVaapiMode && !isHevc && targetIsHevc && bitrate > 0 && bitrate <= effectiveOptions.TargetBitrate && !isHighDef && !bypassSkip)
             {
                 Console.WriteLine($"Skipping {workItem.FileName}: VAAPI can't compress {bitrate}kbps H.264 below target");
                 await MarkSkippedInDb();
@@ -561,7 +570,7 @@ public class TranscodingService
             // to a videoCopy=true encode, and if the audio/sub pipeline has nothing to change either,
             // running ffmpeg just produces a near-identical output. Skip it instead.
             if (!bypassSkip && WouldEncodeBeNoOp(
-                    options, bitrate, isHevc, videoStream?.Height ?? 0, FfprobeService.IsHdr(probe),
+                    effectiveOptions, bitrate, isHevc, videoStream?.Height ?? 0, FfprobeService.IsHdr(probe),
                     ProjectAudioSummaries(probe), ProjectSubtitleSummaries(probe)))
             {
                 Console.WriteLine($"Skipping {workItem.FileName}: no work to do (video would copy, no audio/sub changes, no filters)");
@@ -585,7 +594,6 @@ public class TranscodingService
                 return workItem.Id;
             }
 
-            var dbFile = await _mediaFileRepo.GetByPathAsync(normalizedPath);
             if (dbFile != null)
             {
                 // Change detection: if the file's size changed significantly or duration differs,
@@ -641,6 +649,7 @@ public class TranscodingService
                 FileMtime = fileInfo.LastWriteTimeUtc.Ticks,
                 AudioStreams    = MuxStreamSummary.Serialize(ProjectAudioSummaries(probe)),
                 SubtitleStreams = MuxStreamSummary.Serialize(ProjectSubtitleSummaries(probe)),
+                OriginalLanguage = originalLanguage,
             });
 
             _workItems[workItem.Id] = workItem;
@@ -806,6 +815,24 @@ public class TranscodingService
             result.Width = width;
             result.Height = height;
             result.Duration = length;
+
+            // Resolve original language up front so the skip ladder predicts using the same
+            // effective keep lists ConvertVideoAsync would use. Reads the cached value when
+            // the row already has one (eg. AddFileAsync ran earlier), otherwise hits the
+            // configured integration provider live. Falls back to no-merge on failure.
+            string? originalLanguage = await ResolveOriginalLanguageAsync(filePath, options, dbFile, cancellationToken);
+            // Persist any newly resolved value so subsequent re-evals / scans / dispatches are
+            // cache hits — every place that resolves the language should update the row, so the
+            // value ends up consistent across analyze, scan, and dispatch.
+            if (!string.IsNullOrEmpty(originalLanguage)
+                && dbFile != null
+                && !string.Equals(dbFile.OriginalLanguage, originalLanguage, StringComparison.OrdinalIgnoreCase))
+            {
+                dbFile.OriginalLanguage = originalLanguage;
+                try { await _mediaFileRepo.UpsertAsync(dbFile); }
+                catch { /* analyze is a dry-run; a DB blip here doesn't change the verdict */ }
+            }
+            options = WithOriginalLanguageMerged(options, originalLanguage);
 
             bool targetIsHevc = options.Encoder.Contains("265", StringComparison.OrdinalIgnoreCase);
             bool targetIsAv1 = options.Encoder.Contains("av1", StringComparison.OrdinalIgnoreCase) || options.Encoder.Contains("svt", StringComparison.OrdinalIgnoreCase);
@@ -1383,6 +1410,27 @@ public class TranscodingService
                 var perJobOptions = current.Clone();
                 perJobOptions.HardwareAcceleration = deviceId == "cpu" ? "none" : deviceId;
 
+                // Pre-dispatch finalisation: resolve any missing OriginalLanguage live,
+                // merge it into the per-job keep lists, and re-run the skip ladder under
+                // the merged options. Keeps every "should this still encode?" decision in
+                // the dispatcher — workers are only ever handed items that genuinely need
+                // to encode. Catches three cases the queue couldn't pre-vet:
+                //   • Legacy DB rows queued before the OriginalLanguage cache existed.
+                //   • Settings toggled between AddFileAsync and dispatch (eg. user flipped
+                //     KeepOriginalLanguage on after the file was already queued).
+                //   • Force-adds that bypass parts of AddFileAsync's skip ladder.
+                if (!await FinaliseForDispatchAsync(workItem, perJobOptions, CancellationToken.None))
+                {
+                    Console.WriteLine($"Skipping {workItem.FileName}: pre-dispatch check — file already meets target under current options.");
+                    await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Skipped);
+                    _workItems.TryRemove(workItem.Id, out _);
+                    workItem.Status = WorkItemStatus.Cancelled;
+                    try { await _hubContext.Clients.All.SendAsync("WorkItemRemoved", workItem.Id); } catch { /* SignalR errors are non-fatal */ }
+                    // No slot to release — TryAcquireLocalDeviceSlot reads occupancy live from
+                    // _activeLocalJobs, and we never added this item to that map.
+                    continue;
+                }
+
                 // Pre-register the active job synchronously before spawning so
                 // the scheduler's next iteration counts it against the device's
                 // cap without a race window.
@@ -1649,27 +1697,6 @@ public class TranscodingService
         await ResolveHardwareAccelerationAsync(options);
         await LogAsync(workItem.Id, $"Hardware acceleration: {options.HardwareAcceleration}");
         await LogAsync(workItem.Id, $"Video Bitrate: {workItem.Bitrate}kbps");
-
-        // Original-language lookup: merge the source's original language into the keep-lists
-        // for THIS job only (options is already a per-job clone from EncoderOptionsOverride).
-        if (options.KeepOriginalLanguage && _integrationService != null)
-        {
-            var orig = await _integrationService.LookupOriginalLanguageAsync(
-                workItem.Path, options.OriginalLanguageProvider, cancellationToken);
-            if (!string.IsNullOrEmpty(orig))
-            {
-                await LogAsync(workItem.Id, $"Original language resolved: {orig}");
-                if (!options.AudioLanguagesToKeep.Contains(orig))
-                    options.AudioLanguagesToKeep.Add(orig);
-                if (!options.SubtitleLanguagesToKeep.Contains(orig))
-                    options.SubtitleLanguagesToKeep.Add(orig);
-            }
-            else
-            {
-                await LogAsync(workItem.Id,
-                    $"Original-language lookup ({options.OriginalLanguageProvider}) returned nothing; keeping configured languages.");
-            }
-        }
 
         var (targetBitrate, minBitrate, maxBitrate, videoCopy) = CalculateBitrates(workItem, options);
 
@@ -2338,13 +2365,149 @@ public class TranscodingService
     }
 
     /// <summary>
+    ///     Returns a clone of <paramref name="options"/> with <paramref name="originalLanguage"/>
+    ///     merged into the audio + subtitle keep lists when <c>KeepOriginalLanguage</c> is on.
+    ///     Mirrors the merge that <see cref="ConvertVideoAsync"/> performs at encode time so
+    ///     the scan-phase skip predicates and the analyze dry-run see the same effective lists.
+    ///     Returns <paramref name="options"/> unchanged when the merge is a no-op.
+    /// </summary>
+    /// <param name="options"> Base options to merge into. Not mutated. </param>
+    /// <param name="originalLanguage"> ISO 639-1 code, or <see langword="null"/> when unknown. </param>
+    internal static EncoderOptions WithOriginalLanguageMerged(EncoderOptions options, string? originalLanguage)
+    {
+        if (!options.KeepOriginalLanguage) return options;
+        if (string.IsNullOrWhiteSpace(originalLanguage)) return options;
+
+        bool inAudio = options.AudioLanguagesToKeep.Contains(originalLanguage);
+        bool inSubs  = options.SubtitleLanguagesToKeep.Contains(originalLanguage);
+        if (inAudio && inSubs) return options;
+
+        var merged = options.Clone();
+        if (!inAudio) merged.AudioLanguagesToKeep.Add(originalLanguage);
+        if (!inSubs)  merged.SubtitleLanguagesToKeep.Add(originalLanguage);
+        return merged;
+    }
+
+    /// <summary>
+    ///     Resolves the original language for a file, preferring the cached value on
+    ///     <paramref name="dbFile"/> over a live integration-provider lookup. Returns
+    ///     <see langword="null"/> when <c>KeepOriginalLanguage</c> is off, no provider is
+    ///     wired, or the lookup fails — callers fall back to the user-configured keep
+    ///     lists in that case (matches <see cref="ConvertVideoAsync"/>'s historical behavior).
+    /// </summary>
+    private async Task<string?> ResolveOriginalLanguageAsync(
+        string filePath,
+        EncoderOptions options,
+        MediaFile? dbFile,
+        CancellationToken cancellationToken)
+    {
+        if (!options.KeepOriginalLanguage) return null;
+        if (!string.IsNullOrWhiteSpace(dbFile?.OriginalLanguage)) return dbFile!.OriginalLanguage;
+        if (_integrationService == null) return null;
+
+        try
+        {
+            return await _integrationService.LookupOriginalLanguageAsync(
+                filePath, options.OriginalLanguageProvider, cancellationToken);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { return null; }
+    }
+
+    /// <summary>
+    ///     Builds a transient <see cref="MediaFile"/> view over an in-flight <see cref="WorkItem"/>
+    ///     so the late skip-bail in <see cref="ProcessWorkItemAsync"/> can run the full
+    ///     <see cref="WouldSkipUnderOptions"/> ladder without touching the DB. Stream summaries
+    ///     are projected from the work item's probe; <paramref name="originalLanguage"/> is
+    ///     plugged in so the inner merge inside <see cref="WouldSkipUnderOptions"/> sees the
+    ///     same value <see cref="ApplyOriginalLanguageMergeAsync"/> already merged into options.
+    /// </summary>
+    private static MediaFile SyntheticMediaFile(WorkItem workItem, string? originalLanguage)
+    {
+        var videoStream = workItem.Probe?.Streams.FirstOrDefault(s => s.CodecType == "video");
+        return new MediaFile
+        {
+            FilePath        = workItem.Path,
+            Bitrate         = workItem.Bitrate,
+            Codec           = videoStream?.CodecName ?? (workItem.IsHevc ? "hevc" : "unknown"),
+            Width           = videoStream?.Width  ?? 0,
+            Height          = videoStream?.Height ?? 0,
+            IsHevc          = workItem.IsHevc,
+            Is4K            = workItem.Is4K,
+            AudioStreams    = workItem.Probe != null
+                                ? MuxStreamSummary.Serialize(ProjectAudioSummaries(workItem.Probe))
+                                : null,
+            SubtitleStreams = workItem.Probe != null
+                                ? MuxStreamSummary.Serialize(ProjectSubtitleSummaries(workItem.Probe))
+                                : null,
+            OriginalLanguage = originalLanguage,
+        };
+    }
+
+    /// <summary>
+    ///     The dispatcher's last gate before a <see cref="WorkItem"/> goes to a worker:
+    ///     resolves and persists any missing <see cref="MediaFile.OriginalLanguage"/>,
+    ///     merges it into <paramref name="perJobOptions"/>'s keep lists, and re-runs the
+    ///     full <see cref="WouldSkipUnderOptions"/> ladder under those merged options.
+    ///
+    ///     Returns <see langword="true"/> when the file should still encode; the caller
+    ///     dispatches it. Returns <see langword="false"/> when the merged state reveals
+    ///     there's no real work — the caller marks the row Skipped and drops it from the
+    ///     queue without ever invoking the worker. This keeps every "should this encode?"
+    ///     decision in the dispatcher and lets <see cref="ProcessWorkItemAsync"/> /
+    ///     <see cref="ConvertVideoAsync"/> trust the items they receive.
+    ///
+    ///     <paramref name="perJobOptions"/> must already be a per-job clone — its keep
+    ///     lists are mutated in place.
+    /// </summary>
+    private async Task<bool> FinaliseForDispatchAsync(
+        WorkItem workItem, EncoderOptions perJobOptions, CancellationToken cancellationToken)
+    {
+        var normalizedPath = Path.GetFullPath(workItem.Path);
+        var dbFile = await _mediaFileRepo.GetByPathAsync(normalizedPath);
+        string? originalLanguage = await ResolveOriginalLanguageAsync(
+            workItem.Path, perJobOptions, dbFile, cancellationToken);
+
+        // Cache newly resolved values so re-evaluations and re-scans are cache hits.
+        if (!string.IsNullOrEmpty(originalLanguage)
+            && dbFile != null
+            && !string.Equals(dbFile.OriginalLanguage, originalLanguage, StringComparison.OrdinalIgnoreCase))
+        {
+            dbFile.OriginalLanguage = originalLanguage;
+            try { await _mediaFileRepo.UpsertAsync(dbFile); }
+            catch { /* a DB blip here doesn't change the encode decision; next scan persists it */ }
+        }
+
+        // Merge into perJobOptions so HasMuxableWork at encode time + the audio/sub
+        // planner inside ConvertVideoAsync both see the same effective keep lists.
+        if (!string.IsNullOrEmpty(originalLanguage) && perJobOptions.KeepOriginalLanguage)
+        {
+            if (!perJobOptions.AudioLanguagesToKeep.Contains(originalLanguage))
+                perJobOptions.AudioLanguagesToKeep.Add(originalLanguage);
+            if (!perJobOptions.SubtitleLanguagesToKeep.Contains(originalLanguage))
+                perJobOptions.SubtitleLanguagesToKeep.Add(originalLanguage);
+        }
+
+        // Final skip check under the merged options. Synthesises a MediaFile shape
+        // from the work item + probe so WouldSkipUnderOptions can run against the
+        // same fields it uses on the persisted DB row.
+        var skipMf = SyntheticMediaFile(workItem, originalLanguage);
+        return !WouldSkipUnderOptions(skipMf, perJobOptions);
+    }
+
+    /// <summary>
     ///     Pure function that mirrors the scan-phase skip gate using only <see cref="MediaFile"/>
     ///     fields (no probe required). Returns <see langword="true"/> when the file would still be
     ///     skipped under the given options — used on settings-save to decide whether to reset
     ///     <see cref="MediaFileStatus.Skipped"/> rows back to <see cref="MediaFileStatus.Unseen"/>.
+    ///     Reads <see cref="MediaFile.OriginalLanguage"/> so files that would have their original
+    ///     language preserved at encode time are evaluated against the same effective keep lists
+    ///     instead of predicting drops that won't actually happen.
     /// </summary>
     public static bool WouldSkipUnderOptions(MediaFile mf, EncoderOptions options)
     {
+        options = WithOriginalLanguageMerged(options, mf.OriginalLanguage);
+
         // Skip4K overrides everything else.
         if (options.Skip4K && mf.Is4K) return true;
 
@@ -3002,9 +3165,14 @@ public class TranscodingService
     ///     forcing hardware decode (software decode + VAAPI encode mode).
     /// </summary>
     internal static string GetInitFlags(string hardwareAcceleration, bool hwDecode = true)
-    {
-        bool isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+        => GetInitFlags(hardwareAcceleration, RuntimeInformation.IsOSPlatform(OSPlatform.Windows), hwDecode);
 
+    /// <summary>
+    ///     Pure overload that takes <paramref name="isWindows"/> explicitly so unit tests can
+    ///     exercise the VAAPI / QSV / AMF branches independently of the test host OS.
+    /// </summary>
+    internal static string GetInitFlags(string hardwareAcceleration, bool isWindows, bool hwDecode)
+    {
         return hardwareAcceleration.ToLower() switch
         {
             "intel" when isWindows => "-y -hwaccel qsv -hwaccel_output_format qsv -qsv_device auto",
@@ -4027,6 +4195,44 @@ public class TranscodingService
     public void UpdateOptions(EncoderOptions options) => _lastOptions = options;
 
     /// <summary>
+    ///     Resolves and persists <see cref="MediaFile.OriginalLanguage"/> for every row in
+    ///     <paramref name="files"/> whose value is currently null. No-op when
+    ///     <c>KeepOriginalLanguage</c> is off or no integration provider is wired.
+    ///     The integration service caches per-show / per-movie, so a library with N files
+    ///     across M titles makes ~M API calls, not N.
+    /// </summary>
+    /// <returns>The number of rows whose <c>OriginalLanguage</c> was newly populated.</returns>
+    public async Task<int> BackfillOriginalLanguageAsync(
+        IReadOnlyList<MediaFile> files,
+        EncoderOptions options,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(files);
+        ArgumentNullException.ThrowIfNull(options);
+        if (!options.KeepOriginalLanguage || _integrationService == null) return 0;
+
+        int filled = 0;
+        foreach (var mf in files)
+        {
+            if (cancellationToken.IsCancellationRequested) break;
+            if (!string.IsNullOrWhiteSpace(mf.OriginalLanguage)) continue;
+
+            try
+            {
+                var resolved = await _integrationService.LookupOriginalLanguageAsync(
+                    mf.FilePath, options.OriginalLanguageProvider, cancellationToken);
+                if (string.IsNullOrEmpty(resolved)) continue;
+                mf.OriginalLanguage = resolved;
+                await _mediaFileRepo.UpsertAsync(mf);
+                filled++;
+            }
+            catch (OperationCanceledException) { throw; }
+            catch { /* lookup failures fall back to the configured keep lists, matching ConvertVideoAsync */ }
+        }
+        return filled;
+    }
+
+    /// <summary>
     ///     Removes <see cref="WorkItemStatus.Pending"/> items from the local queue that no
     ///     longer need encoding under <paramref name="newOptions"/> — the inverse of the
     ///     scan-time skip ladder. Used by the settings-save flow when the user changes a
@@ -4061,6 +4267,13 @@ public class TranscodingService
         // Step 2: re-evaluate each candidate against the new options using its cached
         // MediaFile row. Items missing the row or the per-track summaries are left alone
         // (conservative: the next scan re-probes them).
+        //
+        // When KeepOriginalLanguage is on we resolve and cache the original language for
+        // any row that doesn't have one yet — without it, WouldSkipUnderOptions can't see
+        // the merged keep lists and would mis-predict drops on rows queued before the
+        // OriginalLanguage cache existed. Live lookups go through the integration provider
+        // and may be slow; the resolved value is persisted so subsequent re-evaluations are
+        // cache hits.
         var idsToRemove = new HashSet<string>();
         foreach (var (id, path) in candidates)
         {
@@ -4068,6 +4281,23 @@ public class TranscodingService
             var mf = await _mediaFileRepo.GetByPathAsync(normalizedPath);
             if (mf == null) continue;
             if (mf.AudioStreams == null && mf.SubtitleStreams == null) continue;
+
+            if (newOptions.KeepOriginalLanguage
+                && string.IsNullOrWhiteSpace(mf.OriginalLanguage)
+                && _integrationService != null)
+            {
+                try
+                {
+                    var resolved = await _integrationService.LookupOriginalLanguageAsync(
+                        mf.FilePath, newOptions.OriginalLanguageProvider, CancellationToken.None);
+                    if (!string.IsNullOrEmpty(resolved))
+                    {
+                        mf.OriginalLanguage = resolved;
+                        await _mediaFileRepo.UpsertAsync(mf);
+                    }
+                }
+                catch { /* lookup failures fall back to the configured keep lists, matching ConvertVideoAsync */ }
+            }
 
             if (WouldSkipUnderOptions(mf, newOptions)) idsToRemove.Add(id);
         }

@@ -112,6 +112,19 @@ public sealed class MediaFile
     public string? SubtitleStreams { get; set; }
 
     /// <summary>
+    ///     ISO 639-1 (2-letter) original language resolved via the configured
+    ///     <c>OriginalLanguageProvider</c> (Sonarr / Radarr / TVDB / TMDb) at
+    ///     scan time. Cached so the scan-phase skip predicates and the analyze
+    ///     dry-run see the same merged keep-list that <c>ConvertVideoAsync</c>
+    ///     would build at encode time — without re-querying the integration
+    ///     provider on every settings save.
+    ///
+    ///     <see langword="null"/> means "not yet looked up" or "lookup failed";
+    ///     callers fall back to the user-configured keep lists in that case.
+    /// </summary>
+    public string? OriginalLanguage { get; set; }
+
+    /// <summary>
     ///     The <see cref="WorkItem.Id"/> GUID used when this file was dispatched as a remote job.
     ///     Preserved across restarts so nodes can resume partial uploads under the same ID.
     ///     Only cleared on successful completion (not on failure) to enable retry resume.

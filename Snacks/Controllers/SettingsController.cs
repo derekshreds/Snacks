@@ -206,6 +206,17 @@ public sealed class SettingsController : ControllerBase
                 });
             }
 
+            // Pre-pass: resolve and persist OriginalLanguage for any rows that don't have one
+            // yet, so WouldSkipUnderOptions sees the merged keep lists. Without this, the
+            // ladder would mis-predict drops on files queued before the OriginalLanguage
+            // cache existed (or before KeepOriginalLanguage was turned on). Cheap when the
+            // integration provider caches per-show / per-movie.
+            var skippedRows = await _mediaFileRepo.GetFilesWithStatusAsync(MediaFileStatus.Skipped);
+            var unseenRows  = await _mediaFileRepo.GetFilesWithStatusAsync(MediaFileStatus.Unseen);
+            var queuedRows  = await _mediaFileRepo.GetFilesWithStatusAsync(MediaFileStatus.Queued);
+            var allRows     = skippedRows.Concat(unseenRows).Concat(queuedRows).ToList();
+            await _transcodingService.BackfillOriginalLanguageAsync(allRows, options);
+
             // Direction A: files newly eligible under current settings (Skipped → Unseen).
             // Legacy rows without stream summaries are kicked back to Unseen too so the
             // next scan re-probes them.
