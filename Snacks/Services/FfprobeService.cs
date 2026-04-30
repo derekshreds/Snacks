@@ -251,6 +251,7 @@ public class FfprobeService
 
         var maps         = new StringBuilder();   // -map 0:N tokens
         var codecArgs    = new StringBuilder();   // -c:a:N / -b:a:N / -ac:a:N tokens
+        var meta         = new StringBuilder();   // -metadata:s:a:N language=... / title=... tokens
         int outIndex     = 0;                     // running output-audio-stream index
 
         foreach (var (bucket, sources) in buckets)
@@ -329,9 +330,13 @@ public class FfprobeService
                     var fallback = ResolveAudioCodec("aac", src.Channels, isMatroska, warnings);
                     maps.Append($"-map 0:{src.Index} ");
                     codecArgs.Append(BuildAudioCodecArgs(fallback.codec, fallback.channels, 0, outIndex)).Append(' ');
+                    AppendAudioMeta(meta, outIndex, bucket, fallback.codec);
                 }
                 else
                 {
+                    // -c:a copy preserves source language + title metadata, so we leave
+                    // those alone here — overriding would clobber descriptive titles like
+                    // "Surround 5.1" on the original tracks.
                     maps.Append($"-map 0:{src.Index} ");
                     codecArgs.Append($"-c:a:{outIndex} copy ");
                 }
@@ -343,13 +348,42 @@ public class FfprobeService
             {
                 maps.Append($"-map 0:{re.srcIndex} ");
                 codecArgs.Append(BuildAudioCodecArgs(re.codec, re.channels, re.bitrateKbps, outIndex)).Append(' ');
+                AppendAudioMeta(meta, outIndex, bucket, re.codec);
                 outIndex++;
             }
         }
 
         if (outIndex == 0) return "";
-        return (maps.ToString() + codecArgs.ToString()).TrimEnd();
+        return (maps.ToString() + codecArgs.ToString() + meta.ToString()).TrimEnd();
     }
+
+    /// <summary>
+    ///     Stamps an encoded output stream with <c>language=</c> + a
+    ///     <c>"Language (CODEC)"</c> title (e.g. <c>"English (AAC)"</c>) so players display
+    ///     a meaningful track name instead of falling back to the source's stale title (which
+    ///     might still say "5.1 Surround" after a stereo downmix). Copies skip this — their
+    ///     metadata flows through with <c>-c:a copy</c>.
+    /// </summary>
+    private static void AppendAudioMeta(StringBuilder meta, int outIndex, string bucket, string codec)
+    {
+        var langTag = LanguageMatcher.ToThreeLetterB(bucket);
+        if (!string.IsNullOrEmpty(langTag) && !string.Equals(langTag, "und", StringComparison.OrdinalIgnoreCase))
+            meta.Append($"-metadata:s:a:{outIndex} language={langTag} ");
+
+        var langName = LanguageMatcher.ToEnglishName(bucket);
+        var prefix   = !string.IsNullOrEmpty(langName) ? langName : "Audio";
+        meta.Append($"-metadata:s:a:{outIndex} title=\"{prefix} ({CodecLabel(codec)})\" ");
+    }
+
+    /// <summary> Display label for a codec name in track titles. </summary>
+    private static string CodecLabel(string codec) => (codec ?? "").ToLowerInvariant() switch
+    {
+        "aac"  => "AAC",
+        "ac3"  => "AC3",
+        "eac3" => "E-AC3",
+        "opus" => "Opus",
+        _      => (codec ?? "").ToUpperInvariant(),
+    };
 
     /// <summary>
     ///     Resolves a requested codec + channel count into what FFmpeg will actually run,
