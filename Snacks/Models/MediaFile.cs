@@ -68,6 +68,15 @@ public sealed class MediaFile
     /// <summary> Whether the video stream is HEVC/H.265 encoded. </summary>
     public bool IsHevc { get; set; }
 
+    /// <summary>
+    ///     Whether the video stream is HDR (PQ / HLG / Dolby Vision detected via
+    ///     <c>FfprobeService.IsHdr</c>). Cached so the analyze dry-run path and
+    ///     <c>WouldSkipUnderOptions</c> can answer "would tonemap fire?" from a
+    ///     cached row instead of hard-coding <see langword="false"/> when no
+    ///     fresh probe is available.
+    /// </summary>
+    public bool IsHdr { get; set; }
+
     /// <summary> Whether the video resolution exceeds 1920px width (4K/UHD detection). </summary>
     public bool Is4K { get; set; }
 

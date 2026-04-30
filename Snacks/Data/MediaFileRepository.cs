@@ -126,6 +126,7 @@ public class MediaFileRepository
                 existing.PixelFormat = file.PixelFormat;
                 existing.Duration = file.Duration;
                 existing.IsHevc = file.IsHevc;
+                existing.IsHdr = file.IsHdr;
                 existing.Is4K = file.Is4K;
                 existing.Status = file.Status;
                 existing.LastScannedAt = file.LastScannedAt;

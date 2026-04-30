@@ -15,10 +15,11 @@
  * will actually take effect.
  */
 
-import { clusterApi, autoScanApi }    from '../api.js';
-import { escapeHtml }                 from '../utils/dom.js';
-import { openModal, closeModal }      from '../utils/modal-controller.js';
-import { defaultBitrateForCodec }     from '../settings/encoder-form.js';
+import { clusterApi, autoScanApi }                  from '../api.js';
+import { escapeHtml }                               from '../utils/dom.js';
+import { openModal, closeModal }                    from '../utils/modal-controller.js';
+import { defaultBitrateForCodec }                   from '../settings/encoder-form.js';
+import { initChipInput, getChipValues, setChipValues } from '../settings/chip-input.js';
 
 
 // ---------------------------------------------------------------------------
@@ -55,12 +56,14 @@ const FOLDER_OVERRIDE_FIELDS = Object.freeze({
     AudioOutputs:               'audioOutputs',
     KeepOriginalLanguage:       'bool',
     OriginalLanguageProvider:   'select',
+    AudioLanguagesToKeep:       'languageList',
 
     // Subtitles
     ExtractSubtitlesToSidecar:    'bool',
     SidecarSubtitleFormat:        'select',
     ConvertImageSubtitlesToSrt:   'bool',
     PassThroughImageSubtitlesMkv: 'bool',
+    SubtitleLanguagesToKeep:      'languageList',
 
     // Encoding mode
     EncodingMode:               'select',
@@ -94,12 +97,14 @@ const NODE_OVERRIDE_FIELDS = Object.freeze({
     AudioOutputs:               'audioOutputs',
     KeepOriginalLanguage:       'bool',
     OriginalLanguageProvider:   'select',
+    AudioLanguagesToKeep:       'languageList',
 
     // Subtitles
     ExtractSubtitlesToSidecar:    'bool',
     SidecarSubtitleFormat:        'select',
     ConvertImageSubtitlesToSrt:   'bool',
     PassThroughImageSubtitlesMkv: 'bool',
+    SubtitleLanguagesToKeep:      'languageList',
 
     // Encoding mode
     EncodingMode:               'select',
@@ -570,6 +575,14 @@ export class OverrideDialog {
             clone.addEventListener('click', handler);
         }
 
+        // Initialise the chip-input widgets for any languageList fields in the active
+        // context. Idempotent: subsequent opens are a no-op for already-inited roots.
+        for (const [field, type] of Object.entries(this._activeFields)) {
+            if (type !== 'languageList') continue;
+            const root = document.getElementById(`ovr${field}`);
+            if (root) initChipInput(root);
+        }
+
         openModal(MODAL_ID);
     }
 
@@ -595,6 +608,17 @@ export class OverrideDialog {
                     // rather than a single input.
                     ovrSetAudioOutputsEnabled(toggle.checked);
                     if (!toggle.checked) ovrSetAudioOutputs([]);
+                    return;
+                }
+                if (type === 'languageList') {
+                    // Chip-input language list. Greyed-out + pointer-events:none mirrors
+                    // how AudioOutputs handles the disabled state.
+                    const root = document.getElementById(`ovr${field}`);
+                    if (root) {
+                        root.style.opacity = toggle.checked ? '' : '0.5';
+                        root.style.pointerEvents = toggle.checked ? '' : 'none';
+                    }
+                    if (!toggle.checked) setChipValues(`ovr${field}`, []);
                     return;
                 }
 
@@ -623,6 +647,15 @@ export class OverrideDialog {
             if (type === 'audioOutputs') {
                 ovrSetAudioOutputs([]);
                 ovrSetAudioOutputsEnabled(false);
+                continue;
+            }
+            if (type === 'languageList') {
+                setChipValues(`ovr${field}`, []);
+                const root = document.getElementById(`ovr${field}`);
+                if (root) {
+                    root.style.opacity = '0.5';
+                    root.style.pointerEvents = 'none';
+                }
                 continue;
             }
 
@@ -654,6 +687,15 @@ export class OverrideDialog {
             if (type === 'audioOutputs') {
                 ovrSetAudioOutputs(Array.isArray(val) ? val : []);
                 ovrSetAudioOutputsEnabled(true);
+                continue;
+            }
+            if (type === 'languageList') {
+                setChipValues(`ovr${field}`, Array.isArray(val) ? val : []);
+                const root = document.getElementById(`ovr${field}`);
+                if (root) {
+                    root.style.opacity = '';
+                    root.style.pointerEvents = '';
+                }
                 continue;
             }
 
@@ -689,6 +731,12 @@ export class OverrideDialog {
                 // Empty list is a valid override ("no encoded outputs") — distinct from
                 // "override off". Only the toggle decides null vs the value.
                 result[key] = ovrReadAudioOutputs();
+                continue;
+            }
+            if (type === 'languageList') {
+                // Empty list is a valid override ("keep no specific language") — same
+                // null-vs-value distinction the toggle already gates on.
+                result[key] = getChipValues(`ovr${field}`);
                 continue;
             }
 

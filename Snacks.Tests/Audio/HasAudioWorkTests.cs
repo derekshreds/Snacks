@@ -67,15 +67,19 @@ public sealed class HasAudioWorkTests
     // ---------------------------------------------------------------------
 
     [Fact]
-    public void Preserve_off_is_audio_work_even_with_no_extra_outputs()
+    public void Preserve_off_with_no_extra_outputs_and_single_track_per_language_is_not_work()
     {
+        // The empty-language safeguard in FfprobeService.MapAudio copies the
+        // highest-channel kept track unchanged when no profiles produce output —
+        // so a single-track-per-language source produces an output identical to
+        // the input. Treating that as work would burn a no-op encode.
         var opts = new EncoderOptions
         {
             PreserveOriginalAudio = false,
             AudioOutputs          = new(),
             AudioLanguagesToKeep  = new() { "en" },
         };
-        TranscodingService.HasAudioWork(opts, new[] { Sum("ac3", 6, "eng") }).Should().BeTrue();
+        TranscodingService.HasAudioWork(opts, new[] { Sum("ac3", 6, "eng") }).Should().BeFalse();
     }
 
 
@@ -181,5 +185,87 @@ public sealed class HasAudioWorkTests
         // Title doesn't match "comm" → no work signal from commentary detection.
         TranscodingService.HasAudioWork(opts, new[] { Sum("ac3", 6, "eng", title: "Main Theatrical Mix") })
             .Should().BeFalse();
+    }
+
+
+    // ---------------------------------------------------------------------
+    //  Preserve=off interaction with AudioOutputs. The historical "Preserve=off
+    //  ⇒ work" rule over-reported when the planner's empty-language safeguard
+    //  (FfprobeService.MapAudio) would have copied the highest-channel kept
+    //  track unchanged. These tests pin the corrected behavior:
+    //    • non-empty AudioOutputs ⇒ work (drops or re-encodes)
+    //    • empty AudioOutputs + 1 track per language ⇒ no work (safeguard copies)
+    //    • empty AudioOutputs + multi-track per language ⇒ work (siblings dropped)
+    // ---------------------------------------------------------------------
+
+    [Fact]
+    public void Preserve_off_with_audio_outputs_is_work()
+    {
+        // The planner emits one encode (or codec-deduped copy) per profile and
+        // drops everything else. Either way the output differs from the source.
+        var opts = new EncoderOptions
+        {
+            PreserveOriginalAudio = false,
+            AudioOutputs          = new() { new AudioOutputProfile { Codec = "aac", Layout = "stereo", BitrateKbps = 192 } },
+            AudioLanguagesToKeep  = new(),
+        };
+
+        TranscodingService.HasAudioWork(opts, new[] { Sum("ac3", 6, "eng") }).Should().BeTrue();
+    }
+
+
+    [Fact]
+    public void Preserve_off_empty_outputs_single_track_per_language_is_not_work()
+    {
+        // Empty-language safeguard in MapAudio kicks in: highest-channel kept track
+        // gets copied unchanged. Output == source for this case.
+        var opts = new EncoderOptions
+        {
+            PreserveOriginalAudio = false,
+            AudioOutputs          = new(),
+            AudioLanguagesToKeep  = new(),
+        };
+
+        TranscodingService.HasAudioWork(opts, new[] { Sum("ac3", 6, "eng") }).Should().BeFalse();
+    }
+
+
+    [Fact]
+    public void Preserve_off_empty_outputs_multi_track_per_language_is_work()
+    {
+        // 5.1 + stereo English. Safeguard picks one (5.1) and drops the other.
+        // That drop is a real change → work.
+        var opts = new EncoderOptions
+        {
+            PreserveOriginalAudio = false,
+            AudioOutputs          = new(),
+            AudioLanguagesToKeep  = new(),
+        };
+
+        TranscodingService.HasAudioWork(opts, new[]
+        {
+            Sum("ac3", 6, "eng"),
+            Sum("aac", 2, "eng"),
+        }).Should().BeTrue();
+    }
+
+
+    [Fact]
+    public void Preserve_off_empty_outputs_multi_languages_each_single_is_not_work()
+    {
+        // One French + one English: each language bucket has a single track,
+        // safeguard copies both. No drops.
+        var opts = new EncoderOptions
+        {
+            PreserveOriginalAudio = false,
+            AudioOutputs          = new(),
+            AudioLanguagesToKeep  = new(),
+        };
+
+        TranscodingService.HasAudioWork(opts, new[]
+        {
+            Sum("ac3", 6, "eng"),
+            Sum("ac3", 6, "fre"),
+        }).Should().BeFalse();
     }
 }

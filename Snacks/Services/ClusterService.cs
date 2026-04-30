@@ -1173,6 +1173,30 @@ public sealed class ClusterService : IHostedService, IDisposable
                 var nodeOverride  = GetNodeSettings(bestNode.NodeId)?.EncodingOverrides;
                 var finalOptions  = EncoderOptionsOverride.ApplyOverrides(globalOptions, folderOverride, nodeOverride);
 
+                // Pre-dispatch skip gate (mirror of the local FinaliseForDispatchAsync).
+                // Resolves any missing OriginalLanguage live, persists it, merges it into
+                // finalOptions, and re-runs WouldSkipUnderOptions against those merged
+                // options. Catches the same three cases the local path does — legacy rows,
+                // settings flipped between queue add and remote dispatch, force-adds — so
+                // remote workers don't waste time on no-op encodes either.
+                if (!await _transcodingService.FinaliseForDispatchAsync(workItem, finalOptions, CancellationToken.None))
+                {
+                    await _transcodingService.MarkDispatchSkippedAsync(workItem,
+                        "cluster pre-dispatch check — file already meets target under current options");
+                    // Release the optimistic slot we never actually claimed yet (we're
+                    // still pre-dispatch — ActiveJobs hasn't been touched on this iteration).
+                    continue;
+                }
+
+                // Cancel/Stop race: workItem.Status could have flipped during the awaits
+                // inside FinaliseForDispatchAsync. Without this, the dispatch task would
+                // upload + run the encode despite the user having cancelled.
+                if (workItem.Status is WorkItemStatus.Cancelled or WorkItemStatus.Stopped)
+                {
+                    Console.WriteLine($"Dropping {workItem.FileName}: cancelled/stopped during cluster dispatch finalisation");
+                    continue;
+                }
+
                 // Optimistic slot accounting: claim the slot now so the next
                 // iteration of this dispatch loop counts it against the
                 // device's cap before the heartbeat reflects the new state.

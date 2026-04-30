@@ -341,6 +341,15 @@
                             <option value="TVDB">TVDB (TV)</option><option value="TMDb">TMDb</option>
                         </select>
                     </div>
+                    <div class="form-check mb-2" data-context="folder,node">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_AudioLanguagesToKeep" data-field="AudioLanguagesToKeep">
+                        <label class="form-check-label" for="ovr_AudioLanguagesToKeep">Audio Languages to Keep</label>
+                        <div class="form-text">Empty list keeps all audio tracks. The override fully replaces the base list.</div>
+                        <div class="chip-input mt-1" id="ovrAudioLanguagesToKeep" data-source="iso-languages" style="opacity:0.5; pointer-events:none;">
+                            <div class="chip-list"></div>
+                            <input type="text" class="chip-new" placeholder="Type a language (e.g. en, eng, English)">
+                        </div>
+                    </div>
                 </div>
                 <div class="col-md-6">
                     <div class="form-check mb-2" data-context="folder,node">
@@ -415,6 +424,15 @@
                         <input class="form-check-input override-toggle" type="checkbox" id="ovr_PassThroughImageSubtitlesMkv" data-field="PassThroughImageSubtitlesMkv">
                         <label class="form-check-label" for="ovr_PassThroughImageSubtitlesMkv">Pass Through Image Subtitles (MKV)</label>
                         <div class="form-check form-switch mt-1"><input class="form-check-input" type="checkbox" id="ovrPassThroughImageSubtitlesMkv" disabled></div>
+                    </div>
+                    <div class="form-check mb-2" data-context="folder,node">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_SubtitleLanguagesToKeep" data-field="SubtitleLanguagesToKeep">
+                        <label class="form-check-label" for="ovr_SubtitleLanguagesToKeep">Subtitle Languages to Keep</label>
+                        <div class="form-text">Empty list keeps all subtitle tracks. The override fully replaces the base list.</div>
+                        <div class="chip-input mt-1" id="ovrSubtitleLanguagesToKeep" data-source="iso-languages" style="opacity:0.5; pointer-events:none;">
+                            <div class="chip-list"></div>
+                            <input type="text" class="chip-new" placeholder="Type a language (e.g. en, eng, English)">
+                        </div>
                     </div>
                 </div>
             </div>

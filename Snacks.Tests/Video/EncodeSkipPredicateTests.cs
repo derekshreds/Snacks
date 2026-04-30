@@ -365,11 +365,17 @@ public sealed class EncodeSkipPredicateTests
     [Fact]
     public void WouldEncodeBeNoOp_false_when_audio_work_is_pending()
     {
+        // Preserve=off + a profile that doesn't dedup against the source → real audio work.
+        // Pre-fix the "Preserve=off ⇒ work" rule fired on empty AudioOutputs too, which
+        // over-reported single-track-per-language safeguard cases as work.
         var opts = new EncoderOptions
         {
             TargetBitrate         = 3500,
-            PreserveOriginalAudio = false,     // forces audio work
-            AudioOutputs          = new(),
+            PreserveOriginalAudio = false,
+            AudioOutputs          = new()
+            {
+                new AudioOutputProfile { Codec = "aac", Layout = "stereo", BitrateKbps = 192 },
+            },
             AudioLanguagesToKeep  = new() { "en" },
         };
 
@@ -517,15 +523,19 @@ public sealed class EncodeSkipPredicateTests
         int   height         = 1080,
         string? codec        = null,
         string? audioStreams = null,
-        string? subStreams   = null) => new()
+        string? subStreams   = null,
+        bool  isHdr          = false,
+        string? originalLanguage = null) => new()
     {
-        Bitrate         = bitrate,
-        IsHevc          = isHevc,
-        Is4K            = is4K,
-        Height          = height,
-        Codec           = codec ?? (isHevc ? "hevc" : "h264"),
-        AudioStreams    = audioStreams,
-        SubtitleStreams = subStreams,
+        Bitrate          = bitrate,
+        IsHevc           = isHevc,
+        IsHdr            = isHdr,
+        Is4K             = is4K,
+        Height           = height,
+        Codec            = codec ?? (isHevc ? "hevc" : "h264"),
+        AudioStreams     = audioStreams,
+        SubtitleStreams  = subStreams,
+        OriginalLanguage = originalLanguage,
     };
 
 
@@ -645,6 +655,78 @@ public sealed class EncodeSkipPredicateTests
             EncodingMode           = EncodingMode.Transcode,
         };
         var mf = MakeMediaFile(bitrate: 2000, isHevc: false, is4K: false, codec: "av1");
+
+        TranscodingService.WouldSkipUnderOptions(mf, opts).Should().BeTrue();
+    }
+
+
+    [Fact]
+    public void WouldSkipUnderOptions_no_op_gate_uses_cached_IsHdr_for_tonemap()
+    {
+        // HDR HEVC source just over the bitrate ceiling but under target+700 — the no-op
+        // rung previously hard-coded isHdr=false and would mis-skip when TonemapHdrToSdr
+        // was on. With the cached MediaFile.IsHdr in play, HasActiveFilter sees the
+        // active tonemap → no skip.
+        var opts = new EncoderOptions
+        {
+            Encoder                 = "libx265",
+            TargetBitrate           = 3500,
+            SkipPercentAboveTarget  = 0,
+            EncodingMode            = EncodingMode.Transcode,
+            TonemapHdrToSdr         = true,
+            PreserveOriginalAudio   = true,
+            AudioOutputs            = new(),
+        };
+        var mf = MakeMediaFile(bitrate: 3700, isHevc: true, is4K: false, isHdr: true);
+
+        TranscodingService.WouldSkipUnderOptions(mf, opts).Should().BeFalse();
+    }
+
+
+    [Fact]
+    public void WouldSkipUnderOptions_no_op_gate_skips_when_cached_IsHdr_is_false()
+    {
+        // Same bitrate window as above, but the cached row is SDR — tonemap can't fire
+        // even though it's enabled. No-op rung correctly returns true.
+        var opts = new EncoderOptions
+        {
+            Encoder                 = "libx265",
+            TargetBitrate           = 3500,
+            SkipPercentAboveTarget  = 0,
+            EncodingMode            = EncodingMode.Transcode,
+            TonemapHdrToSdr         = true,
+            PreserveOriginalAudio   = true,
+            AudioOutputs            = new(),
+        };
+        var mf = MakeMediaFile(bitrate: 3700, isHevc: true, is4K: false, isHdr: false);
+
+        TranscodingService.WouldSkipUnderOptions(mf, opts).Should().BeTrue();
+    }
+
+
+    [Fact]
+    public void WouldSkipUnderOptions_KeepOriginalLanguage_merges_cached_value_before_predicate()
+    {
+        // Japanese-only audio source, English in keep-list, KeepOriginalLanguage on with
+        // OriginalLanguage cached as "ja". Without the merge the predicate would see
+        // "Japanese gets dropped → muxable work" and refuse to skip; with the merge the
+        // keep list effectively becomes [en, ja] and the file is at-target → skip.
+        var audioStreams = "[{\"l\":\"jpn\",\"c\":\"ac3\",\"ch\":6}]";
+        var opts = new EncoderOptions
+        {
+            Encoder                 = "libx265",
+            TargetBitrate           = 3500,
+            SkipPercentAboveTarget  = 20,
+            EncodingMode            = EncodingMode.Transcode,
+            KeepOriginalLanguage    = true,
+            AudioLanguagesToKeep    = new() { "en" },
+            PreserveOriginalAudio   = true,
+            AudioOutputs            = new(),
+        };
+        var mf = MakeMediaFile(
+            bitrate: 4000, isHevc: true, is4K: false,
+            audioStreams: audioStreams,
+            originalLanguage: "ja");
 
         TranscodingService.WouldSkipUnderOptions(mf, opts).Should().BeTrue();
     }

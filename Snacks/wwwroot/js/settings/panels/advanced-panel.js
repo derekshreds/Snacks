@@ -180,8 +180,11 @@ async function reevaluateQueue() {
         if (requeued + reskipped + dequeued === 0) {
             showToast('Re-evaluation complete — no changes needed.', 'info');
         } else {
+            // ReevaluateSkippedAsync flips Skipped → Unseen — those rows wait for the next
+            // library scan to actually enter the queue. ReevaluateUnseenAsync flips Unseen →
+            // Skipped immediately. RemoveSettingsObsoletedQueueItemsAsync drops queue items.
             const parts = [];
-            if (requeued)  parts.push(`${requeued} re-queued`);
+            if (requeued)  parts.push(`${requeued} flagged for re-scan`);
             if (reskipped) parts.push(`${reskipped} re-skipped`);
             if (dequeued)  parts.push(`${dequeued} dropped from queue`);
             showToast(`Re-evaluation complete — ${parts.join(', ')}.`, 'success');

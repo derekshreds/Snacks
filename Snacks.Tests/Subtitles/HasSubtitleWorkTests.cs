@@ -17,12 +17,16 @@ public sealed class HasSubtitleWorkTests
 
     private static EncoderOptions Opts(
         IEnumerable<string>? keep = null,
-        bool sidecar = false,
-        bool ocr     = false) => new()
+        bool sidecar       = false,
+        bool ocr           = false,
+        bool passBitmaps   = true,
+        string format      = "mkv") => new()
     {
-        SubtitleLanguagesToKeep    = keep?.ToList() ?? new(),
-        ExtractSubtitlesToSidecar  = sidecar,
-        ConvertImageSubtitlesToSrt = ocr,
+        Format                       = format,
+        SubtitleLanguagesToKeep      = keep?.ToList() ?? new(),
+        ExtractSubtitlesToSidecar    = sidecar,
+        ConvertImageSubtitlesToSrt   = ocr,
+        PassThroughImageSubtitlesMkv = passBitmaps,
     };
 
 
@@ -156,5 +160,61 @@ public sealed class HasSubtitleWorkTests
             Opts(keep: new[] { "en", "fr" }, ocr: true),
             subs)
         .Should().BeFalse();
+    }
+
+
+    // ---------------------------------------------------------------------
+    //  Bitmap-drop on MKV: when PassThroughImageSubtitlesMkv is off, MapSub
+    //  silently strips PGS / VobSub / DVB. HasSubtitleWork must surface that
+    //  as work — without it, a kept-language bitmap-only file slips past the
+    //  no-op skip gate and the user's "do not pass through" intent gets
+    //  silently honored only on a re-encode triggered by some other reason.
+    // ---------------------------------------------------------------------
+
+    [Fact]
+    public void Bitmap_subs_with_passthrough_off_on_mkv_is_work()
+    {
+        // PGS English, kept by the language filter, but pass-through is off.
+        // The mux pass / encode would drop it → that's a real change → work.
+        TranscodingService.HasSubtitleWork(
+            Opts(keep: new[] { "en" }, passBitmaps: false, format: "mkv"),
+            new[] { Sum("hdmv_pgs_subtitle", "eng") })
+        .Should().BeTrue();
+    }
+
+
+    [Fact]
+    public void Bitmap_subs_with_passthrough_on_is_not_work()
+    {
+        // Pass-through on: bitmap subs survive the mux/copy. No work because no
+        // language filter, no sidecar, no OCR, no bitmap drop.
+        TranscodingService.HasSubtitleWork(
+            Opts(keep: new[] { "en" }, passBitmaps: true, format: "mkv"),
+            new[] { Sum("hdmv_pgs_subtitle", "eng") })
+        .Should().BeFalse();
+    }
+
+
+    [Fact]
+    public void Text_subs_with_passthrough_off_is_not_work()
+    {
+        // PassThroughImageSubtitlesMkv only gates BITMAP codecs. Text subs
+        // survive regardless, so no work for them on this rung.
+        TranscodingService.HasSubtitleWork(
+            Opts(keep: new[] { "en" }, passBitmaps: false, format: "mkv"),
+            new[] { Sum("subrip", "eng") })
+        .Should().BeFalse();
+    }
+
+
+    [Fact]
+    public void Mixed_text_and_bitmap_subs_with_passthrough_off_is_work()
+    {
+        // Bitmap track present + pass-through off → that bitmap drop is work
+        // even though the text English track would copy through cleanly.
+        TranscodingService.HasSubtitleWork(
+            Opts(keep: new[] { "en" }, passBitmaps: false, format: "mkv"),
+            new[] { Sum("subrip", "eng"), Sum("hdmv_pgs_subtitle", "eng") })
+        .Should().BeTrue();
     }
 }
