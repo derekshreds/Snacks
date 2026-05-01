@@ -24,8 +24,13 @@
             <h6 class="fw-bold mb-3"><i class="fas fa-tools me-2 text-warning"></i>Maintenance</h6>
 
             <div class="d-flex flex-column gap-2">
+                <button class="btn btn-outline-primary" id="reevaluateQueueBtn">
+                    <i class="fas fa-arrows-rotate me-1"></i> Re-evaluate Queue Against Current Settings
+                </button>
+                <div class="form-text mt-n1 mb-2 ms-1">Re-checks every library file against the current encoder settings: skipped → unseen for files that newly need encoding, unseen → skipped for files that no longer do, and drops queued items that no longer need encoding. Safe to run any time. The button blocks itself while the walk is in progress.</div>
                 <button class="btn btn-outline-warning" id="clearScanHistory"><i class="fas fa-eraser me-1"></i> Clear Auto-Scan History</button>
                 <button class="btn btn-outline-warning" id="clearDashboardHistory"><i class="fas fa-chart-line me-1"></i> Clear Dashboard Data</button>
+                <button class="btn btn-outline-warning" id="removeFailedFiles"><i class="fas fa-trash-can me-1"></i> Remove Failed Items</button>
                 <button class="btn btn-outline-danger" id="restartAppBtn"><i class="fas fa-redo me-1"></i> Restart Application</button>
             </div>
         </div>

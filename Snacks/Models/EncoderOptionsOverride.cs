@@ -63,6 +63,15 @@ public sealed class EncoderOptionsOverride
     /// <summary> Overrides <see cref="EncoderOptions.AudioBitrateKbps"/> when non-<see langword="null"/>. </summary>
     public int? AudioBitrateKbps { get; set; }
 
+    /// <summary> Overrides <see cref="EncoderOptions.PreserveOriginalAudio"/> when non-<see langword="null"/>. </summary>
+    public bool? PreserveOriginalAudio { get; set; }
+
+    /// <summary>
+    ///     Overrides <see cref="EncoderOptions.AudioOutputs"/> when non-<see langword="null"/>.
+    ///     A non-null value fully replaces the base list (no merging).
+    /// </summary>
+    public List<AudioOutputProfile>? AudioOutputs { get; set; }
+
     /******************************************************************
      *  Encoding Mode
      ******************************************************************/
@@ -169,8 +178,27 @@ public sealed class EncoderOptionsOverride
         if (over.AudioLanguagesToKeep != null)        target.AudioLanguagesToKeep       = over.AudioLanguagesToKeep;
         if (over.KeepOriginalLanguage.HasValue)       target.KeepOriginalLanguage       = over.KeepOriginalLanguage.Value;
         if (over.OriginalLanguageProvider != null)    target.OriginalLanguageProvider   = over.OriginalLanguageProvider;
+        // Audio: a non-null AudioOutputs/PreserveOriginalAudio override is the new shape and
+        // wins outright. Otherwise, if a legacy AudioCodec/Bitrate/TwoChannel override is
+        // present, re-run the legacy migration so the override actually takes effect — without
+        // this, legacy overrides would write into AudioCodec but the planner only reads the
+        // new AudioOutputs list and would silently ignore them.
+        bool legacyAudioTouched = over.AudioCodec != null
+                                 || over.AudioBitrateKbps.HasValue
+                                 || over.TwoChannelAudio.HasValue;
+        bool newAudioTouched    = over.AudioOutputs != null
+                                 || over.PreserveOriginalAudio.HasValue;
+
         if (over.AudioCodec != null)                  target.AudioCodec                 = over.AudioCodec;
         if (over.AudioBitrateKbps.HasValue)           target.AudioBitrateKbps           = over.AudioBitrateKbps.Value;
+        if (over.PreserveOriginalAudio.HasValue)      target.PreserveOriginalAudio      = over.PreserveOriginalAudio.Value;
+        if (over.AudioOutputs != null)                target.AudioOutputs               = over.AudioOutputs.Select(p => p.Clone()).ToList();
+
+        if (legacyAudioTouched && !newAudioTouched)
+        {
+            target.AudioOutputs = new();
+            target.ApplyLegacyAudioMigration();
+        }
         if (over.EncodingMode.HasValue)               target.EncodingMode               = over.EncodingMode.Value;
         if (over.MuxStreams.HasValue)                 target.MuxStreams                 = over.MuxStreams.Value;
         if (over.SubtitleLanguagesToKeep != null)     target.SubtitleLanguagesToKeep    = over.SubtitleLanguagesToKeep;

@@ -83,11 +83,34 @@ public sealed class EncoderOptions
     /// <summary> Provider used to look up the original language of a file (e.g. "None", "Sonarr"). </summary>
     public string OriginalLanguageProvider { get; set; } = "None";
 
-    /// <summary> FFmpeg audio codec name (e.g. "copy", "aac", "ac3"). </summary>
+    /// <summary>
+    ///     Legacy single-codec selector. Kept on the model so old <c>settings.json</c>
+    ///     files load without errors and so <see cref="ApplyLegacyAudioMigration"/>
+    ///     can translate them into the new <see cref="AudioOutputs"/> shape. The planner
+    ///     no longer reads this directly.
+    /// </summary>
     public string AudioCodec { get; set; } = "copy";
 
-    /// <summary> Target audio bitrate in kilobits per second. </summary>
+    /// <summary>
+    ///     Legacy single-bitrate field. Carried forward into the migrated
+    ///     <see cref="AudioOutputs"/> entry when the legacy fields are populated.
+    /// </summary>
     public int AudioBitrateKbps { get; set; } = 192;
+
+    /// <summary>
+    ///     When <see langword="true"/>, every kept source audio track is passed through
+    ///     with <c>-c:a copy</c> alongside any encoded variants in <see cref="AudioOutputs"/>.
+    ///     Defaults to <see langword="true"/> so out-of-the-box behavior is "remux, don't re-encode".
+    /// </summary>
+    public bool PreserveOriginalAudio { get; set; } = true;
+
+    /// <summary>
+    ///     Encoded audio variants to emit per kept language, on top of any preserved
+    ///     source tracks. Empty list means "no additional outputs" — combined with
+    ///     <see cref="PreserveOriginalAudio"/><c>=true</c> that reproduces the legacy
+    ///     "copy everything" behavior.
+    /// </summary>
+    public List<AudioOutputProfile> AudioOutputs { get; set; } = new();
 
     /******************************************************************
      *  Encoding Mode
@@ -192,6 +215,8 @@ public sealed class EncoderOptions
         OriginalLanguageProvider   = OriginalLanguageProvider,
         AudioCodec                 = AudioCodec,
         AudioBitrateKbps           = AudioBitrateKbps,
+        PreserveOriginalAudio      = PreserveOriginalAudio,
+        AudioOutputs               = AudioOutputs.Select(p => p.Clone()).ToList(),
         EncodingMode               = EncodingMode,
         MuxStreams                 = MuxStreams,
         SubtitleLanguagesToKeep    = new List<string>(SubtitleLanguagesToKeep),
@@ -210,4 +235,48 @@ public sealed class EncoderOptions
         EncodeDirectory            = EncodeDirectory,
         HardwareAcceleration       = HardwareAcceleration,
     };
+
+    /******************************************************************
+     *  Legacy audio migration
+     ******************************************************************/
+
+    /// <summary>
+    ///     Translates the legacy <see cref="AudioCodec"/> + <see cref="AudioBitrateKbps"/> +
+    ///     <see cref="TwoChannelAudio"/> trio into the new <see cref="PreserveOriginalAudio"/> +
+    ///     <see cref="AudioOutputs"/> shape. Idempotent: runs only when <see cref="AudioOutputs"/>
+    ///     is empty AND the legacy fields look populated, so newer configs are left alone.
+    ///     Mapping:
+    ///     <list type="bullet">
+    ///         <item><c>AudioCodec="copy"</c> → <c>Preserve=true, Outputs=[]</c></item>
+    ///         <item><c>AudioCodec=X (X!=copy), TwoChannelAudio=true</c> → <c>Preserve=false, Outputs=[{X, "Stereo", AudioBitrateKbps}]</c></item>
+    ///         <item><c>AudioCodec=X (X!=copy), TwoChannelAudio=false</c> → <c>Preserve=false, Outputs=[{X, "Source", AudioBitrateKbps}]</c></item>
+    ///     </list>
+    /// </summary>
+    public void ApplyLegacyAudioMigration()
+    {
+        // Already migrated — leave the new shape alone.
+        if (AudioOutputs is { Count: > 0 }) return;
+
+        var legacy = (AudioCodec ?? "").Trim().ToLowerInvariant();
+
+        if (legacy == "copy" || string.IsNullOrEmpty(legacy))
+        {
+            // Default / "copy" config — preserve originals, no extra outputs.
+            PreserveOriginalAudio = true;
+            AudioOutputs          = new();
+            return;
+        }
+
+        // Legacy non-copy codec — emit a single output that reproduces the prior behavior.
+        PreserveOriginalAudio = false;
+        AudioOutputs = new()
+        {
+            new AudioOutputProfile
+            {
+                Codec       = legacy,
+                Layout      = TwoChannelAudio ? "Stereo" : "Source",
+                BitrateKbps = AudioBitrateKbps > 0 ? AudioBitrateKbps : 0,
+            }
+        };
+    }
 }

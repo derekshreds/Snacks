@@ -15,9 +15,11 @@
  * will actually take effect.
  */
 
-import { clusterApi, autoScanApi }    from '../api.js';
-import { escapeHtml }                 from '../utils/dom.js';
-import { openModal, closeModal }      from '../utils/modal-controller.js';
+import { clusterApi, autoScanApi }                  from '../api.js';
+import { escapeHtml }                               from '../utils/dom.js';
+import { openModal, closeModal }                    from '../utils/modal-controller.js';
+import { defaultBitrateForCodec }                   from '../settings/encoder-form.js';
+import { initChipInput, getChipValues, setChipValues } from '../settings/chip-input.js';
 
 
 // ---------------------------------------------------------------------------
@@ -50,17 +52,18 @@ const FOLDER_OVERRIDE_FIELDS = Object.freeze({
     RemoveBlackBorders:         'bool',
 
     // Audio
-    AudioCodec:                 'select',
-    AudioBitrateKbps:           'number',
-    TwoChannelAudio:            'bool',
+    PreserveOriginalAudio:      'bool',
+    AudioOutputs:               'audioOutputs',
     KeepOriginalLanguage:       'bool',
     OriginalLanguageProvider:   'select',
+    AudioLanguagesToKeep:       'languageList',
 
     // Subtitles
     ExtractSubtitlesToSidecar:    'bool',
     SidecarSubtitleFormat:        'select',
     ConvertImageSubtitlesToSrt:   'bool',
     PassThroughImageSubtitlesMkv: 'bool',
+    SubtitleLanguagesToKeep:      'languageList',
 
     // Encoding mode
     EncodingMode:               'select',
@@ -90,17 +93,18 @@ const NODE_OVERRIDE_FIELDS = Object.freeze({
     RemoveBlackBorders:         'bool',
 
     // Audio
-    AudioCodec:                 'select',
-    AudioBitrateKbps:           'number',
-    TwoChannelAudio:            'bool',
+    PreserveOriginalAudio:      'bool',
+    AudioOutputs:               'audioOutputs',
     KeepOriginalLanguage:       'bool',
     OriginalLanguageProvider:   'select',
+    AudioLanguagesToKeep:       'languageList',
 
     // Subtitles
     ExtractSubtitlesToSidecar:    'bool',
     SidecarSubtitleFormat:        'select',
     ConvertImageSubtitlesToSrt:   'bool',
     PassThroughImageSubtitlesMkv: 'bool',
+    SubtitleLanguagesToKeep:      'languageList',
 
     // Encoding mode
     EncodingMode:               'select',
@@ -112,8 +116,88 @@ const NUMBER_DEFAULTS = Object.freeze({
     TargetBitrate:          '3500',
     FourKBitrateMultiplier: '4',
     SkipPercentAboveTarget: '20',
-    AudioBitrateKbps:       '192',
 });
+
+
+// ---------------------------------------------------------------------------
+//  Audio-outputs row editor inside the override dialog. The override semantics
+//  are full-replace (the C# Apply does `target.AudioOutputs = override.Clone()`),
+//  so the dialog needs an editable list, not a single-control toggle.
+//
+//  Note: the row template lives inside the modal markup (`#ovrAudioOutputRowTemplate`
+//  in _AppModals.cshtml) and the row container is `#ovrAudioOutputs`. These
+//  helpers look up by hardcoded id rather than parameterized prefix because the
+//  override dialog is a singleton, unlike the multi-instance form helpers.
+// ---------------------------------------------------------------------------
+
+const OVR_AUDIO_OUTPUTS_ROOT     = 'ovrAudioOutputs';
+const OVR_AUDIO_OUTPUTS_TEMPLATE = 'ovrAudioOutputRowTemplate';
+const OVR_AUDIO_OUTPUTS_ADD      = 'ovrAudioOutputsAdd';
+
+function ovrAppendAudioRow(profile = {}) {
+    const root = document.getElementById(OVR_AUDIO_OUTPUTS_ROOT);
+    const tpl  = document.getElementById(OVR_AUDIO_OUTPUTS_TEMPLATE);
+    if (!root || !tpl) return;
+
+    const row       = tpl.content.firstElementChild.cloneNode(true);
+    const codecSel  = row.querySelector('[data-field="Codec"]');
+    const layoutSel = row.querySelector('[data-field="Layout"]');
+    const bitrateIn = row.querySelector('[data-field="BitrateKbps"]');
+
+    if (profile.Codec)  codecSel.value  = profile.Codec;
+    if (profile.Layout) layoutSel.value = profile.Layout;
+    bitrateIn.value = (profile.BitrateKbps && profile.BitrateKbps > 0)
+        ? profile.BitrateKbps
+        : defaultBitrateForCodec(codecSel.value);
+
+    bitrateIn.dataset.lastDefault = bitrateIn.value;
+    codecSel.addEventListener('change', () => {
+        const next = defaultBitrateForCodec(codecSel.value);
+        if (bitrateIn.value === bitrateIn.dataset.lastDefault || bitrateIn.value === '' || bitrateIn.value === '0') {
+            bitrateIn.value = next;
+        }
+        bitrateIn.dataset.lastDefault = next;
+    });
+
+    // The override dialog has its own save flow (the Save button at the bottom),
+    // so we don't need to dispatch a change event here — but keeping the row
+    // structure pure DOM lets the operator preview the rows before committing.
+    row.querySelector('[data-audio-output-remove]').addEventListener('click', () => row.remove());
+    root.appendChild(row);
+}
+
+function ovrSetAudioOutputs(profiles) {
+    const root = document.getElementById(OVR_AUDIO_OUTPUTS_ROOT);
+    if (!root) return;
+    root.replaceChildren();
+    for (const p of (profiles || [])) {
+        ovrAppendAudioRow({
+            Codec:       p.Codec       ?? p.codec,
+            Layout:      p.Layout      ?? p.layout,
+            BitrateKbps: p.BitrateKbps ?? p.bitrateKbps ?? 0,
+        });
+    }
+}
+
+function ovrReadAudioOutputs() {
+    const root = document.getElementById(OVR_AUDIO_OUTPUTS_ROOT);
+    if (!root) return [];
+    return Array.from(root.querySelectorAll('[data-audio-output-row]')).map(row => ({
+        Codec:       row.querySelector('[data-field="Codec"]')?.value       ?? 'aac',
+        Layout:      row.querySelector('[data-field="Layout"]')?.value      ?? 'Source',
+        BitrateKbps: parseInt(row.querySelector('[data-field="BitrateKbps"]')?.value, 10) || 0,
+    }));
+}
+
+function ovrSetAudioOutputsEnabled(enabled) {
+    const root = document.getElementById(OVR_AUDIO_OUTPUTS_ROOT);
+    const add  = document.getElementById(OVR_AUDIO_OUTPUTS_ADD);
+    if (root) {
+        root.style.opacity       = enabled ? '1' : '0.5';
+        root.style.pointerEvents = enabled ? 'auto' : 'none';
+    }
+    if (add) add.disabled = !enabled;
+}
 
 
 // ---------------------------------------------------------------------------
@@ -491,6 +575,14 @@ export class OverrideDialog {
             clone.addEventListener('click', handler);
         }
 
+        // Initialise the chip-input widgets for any languageList fields in the active
+        // context. Idempotent: subsequent opens are a no-op for already-inited roots.
+        for (const [field, type] of Object.entries(this._activeFields)) {
+            if (type !== 'languageList') continue;
+            const root = document.getElementById(`ovr${field}`);
+            if (root) initChipInput(root);
+        }
+
         openModal(MODAL_ID);
     }
 
@@ -499,10 +591,37 @@ export class OverrideDialog {
      * corresponding value input. Only wires fields in the active context.
      */
     _initToggles() {
+        // The "+ Add output" button is bound once per dialog open — it isn't a per-field
+        // toggle so it lives outside the loop below.
+        const addBtn = document.getElementById(OVR_AUDIO_OUTPUTS_ADD);
+        if (addBtn && addBtn.dataset.bound !== '1') {
+            addBtn.dataset.bound = '1';
+            addBtn.addEventListener('click', () => ovrAppendAudioRow());
+        }
+
         for (const [field, type] of Object.entries(this._activeFields)) {
             const toggle = document.getElementById(`ovr_${field}`);
             if (!toggle) continue;
             toggle.onchange = () => {
+                if (type === 'audioOutputs') {
+                    // List-typed field: enable/disable the row container + add button
+                    // rather than a single input.
+                    ovrSetAudioOutputsEnabled(toggle.checked);
+                    if (!toggle.checked) ovrSetAudioOutputs([]);
+                    return;
+                }
+                if (type === 'languageList') {
+                    // Chip-input language list. Greyed-out + pointer-events:none mirrors
+                    // how AudioOutputs handles the disabled state.
+                    const root = document.getElementById(`ovr${field}`);
+                    if (root) {
+                        root.style.opacity = toggle.checked ? '' : '0.5';
+                        root.style.pointerEvents = toggle.checked ? '' : 'none';
+                    }
+                    if (!toggle.checked) setChipValues(`ovr${field}`, []);
+                    return;
+                }
+
                 const el = document.getElementById(`ovr${field}`);
                 if (!el) return;
 
@@ -524,6 +643,21 @@ export class OverrideDialog {
         for (const [field, type] of Object.entries(this._activeFields)) {
             const toggle = document.getElementById(`ovr_${field}`);
             if (toggle) toggle.checked = false;
+
+            if (type === 'audioOutputs') {
+                ovrSetAudioOutputs([]);
+                ovrSetAudioOutputsEnabled(false);
+                continue;
+            }
+            if (type === 'languageList') {
+                setChipValues(`ovr${field}`, []);
+                const root = document.getElementById(`ovr${field}`);
+                if (root) {
+                    root.style.opacity = '0.5';
+                    root.style.pointerEvents = 'none';
+                }
+                continue;
+            }
 
             const el = document.getElementById(`ovr${field}`);
             if (!el) continue;
@@ -550,6 +684,21 @@ export class OverrideDialog {
             const toggle = document.getElementById(`ovr_${field}`);
             if (toggle) toggle.checked = true;
 
+            if (type === 'audioOutputs') {
+                ovrSetAudioOutputs(Array.isArray(val) ? val : []);
+                ovrSetAudioOutputsEnabled(true);
+                continue;
+            }
+            if (type === 'languageList') {
+                setChipValues(`ovr${field}`, Array.isArray(val) ? val : []);
+                const root = document.getElementById(`ovr${field}`);
+                if (root) {
+                    root.style.opacity = '';
+                    root.style.pointerEvents = '';
+                }
+                continue;
+            }
+
             const el = document.getElementById(`ovr${field}`);
             if (!el) continue;
 
@@ -575,6 +724,19 @@ export class OverrideDialog {
 
             if (!toggle?.checked) {
                 result[key] = null;
+                continue;
+            }
+
+            if (type === 'audioOutputs') {
+                // Empty list is a valid override ("no encoded outputs") — distinct from
+                // "override off". Only the toggle decides null vs the value.
+                result[key] = ovrReadAudioOutputs();
+                continue;
+            }
+            if (type === 'languageList') {
+                // Empty list is a valid override ("keep no specific language") — same
+                // null-vs-value distinction the toggle already gates on.
+                result[key] = getChipValues(`ovr${field}`);
                 continue;
             }
 

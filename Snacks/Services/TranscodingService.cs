@@ -221,6 +221,15 @@ public class TranscodingService
     private Func<ExclusionRules?>?               _exclusionRulesProvider;
 
     /// <summary>
+    ///     Resolves the per-folder <see cref="EncoderOptionsOverride"/> for a given file
+    ///     path so the local dispatcher applies the same overrides the auto-scanner used
+    ///     when queueing. Wired by <see cref="AutoScanService"/> (avoids the
+    ///     TranscodingService ↔ AutoScanService DI cycle). When unset (tests / node mode)
+    ///     the global options are used as-is.
+    /// </summary>
+    private Func<string, EncoderOptionsOverride?>? _folderOverrideResolver;
+
+    /// <summary>
     ///     Installs a predicate that returns <c>true</c> when this instance
     ///     should originate external-facing side effects (webhooks, library rescans).
     ///     Wired by <see cref="ClusterService"/> during its own construction to
@@ -241,6 +250,19 @@ public class TranscodingService
         _exclusionRulesProvider = provider;
 
     private ExclusionRules? GetExclusionRules() => _exclusionRulesProvider?.Invoke();
+
+    /// <summary>
+    ///     Installs the folder-override resolver. The local dispatcher uses this in
+    ///     <see cref="ProcessQueueAsync"/> to apply per-folder overrides to the per-job
+    ///     options clone — without it, a folder configured to encode at a different
+    ///     codec / target / language would be queued correctly but encoded under the
+    ///     global settings.
+    /// </summary>
+    public void SetFolderOverrideResolver(Func<string, EncoderOptionsOverride?> resolver) =>
+        _folderOverrideResolver = resolver;
+
+    private EncoderOptionsOverride? ResolveFolderOverride(string filePath) =>
+        _folderOverrideResolver?.Invoke(filePath);
 
     /// <summary>
     ///     Initializes the service and eagerly starts hardware acceleration detection in the
@@ -447,8 +469,8 @@ public class TranscodingService
             };
 
             // Don't add items that already meet the requirements.
-            bool targetIsHevc = options.Encoder.Contains("265");
-            bool targetIsAv1 = options.Encoder.Contains("av1") || options.Encoder.Contains("svt");
+            bool targetIsHevc = options.Encoder.Contains("265", StringComparison.OrdinalIgnoreCase);
+            bool targetIsAv1 = options.Encoder.Contains("av1", StringComparison.OrdinalIgnoreCase) || options.Encoder.Contains("svt", StringComparison.OrdinalIgnoreCase);
             bool isAv1 = sourceCodec == "av1";
             bool alreadyTargetCodec = targetIsAv1 ? isAv1 : (targetIsHevc ? isHevc : !isHevc);
             bool isHighDef = probe.Streams.Any(s => s.CodecType == "video" && s.Width > 1920);
@@ -478,6 +500,15 @@ public class TranscodingService
                 }
             }
 
+            // Resolve original language eagerly so every skip-ladder predicate sees the same
+            // effective keep lists that ConvertVideoAsync would build at encode time. Cached
+            // on MediaFile.OriginalLanguage so re-scans avoid re-querying the integration
+            // provider, and so WouldSkipUnderOptions / AnalyzeFileAsync can stay in sync.
+            var dbFile = await _mediaFileRepo.GetByPathAsync(normalizedPath);
+            string? originalLanguage = await ResolveOriginalLanguageAsync(filePath, options, dbFile, cancellationToken);
+            var effectiveOptions = WithOriginalLanguageMerged(options, originalLanguage);
+            bool isHdr = FfprobeService.IsHdr(probe);
+
             async Task MarkSkippedInDb()
             {
                 await _mediaFileRepo.UpsertAsync(new MediaFile
@@ -494,6 +525,7 @@ public class TranscodingService
                     PixelFormat = videoStream?.PixFmt,
                     Duration = length,
                     IsHevc = isHevc,
+                    IsHdr = isHdr,
                     Is4K = isHighDef,
                     Status = MediaFileStatus.Skipped,
                     LastScannedAt = DateTime.UtcNow,
@@ -502,25 +534,26 @@ public class TranscodingService
                     // whether to flip this file back to Unseen without a re-probe.
                     AudioStreams    = MuxStreamSummary.Serialize(ProjectAudioSummaries(probe)),
                     SubtitleStreams = MuxStreamSummary.Serialize(ProjectSubtitleSummaries(probe)),
+                    OriginalLanguage = originalLanguage,
                 });
             }
 
             // Bypass the skip gate only when a non-Transcode mode has actual work to do on
             // this file. A pointless remux of a file that already matches every audio/subtitle
             // setting is never what the user wants.
-            bool hasMuxableWork = HasMuxableWork(options, probe);
-            bool bypassSkip     = options.EncodingMode != EncodingMode.Transcode && hasMuxableWork;
+            bool hasMuxableWork = HasMuxableWork(effectiveOptions, probe);
+            bool bypassSkip     = effectiveOptions.EncodingMode != EncodingMode.Transcode && hasMuxableWork;
 
             // MuxOnly: video is never re-encoded, so a file with no muxable audio/sub work
             // has nothing to do — skip it unconditionally, even if it's above the bitrate target.
-            if (options.EncodingMode == EncodingMode.MuxOnly && !hasMuxableWork)
+            if (effectiveOptions.EncodingMode == EncodingMode.MuxOnly && !hasMuxableWork)
             {
                 Console.WriteLine($"Skipping {workItem.FileName}: MuxOnly mode, no audio/subtitle work");
                 await MarkSkippedInDb();
                 return workItem.Id;
             }
 
-            if (options.Skip4K && isHighDef)
+            if (effectiveOptions.Skip4K && isHighDef)
             {
                 Console.WriteLine($"Skipping {workItem.FileName}: 4K video (Skip 4K enabled)");
                 await MarkSkippedInDb();
@@ -528,16 +561,16 @@ public class TranscodingService
             }
 
             string targetCodecLabel = targetIsAv1 ? "AV1" : (isHevc ? "HEVC" : "H.264");
-            double skipMultiplier = 1.0 + (Math.Clamp(options.SkipPercentAboveTarget, 0, 100) / 100.0);
-            if (alreadyTargetCodec && bitrate > 0 && bitrate <= options.TargetBitrate * skipMultiplier && !isHighDef && !bypassSkip)
+            double skipMultiplier = 1.0 + (Math.Clamp(effectiveOptions.SkipPercentAboveTarget, 0, 100) / 100.0);
+            if (alreadyTargetCodec && bitrate > 0 && bitrate <= effectiveOptions.TargetBitrate * skipMultiplier && !isHighDef && !bypassSkip)
             {
-                Console.WriteLine($"Skipping {workItem.FileName}: already {targetCodecLabel} at {bitrate}kbps (target {options.TargetBitrate}kbps, skip threshold {skipMultiplier:P0})");
+                Console.WriteLine($"Skipping {workItem.FileName}: already {targetCodecLabel} at {bitrate}kbps (target {effectiveOptions.TargetBitrate}kbps, skip threshold {skipMultiplier:P0})");
                 await MarkSkippedInDb();
                 return workItem.Id;
             }
 
-            int fourKMultiplier = Math.Clamp(options.FourKBitrateMultiplier, 2, 8);
-            int fourKTarget = options.TargetBitrate * fourKMultiplier;
+            int fourKMultiplier = Math.Clamp(effectiveOptions.FourKBitrateMultiplier, 2, 8);
+            int fourKTarget = effectiveOptions.TargetBitrate * fourKMultiplier;
             if (alreadyTargetCodec && isHighDef && bitrate > 0 && bitrate <= fourKTarget * skipMultiplier && !bypassSkip)
             {
                 Console.WriteLine($"Skipping {workItem.FileName}: already {targetCodecLabel} 4K at {bitrate}kbps (4K target {fourKTarget}kbps)");
@@ -547,10 +580,10 @@ public class TranscodingService
 
             // Skip low-bitrate non-HEVC files when using VAAPI CQP — it can't target specific bitrates.
             // Check both explicit VAAPI selection and "auto" (which resolves to VAAPI on Linux NAS).
-            bool isVaapiMode = IsVaapiAcceleration(options.HardwareAcceleration) ||
-                (options.HardwareAcceleration.Equals("auto", StringComparison.OrdinalIgnoreCase) &&
+            bool isVaapiMode = IsVaapiAcceleration(effectiveOptions.HardwareAcceleration) ||
+                (effectiveOptions.HardwareAcceleration.Equals("auto", StringComparison.OrdinalIgnoreCase) &&
                     _detectedHardware != null && IsVaapiAcceleration(_detectedHardware));
-            if (isVaapiMode && !isHevc && targetIsHevc && bitrate > 0 && bitrate <= options.TargetBitrate && !isHighDef && !bypassSkip)
+            if (isVaapiMode && !isHevc && targetIsHevc && bitrate > 0 && bitrate <= effectiveOptions.TargetBitrate && !isHighDef && !bypassSkip)
             {
                 Console.WriteLine($"Skipping {workItem.FileName}: VAAPI can't compress {bitrate}kbps H.264 below target");
                 await MarkSkippedInDb();
@@ -561,7 +594,7 @@ public class TranscodingService
             // to a videoCopy=true encode, and if the audio/sub pipeline has nothing to change either,
             // running ffmpeg just produces a near-identical output. Skip it instead.
             if (!bypassSkip && WouldEncodeBeNoOp(
-                    options, bitrate, isHevc, videoStream?.Height ?? 0, FfprobeService.IsHdr(probe),
+                    effectiveOptions, bitrate, isHevc, videoStream?.Height ?? 0, FfprobeService.IsHdr(probe),
                     ProjectAudioSummaries(probe), ProjectSubtitleSummaries(probe)))
             {
                 Console.WriteLine($"Skipping {workItem.FileName}: no work to do (video would copy, no audio/sub changes, no filters)");
@@ -585,7 +618,6 @@ public class TranscodingService
                 return workItem.Id;
             }
 
-            var dbFile = await _mediaFileRepo.GetByPathAsync(normalizedPath);
             if (dbFile != null)
             {
                 // Change detection: if the file's size changed significantly or duration differs,
@@ -635,12 +667,14 @@ public class TranscodingService
                 PixelFormat = videoStream?.PixFmt,
                 Duration = length,
                 IsHevc = isHevc,
+                IsHdr = isHdr,
                 Is4K = isHighDef,
                 Status = MediaFileStatus.Queued,
                 LastScannedAt = DateTime.UtcNow,
                 FileMtime = fileInfo.LastWriteTimeUtc.Ticks,
                 AudioStreams    = MuxStreamSummary.Serialize(ProjectAudioSummaries(probe)),
                 SubtitleStreams = MuxStreamSummary.Serialize(ProjectSubtitleSummaries(probe)),
+                OriginalLanguage = originalLanguage,
             });
 
             _workItems[workItem.Id] = workItem;
@@ -798,7 +832,25 @@ public class TranscodingService
                 width = videoStream?.Width ?? 0;
                 height = videoStream?.Height ?? 0;
                 pixelFormat = videoStream?.PixFmt;
-                bitrate = length > 0 ? (long)(fileInfo.Length * 8 / length / 1000) : 0;
+
+                // Match AddFileAsync: start with file-size÷duration (total bitrate including
+                // audio/subs), then re-measure video-only via the same 15s copy pass when the
+                // total is within 2× the effective target. Without this, a file with chunky
+                // audio inflates the analyze bitrate, predicting Queue when AddFileAsync would
+                // re-measure to a lower video-only number and Skip.
+                long totalBitrate = length > 0 ? (long)(fileInfo.Length * 8 / length / 1000) : 0;
+                bitrate = totalBitrate;
+                int analyzeFourK = options.TargetBitrate * Math.Clamp(options.FourKBitrateMultiplier, 2, 8);
+                int analyzeEffectiveTarget = (videoStream?.Width ?? 0) > 1920
+                    ? analyzeFourK
+                    : options.TargetBitrate;
+                if (bitrate > 0 && bitrate <= analyzeEffectiveTarget * 2 && length > 5)
+                {
+                    long videoBitrate = await MeasureVideoBitrateAsync(
+                        new WorkItem { Path = filePath, Length = length });
+                    if (videoBitrate > 0 && videoBitrate <= totalBitrate)
+                        bitrate = videoBitrate;
+                }
             }
 
             result.Codec = sourceCodec;
@@ -807,8 +859,26 @@ public class TranscodingService
             result.Height = height;
             result.Duration = length;
 
-            bool targetIsHevc = options.Encoder.Contains("265");
-            bool targetIsAv1 = options.Encoder.Contains("av1") || options.Encoder.Contains("svt");
+            // Resolve original language up front so the skip ladder predicts using the same
+            // effective keep lists ConvertVideoAsync would use. Reads the cached value when
+            // the row already has one (eg. AddFileAsync ran earlier), otherwise hits the
+            // configured integration provider live. Falls back to no-merge on failure.
+            string? originalLanguage = await ResolveOriginalLanguageAsync(filePath, options, dbFile, cancellationToken);
+            // Persist any newly resolved value so subsequent re-evals / scans / dispatches are
+            // cache hits — every place that resolves the language should update the row, so the
+            // value ends up consistent across analyze, scan, and dispatch.
+            if (!string.IsNullOrEmpty(originalLanguage)
+                && dbFile != null
+                && !string.Equals(dbFile.OriginalLanguage, originalLanguage, StringComparison.OrdinalIgnoreCase))
+            {
+                dbFile.OriginalLanguage = originalLanguage;
+                try { await _mediaFileRepo.UpsertAsync(dbFile); }
+                catch { /* analyze is a dry-run; a DB blip here doesn't change the verdict */ }
+            }
+            options = WithOriginalLanguageMerged(options, originalLanguage);
+
+            bool targetIsHevc = options.Encoder.Contains("265", StringComparison.OrdinalIgnoreCase);
+            bool targetIsAv1 = options.Encoder.Contains("av1", StringComparison.OrdinalIgnoreCase) || options.Encoder.Contains("svt", StringComparison.OrdinalIgnoreCase);
             bool alreadyTargetCodec = targetIsAv1 ? isAv1 : (targetIsHevc ? isHevc : !isHevc);
             bool isHighDef = width > 1920;
             result.Is4K = isHighDef;
@@ -927,12 +997,15 @@ public class TranscodingService
                 return result;
             }
 
-            // No-op gate (mirrors AddFileAsync). Detecting HDR requires the probe; when we used
-            // cached DB data the safe fall-back is "isHdr unknown → don't claim no-op," which we
-            // express by treating the cached path as never-HDR (matches AddFileAsync conservatively
-            // since the DB doesn't carry HDR metadata).
+            // No-op gate (mirrors AddFileAsync). Prefer the live probe's HDR signal when we
+            // have one; fall back to the cached MediaFile.IsHdr that AddFileAsync persisted on
+            // its last full probe. Without the cached read, the dbFresh branch would silently
+            // treat HDR sources as SDR — a tonemap-on user would see analyze report Skip while
+            // AddFileAsync would queue for transcode (active filter forces re-encode).
             int sourceHeight = height;
-            bool isHdr = probe != null && FfprobeService.IsHdr(probe);
+            bool isHdr = probe != null
+                ? FfprobeService.IsHdr(probe)
+                : dbFile?.IsHdr ?? false;
             if (!bypassSkip && WouldEncodeBeNoOp(options, bitrate, isHevc, sourceHeight, isHdr, audioStreams, subtitleStreams))
             {
                 result.Decision = "Skip";
@@ -1377,11 +1450,45 @@ public class TranscodingService
                     continue;
                 }
 
-                // Clone options so the per-job HW pin doesn't leak into the
-                // shared instance, and so a settings change after dispatch
-                // can't mutate the encode mid-run.
-                var perJobOptions = current.Clone();
+                // Resolve any per-folder override and merge it into the per-job options.
+                // Cluster dispatch already does this via ClusterService.ResolveOptionsForJob;
+                // local dispatch was the one path that wasn't applying overrides — without
+                // this, a folder configured to encode at h264 (say) was queued under those
+                // settings (the scan-phase skip ladder ran correctly) but the local encoder
+                // ran at the global codec. Three-tier merge: global → folder → (no node
+                // override on the local path).
+                var folderOverride = ResolveFolderOverride(workItem.Path);
+                var perJobOptions = EncoderOptionsOverride.ApplyOverrides(current, folderOverride, null);
                 perJobOptions.HardwareAcceleration = deviceId == "cpu" ? "none" : deviceId;
+
+                // Pre-dispatch finalisation: resolve any missing OriginalLanguage live,
+                // merge it into the per-job keep lists, and re-run the skip ladder under
+                // the merged options. Keeps every "should this still encode?" decision in
+                // the dispatcher — workers are only ever handed items that genuinely need
+                // to encode. Catches three cases the queue couldn't pre-vet:
+                //   • Legacy DB rows queued before the OriginalLanguage cache existed.
+                //   • Settings toggled between AddFileAsync and dispatch (eg. user flipped
+                //     KeepOriginalLanguage on after the file was already queued).
+                //   • Force-adds that bypass parts of AddFileAsync's skip ladder.
+                if (!await FinaliseForDispatchAsync(workItem, perJobOptions, CancellationToken.None))
+                {
+                    await MarkDispatchSkippedAsync(workItem, "pre-dispatch check — file already meets target under current options");
+                    // No slot to release — TryAcquireLocalDeviceSlot reads occupancy live from
+                    // _activeLocalJobs, and we never added this item to that map.
+                    continue;
+                }
+
+                // Cancel/Stop race: a Pending → Cancelled transition could have landed during
+                // FinaliseForDispatchAsync's awaits. Re-check the workItem.Status before
+                // committing to dispatch — without this, ProcessWorkItemAsync's unconditional
+                // Status = Processing assignment would clobber the user's cancel.
+                if (workItem.Status is WorkItemStatus.Cancelled or WorkItemStatus.Stopped)
+                {
+                    Console.WriteLine($"Dropping {workItem.FileName}: cancelled/stopped during dispatch finalisation");
+                    _workItems.TryRemove(workItem.Id, out _);
+                    try { await _hubContext.Clients.All.SendAsync("WorkItemRemoved", workItem.Id); } catch { /* SignalR errors are non-fatal */ }
+                    continue;
+                }
 
                 // Pre-register the active job synchronously before spawning so
                 // the scheduler's next iteration counts it against the device's
@@ -1650,27 +1757,6 @@ public class TranscodingService
         await LogAsync(workItem.Id, $"Hardware acceleration: {options.HardwareAcceleration}");
         await LogAsync(workItem.Id, $"Video Bitrate: {workItem.Bitrate}kbps");
 
-        // Original-language lookup: merge the source's original language into the keep-lists
-        // for THIS job only (options is already a per-job clone from EncoderOptionsOverride).
-        if (options.KeepOriginalLanguage && _integrationService != null)
-        {
-            var orig = await _integrationService.LookupOriginalLanguageAsync(
-                workItem.Path, options.OriginalLanguageProvider, cancellationToken);
-            if (!string.IsNullOrEmpty(orig))
-            {
-                await LogAsync(workItem.Id, $"Original language resolved: {orig}");
-                if (!options.AudioLanguagesToKeep.Contains(orig))
-                    options.AudioLanguagesToKeep.Add(orig);
-                if (!options.SubtitleLanguagesToKeep.Contains(orig))
-                    options.SubtitleLanguagesToKeep.Add(orig);
-            }
-            else
-            {
-                await LogAsync(workItem.Id,
-                    $"Original-language lookup ({options.OriginalLanguageProvider}) returned nothing; keeping configured languages.");
-            }
-        }
-
         var (targetBitrate, minBitrate, maxBitrate, videoCopy) = CalculateBitrates(workItem, options);
 
         // Mux pass: copy the video stream and only touch the stream types selected by
@@ -1842,16 +1928,17 @@ public class TranscodingService
             $"{_ffprobeService.MapVideo(workItem.Probe!)} -c:v {encoder} {presetFlag}{vfFlag}";
 
         // On a mux pass that excludes audio (MuxStreams.Subtitles), keep every audio track as-is:
-        // empty language list = keep all, "copy" codec = no re-encode, no downmix.
+        // empty language list = keep all, preserve-only profile = no re-encode.
         string audioFlags = _ffprobeService.MapAudio(
             workItem.Probe!,
             doAudioWork ? options.AudioLanguagesToKeep : new List<string>(),
-            doAudioWork ? options.AudioCodec : "copy",
-            options.AudioBitrateKbps,
-            doAudioWork && options.TwoChannelAudio,
-            options.Format == "mkv") + " ";
+            doAudioWork ? options.PreserveOriginalAudio : true,
+            doAudioWork ? options.AudioOutputs : null,
+            options.Format == "mkv",
+            out var audioWarnings) + " ";
 
-        string varFlags = options.Format == "mkv" ? "-max_muxing_queue_size 9999 " : "-movflags +faststart -max_muxing_queue_size 9999 ";
+        foreach (var w in audioWarnings)
+            await LogAsync(workItem.Id, w);
 
         string outputPath = GetOutputPath(workItem, options);
         string inputPath = workItem.Path;
@@ -2017,8 +2104,9 @@ public class TranscodingService
 
         // -analyzeduration and -probesize handle files with many streams (e.g. 30+ PGS subtitle tracks)
         string analyzeFlags = "-analyzeduration 10M -probesize 50M ";
-        string command = $"{initFlags} {analyzeFlags}-i \"{inputPath}\" {extraInputs}{videoFlags}{compressionFlags}{audioFlags}{subtitleFlags}" +
-                        $"{varFlags}-f {(options.Format == "mkv" ? "matroska" : "mp4")} \"{outputPath}\"";
+        string command = BuildFfmpegCommand(
+            options.Format, initFlags, analyzeFlags, inputPath, extraInputs,
+            videoFlags, compressionFlags, audioFlags, subtitleFlags, outputPath);
 
         await LogAsync(workItem.Id, $"Converting {workItem.FileName}");
         await LogAsync(workItem.Id, $"Command: ffmpeg {command}");
@@ -2090,12 +2178,26 @@ public class TranscodingService
         await LogAsync(workItem.Id,
             $"Converted successfully in {DateTime.Now.Subtract(startTime).TotalMinutes:0.00} minutes.");
 
-        if (savings > 0 || videoCopy)
+        // Configured audio fan-out can grow the file past any video savings; user opted
+        // into that growth, so we exempt it from the savings gate and keep the output.
+        bool userConfiguredGrowth = options.AudioOutputs is { Count: > 0 };
+
+        if (savings > 0 || videoCopy || userConfiguredGrowth)
         {
             // Show both sizes explicitly so users don't misread the savings number
             // as the output size.
-            await LogAsync(workItem.Id,
-                $"Size: {FormatSize(workItem.Size)} → {FormatSize(outputSize)}  (saved {FormatSize((long)(savings * 1048576))}, {percent:P0})");
+            if (savings > 0)
+            {
+                await LogAsync(workItem.Id,
+                    $"Size: {FormatSize(workItem.Size)} → {FormatSize(outputSize)}  (saved {FormatSize((long)(savings * 1048576))}, {percent:P0})");
+            }
+            else
+            {
+                long delta  = outputSize - workItem.Size;
+                var  reason = userConfiguredGrowth ? "configured audio outputs" : "remux";
+                await LogAsync(workItem.Id,
+                    $"Size: {FormatSize(workItem.Size)} → {FormatSize(outputSize)}  (+{FormatSize(delta)}, kept due to {reason})");
+            }
 
             await HandleOutputPlacement(outputPath, workItem, options);
         }
@@ -2135,36 +2237,80 @@ public class TranscodingService
 
     /// <summary>
     ///     Returns <see langword="true"/> when audio settings would change the output
-    ///     (language drop, codec re-encode, or downmix) versus a straight stream copy.
+    ///     (language drop, commentary drop, dropped source on Preserve=off, or any output
+    ///     profile that would emit a re-encode) versus a straight stream copy. Used to
+    ///     decide mux-pass eligibility — must agree with <see cref="FfprobeService.MapAudio"/>
+    ///     about which source tracks survive, otherwise files with droppable tracks slip
+    ///     through the no-op skip gate without being processed.
     /// </summary>
-    private static bool HasAudioWork(EncoderOptions options, IReadOnlyList<AudioStreamSummary> audioStreams)
+    internal static bool HasAudioWork(EncoderOptions options, IReadOnlyList<AudioStreamSummary> audioStreams)
     {
         if (audioStreams.Count == 0) return false;
 
         // Language filter would drop at least one track?
+        IReadOnlyList<AudioStreamSummary> kept = audioStreams;
         if (options.AudioLanguagesToKeep is { Count: > 0 } audLangs)
         {
-            var kept = audioStreams
+            var filtered = audioStreams
                 .Where(s => LanguageMatcher.Matches(s.Language, s.Title, audLangs))
                 .ToList();
-            if (kept.Count < audioStreams.Count) return true;
-            audioStreams = kept;
+            if (filtered.Count < audioStreams.Count) return true;
+            kept = filtered;
         }
 
-        // Codec re-encode on any surviving track?
-        if (!string.IsNullOrEmpty(options.AudioCodec)
-            && !options.AudioCodec.Equals("copy", StringComparison.OrdinalIgnoreCase))
+        // Commentary tracks are unconditionally dropped by the planner (see
+        // FfprobeService.IsCommentaryTitle). If any survived the language filter,
+        // running the planner would change the output — that's audio work.
+        foreach (var s in kept)
+            if (FfprobeService.IsCommentaryTitle(s.Title)) return true;
+
+        // Preserve=off + AudioOutputs profiles: the planner emits encoded (or codec-deduped
+        // copy) outputs for the matched sources and DROPS every other source — that's work
+        // either way.
+        if (!options.PreserveOriginalAudio
+            && options.AudioOutputs is { Count: > 0 })
         {
-            foreach (var s in audioStreams)
-                if (!string.Equals(s.CodecName, options.AudioCodec, StringComparison.OrdinalIgnoreCase))
-                    return true;
+            return true;
         }
 
-        // Downmix would reduce channels on any surviving track?
-        if (options.TwoChannelAudio)
+        // Preserve=off + empty AudioOutputs: the empty-language safeguard in
+        // FfprobeService.MapAudio copies the highest-channel kept track per language.
+        // That's a no-op when each language bucket has a single track, but it drops
+        // sibling tracks when a language has multiple (eg. 5.1 + stereo English) — that
+        // is real work. Without this distinction, the common single-track-per-language
+        // case would burn an encode that ConvertVideoAsync's savings check would just
+        // discard, while the multi-track case would slip through the no-op gate.
+        if (!options.PreserveOriginalAudio)
         {
-            foreach (var s in audioStreams)
-                if (s.Channels > 2) return true;
+            foreach (var bucket in kept.GroupBy(s => (s.Language ?? "und").ToLowerInvariant()))
+            {
+                if (bucket.Count() > 1) return true;
+            }
+            return false;
+        }
+
+        // With Preserve=on, any output profile that wouldn't dedupe-to-copy against an
+        // existing source is a re-encode and therefore audio work. Codec name + channel
+        // count are enough since dedup uses exactly those two fields.
+        if (options.AudioOutputs is { Count: > 0 } profiles)
+        {
+            foreach (var p in profiles)
+            {
+                int? targetCh = p.Layout?.Trim().ToLowerInvariant() switch
+                {
+                    "mono"   => 1,
+                    "stereo" => 2,
+                    "5.1"    => 6,
+                    "7.1"    => 8,
+                    _        => null,
+                };
+
+                bool deduped = kept.Any(s =>
+                    string.Equals(s.CodecName, p.Codec, StringComparison.OrdinalIgnoreCase)
+                    && (targetCh == null || s.Channels == targetCh.Value));
+
+                if (!deduped) return true;
+            }
         }
 
         return false;
@@ -2172,9 +2318,11 @@ public class TranscodingService
 
     /// <summary>
     ///     Returns <see langword="true"/> when subtitle settings would change the output
-    ///     (language drop, sidecar extraction, or OCR of bitmap subs) versus a straight copy.
+    ///     (language drop, sidecar extraction, OCR of bitmap subs, or the default bitmap
+    ///     drop that fires when <c>PassThroughImageSubtitlesMkv</c> is off and the format
+    ///     is Matroska) versus a straight copy.
     /// </summary>
-    private static bool HasSubtitleWork(EncoderOptions options, IReadOnlyList<SubtitleStreamSummary> subStreams)
+    internal static bool HasSubtitleWork(EncoderOptions options, IReadOnlyList<SubtitleStreamSummary> subStreams)
     {
         if (subStreams.Count == 0) return false;
 
@@ -2193,6 +2341,21 @@ public class TranscodingService
 
         // OCR requested and a bitmap track is actually present to OCR?
         if (options.ConvertImageSubtitlesToSrt)
+        {
+            foreach (var s in subStreams)
+                if (FfprobeService._bitmapSubCodecs.Contains(s.CodecName ?? ""))
+                    return true;
+        }
+
+        // Bitmap-drop. MapSub silently strips PGS / VobSub / DVB streams whenever
+        // PassThroughImageSubtitlesMkv is off — including from the no-op gate path. Without
+        // counting that as work, a kept-language bitmap-only file would be reported as
+        // "Mux pass would copy audio/subs" or "no work to do" when in reality those subs
+        // would disappear from the output. MP4 always strips bitmap subs (MapSub returns
+        // -sn for non-Matroska anyway), so the format check is "are we keeping the MKV
+        // copy path AND has the user opted out of pass-through?"
+        bool isMatroskaOutput = string.Equals(options.Format, "mkv", StringComparison.OrdinalIgnoreCase);
+        if (isMatroskaOutput && !options.PassThroughImageSubtitlesMkv)
         {
             foreach (var s in subStreams)
                 if (FfprobeService._bitmapSubCodecs.Contains(s.CodecName ?? ""))
@@ -2259,7 +2422,7 @@ public class TranscodingService
     ///     a skip-ladder rung in <see cref="AddFileAsync"/> so we don't run ffmpeg just to produce
     ///     a near-identical output.
     /// </summary>
-    private static bool WouldEncodeBeNoOp(
+    internal static bool WouldEncodeBeNoOp(
         EncoderOptions options,
         long bitrate,
         bool isHevc,
@@ -2289,7 +2452,7 @@ public class TranscodingService
     ///     analyze preview's Copy-vs-Queue prediction, since an active filter forces a re-encode
     ///     even when bitrate logic would otherwise have chosen <c>videoCopy</c>.
     /// </summary>
-    private static bool HasActiveFilter(EncoderOptions options, int sourceHeight, bool isHdr)
+    internal static bool HasActiveFilter(EncoderOptions options, int sourceHeight, bool isHdr)
     {
         if (options.RemoveBlackBorders)                       return true;
         if (WouldDownscale(options, sourceHeight))            return true;
@@ -2302,7 +2465,7 @@ public class TranscodingService
     ///     for a source of the given height. Mirrors <see cref="ComputeScaleExpr"/>'s decision
     ///     without producing an FFmpeg expression.
     /// </summary>
-    private static bool WouldDownscale(EncoderOptions options, int sourceHeight)
+    internal static bool WouldDownscale(EncoderOptions options, int sourceHeight)
     {
         if (!IsDownscalePolicyActive(options.DownscalePolicy)) return false;
         if (sourceHeight <= 0)                                 return false;
@@ -2313,13 +2476,176 @@ public class TranscodingService
     }
 
     /// <summary>
+    ///     Returns a clone of <paramref name="options"/> with <paramref name="originalLanguage"/>
+    ///     merged into the audio + subtitle keep lists when <c>KeepOriginalLanguage</c> is on.
+    ///     Mirrors the merge that <see cref="ConvertVideoAsync"/> performs at encode time so
+    ///     the scan-phase skip predicates and the analyze dry-run see the same effective lists.
+    ///     Returns <paramref name="options"/> unchanged when the merge is a no-op.
+    /// </summary>
+    /// <param name="options"> Base options to merge into. Not mutated. </param>
+    /// <param name="originalLanguage"> ISO 639-1 code, or <see langword="null"/> when unknown. </param>
+    internal static EncoderOptions WithOriginalLanguageMerged(EncoderOptions options, string? originalLanguage)
+    {
+        if (!options.KeepOriginalLanguage) return options;
+        if (string.IsNullOrWhiteSpace(originalLanguage)) return options;
+
+        bool inAudio = options.AudioLanguagesToKeep.Contains(originalLanguage);
+        bool inSubs  = options.SubtitleLanguagesToKeep.Contains(originalLanguage);
+        if (inAudio && inSubs) return options;
+
+        var merged = options.Clone();
+        if (!inAudio) merged.AudioLanguagesToKeep.Add(originalLanguage);
+        if (!inSubs)  merged.SubtitleLanguagesToKeep.Add(originalLanguage);
+        return merged;
+    }
+
+    /// <summary>
+    ///     Resolves the original language for a file, preferring the cached value on
+    ///     <paramref name="dbFile"/> over a live integration-provider lookup. Returns
+    ///     <see langword="null"/> when <c>KeepOriginalLanguage</c> is off, no provider is
+    ///     wired, or the lookup fails — callers fall back to the user-configured keep
+    ///     lists in that case (matches <see cref="ConvertVideoAsync"/>'s historical behavior).
+    /// </summary>
+    private async Task<string?> ResolveOriginalLanguageAsync(
+        string filePath,
+        EncoderOptions options,
+        MediaFile? dbFile,
+        CancellationToken cancellationToken)
+    {
+        if (!options.KeepOriginalLanguage) return null;
+        if (!string.IsNullOrWhiteSpace(dbFile?.OriginalLanguage)) return dbFile!.OriginalLanguage;
+        if (_integrationService == null) return null;
+
+        try
+        {
+            return await _integrationService.LookupOriginalLanguageAsync(
+                filePath, options.OriginalLanguageProvider, cancellationToken);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { return null; }
+    }
+
+    /// <summary>
+    ///     Builds a transient <see cref="MediaFile"/> view over an in-flight <see cref="WorkItem"/>
+    ///     so the late skip-bail in <see cref="ProcessWorkItemAsync"/> can run the full
+    ///     <see cref="WouldSkipUnderOptions"/> ladder without touching the DB. Stream summaries
+    ///     are projected from the work item's probe; <paramref name="originalLanguage"/> is
+    ///     plugged in so the inner merge inside <see cref="WouldSkipUnderOptions"/> sees the
+    ///     same value <see cref="ApplyOriginalLanguageMergeAsync"/> already merged into options.
+    /// </summary>
+    private static MediaFile SyntheticMediaFile(WorkItem workItem, string? originalLanguage)
+    {
+        var videoStream = workItem.Probe?.Streams.FirstOrDefault(s => s.CodecType == "video");
+        return new MediaFile
+        {
+            FilePath        = workItem.Path,
+            Bitrate         = workItem.Bitrate,
+            Codec           = videoStream?.CodecName ?? (workItem.IsHevc ? "hevc" : "unknown"),
+            Width           = videoStream?.Width  ?? 0,
+            Height          = videoStream?.Height ?? 0,
+            IsHevc          = workItem.IsHevc,
+            IsHdr           = workItem.Probe != null && FfprobeService.IsHdr(workItem.Probe),
+            Is4K            = workItem.Is4K,
+            AudioStreams    = workItem.Probe != null
+                                ? MuxStreamSummary.Serialize(ProjectAudioSummaries(workItem.Probe))
+                                : null,
+            SubtitleStreams = workItem.Probe != null
+                                ? MuxStreamSummary.Serialize(ProjectSubtitleSummaries(workItem.Probe))
+                                : null,
+            OriginalLanguage = originalLanguage,
+        };
+    }
+
+    /// <summary>
+    ///     Bookkeeping companion to <see cref="FinaliseForDispatchAsync"/>. When the
+    ///     dispatch gate decides a queued item shouldn't encode, the caller pairs the
+    ///     `false` return with this method: persist Skipped to the DB, drop the item
+    ///     from the in-memory work-item registry, mark the in-flight WorkItem terminal,
+    ///     and notify the UI. Used by both local (<see cref="ProcessQueueAsync"/>) and
+    ///     cluster dispatch paths so the cleanup is identical.
+    /// </summary>
+    public async Task MarkDispatchSkippedAsync(WorkItem workItem, string reason)
+    {
+        ArgumentNullException.ThrowIfNull(workItem);
+        Console.WriteLine($"Skipping {workItem.FileName}: {reason}");
+        try
+        {
+            await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Skipped);
+        }
+        catch { /* DB blip — next scan re-evaluates */ }
+        _workItems.TryRemove(workItem.Id, out _);
+        workItem.Status = WorkItemStatus.Cancelled;
+        try { await _hubContext.Clients.All.SendAsync("WorkItemRemoved", workItem.Id); }
+        catch { /* SignalR errors are non-fatal */ }
+    }
+
+    /// <summary>
+    ///     The dispatcher's last gate before a <see cref="WorkItem"/> goes to a worker:
+    ///     resolves and persists any missing <see cref="MediaFile.OriginalLanguage"/>,
+    ///     merges it into <paramref name="perJobOptions"/>'s keep lists, and re-runs the
+    ///     full <see cref="WouldSkipUnderOptions"/> ladder under those merged options.
+    ///
+    ///     Returns <see langword="true"/> when the file should still encode; the caller
+    ///     dispatches it. Returns <see langword="false"/> when the merged state reveals
+    ///     there's no real work — the caller pairs that with
+    ///     <see cref="MarkDispatchSkippedAsync"/> to mark the row Skipped and drop it
+    ///     from the queue without ever invoking the worker. This keeps every
+    ///     "should this encode?" decision in the dispatcher and lets the worker path
+    ///     trust the items it receives.
+    ///
+    ///     <paramref name="perJobOptions"/> must already be a per-job clone — its keep
+    ///     lists are mutated in place. Both the local <see cref="ProcessQueueAsync"/>
+    ///     and the cluster <c>DispatchPendingItemsAsync</c> path call this so the two
+    ///     dispatch paths agree on the skip decision.
+    /// </summary>
+    public async Task<bool> FinaliseForDispatchAsync(
+        WorkItem workItem, EncoderOptions perJobOptions, CancellationToken cancellationToken)
+    {
+        var normalizedPath = Path.GetFullPath(workItem.Path);
+        var dbFile = await _mediaFileRepo.GetByPathAsync(normalizedPath);
+        string? originalLanguage = await ResolveOriginalLanguageAsync(
+            workItem.Path, perJobOptions, dbFile, cancellationToken);
+
+        // Cache newly resolved values so re-evaluations and re-scans are cache hits.
+        if (!string.IsNullOrEmpty(originalLanguage)
+            && dbFile != null
+            && !string.Equals(dbFile.OriginalLanguage, originalLanguage, StringComparison.OrdinalIgnoreCase))
+        {
+            dbFile.OriginalLanguage = originalLanguage;
+            try { await _mediaFileRepo.UpsertAsync(dbFile); }
+            catch { /* a DB blip here doesn't change the encode decision; next scan persists it */ }
+        }
+
+        // Merge into perJobOptions so HasMuxableWork at encode time + the audio/sub
+        // planner inside ConvertVideoAsync both see the same effective keep lists.
+        if (!string.IsNullOrEmpty(originalLanguage) && perJobOptions.KeepOriginalLanguage)
+        {
+            if (!perJobOptions.AudioLanguagesToKeep.Contains(originalLanguage))
+                perJobOptions.AudioLanguagesToKeep.Add(originalLanguage);
+            if (!perJobOptions.SubtitleLanguagesToKeep.Contains(originalLanguage))
+                perJobOptions.SubtitleLanguagesToKeep.Add(originalLanguage);
+        }
+
+        // Final skip check under the merged options. Synthesises a MediaFile shape
+        // from the work item + probe so WouldSkipUnderOptions can run against the
+        // same fields it uses on the persisted DB row.
+        var skipMf = SyntheticMediaFile(workItem, originalLanguage);
+        return !WouldSkipUnderOptions(skipMf, perJobOptions);
+    }
+
+    /// <summary>
     ///     Pure function that mirrors the scan-phase skip gate using only <see cref="MediaFile"/>
     ///     fields (no probe required). Returns <see langword="true"/> when the file would still be
     ///     skipped under the given options — used on settings-save to decide whether to reset
     ///     <see cref="MediaFileStatus.Skipped"/> rows back to <see cref="MediaFileStatus.Unseen"/>.
+    ///     Reads <see cref="MediaFile.OriginalLanguage"/> so files that would have their original
+    ///     language preserved at encode time are evaluated against the same effective keep lists
+    ///     instead of predicting drops that won't actually happen.
     /// </summary>
     public static bool WouldSkipUnderOptions(MediaFile mf, EncoderOptions options)
     {
+        options = WithOriginalLanguageMerged(options, mf.OriginalLanguage);
+
         // Skip4K overrides everything else.
         if (options.Skip4K && mf.Is4K) return true;
 
@@ -2336,8 +2662,8 @@ public class TranscodingService
         if (options.EncodingMode == EncodingMode.MuxOnly) return true;
 
         // Codec match — mirrors the scan-phase `alreadyTargetCodec` computation.
-        bool targetIsHevc = options.Encoder.Contains("265");
-        bool targetIsAv1  = options.Encoder.Contains("av1") || options.Encoder.Contains("svt");
+        bool targetIsHevc = options.Encoder.Contains("265", StringComparison.OrdinalIgnoreCase);
+        bool targetIsAv1  = options.Encoder.Contains("av1", StringComparison.OrdinalIgnoreCase) || options.Encoder.Contains("svt", StringComparison.OrdinalIgnoreCase);
         bool sourceIsAv1  = string.Equals(mf.Codec, "av1", StringComparison.OrdinalIgnoreCase);
         bool alreadyTargetCodec = targetIsAv1 ? sourceIsAv1
                                 : targetIsHevc ? mf.IsHevc
@@ -2355,13 +2681,14 @@ public class TranscodingService
         // No-op gate — mirrors AddFileAsync's WouldEncodeBeNoOp rung. An HEVC file just above
         // the ceiling but under target+700 would get a videoCopy=true encode at run-time, and
         // if there's no audio/sub work or filters either, the encode is a near-no-op. MediaFile
-        // doesn't carry HDR metadata so we treat tonemap as inactive here — worst case the file
-        // gets re-evaluated by AddFileAsync, which has the probe and will catch the HDR case.
+        // now carries cached IsHdr (set by AddFileAsync during the live probe), so the tonemap
+        // arm of HasActiveFilter is evaluated correctly even on the predicate path that has no
+        // probe in hand.
         if (mf.IsHevc && mf.Bitrate < options.TargetBitrate + 700)
         {
             var audioStreams = MuxStreamSummary.DeserializeAudio(mf.AudioStreams);
             var subStreams   = MuxStreamSummary.DeserializeSubtitle(mf.SubtitleStreams);
-            if (!HasActiveFilter(options, mf.Height, isHdr: false)
+            if (!HasActiveFilter(options, mf.Height, mf.IsHdr)
                 && !HasAudioWork(options, audioStreams)
                 && !HasSubtitleWork(options, subStreams))
             {
@@ -2378,13 +2705,13 @@ public class TranscodingService
     ///     4K multiplier when applicable). Used at encode time to decide whether a configured
     ///     <see cref="EncodingMode.Hybrid"/> should trigger a video-copy mux pass.
     /// </summary>
-    private static bool MeetsBitrateTarget(WorkItem workItem, EncoderOptions options)
+    internal static bool MeetsBitrateTarget(WorkItem workItem, EncoderOptions options)
     {
         if (workItem.Bitrate <= 0 || workItem.Probe == null) return false;
 
         var videoStream = workItem.Probe.Streams.FirstOrDefault(s => s.CodecType == "video");
-        bool targetIsHevc = options.Encoder.Contains("265");
-        bool targetIsAv1  = options.Encoder.Contains("av1") || options.Encoder.Contains("svt");
+        bool targetIsHevc = options.Encoder.Contains("265", StringComparison.OrdinalIgnoreCase);
+        bool targetIsAv1  = options.Encoder.Contains("av1", StringComparison.OrdinalIgnoreCase) || options.Encoder.Contains("svt", StringComparison.OrdinalIgnoreCase);
         bool sourceIsAv1  = string.Equals(videoStream?.CodecName, "av1", StringComparison.OrdinalIgnoreCase);
         bool alreadyTargetCodec = targetIsAv1 ? sourceIsAv1
                                 : targetIsHevc ? workItem.IsHevc
@@ -2406,7 +2733,47 @@ public class TranscodingService
     ///     4K content uses the configured multiplier; source bitrate is always respected as an upper cap.
     /// </summary>
     /// <returns>A tuple of (targetBitrate, minBitrate, maxBitrate, videoCopy).</returns>
-    private (string target, string min, string max, bool copy) CalculateBitrates(WorkItem workItem, EncoderOptions options)
+    /// <summary>
+    ///     Assembles the final ffmpeg command string from the per-section flag fragments
+    ///     produced upstream. The format toggles two things: the container muxer
+    ///     (<c>matroska</c> vs <c>mp4</c>) and the variable flags (MP4 needs
+    ///     <c>-movflags +faststart</c>; MKV doesn't). Extracted from
+    ///     <c>ConvertVideoAsync</c> so the wire format can be unit-tested without
+    ///     spinning up the encode pipeline.
+    /// </summary>
+    /// <param name="format">"mkv" or "mp4". Anything else is treated as MP4.</param>
+    /// <param name="initFlags">Hardware init flags (from <see cref="GetInitFlags"/>).</param>
+    /// <param name="analyzeFlags">Probe-size / analyze-duration flags.</param>
+    /// <param name="inputPath">Source file path. Quoted into the command.</param>
+    /// <param name="extraInputs">Additional <c>-i</c> arguments for OCR-mux SRT inputs, or <c>""</c>.</param>
+    /// <param name="videoFlags">Video map + codec args.</param>
+    /// <param name="compressionFlags">Rate-control / preset / quality flags.</param>
+    /// <param name="audioFlags">Audio map + per-output-stream codec args.</param>
+    /// <param name="subtitleFlags">Subtitle map + codec args (or <c>-sn</c>).</param>
+    /// <param name="outputPath">Destination file path. Quoted into the command.</param>
+    /// <returns>The full ffmpeg argument string (without the leading <c>ffmpeg</c> binary name).</returns>
+    internal static string BuildFfmpegCommand(
+        string format,
+        string initFlags,
+        string analyzeFlags,
+        string inputPath,
+        string extraInputs,
+        string videoFlags,
+        string compressionFlags,
+        string audioFlags,
+        string subtitleFlags,
+        string outputPath)
+    {
+        bool isMkv      = string.Equals(format, "mkv", StringComparison.OrdinalIgnoreCase);
+        string varFlags = isMkv
+            ? "-max_muxing_queue_size 9999 "
+            : "-movflags +faststart -max_muxing_queue_size 9999 ";
+        string muxer = isMkv ? "matroska" : "mp4";
+
+        return $"{initFlags} {analyzeFlags}-i \"{inputPath}\" {extraInputs}{videoFlags}{compressionFlags}{audioFlags}{subtitleFlags}{varFlags}-f {muxer} \"{outputPath}\"";
+    }
+
+    internal static (string target, string min, string max, bool copy) CalculateBitrates(WorkItem workItem, EncoderOptions options)
     {
         bool videoCopy = false;
         string targetBitrate, minBitrate, maxBitrate;
@@ -2422,7 +2789,9 @@ public class TranscodingService
             int multiplier = Math.Clamp(options.FourKBitrateMultiplier, 2, 8);
             int hdBitrate = options.TargetBitrate * multiplier;
 
-            if (workItem.Bitrate < hdBitrate + 700 && !workItem.IsHevc)
+            // Bitrate>0 gates the compression branch: a probe that returned no source
+            // bitrate would otherwise produce 0k targets, which ffmpeg refuses.
+            if (workItem.Bitrate > 0 && workItem.Bitrate < hdBitrate + 700 && !workItem.IsHevc)
             {
                 // Low-bitrate 4K H.264 — compress to 70% like non-4K
                 targetBitrate = $"{(int)(workItem.Bitrate * 0.7)}k";
@@ -2436,7 +2805,7 @@ public class TranscodingService
                 maxBitrate = $"{hdBitrate + 500}k";
             }
         }
-        else if (workItem.Bitrate < options.TargetBitrate + 700 && !workItem.IsHevc)
+        else if (workItem.Bitrate > 0 && workItem.Bitrate < options.TargetBitrate + 700 && !workItem.IsHevc)
         {
             targetBitrate = $"{(int)(workItem.Bitrate * 0.7)}k";
             minBitrate = $"{(int)(workItem.Bitrate * 0.6)}k";
@@ -2467,18 +2836,18 @@ public class TranscodingService
     ///     no longer qualifies as 4K (≤ 1440p). Used to skip the 4K bitrate multiplier
     ///     so a 4K→1080p downscale doesn't get allocated a 4K-sized bitrate budget.
     /// </summary>
-    private static bool WillDownscaleBelow4K(EncoderOptions options)
+    internal static bool WillDownscaleBelow4K(EncoderOptions options)
     {
         if (!IsDownscalePolicyActive(options.DownscalePolicy)) return false;
         return ResolveDownscaleHeight(options.DownscaleTarget) <= 1440;
     }
 
-    private static bool IsDownscalePolicyActive(string policy) =>
+    internal static bool IsDownscalePolicyActive(string policy) =>
         string.Equals(policy, "Always",      StringComparison.OrdinalIgnoreCase)
         || string.Equals(policy, "CapAtTarget", StringComparison.OrdinalIgnoreCase)
         || string.Equals(policy, "IfLarger",    StringComparison.OrdinalIgnoreCase);
 
-    private static int ResolveDownscaleHeight(string target) => target switch
+    internal static int ResolveDownscaleHeight(string target) => target switch
     {
         "4K"    => 2160,
         "2160p" => 2160,
@@ -2495,7 +2864,7 @@ public class TranscodingService
     ///     <see cref="VideoFilterBuilder"/> keeps this form verbatim for the SW
     ///     hwupload path the user has chosen for all HW encoders.
     /// </summary>
-    private static string? ComputeScaleExpr(WorkItem workItem, EncoderOptions options)
+    internal static string? ComputeScaleExpr(WorkItem workItem, EncoderOptions options)
     {
         var policy = options.DownscalePolicy;
         if (!IsDownscalePolicyActive(policy)) return null;
@@ -2521,7 +2890,7 @@ public class TranscodingService
     ///     skips VAAPI calibration — uses a fixed CQP since filter activation typically
     ///     already implies bitrate guesswork is acceptable for an exceptional case.
     /// </summary>
-    private static string GetForcedReencodeCompressionFlags(string encoder, bool useVaapi, bool isSvtAv1,
+    internal static string GetForcedReencodeCompressionFlags(string encoder, bool useVaapi, bool isSvtAv1,
         string targetBitrate, string minBitrate, string maxBitrate, bool useConservativeHwFlags)
     {
         int maxBitrateVal = int.Parse(maxBitrate.TrimEnd('k'));
@@ -2921,7 +3290,7 @@ public class TranscodingService
     ///     Returns <c>true</c> if the source video codec is supported by VAAPI hardware decoding
     ///     on Elkhart Lake (J6412) hardware (h264, hevc, mpeg2, vp8, vp9, mjpeg).
     /// </summary>
-    private static bool CanVaapiDecode(ProbeResult? probe)
+    internal static bool CanVaapiDecode(ProbeResult? probe)
     {
         var codec = probe?.Streams?.FirstOrDefault(s => s.CodecType == "video")?.CodecName;
         // J6412 (Elkhart Lake) VAAPI decode: h264, hevc, mpeg2, vp8, vp9, jpeg
@@ -2934,10 +3303,15 @@ public class TranscodingService
     ///     When <paramref name="hwDecode"/> is <c>false</c>, initializes the VAAPI device but skips
     ///     forcing hardware decode (software decode + VAAPI encode mode).
     /// </summary>
-    private string GetInitFlags(string hardwareAcceleration, bool hwDecode = true)
-    {
-        bool isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+    internal static string GetInitFlags(string hardwareAcceleration, bool hwDecode = true)
+        => GetInitFlags(hardwareAcceleration, RuntimeInformation.IsOSPlatform(OSPlatform.Windows), hwDecode);
 
+    /// <summary>
+    ///     Pure overload that takes <paramref name="isWindows"/> explicitly so unit tests can
+    ///     exercise the VAAPI / QSV / AMF branches independently of the test host OS.
+    /// </summary>
+    internal static string GetInitFlags(string hardwareAcceleration, bool isWindows, bool hwDecode)
+    {
         return hardwareAcceleration.ToLower() switch
         {
             "intel" when isWindows => "-y -hwaccel qsv -hwaccel_output_format qsv -qsv_device auto",
@@ -2957,12 +3331,18 @@ public class TranscodingService
     ///     Maps the user's encoder preference and hardware acceleration setting to the
     ///     concrete FFmpeg encoder name (e.g., <c>"hevc_vaapi"</c>, <c>"hevc_nvenc"</c>, <c>"libx265"</c>).
     /// </summary>
-    private string GetEncoder(EncoderOptions options)
+    internal static string GetEncoder(EncoderOptions options)
     {
         bool isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
-        bool isAv1 = options.Encoder.Contains("av1") || options.Encoder.Contains("svt");
-        bool isH265 = !isAv1 && options.Encoder.Contains("265");
-        bool isH264 = !isAv1 && options.Encoder.Contains("264");
+        // Case-insensitive: Encoder can come from settings.json or per-folder overrides
+        // where casing isn't enforced; the UI's ENCODER_MAP is lowercase but external
+        // entry points aren't, and a non-matching codec string silently falls through
+        // to passing the raw value to ffmpeg.
+        var encoder = options.Encoder ?? "";
+        bool isAv1  = encoder.Contains("av1", StringComparison.OrdinalIgnoreCase)
+                   || encoder.Contains("svt", StringComparison.OrdinalIgnoreCase);
+        bool isH265 = !isAv1 && encoder.Contains("265", StringComparison.OrdinalIgnoreCase);
+        bool isH264 = !isAv1 && encoder.Contains("264", StringComparison.OrdinalIgnoreCase);
 
         return options.HardwareAcceleration.ToLower() switch
         {
@@ -2991,7 +3371,7 @@ public class TranscodingService
             "apple" when isAv1 => "libsvtav1",
             "apple" when isH265 => "hevc_videotoolbox",
             "apple" when isH264 => "h264_videotoolbox",
-            _ => options.Encoder
+            _ => encoder
         };
     }
 
@@ -2999,10 +3379,13 @@ public class TranscodingService
     ///     Returns the software fallback encoder for the user's codec preference.
     ///     Used when the requested hardware encoder isn't available on the system.
     /// </summary>
-    private static string GetSoftwareFallbackEncoder(EncoderOptions options)
+    internal static string GetSoftwareFallbackEncoder(EncoderOptions options)
     {
-        bool isAv1 = options.Encoder.Contains("av1") || options.Encoder.Contains("svt");
-        bool isH264 = !isAv1 && options.Encoder.Contains("264");
+        // Case-insensitive — same reason as GetEncoder above.
+        var encoder = options.Encoder ?? "";
+        bool isAv1  = encoder.Contains("av1", StringComparison.OrdinalIgnoreCase)
+                   || encoder.Contains("svt", StringComparison.OrdinalIgnoreCase);
+        bool isH264 = !isAv1 && encoder.Contains("264", StringComparison.OrdinalIgnoreCase);
         if (isAv1) return "libsvtav1";
         if (isH264) return "libx264";
         return "libx265";
@@ -3014,7 +3397,7 @@ public class TranscodingService
     ///     SVT-AV1's range so a user who picks "slow" in the UI actually gets slower
     ///     encodes on AV1 too. Unknown values fall back to 6 (matches the prior hardcode).
     /// </summary>
-    private static int MapSvtAv1Preset(string preset) => (preset ?? "").ToLowerInvariant() switch
+    internal static int MapSvtAv1Preset(string preset) => (preset ?? "").ToLowerInvariant() switch
     {
         "veryslow" => 2,
         "slow"     => 4,
@@ -3886,7 +4269,9 @@ public class TranscodingService
             workItem.Progress = 0;
             await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
             // Use the correct software encoder for the target codec
-            bool isAv1Target = options.Encoder.Contains("av1") || options.Encoder.Contains("svt") || options.Codec == "av1";
+            bool isAv1Target = options.Encoder.Contains("av1", StringComparison.OrdinalIgnoreCase)
+                            || options.Encoder.Contains("svt", StringComparison.OrdinalIgnoreCase)
+                            || string.Equals(options.Codec, "av1", StringComparison.OrdinalIgnoreCase);
             options.Encoder = isAv1Target ? "libsvtav1" : "libx265";
             options.HardwareAcceleration = "none";
             await ConvertVideoAsync(workItem, options,
@@ -3947,6 +4332,154 @@ public class TranscodingService
     ///     settings changes without needing a new scan.
     /// </summary>
     public void UpdateOptions(EncoderOptions options) => _lastOptions = options;
+
+    /// <summary>
+    ///     Resolves and persists <see cref="MediaFile.OriginalLanguage"/> for every row in
+    ///     <paramref name="files"/> whose value is currently null. No-op when
+    ///     <c>KeepOriginalLanguage</c> is off or no integration provider is wired.
+    ///     The integration service caches per-show / per-movie, so a library with N files
+    ///     across M titles makes ~M API calls, not N.
+    /// </summary>
+    /// <returns>The number of rows whose <c>OriginalLanguage</c> was newly populated.</returns>
+    public async Task<int> BackfillOriginalLanguageAsync(
+        IReadOnlyList<MediaFile> files,
+        EncoderOptions options,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(files);
+        ArgumentNullException.ThrowIfNull(options);
+        if (!options.KeepOriginalLanguage || _integrationService == null) return 0;
+
+        int filled = 0;
+        foreach (var mf in files)
+        {
+            if (cancellationToken.IsCancellationRequested) break;
+            if (!string.IsNullOrWhiteSpace(mf.OriginalLanguage)) continue;
+
+            try
+            {
+                var resolved = await _integrationService.LookupOriginalLanguageAsync(
+                    mf.FilePath, options.OriginalLanguageProvider, cancellationToken);
+                if (string.IsNullOrEmpty(resolved)) continue;
+                mf.OriginalLanguage = resolved;
+                await _mediaFileRepo.UpsertAsync(mf);
+                filled++;
+            }
+            catch (OperationCanceledException) { throw; }
+            catch { /* lookup failures fall back to the configured keep lists, matching ConvertVideoAsync */ }
+        }
+        return filled;
+    }
+
+    /// <summary>
+    ///     Removes <see cref="WorkItemStatus.Pending"/> items from the local queue that no
+    ///     longer need encoding under <paramref name="newOptions"/> — the inverse of the
+    ///     scan-time skip ladder. Used by the settings-save flow when the user changes a
+    ///     setting in the "no longer needs encoding" direction (e.g., adds an audio output
+    ///     that re-queues a batch, then removes it). Without this, those items keep running
+    ///     even though the setting that made them eligible has been reverted.
+    ///
+    ///     Active jobs (<see cref="WorkItemStatus.Processing"/>, etc.) are left alone — they
+    ///     either finish or get cancelled explicitly. Remote-assigned items are also left
+    ///     alone since they're not in <c>_workQueue</c> anymore (they're in worker hands).
+    /// </summary>
+    /// <param name="newOptions">The just-saved encoder options to evaluate against.</param>
+    /// <returns>The number of pending items removed from the queue.</returns>
+    public async Task<int> RemoveSettingsObsoletedQueueItemsAsync(EncoderOptions newOptions)
+    {
+        ArgumentNullException.ThrowIfNull(newOptions);
+
+        // Step 1: snapshot the candidate (id, path) pairs under the queue lock. We don't
+        // remove yet — the DB lookup that decides "is this still needed?" is async and
+        // can't run under a lock. Holding the snapshot's ids lets us re-find the items
+        // in step 3 and verify they're still Pending before removal.
+        List<(string Id, string Path)> candidates;
+        lock (_queueLock)
+        {
+            candidates = _workQueue
+                .Where(w => w.Status == WorkItemStatus.Pending)
+                .Select(w => (w.Id, w.Path))
+                .ToList();
+        }
+        if (candidates.Count == 0) return 0;
+
+        // Step 2: re-evaluate each candidate against the new options using its cached
+        // MediaFile row. Items missing the row or the per-track summaries are left alone
+        // (conservative: the next scan re-probes them).
+        //
+        // When KeepOriginalLanguage is on we resolve and cache the original language for
+        // any row that doesn't have one yet — without it, WouldSkipUnderOptions can't see
+        // the merged keep lists and would mis-predict drops on rows queued before the
+        // OriginalLanguage cache existed. Live lookups go through the integration provider
+        // and may be slow; the resolved value is persisted so subsequent re-evaluations are
+        // cache hits.
+        var idsToRemove = new HashSet<string>();
+        foreach (var (id, path) in candidates)
+        {
+            var normalizedPath = Path.GetFullPath(path);
+            var mf = await _mediaFileRepo.GetByPathAsync(normalizedPath);
+            if (mf == null) continue;
+            if (mf.AudioStreams == null && mf.SubtitleStreams == null) continue;
+
+            if (newOptions.KeepOriginalLanguage
+                && string.IsNullOrWhiteSpace(mf.OriginalLanguage)
+                && _integrationService != null)
+            {
+                try
+                {
+                    var resolved = await _integrationService.LookupOriginalLanguageAsync(
+                        mf.FilePath, newOptions.OriginalLanguageProvider, CancellationToken.None);
+                    if (!string.IsNullOrEmpty(resolved))
+                    {
+                        mf.OriginalLanguage = resolved;
+                        await _mediaFileRepo.UpsertAsync(mf);
+                    }
+                }
+                catch { /* lookup failures fall back to the configured keep lists, matching ConvertVideoAsync */ }
+            }
+
+            if (WouldSkipUnderOptions(mf, newOptions)) idsToRemove.Add(id);
+        }
+        if (idsToRemove.Count == 0) return 0;
+
+        // Step 3: remove the matching items from the queue under the lock. Re-check status
+        // because a concurrent picker may have dequeued an item between steps 1 and 3.
+        var removed = new List<WorkItem>();
+        lock (_queueLock)
+        {
+            for (int i = _workQueue.Count - 1; i >= 0; i--)
+            {
+                var item = _workQueue[i];
+                if (!idsToRemove.Contains(item.Id))           continue;
+                if (item.Status != WorkItemStatus.Pending)    continue;
+
+                _workQueue.RemoveAt(i);
+                removed.Add(item);
+            }
+        }
+        if (removed.Count == 0) return 0;
+
+        // Step 4: drop from the work-item registry, notify the UI, and persist the
+        // MediaFile transition to Skipped so the next scan respects the reverted setting.
+        foreach (var item in removed)
+        {
+            _workItems.TryRemove(item.Id, out _);
+            item.Status = WorkItemStatus.Cancelled;
+            try
+            {
+                await _hubContext.Clients.All.SendAsync("WorkItemRemoved", item.Id);
+            }
+            catch { /* SignalR failures are non-fatal — the next page refresh corrects state */ }
+            try
+            {
+                await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(item.Path), MediaFileStatus.Skipped);
+            }
+            catch { /* DB failures don't block queue cleanup; next scan corrects via WouldSkipUnderOptions */ }
+        }
+
+        Console.WriteLine($"Settings change: dropped {removed.Count} now-obsolete pending queue item(s).");
+        return removed.Count;
+    }
 
     /// <summary>
     ///     Suspends or resumes the local processing loop. When suspended, pending items remain
@@ -4257,7 +4790,11 @@ public class TranscodingService
 
         Console.WriteLine($"Cluster: Remote encode of {workItem.FileName}: {FormatSize(workItem.Size)} → {FormatSize(outputSize)} (saved {FormatSize((long)(savings * 1048576))}, {percent:P0})");
 
-        if (savings > 0)
+        // Mirrors the local savings gate: configured audio fan-out is allowed to grow
+        // the file past any video savings since the user opted into that output.
+        bool userConfiguredGrowth = options.AudioOutputs is { Count: > 0 };
+
+        if (savings > 0 || userConfiguredGrowth)
         {
             await HandleOutputPlacement(outputPath, workItem, options);
             workItem.Status = WorkItemStatus.Completed;
@@ -4285,7 +4822,7 @@ public class TranscodingService
         {
             if (_notificationService != null)
                 _ = _notificationService.NotifyEncodeCompletedAsync(Path.GetFileName(workItem.Path), new FileInfo(workItem.Path).Length);
-            if (_integrationService != null && savings > 0)
+            if (_integrationService != null && (savings > 0 || userConfiguredGrowth))
                 _ = _integrationService.TriggerRescansAsync(workItem.Path);
         }
     }

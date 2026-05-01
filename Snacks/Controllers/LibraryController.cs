@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.Mvc;
+using Snacks.Models;
 using Snacks.Models.Requests;
 using Snacks.Services;
 
@@ -13,13 +14,19 @@ public sealed class LibraryController : ControllerBase
 {
     private readonly FileService        _fileService;
     private readonly TranscodingService _transcodingService;
+    private readonly AutoScanService    _autoScanService;
 
-    public LibraryController(FileService fileService, TranscodingService transcodingService)
+    public LibraryController(
+        FileService fileService,
+        TranscodingService transcodingService,
+        AutoScanService autoScanService)
     {
         ArgumentNullException.ThrowIfNull(fileService);
         ArgumentNullException.ThrowIfNull(transcodingService);
+        ArgumentNullException.ThrowIfNull(autoScanService);
         _fileService        = fileService;
         _transcodingService = transcodingService;
+        _autoScanService    = autoScanService;
     }
 
     /******************************************************************
@@ -213,7 +220,15 @@ public sealed class LibraryController : ControllerBase
         if (!_fileService.IsFilePathAllowed(request.FilePath))
             return BadRequest("File is not within allowed library path");
 
-        var workItemId = await _transcodingService.AddFileAsync(request.FilePath, request.Options, force: true);
+        // Apply per-folder overrides (same path the auto-scanner uses) so a manually queued
+        // file under a folder with a Codec / language / target override actually honors that
+        // override. Without this, the file is queued under the global options and the local
+        // dispatcher's override application can't help — the request.Options it'd see is
+        // already the globals.
+        var folderOverride = _autoScanService.FindFolderOverride(request.FilePath);
+        var fileOptions    = EncoderOptionsOverride.ApplyOverrides(request.Options, folderOverride, null);
+
+        var workItemId = await _transcodingService.AddFileAsync(request.FilePath, fileOptions, force: true);
         return new JsonResult(new { success = true, workItemId });
     }
 }

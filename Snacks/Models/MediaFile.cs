@@ -68,6 +68,15 @@ public sealed class MediaFile
     /// <summary> Whether the video stream is HEVC/H.265 encoded. </summary>
     public bool IsHevc { get; set; }
 
+    /// <summary>
+    ///     Whether the video stream is HDR (PQ / HLG / Dolby Vision detected via
+    ///     <c>FfprobeService.IsHdr</c>). Cached so the analyze dry-run path and
+    ///     <c>WouldSkipUnderOptions</c> can answer "would tonemap fire?" from a
+    ///     cached row instead of hard-coding <see langword="false"/> when no
+    ///     fresh probe is available.
+    /// </summary>
+    public bool IsHdr { get; set; }
+
     /// <summary> Whether the video resolution exceeds 1920px width (4K/UHD detection). </summary>
     public bool Is4K { get; set; }
 
@@ -110,6 +119,19 @@ public sealed class MediaFile
     ///     <see cref="AudioStreams" />.
     /// </summary>
     public string? SubtitleStreams { get; set; }
+
+    /// <summary>
+    ///     ISO 639-1 (2-letter) original language resolved via the configured
+    ///     <c>OriginalLanguageProvider</c> (Sonarr / Radarr / TVDB / TMDb) at
+    ///     scan time. Cached so the scan-phase skip predicates and the analyze
+    ///     dry-run see the same merged keep-list that <c>ConvertVideoAsync</c>
+    ///     would build at encode time — without re-querying the integration
+    ///     provider on every settings save.
+    ///
+    ///     <see langword="null"/> means "not yet looked up" or "lookup failed";
+    ///     callers fall back to the user-configured keep lists in that case.
+    /// </summary>
+    public string? OriginalLanguage { get; set; }
 
     /// <summary>
     ///     The <see cref="WorkItem.Id"/> GUID used when this file was dispatched as a remote job.

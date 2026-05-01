@@ -41,27 +41,50 @@
             <h6 class="fw-bold mb-3"><i class="fas fa-sliders-h me-2 text-info"></i>Codec &amp; Mix</h6>
 
             <div class="form-check mb-3">
-                <input class="form-check-input" type="checkbox" id="@(formPrefix)TwoChannelAudio" name="TwoChannelAudio">
-                <label class="form-check-label" for="@(formPrefix)TwoChannelAudio"><i class="fas fa-volume-up me-1"></i> Downmix to Stereo</label>
-                <div class="form-text">Replace surround tracks (5.1/7.1) with a 2-channel stereo mix.</div>
+                <input class="form-check-input" type="checkbox" id="@(formPrefix)PreserveOriginalAudio" name="PreserveOriginalAudio" checked>
+                <label class="form-check-label" for="@(formPrefix)PreserveOriginalAudio"><i class="fas fa-clone me-1"></i> Preserve original audio tracks</label>
+                <div class="form-text">Pass every kept source track through with <code>-c:a copy</code> alongside any added outputs below.</div>
             </div>
 
-            <div class="mb-3">
-                <label for="@(formPrefix)AudioCodec" class="form-label">Audio Codec</label>
-                <select class="form-select" id="@(formPrefix)AudioCodec" name="AudioCodec">
-                    <option value="copy" selected>Copy (no re-encode)</option>
-                    <option value="aac">AAC</option>
-                    <option value="eac3">E-AC3</option>
-                    <option value="opus">Opus</option>
-                </select>
-                <div class="form-text">"Copy" preserves the original audio bit-for-bit; AAC is the safest cross-device fallback.</div>
-            </div>
-
-            <div class="mb-3">
-                <label for="@(formPrefix)AudioBitrateKbps" class="form-label">Audio Bitrate (kbps)</label>
-                <input type="number" class="form-control" id="@(formPrefix)AudioBitrateKbps" name="AudioBitrateKbps" min="32" max="1536" step="16" value="192">
-                <div class="form-text">Target bitrate for re-encoded audio (ignored when the codec is set to Copy).</div>
+            <div class="mb-2">
+                <label class="form-label mb-1"><i class="fas fa-plus-circle me-1"></i> Output formats to add</label>
+                <div class="form-text mb-2">For each kept language, the planner emits one stream per row, picking the best matching source track and downmixing higher channel layouts when needed. Rows that already exist in the source as-is are deduped to a copy automatically.</div>
+                <div id="@(formPrefix)AudioOutputs" class="audio-outputs"></div>
+                <button type="button" class="btn btn-sm btn-outline-primary mt-2" id="@(formPrefix)AudioOutputsAdd">
+                    <i class="fas fa-plus"></i> Add output
+                </button>
             </div>
         </div>
     </div>
 </div>
+
+<template id="@(formPrefix)AudioOutputRowTemplate">
+    <div class="audio-output-row d-flex align-items-end gap-2 mb-2" data-audio-output-row>
+        <div class="flex-fill">
+            <label class="form-label form-label-sm mb-1">Codec</label>
+            <select class="form-select form-select-sm" data-field="Codec">
+                <option value="aac">AAC</option>
+                <option value="ac3">AC3</option>
+                <option value="eac3">E-AC3</option>
+                <option value="opus">Opus</option>
+            </select>
+        </div>
+        <div class="flex-fill">
+            <label class="form-label form-label-sm mb-1">Layout</label>
+            <select class="form-select form-select-sm" data-field="Layout">
+                <option value="Source">Source (keep)</option>
+                <option value="Mono">Mono (1.0)</option>
+                <option value="Stereo">Stereo (2.0)</option>
+                <option value="5.1">5.1 surround</option>
+                <option value="7.1">7.1 surround</option>
+            </select>
+        </div>
+        <div style="width: 7rem;">
+            <label class="form-label form-label-sm mb-1">Bitrate (kbps)</label>
+            <input type="number" class="form-control form-control-sm" data-field="BitrateKbps" min="0" max="1536" step="16" value="0">
+        </div>
+        <button type="button" class="btn btn-sm btn-outline-danger" data-audio-output-remove title="Remove output">
+            <i class="fas fa-trash"></i>
+        </button>
+    </div>
+</template>

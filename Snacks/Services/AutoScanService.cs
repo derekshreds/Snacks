@@ -84,8 +84,11 @@ public sealed class AutoScanService : IHostedService, IDisposable
         await MigrateSeenFilesIfNeededAsync();
         ScheduleTimer();
 
-        // Wire up folder override resolver for cluster dispatch (avoids circular DI)
+        // Wire up folder override resolver for cluster dispatch (avoids circular DI).
+        // Local dispatch needs the same resolver so per-folder overrides are applied to
+        // the encoder, not just to the queue-time skip ladder.
         _clusterService.FolderOverrideResolver = FindFolderOverride;
+        _transcodingService.SetFolderOverrideResolver(FindFolderOverride);
 
         // Feed library exclusion rules into the transcoding service so manual adds honor
         // the same filename/size/resolution filters the auto-scanner applies.

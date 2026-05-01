@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-2.7.0-8b5cf6?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-2.8.0-8b5cf6?style=flat-square" alt="Version">
   <img src="https://img.shields.io/badge/.NET-10.0-512bd4?style=flat-square" alt=".NET 10">
   <img src="https://img.shields.io/badge/Electron-41-47848f?style=flat-square" alt="Electron">
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License">
@@ -100,6 +100,20 @@ services:
 | Synology | `/volume1/video` or `/volume1/Media` |
 
 **4. Access Snacks** at `http://YOUR-NAS-IP:6767`
+
+---
+
+### Option 1b: Unraid
+
+An Unraid Community Applications template ships in [`unraid/snacks.xml`](unraid/snacks.xml).
+
+In Unraid: **Docker** → **Add Container** → paste this URL into the **Template** field at the top:
+
+```
+https://raw.githubusercontent.com/derekshreds/Snacks/master/unraid/snacks.xml
+```
+
+Adjust the *Media Library* path (default `/mnt/user/Media`) and apply. Web UI at `http://YOUR-UNRAID-IP:6767`. See [`unraid/README.md`](unraid/README.md) for NVIDIA setup.
 
 ---
 
@@ -410,5 +424,5 @@ Creates a self-contained `.dmg` at `electron-app/dist/` with the .NET runtime, F
 ---
 
 <p align="center">
-  <strong>Snacks</strong> v2.7.0 &copy; 2026 Derek Morris
+  <strong>Snacks</strong> v2.8.0 &copy; 2026 Derek Morris
 </p>

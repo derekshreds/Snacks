@@ -169,6 +169,20 @@ public sealed class QueueController : ControllerBase
         return new JsonResult(files);
     }
 
+    /// <summary>
+    ///     Deletes every Failed row from the persistent database. The next library scan
+    ///     re-discovers any source file still on disk; items whose source has already been
+    ///     replaced (the bogus-failure backlog from the source-removed bug) simply stay gone,
+    ///     since their original path no longer exists for AutoScan to find. No video files
+    ///     are touched.
+    /// </summary>
+    [HttpDelete("failed")]
+    public async Task<IActionResult> DeleteFailed()
+    {
+        var deleted = await _mediaFileRepo.DeleteAllFailedAsync();
+        return new JsonResult(new { success = true, deleted });
+    }
+
     /******************************************************************
      *  Pause State
      ******************************************************************/

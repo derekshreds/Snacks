@@ -191,10 +191,16 @@ namespace Snacks.Data.Migrations
                     b.Property<bool>("Is4K")
                         .HasColumnType("INTEGER");
 
+                    b.Property<bool>("IsHdr")
+                        .HasColumnType("INTEGER");
+
                     b.Property<bool>("IsHevc")
                         .HasColumnType("INTEGER");
 
                     b.Property<DateTime?>("LastScannedAt")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("OriginalLanguage")
                         .HasColumnType("TEXT");
 
                     b.Property<string>("PixelFormat")

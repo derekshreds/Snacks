@@ -126,6 +126,7 @@ public class MediaFileRepository
                 existing.PixelFormat = file.PixelFormat;
                 existing.Duration = file.Duration;
                 existing.IsHevc = file.IsHevc;
+                existing.IsHdr = file.IsHdr;
                 existing.Is4K = file.Is4K;
                 existing.Status = file.Status;
                 existing.LastScannedAt = file.LastScannedAt;
@@ -135,6 +136,10 @@ public class MediaFileRepository
                 // summaries that the Mux re-evaluation still needs.
                 if (file.AudioStreams    != null) existing.AudioStreams    = file.AudioStreams;
                 if (file.SubtitleStreams != null) existing.SubtitleStreams = file.SubtitleStreams;
+                // Same null-aware policy: a re-scan that didn't run a fresh language lookup
+                // (KeepOriginalLanguage off, no integration provider, or transient network
+                // failure) shouldn't wipe a value that was successfully resolved earlier.
+                if (file.OriginalLanguage != null) existing.OriginalLanguage = file.OriginalLanguage;
             }
             else
             {
@@ -286,6 +291,22 @@ public class MediaFileRepository
                 .ToListAsync();
         }
 
+        /// <summary>
+        ///     Deletes every <see cref="MediaFile" /> row whose status is
+        ///     <see cref="MediaFileStatus.Failed" />. The next library scan re-discovers
+        ///     any source file still on disk as <see cref="MediaFileStatus.Unseen" />,
+        ///     giving the user a one-click recovery path for legitimate failures and
+        ///     for the bogus "Source file was removed during encoding" backlog.
+        /// </summary>
+        /// <returns>The number of rows deleted.</returns>
+        public async Task<int> DeleteAllFailedAsync()
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            return await context.MediaFiles
+                .Where(f => f.Status == MediaFileStatus.Failed)
+                .ExecuteDeleteAsync();
+        }
+
         #endregion
 
         #region Reset & Maintenance
@@ -358,6 +379,41 @@ public class MediaFileRepository
                 if (shouldStaySkipped(mf)) continue;
                 mf.Status = MediaFileStatus.Unseen;
                 mf.LastScannedAt = null;
+                flipped++;
+            }
+
+            if (flipped > 0) await SaveChangesWithRetryAsync(context);
+            return flipped;
+        }
+
+        /// <summary>
+        ///     Reverse of <see cref="ReevaluateSkippedAsync"/>: re-evaluates every <see cref="MediaFileStatus.Unseen" />
+        ///     row against the supplied predicate. Files for which <paramref name="shouldBeSkipped" /> returns
+        ///     <see langword="true" /> are flipped back to <see cref="MediaFileStatus.Skipped" />. Used when encoder
+        ///     settings change in the "no longer needs encoding" direction — e.g., the user added an audio output
+        ///     that re-queued a batch of files, then removed it. Without this method, those files stay queued.
+        /// </summary>
+        /// <param name="shouldBeSkipped">
+        ///     Pure predicate over the DB-stored fields (no probing). Return <see langword="true" /> to flip
+        ///     the row back to Skipped, <see langword="false" /> to leave it Unseen.
+        /// </param>
+        /// <returns> The number of rows whose status was flipped. </returns>
+        public async Task<int> ReevaluateUnseenAsync(Func<MediaFile, bool> shouldBeSkipped)
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            // Only consider rows we have enough data on to make a decision. A null AudioStreams /
+            // SubtitleStreams blob means the file was scanned before stream-summary persistence
+            // existed; we can't safely re-evaluate without re-probing, so leave it for the next scan.
+            var unseen = await context.MediaFiles
+                .Where(f => f.Status == MediaFileStatus.Unseen
+                         && (f.AudioStreams != null || f.SubtitleStreams != null))
+                .ToListAsync();
+
+            int flipped = 0;
+            foreach (var mf in unseen)
+            {
+                if (!shouldBeSkipped(mf)) continue;
+                mf.Status = MediaFileStatus.Skipped;
                 flipped++;
             }
 

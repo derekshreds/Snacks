@@ -1118,6 +1118,24 @@ public sealed class ClusterService : IHostedService, IDisposable
                 bool masterExcludes4K = masterNs?.Exclude4K == true;
                 bool masterOnly4K     = masterNs?.Only4K == true;
 
+                // Snapshot every source path that's currently in flight on a
+                // remote worker (assigned + uploading + downloading). The
+                // dispatcher already de-duplicates by WorkItem.Id; this closes
+                // the same-path-different-Id variant where two distinct work
+                // items pointing at the same source file can race through
+                // FinalizeCompletionAsync and have the second one trip the
+                // source-existence check after the first one replaces the
+                // original.
+                var inFlightPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var rj in _remoteJobs.Values)
+                    inFlightPaths.Add(Path.GetFullPath(rj.Path));
+                foreach (var uploadId in _activeUploads.Keys)
+                {
+                    var uploadItem = _transcodingService.GetWorkItem(uploadId);
+                    if (uploadItem != null)
+                        inFlightPaths.Add(Path.GetFullPath(uploadItem.Path));
+                }
+
                 var workItem = _transcodingService.DequeueForRemoteProcessing(item =>
                 {
                     // Master's 4K preference only hogs an item type when no worker
@@ -1126,6 +1144,12 @@ public sealed class ClusterService : IHostedService, IDisposable
                     // the queue. When a worker can take the type, load-share instead.
                     if (masterExcludes4K && !item.Is4K && !anyNon4KWorker) return false;
                     if (masterOnly4K     &&  item.Is4K && !any4KWorker)    return false;
+
+                    // Skip items whose source path is already being processed
+                    // by another in-flight job — same-path double dispatch is
+                    // what produces "Source file was removed during encoding"
+                    // when the first job replaces the source under the second.
+                    if (inFlightPaths.Contains(Path.GetFullPath(item.Path))) return false;
 
                     return item.Is4K ? any4KWorker : anyNon4KWorker;
                 });
@@ -1148,6 +1172,30 @@ public sealed class ClusterService : IHostedService, IDisposable
                 // Final options: global → folder → node overrides
                 var nodeOverride  = GetNodeSettings(bestNode.NodeId)?.EncodingOverrides;
                 var finalOptions  = EncoderOptionsOverride.ApplyOverrides(globalOptions, folderOverride, nodeOverride);
+
+                // Pre-dispatch skip gate (mirror of the local FinaliseForDispatchAsync).
+                // Resolves any missing OriginalLanguage live, persists it, merges it into
+                // finalOptions, and re-runs WouldSkipUnderOptions against those merged
+                // options. Catches the same three cases the local path does — legacy rows,
+                // settings flipped between queue add and remote dispatch, force-adds — so
+                // remote workers don't waste time on no-op encodes either.
+                if (!await _transcodingService.FinaliseForDispatchAsync(workItem, finalOptions, CancellationToken.None))
+                {
+                    await _transcodingService.MarkDispatchSkippedAsync(workItem,
+                        "cluster pre-dispatch check — file already meets target under current options");
+                    // Release the optimistic slot we never actually claimed yet (we're
+                    // still pre-dispatch — ActiveJobs hasn't been touched on this iteration).
+                    continue;
+                }
+
+                // Cancel/Stop race: workItem.Status could have flipped during the awaits
+                // inside FinaliseForDispatchAsync. Without this, the dispatch task would
+                // upload + run the encode despite the user having cancelled.
+                if (workItem.Status is WorkItemStatus.Cancelled or WorkItemStatus.Stopped)
+                {
+                    Console.WriteLine($"Dropping {workItem.FileName}: cancelled/stopped during cluster dispatch finalisation");
+                    continue;
+                }
 
                 // Optimistic slot accounting: claim the slot now so the next
                 // iteration of this dispatch loop counts it against the
@@ -1849,6 +1897,18 @@ public sealed class ClusterService : IHostedService, IDisposable
     /// <summary>Finalizes a successfully validated output.</summary>
     private async Task FinalizeCompletionAsync(string jobId, WorkItem workItem, string outputPath, EncoderOptions options, string nodeBaseUrl)
     {
+        // Remove from in-flight tracking BEFORE any side effect that mutates
+        // shared state observable to other completion paths. HandleRemoteCompletion
+        // below deletes the source file; if jobId stayed in _remoteJobs through
+        // that step, a heartbeat-driven re-fire of HandleRemoteCompletionAsync
+        // (or a delayed RetryDownloadAsync, or a worker's persisted-completion
+        // re-POST) could enter the source-existence check against a path the
+        // master itself just deleted, marking the work item failed even though
+        // encoding succeeded.
+        _remoteJobs.TryRemove(jobId, out _);
+        _downloadRetryCounts.TryRemove(jobId, out _);
+        _downloadRetryCounts.TryRemove($"_validation_{jobId}", out _);
+
         // WAL: Downloading → Completed
         var completeScope = await _stateTransitions.BeginAsync(jobId, "Downloading", "Completed");
 
@@ -1882,9 +1942,6 @@ public sealed class ClusterService : IHostedService, IDisposable
             }
         }
 
-        _remoteJobs.TryRemove(jobId, out _);
-        _downloadRetryCounts.TryRemove(jobId, out _);
-        _downloadRetryCounts.TryRemove($"_validation_{jobId}", out _);
         if (_jobCts.TryRemove(jobId, out var completedCts))
             completedCts.Dispose();
         Console.WriteLine($"Cluster: Remote job {workItem.FileName} completed successfully");
@@ -2310,19 +2367,23 @@ public sealed class ClusterService : IHostedService, IDisposable
             return -50;
 
         // CPU is reserved for explicit "Software" jobs and for "auto" jobs
-        // on nodes that have no hardware encoder at all. Under "auto" with
-        // detected hardware, or any specific-vendor preference, CPU is
-        // excluded outright — we'd rather queue a job than silently spend
-        // it on a slow software encode while a GPU sits idle. The
-        // "no hardware on this node" check is per-node, so a CPU-only
-        // worker still pulls "auto" jobs.
+        // on nodes that have no usable hardware encoder for the requested
+        // codec. Under "auto" with hardware that can do the codec, or any
+        // specific-vendor preference, CPU is excluded outright — we'd rather
+        // queue a job than silently spend it on a slow software encode while
+        // a GPU sits idle. "Usable" means present, enabled, and capable of
+        // the requested codec — an Intel iGPU without AV1 encode shouldn't
+        // lock out the CPU on an AV1 job, otherwise the node deadlocks.
         var hw = options.HardwareAcceleration?.ToLower() ?? "auto";
         bool isCpu = device.DeviceId == "cpu";
-        bool nodeHasHardware = node.Capabilities?.Devices?.Any(d => d.DeviceId != "cpu") == true;
+        bool nodeHasUsableHardware = node.Capabilities?.Devices?.Any(d =>
+            d.DeviceId != "cpu"
+            && IsDeviceEnabled(node, d.DeviceId)
+            && d.SupportedCodecs.Any(c => c.Equals(codecKey, StringComparison.OrdinalIgnoreCase))) == true;
 
         if (hw == "none" && !isCpu) return -50;                             // software-only ⇒ CPU only
         if (hw != "none" && hw != "auto" && isCpu) return -50;              // specific vendor ⇒ never CPU
-        if (hw == "auto" && isCpu && nodeHasHardware) return -50;           // auto with HW ⇒ never CPU
+        if (hw == "auto" && isCpu && nodeHasUsableHardware) return -50;     // auto + usable HW ⇒ never CPU
         if (hw != "none" && !isCpu && !string.Equals(device.DeviceId, hw, StringComparison.OrdinalIgnoreCase)
             && hw != "auto") return -50;                                    // specific vendor ⇒ wrong family
 
@@ -2968,13 +3029,33 @@ public sealed class ClusterService : IHostedService, IDisposable
 
         try
         {
-            var orig = await _integrationService.LookupOriginalLanguageAsync(
-                originalPath, clone.OriginalLanguageProvider, ct);
+            // Cache-first: if the local-side scan / re-eval already resolved this file's
+            // original language, reuse the persisted value instead of re-hitting the
+            // integration provider. Same contract as TranscodingService.ResolveOriginalLanguageAsync.
+            var normalizedPath = Path.GetFullPath(originalPath);
+            var dbFile = await _mediaFileRepo.GetByPathAsync(normalizedPath);
+
+            string? orig = !string.IsNullOrWhiteSpace(dbFile?.OriginalLanguage)
+                ? dbFile!.OriginalLanguage
+                : await _integrationService.LookupOriginalLanguageAsync(
+                    originalPath, clone.OriginalLanguageProvider, ct);
+
             if (!string.IsNullOrEmpty(orig))
             {
                 if (!clone.AudioLanguagesToKeep.Contains(orig))    clone.AudioLanguagesToKeep.Add(orig);
                 if (!clone.SubtitleLanguagesToKeep.Contains(orig)) clone.SubtitleLanguagesToKeep.Add(orig);
                 Console.WriteLine($"Cluster: Pre-resolved original language '{orig}' for {Path.GetFileName(originalPath)}");
+
+                // Persist newly resolved values so subsequent scans / re-evals / local
+                // dispatches are cache hits, matching what the local TranscodingService
+                // paths do.
+                if (dbFile != null
+                    && !string.Equals(dbFile.OriginalLanguage, orig, StringComparison.OrdinalIgnoreCase))
+                {
+                    dbFile.OriginalLanguage = orig;
+                    try { await _mediaFileRepo.UpsertAsync(dbFile); }
+                    catch { /* DB blip; next scan will retry the persistence */ }
+                }
             }
         }
         catch (OperationCanceledException) { throw; }
