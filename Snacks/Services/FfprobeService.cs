@@ -330,7 +330,7 @@ public class FfprobeService
                     var fallback = ResolveAudioCodec("aac", src.Channels, isMatroska, warnings);
                     maps.Append($"-map 0:{src.Index} ");
                     codecArgs.Append(BuildAudioCodecArgs(fallback.codec, fallback.channels, 0, outIndex)).Append(' ');
-                    AppendAudioMeta(meta, outIndex, bucket, fallback.codec);
+                    AppendAudioMeta(meta, outIndex, bucket, fallback.codec, fallback.channels);
                 }
                 else
                 {
@@ -348,7 +348,7 @@ public class FfprobeService
             {
                 maps.Append($"-map 0:{re.srcIndex} ");
                 codecArgs.Append(BuildAudioCodecArgs(re.codec, re.channels, re.bitrateKbps, outIndex)).Append(' ');
-                AppendAudioMeta(meta, outIndex, bucket, re.codec);
+                AppendAudioMeta(meta, outIndex, bucket, re.codec, re.channels);
                 outIndex++;
             }
         }
@@ -359,12 +359,12 @@ public class FfprobeService
 
     /// <summary>
     ///     Stamps an encoded output stream with <c>language=</c> + a
-    ///     <c>"Language (CODEC)"</c> title (e.g. <c>"English (AAC)"</c>) so players display
-    ///     a meaningful track name instead of falling back to the source's stale title (which
-    ///     might still say "5.1 Surround" after a stereo downmix). Copies skip this — their
-    ///     metadata flows through with <c>-c:a copy</c>.
+    ///     <c>"Language (CODEC LAYOUT)"</c> title (e.g. <c>"English (Opus 5.1)"</c>) so
+    ///     players display a meaningful track name instead of falling back to the source's
+    ///     stale title (which might still say "5.1 Surround" after a stereo downmix).
+    ///     Copies skip this — their metadata flows through with <c>-c:a copy</c>.
     /// </summary>
-    private static void AppendAudioMeta(StringBuilder meta, int outIndex, string bucket, string codec)
+    private static void AppendAudioMeta(StringBuilder meta, int outIndex, string bucket, string codec, int channels)
     {
         var langTag = LanguageMatcher.ToThreeLetterB(bucket);
         if (!string.IsNullOrEmpty(langTag) && !string.Equals(langTag, "und", StringComparison.OrdinalIgnoreCase))
@@ -372,7 +372,9 @@ public class FfprobeService
 
         var langName = LanguageMatcher.ToEnglishName(bucket);
         var prefix   = !string.IsNullOrEmpty(langName) ? langName : "Audio";
-        meta.Append($"-metadata:s:a:{outIndex} title=\"{prefix} ({CodecLabel(codec)})\" ");
+        var layout   = ChannelsToLayoutLabel(channels);
+        var suffix   = string.IsNullOrEmpty(layout) ? CodecLabel(codec) : $"{CodecLabel(codec)} {layout}";
+        meta.Append($"-metadata:s:a:{outIndex} title=\"{prefix} ({suffix})\" ");
     }
 
     /// <summary> Display label for a codec name in track titles. </summary>
@@ -383,6 +385,22 @@ public class FfprobeService
         "eac3" => "E-AC3",
         "opus" => "Opus",
         _      => (codec ?? "").ToUpperInvariant(),
+    };
+
+    /// <summary>
+    ///     Channel count → human-readable layout label for track titles. Falls back to
+    ///     <c>"{N}ch"</c> for unusual counts so 4.0 quad / 6.1 still surface something
+    ///     meaningful instead of nothing. Returns empty for non-positive counts so the
+    ///     title omits the layout segment entirely rather than printing "(Codec )".
+    /// </summary>
+    private static string ChannelsToLayoutLabel(int channels) => channels switch
+    {
+        <= 0 => "",
+        1    => "Mono",
+        2    => "Stereo",
+        6    => "5.1",
+        8    => "7.1",
+        _    => $"{channels}ch",
     };
 
     /// <summary>
