@@ -77,6 +77,7 @@ export class ClusterDashboard {
         this._selfVersion   = null;
         this._localDone     = 0;
         this._localFailed   = 0;
+        this._selfOffSchedule = false;   // master is outside its configured schedule windows
 
         /**
          * Per-node settings keyed by NodeId, mirroring the server-side
@@ -230,6 +231,7 @@ export class ClusterDashboard {
             this._selfVersion   = status.selfVersion        || null;
             this._localDone     = status.localCompletedJobs || 0;
             this._localFailed   = status.localFailedJobs    || 0;
+            this._selfOffSchedule = !!status.selfOffSchedule;
 
             if (status.nodeId)   this._nodeId   = status.nodeId;
             if (status.nodeName) this._nodeName = status.nodeName;
@@ -318,6 +320,9 @@ export class ClusterDashboard {
         const selfStatus = localPaused ? 'Paused' : (this._selfActive.length > 0 ? 'Busy' : 'Online');
         const selfColor  = STATUS_COLORS[selfStatus] || 'gray';
         const devicesHtml = this._renderDeviceSummary(this._nodeId, this._selfCaps, this._selfActive);
+        const offScheduleBadge = this._selfOffSchedule
+            ? ' <span class="badge bg-warning text-dark ms-1" title="Outside this node\'s configured schedule windows. New jobs will not be dispatched until the next allowed window."><i class="fas fa-clock me-1"></i>Off-schedule</span>'
+            : '';
 
         return `
             <div class="card hover-lift cluster-card" style="min-width: 240px; max-width: 300px; flex: 1 1 260px;">
@@ -329,7 +334,7 @@ export class ClusterDashboard {
                     </div>
                     <div class="text-muted small">
                         <div>${escapeHtml(this._role)} &bull; ${escapeHtml(selfOs)}${selfGpu ? ' / ' + escapeHtml(selfGpu) : ''}</div>
-                        <div style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(selfStatus)}${this._selfVersion ? ` &bull; v${escapeHtml(this._selfVersion)}` : ''}</div>
+                        <div style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(selfStatus)}${this._selfVersion ? ` &bull; v${escapeHtml(this._selfVersion)}` : ''}${offScheduleBadge}</div>
                         <div class="mt-1">Jobs: ${this._localDone} done, ${this._localFailed} failed</div>
                         ${this._role === 'master' ? `
                         <div class="d-flex gap-1 mt-1">
@@ -418,6 +423,9 @@ export class ClusterDashboard {
         const canControl = this._role === 'master' && node.role === 'node';
         const active     = node.activeJobs || [];
         const devicesHtml = this._renderDeviceSummary(node.nodeId, node.capabilities, active);
+        const offScheduleBadge = node.offSchedule
+            ? ' <span class="badge bg-warning text-dark ms-1" title="Outside this node\'s configured schedule windows. New jobs will not be dispatched until the next allowed window."><i class="fas fa-clock me-1"></i>Off-schedule</span>'
+            : '';
 
         return `
             <div class="card hover-lift cluster-card" style="min-width: 240px; max-width: 300px; flex: 1 1 260px;">
@@ -429,7 +437,7 @@ export class ClusterDashboard {
                     </div>
                     <div class="text-muted small">
                         <div>${escapeHtml(node.role)} &bull; ${escapeHtml(osInfo)}${gpuInfo ? ' / ' + escapeHtml(gpuInfo) : ''}</div>
-                        <div style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(statusName)}${node.version ? ` &bull; v${escapeHtml(node.version)}` : ''}</div>
+                        <div style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(statusName)}${node.version ? ` &bull; v${escapeHtml(node.version)}` : ''}${offScheduleBadge}</div>
                         <div class="mt-1">Jobs: ${node.completedJobs || 0} done, ${node.failedJobs || 0} failed</div>
                         ${canControl ? `
                             <div class="d-flex gap-1 mt-1">

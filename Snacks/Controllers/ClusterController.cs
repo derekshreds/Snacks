@@ -173,6 +173,10 @@ public sealed class ClusterController : ControllerBase
             : (self.ActiveJobs.Count > 0 ? Models.NodeStatus.Busy : Models.NodeStatus.Online);
         self.CompletedJobs  = _clusterService.LocalCompletedJobs;
         self.FailedJobs     = _clusterService.LocalFailedJobs;
+        // Master is not in _nodes (RefreshOffScheduleFlags only walks peers),
+        // so workers proxying this endpoint would otherwise always see the
+        // master's card without an Off-schedule badge. Stamp it here.
+        self.OffSchedule    = !_clusterService.IsNodeWithinScheduleById(self.NodeId);
 
         var nodes = _clusterService.GetNodes().ToList();
         if (!nodes.Any(n => n.NodeId == self.NodeId)) nodes.Add(self);

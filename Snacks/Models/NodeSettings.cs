@@ -40,6 +40,32 @@ public sealed class NodeSettings
     ///     reported defaults.
     /// </summary>
     public Dictionary<string, DeviceConcurrencySetting>? DeviceSettings { get; set; }
+
+    /// <summary>
+    ///     Optional weekly schedule of windows during which this node may
+    ///     accept new transcode dispatches. Null or empty means the node is
+    ///     always available (the original behavior). Evaluated against the
+    ///     master's local clock; in-flight jobs run to completion regardless.
+    /// </summary>
+    public List<ScheduleWindow>? Schedule { get; set; }
+}
+
+/// <summary>
+///     One allowed-to-transcode window in a node's weekly schedule. Times
+///     are "HH:mm" strings in master local time; <see cref="End"/> ≤ <see cref="Start"/>
+///     is treated as a window that wraps past midnight (e.g. 22:00–06:00).
+///     An "00:00" → "00:00" window means the full 24 hours of each listed day.
+/// </summary>
+public sealed class ScheduleWindow
+{
+    /// <summary> Days the window is active on. An empty list means the window never fires. </summary>
+    public List<DayOfWeek> Days { get; set; } = new();
+
+    /// <summary> Start of window as "HH:mm", master local time. </summary>
+    public string Start { get; set; } = "00:00";
+
+    /// <summary> End of window as "HH:mm". If End ≤ Start the window wraps to the next day. </summary>
+    public string End { get; set; } = "00:00";
 }
 
 /// <summary>

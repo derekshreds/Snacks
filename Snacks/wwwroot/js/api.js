@@ -353,6 +353,13 @@ export const clusterApi = {
     /** Persists per-folder encoding overrides (or clears them when `encodingOverrides` is null). */
     saveFolderSettings: (path, encodingOverrides) =>
         postJson('/api/cluster-admin/folder-settings', { path, encodingOverrides }),
+
+    /**
+     * Fetches the master server's local time + timezone metadata. Used by the
+     * Scheduling tab to display a live clock so users can see whether the
+     * server is running on UTC (and adjust their windows accordingly).
+     */
+    getMasterTime: () => getJson('/api/cluster-admin/master-time'),
 };
 
 
