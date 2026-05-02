@@ -3764,9 +3764,20 @@ public class TranscodingService
                 return (chosenQp, lowPower);
             }
 
+            // Every pass in this mode failed before producing a measurable bitrate
+            // (e.g. iGPUs with no HEVC LP entrypoint — common on pre-Tiger Lake Intel
+            // and on Proxmox LXC where GuC firmware isn't loaded). Fall through to
+            // normal mode; in normal mode, signal incompatibility so the retry chain
+            // skips conservative-HW (a no-op for VAAPI) and goes straight to software.
+            if (lowPower)
+            {
+                await LogAsync(workItem.Id,
+                    $"{modeLabel}: encoder rejected every sample — falling back to normal mode.");
+                continue;
+            }
             await LogAsync(workItem.Id,
-                $"Calibration complete after {maxIterations} passes. Using QP {currentQp} ({modeLabel}).");
-            return (currentQp, lowPower);
+                $"{modeLabel}: encoder rejected every sample — VAAPI cannot encode this file.");
+            return (-1, false);
         }
 
         // Both LP and normal mode failed

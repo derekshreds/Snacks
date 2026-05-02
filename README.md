@@ -16,6 +16,10 @@
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License">
 </p>
 
+<p align="center">
+  <a href="https://discord.gg/3uVGGJtB"><img src="https://img.shields.io/badge/Discord-Join%20Chat-5865f2?style=flat-square&logo=discord&logoColor=white" alt="Discord"></a>
+</p>
+
 ---
 
 ## Features
