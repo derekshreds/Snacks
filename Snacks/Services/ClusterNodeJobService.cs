@@ -71,6 +71,16 @@ public sealed class ClusterNodeJobService
     private readonly ConcurrentDictionary<string, DateTime> _receivingJobIds = new();
 
     /// <summary>
+    ///     Per-job device assignment captured from the master's <see cref="JobMetadata"/>
+    ///     register call (which happens before the first chunk arrives). Lets
+    ///     <see cref="GetActiveJobs"/> emit a non-empty <see cref="ActiveJobInfo.DeviceId"/>
+    ///     for jobs in the receiving phase so a worker's self-card chip
+    ///     correctly counts the slot as occupied while the upload is in
+    ///     flight — not just once encoding starts.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, string> _receivingDeviceIds = new();
+
+    /// <summary>
     ///     Per-device slot pools. Tracks active slot count against a max
     ///     capacity that grows on demand to honor the master's effective
     ///     concurrency setting (<see cref="JobMetadata.DeviceMaxConcurrency"/>).
@@ -193,20 +203,34 @@ public sealed class ClusterNodeJobService
         }
         foreach (var kv in _receivingJobIds)
         {
-            // Receiving slots haven't acquired a device yet — surface them
-            // separately so the master can render an "Uploading" tile without
-            // double-counting against any device's slot pool.
+            // Surface the device the master pre-assigned at metadata-register
+            // time. With the deviceId set, the worker's self-card chip
+            // counts this slot as "in use" during the upload phase — same
+            // visual the master shows for the same job.
             if (_activeJobs.ContainsKey(kv.Key)) continue;
+            _receivingDeviceIds.TryGetValue(kv.Key, out var deviceId);
             list.Add(new ActiveJobInfo
             {
                 JobId    = kv.Key,
-                DeviceId = "",
+                DeviceId = deviceId ?? "",
                 FileName = null,
                 Progress = 0,
                 Phase    = "Receiving",
             });
         }
         return list;
+    }
+
+    /// <summary>
+    ///     Records the device the master assigned for an incoming job. Called
+    ///     by <see cref="ClusterController.RegisterMetadata"/> before the first
+    ///     chunk arrives so the receiving phase reports the correct device on
+    ///     the worker's self-card chips.
+    /// </summary>
+    public void RegisterReceivingDevice(string jobId, string? deviceId)
+    {
+        if (string.IsNullOrEmpty(jobId) || string.IsNullOrEmpty(deviceId)) return;
+        _receivingDeviceIds[jobId] = deviceId;
     }
 
     /// <summary> Snapshot of all completed-but-not-downloaded job IDs. </summary>
@@ -242,6 +266,7 @@ public sealed class ClusterNodeJobService
         _receiveLocks.TryRemove(jobId, out _);
         if (_receiveCts.TryRemove(jobId, out var cts)) cts.Dispose();
         _receivingJobIds.TryRemove(jobId, out _);
+        _receivingDeviceIds.TryRemove(jobId, out _);
     }
 
     /// <summary>
@@ -257,7 +282,10 @@ public sealed class ClusterNodeJobService
             if (_activeJobs.ContainsKey(kv.Key)) continue;            // already encoding — not stale
             if (kv.Value > cutoff)              continue;             // recent activity
             if (_receivingJobIds.TryRemove(kv.Key, out _))
+            {
+                _receivingDeviceIds.TryRemove(kv.Key, out _);
                 Console.WriteLine($"Cluster: Cleared stale receiving state for job {kv.Key} (no activity for {timeout.TotalSeconds:0}s)");
+            }
             // Master owns lifecycle messaging — no synthetic completion broadcast.
         }
     }
@@ -377,6 +405,7 @@ public sealed class ClusterNodeJobService
             // Register before launching so the very next heartbeat sees it.
             _activeJobs[jobId] = active;
             _receivingJobIds.TryRemove(jobId, out _);
+            _receivingDeviceIds.TryRemove(jobId, out _);
 
             // The slot stays held for the lifetime of the encode — the
             // background task releases it in a finally block.

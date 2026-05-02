@@ -158,8 +158,23 @@ public sealed class ClusterController : ControllerBase
         // here so a worker proxying this endpoint sees the master in its
         // cluster view too. Without it, the worker UI's remote-card list
         // would silently drop the master when the proxy kicks in.
+        //
+        // BuildSelfNode hardcodes Status=Online and leaves ActiveJobs empty
+        // — fine for handshake (the master's status is computed master-side
+        // from active-job count) but wrong for cluster-state, where workers
+        // render this entry directly as a node card. Stamp the runtime state
+        // here so the master's card on a worker UI shows the same Busy /
+        // Paused status and per-device slot fill the master's own UI shows.
+        var self = _clusterService.BuildSelfNode();
+        self.ActiveJobs     = _clusterService.GetEnrichedSelfActiveJobs();
+        self.IsPaused       = !_clusterService.IsLocalEncodingEnabled;
+        self.Status         = self.IsPaused
+            ? Models.NodeStatus.Paused
+            : (self.ActiveJobs.Count > 0 ? Models.NodeStatus.Busy : Models.NodeStatus.Online);
+        self.CompletedJobs  = _clusterService.LocalCompletedJobs;
+        self.FailedJobs     = _clusterService.LocalFailedJobs;
+
         var nodes = _clusterService.GetNodes().ToList();
-        var self  = _clusterService.BuildSelfNode();
         if (!nodes.Any(n => n.NodeId == self.NodeId)) nodes.Add(self);
 
         return Ok(new
@@ -264,6 +279,10 @@ public sealed class ClusterController : ControllerBase
         try
         {
             System.IO.File.WriteAllText(metadataPath, JsonSerializer.Serialize(metadata, _jsonOptions));
+            // Record the assigned device so the worker self-card's per-device
+            // chip counts this slot as occupied during the upload phase, not
+            // only once encoding actually starts.
+            _clusterService.RegisterReceivingDevice(jobId, metadata.DeviceId);
             Console.WriteLine($"Cluster: Registered metadata for job {jobId}");
             return Ok(new { registered = true });
         }

@@ -441,6 +441,28 @@ public sealed class ClusterService : IHostedService, IDisposable
     public HttpClient CreateClusterClient() => _discovery.CreateAuthenticatedClient();
 
     /// <summary>
+    ///     Local-encoding pause state — true when the master is allowed to
+    ///     run encodes on its own hardware, false when the user has paused
+    ///     local encoding from the dashboard. Used to compute the master's
+    ///     <see cref="ClusterNode.IsPaused"/> in cluster-state responses.
+    /// </summary>
+    public bool IsLocalEncodingEnabled => _config.LocalEncodingEnabled;
+
+    /// <summary> Count of jobs this instance finished encoding locally. </summary>
+    public int LocalCompletedJobs => _transcodingService.LocalCompletedJobs;
+
+    /// <summary> Count of jobs this instance failed to encode locally. </summary>
+    public int LocalFailedJobs => _transcodingService.LocalFailedJobs;
+
+    /// <summary>
+    ///     The current local-encoding active-jobs list. Returned to workers
+    ///     via cluster-state as the master's <see cref="ClusterNode.ActiveJobs"/>
+    ///     so a worker UI's master card shows the same per-device slot fill
+    ///     the master's own UI shows.
+    /// </summary>
+    public List<ActiveJobInfo> GetEnrichedSelfActiveJobs() => _transcodingService.GetActiveLocalJobs();
+
+    /// <summary>
     ///     Snapshot of the most recent cluster view fetched from the master,
     ///     or <see langword="null"/> on master/standalone instances or before
     ///     the worker's first refresh has completed. Used by the admin status
@@ -587,6 +609,13 @@ public sealed class ClusterService : IHostedService, IDisposable
 
     /// <summary> Sets the job ID being received during file transfer. </summary>
     public void SetReceivingJob(string? jobId) => _nodeJobs.SetReceivingJob(jobId);
+
+    /// <summary>
+    ///     Records the device the master assigned for an incoming job so the
+    ///     worker's self-card chip counts the slot as occupied during the
+    ///     upload phase, not only once encoding starts.
+    /// </summary>
+    public void RegisterReceivingDevice(string jobId, string? deviceId) => _nodeJobs.RegisterReceivingDevice(jobId, deviceId);
 
     /// <summary> Returns the per-job semaphore that serializes ReceiveFile requests. </summary>
     public SemaphoreSlim GetReceiveLock(string jobId) => _nodeJobs.GetReceiveLock(jobId);
