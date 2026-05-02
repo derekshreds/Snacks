@@ -1878,9 +1878,9 @@ footer a.text-muted:hover {
 }
 
 .scheduling-day-chips .day-chip.active {
-    background-color: var(--bs-primary);
+    background-color: var(--bs-purple, #6f42c1);
     color: #fff;
-    border-color: var(--bs-primary);
+    border-color: var(--bs-purple, #6f42c1);
 }
 
 .scheduling-node-section > summary {
