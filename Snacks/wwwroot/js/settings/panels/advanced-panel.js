@@ -166,27 +166,35 @@ async function reevaluateQueue() {
     btn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i> Re-evaluating…';
 
     try {
-        const data = await settingsApi.reevaluate();
+        // Default off — only retry NoSavings rows when the user explicitly opts in.
+        // The whole point of the NoSavings status is that "we already ran ffmpeg and it
+        // didn't shrink" should not auto-retry on every Re-evaluate click.
+        const forceRetryNoSavings = document.getElementById('forceRetryNoSavingsCheck')?.checked ?? false;
+        const data = await settingsApi.reevaluate({ forceRetryNoSavings });
         if (data?.success === false) {
             // Server-side rejection (e.g. no settings file). Body is JSON, not an error.
             showToast(data.error || 'Re-evaluation failed', 'warning');
             return;
         }
 
-        const requeued  = data?.requeued  ?? 0;
-        const reskipped = data?.reskipped ?? 0;
-        const dequeued  = data?.dequeued  ?? 0;
+        const requeued         = data?.requeued         ?? 0;
+        const reskipped        = data?.reskipped        ?? 0;
+        const dequeued         = data?.dequeued         ?? 0;
+        const retriedNoSavings = data?.retriedNoSavings ?? 0;
 
-        if (requeued + reskipped + dequeued === 0) {
+        if (requeued + reskipped + dequeued + retriedNoSavings === 0) {
             showToast('Re-evaluation complete — no changes needed.', 'info');
         } else {
             // ReevaluateSkippedAsync flips Skipped → Unseen — those rows wait for the next
             // library scan to actually enter the queue. ReevaluateUnseenAsync flips Unseen →
             // Skipped immediately. RemoveSettingsObsoletedQueueItemsAsync drops queue items.
+            // ReevaluateNoSavingsAsync flips NoSavings → Unseen — only when forceRetryNoSavings
+            // was on; same wait-for-next-scan semantics as the Skipped flip.
             const parts = [];
-            if (requeued)  parts.push(`${requeued} flagged for re-scan`);
-            if (reskipped) parts.push(`${reskipped} re-skipped`);
-            if (dequeued)  parts.push(`${dequeued} dropped from queue`);
+            if (requeued)         parts.push(`${requeued} flagged for re-scan`);
+            if (retriedNoSavings) parts.push(`${retriedNoSavings} no-savings retried`);
+            if (reskipped)        parts.push(`${reskipped} re-skipped`);
+            if (dequeued)         parts.push(`${dequeued} dropped from queue`);
             showToast(`Re-evaluation complete — ${parts.join(', ')}.`, 'success');
         }
     } catch (e) {

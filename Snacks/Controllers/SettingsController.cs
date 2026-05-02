@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Logging;
 using Snacks.Data;
 using Snacks.Models;
 using Snacks.Services;
@@ -18,6 +19,7 @@ public sealed class SettingsController : ControllerBase
     private readonly TranscodingService  _transcodingService;
     private readonly FileService         _fileService;
     private readonly MediaFileRepository _mediaFileRepo;
+    private readonly ILogger<SettingsController>? _log;
 
     private static readonly JsonSerializerOptions _jsonOptions = new()
     {
@@ -25,7 +27,11 @@ public sealed class SettingsController : ControllerBase
         PropertyNameCaseInsensitive = true,
     };
 
-    public SettingsController(TranscodingService transcodingService, FileService fileService, MediaFileRepository mediaFileRepo)
+    public SettingsController(
+        TranscodingService transcodingService,
+        FileService fileService,
+        MediaFileRepository mediaFileRepo,
+        ILogger<SettingsController>? logger = null)
     {
         ArgumentNullException.ThrowIfNull(transcodingService);
         ArgumentNullException.ThrowIfNull(fileService);
@@ -33,6 +39,7 @@ public sealed class SettingsController : ControllerBase
         _transcodingService = transcodingService;
         _fileService        = fileService;
         _mediaFileRepo      = mediaFileRepo;
+        _log                = logger;
     }
 
     /******************************************************************
@@ -183,7 +190,7 @@ public sealed class SettingsController : ControllerBase
     ///     button disables itself, you can click it again when it finishes."
     /// </summary>
     [HttpPost("reevaluate")]
-    public async Task<IActionResult> Reevaluate()
+    public async Task<IActionResult> Reevaluate([FromQuery] bool forceRetryNoSavings = false)
     {
         if (!await _reevaluateLock.WaitAsync(0))
         {
@@ -232,7 +239,22 @@ public sealed class SettingsController : ControllerBase
             // Drop pending queue items that current settings would skip.
             int dequeued = await _transcodingService.RemoveSettingsObsoletedQueueItemsAsync(options);
 
-            return new JsonResult(new { success = true, requeued, reskipped, dequeued });
+            // Opt-in retry of empirical no-savings outcomes. Default off because "we tried,
+            // it didn't shrink" should not auto-retry on every Re-evaluate — that's the loop
+            // the new NoSavings status was introduced to break. The user clicks this when
+            // they've changed encoder settings (target bitrate, codec, etc.) and want files
+            // that previously gave no savings re-evaluated under the new options.
+            int retriedNoSavings = forceRetryNoSavings
+                ? await _mediaFileRepo.ReevaluateNoSavingsAsync()
+                : 0;
+
+            // Surfaces the magnitude of each Re-evaluate run in the ops log so a future
+            // "Re-evaluate flagged 1650 items as needing rescan" report has historical context.
+            _log?.LogInformation(
+                "ReevaluateRun requeuedSkipped={Requeued} reskippedUnseen={Reskipped} dequeuedPending={Dequeued} retriedNoSavings={RetriedNoSavings} forceRetryNoSavings={ForceRetry}",
+                requeued, reskipped, dequeued, retriedNoSavings, forceRetryNoSavings);
+
+            return new JsonResult(new { success = true, requeued, reskipped, dequeued, retriedNoSavings });
         }
         catch (Exception ex)
         {

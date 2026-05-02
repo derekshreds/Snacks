@@ -95,6 +95,18 @@ public sealed class MediaFile
     /// <summary> UTC timestamp when encoding completed successfully. </summary>
     public DateTime? CompletedAt { get; set; }
 
+    /// <summary>
+    ///     UTC timestamp of the most recent encode attempt's terminal outcome — set by both the
+    ///     keep and the no-savings paths in <c>HandleRemoteCompletion</c> and the local encode
+    ///     completion. Distinct from <see cref="CompletedAt"/> which only ticks on successful keeps.
+    ///
+    ///     <para>Used by the Re-evaluate flow to reason about empirical outcomes ("we already tried
+    ///     this and got no savings"); without it, every Re-evaluate click flips no-savings rows back
+    ///     to <c>Unseen</c> based on the (still-wrong) bitrate prediction and re-runs the same
+    ///     encoder against the same inputs forever.</para>
+    /// </summary>
+    public DateTime? LastEncodedAt { get; set; }
+
     /// <summary> UTC timestamp when this record was first created. </summary>
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
 
@@ -190,5 +202,19 @@ public enum MediaFileStatus
     Skipped,
 
     /// <summary> User cancelled encoding for this file. </summary>
-    Cancelled
+    Cancelled,
+
+    /// <summary>
+    ///     Encoding ran to completion but the output didn't shrink (and wasn't a remux/configured
+    ///     audio-output keep). Distinct from <see cref="Skipped"/> which is a *predicted* skip — this
+    ///     is an *empirical* "we tried, it didn't help."
+    ///
+    ///     <para>Re-evaluate's Skipped→Unseen sweep does NOT touch this status. That's the whole
+    ///     point: bitrate prediction is unreliable for files with hefty audio, so a row that flunks
+    ///     the prediction every time would loop forever between <c>Skipped</c> and queued. Items in
+    ///     <c>NoSavings</c> only re-enter the queue when the user explicitly opts in via the
+    ///     "Retry no-savings encodes" toggle on Re-evaluate, or when the source file changes on disk
+    ///     (handled by the auto-scan size-delta check).</para>
+    /// </summary>
+    NoSavings
 }

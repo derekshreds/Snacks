@@ -40,6 +40,7 @@ const STATUS_NAMES_BY_CODE = Object.freeze({
     5: 'Stopped',
     6: 'Uploading',
     7: 'Downloading',
+    8: 'NoSavings',
 });
 
 
@@ -72,7 +73,11 @@ export function getStatusString(status) {
 function getMetaLineHtml(workItem) {
     let sizeStr = formatFileSize(workItem.size);
 
-    if (workItem.status === 'Completed' && workItem.outputSize != null && workItem.size > 0) {
+    // NoSavings: encode finished but the output didn't shrink. Show source → encoded so the
+    // user can see exactly how close the encoder came (often within a few %), with a muted
+    // "no savings" label. Same shape as Completed but the percent is +/0 instead of negative.
+    if ((workItem.status === 'Completed' || workItem.status === 'NoSavings')
+        && workItem.outputSize != null && workItem.size > 0) {
         const delta   = workItem.size - workItem.outputSize;
         const percent = Math.round((delta / workItem.size) * 100);
         const sign    = percent > 0 ? '−' : (percent < 0 ? '+' : '');
@@ -110,6 +115,16 @@ export function getActionButtons(workItem) {
         case 'Cancelled':
         case 'Stopped':
             return '<button class="btn btn-sm btn-outline-info log-btn" data-action="log" title="View Log"><i class="fas fa-terminal"></i></button>';
+
+        case 'NoSavings':
+            // Encoded but didn't shrink. Log button + "Try again" lets the user request
+            // a single-row retry under the same settings (the bulk "Retry no-savings"
+            // toggle on the Re-evaluate button covers the entire library at once).
+            return `
+                <div class="btn-group" role="group">
+                    <button class="btn btn-sm btn-outline-warning retry-btn" data-action="retry" title="Try encoding again under current settings"><i class="fas fa-redo"></i></button>
+                    <button class="btn btn-sm btn-outline-info log-btn" data-action="log" title="View Log"><i class="fas fa-terminal"></i></button>
+                </div>`;
 
         default:
             return '';

@@ -28,6 +28,13 @@
                     <i class="fas fa-arrows-rotate me-1"></i> Re-evaluate Queue Against Current Settings
                 </button>
                 <div class="form-text mt-n1 mb-2 ms-1">Re-checks every library file against the current encoder settings: skipped → unseen for files that newly need encoding, unseen → skipped for files that no longer do, and drops queued items that no longer need encoding. Safe to run any time. The button blocks itself while the walk is in progress.</div>
+                <div class="form-check ms-1 mt-n2 mb-2">
+                    <input class="form-check-input" type="checkbox" id="forceRetryNoSavingsCheck">
+                    <label class="form-check-label small" for="forceRetryNoSavingsCheck">
+                        Also retry encodes that previously produced no savings
+                    </label>
+                    <div class="form-text mt-n1 ms-1">Off by default. Re-running an encode that already proved &ldquo;no savings&rdquo; under the same settings just burns CPU. Tick this when you've changed encoder settings (target bitrate, codec, etc.) and want those files reconsidered.</div>
+                </div>
                 <button class="btn btn-outline-warning" id="clearScanHistory"><i class="fas fa-eraser me-1"></i> Clear Auto-Scan History</button>
                 <button class="btn btn-outline-warning" id="clearDashboardHistory"><i class="fas fa-chart-line me-1"></i> Clear Dashboard Data</button>
                 <button class="btn btn-outline-warning" id="removeFailedFiles"><i class="fas fa-trash-can me-1"></i> Remove Failed Items</button>

@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using Serilog;
 using Snacks.Data;
 using Snacks.Services;
 using Snacks.Hubs;
@@ -19,6 +20,36 @@ if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ||
 }
 
 var builder = WebApplication.CreateBuilder(args);
+
+// Operations log: rolling daily file under ${SNACKS_WORK_DIR}/logs/snacks-.log.
+//
+// <para>Every recurrence of "queue items vanished overnight" so far has been impossible
+// to diagnose because every interesting event was a `Console.WriteLine` that died with
+// the process. Wire Serilog as the host logger so any future occurrence has a persistent
+// record. The DiagnosticsController surfaces this file via a read-only tail endpoint.</para>
+//
+// <para>10MB cap per file, retain 7 daily rolls. Keeps roughly a week of activity at the
+// volume the cluster path generates without unbounded disk growth.</para>
+var snacksWorkDir = Environment.GetEnvironmentVariable("SNACKS_WORK_DIR")
+    ?? Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "Snacks", "work");
+var snacksLogDir = Path.Combine(snacksWorkDir, "logs");
+try { Directory.CreateDirectory(snacksLogDir); } catch { /* logger fallback handles this */ }
+
+Log.Logger = new LoggerConfiguration()
+    .MinimumLevel.Information()
+    .Enrich.FromLogContext()
+    .WriteTo.Console()
+    .WriteTo.File(
+        path: Path.Combine(snacksLogDir, "snacks-.log"),
+        rollingInterval: RollingInterval.Day,
+        fileSizeLimitBytes: 10 * 1024 * 1024,
+        rollOnFileSizeLimit: true,
+        retainedFileCountLimit: 7,
+        outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} [{Level:u3}] {SourceContext} {Message:lj}{NewLine}{Exception}")
+    .CreateLogger();
+builder.Host.UseSerilog();
 
 // Determine listening address.
 // Docker: always 0.0.0.0:6767 (container isolation provides security).
