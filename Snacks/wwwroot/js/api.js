@@ -92,7 +92,8 @@ export const settingsApi = {
      *
      * @returns {Promise<{success: boolean, requeued?: number, reskipped?: number, dequeued?: number, error?: string}>}
      */
-    reevaluate: () => postJson('/api/settings/reevaluate'),
+    reevaluate: ({ forceRetryNoSavings = false } = {}) =>
+        postJson(`/api/settings/reevaluate?forceRetryNoSavings=${forceRetryNoSavings ? 'true' : 'false'}`),
 };
 
 

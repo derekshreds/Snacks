@@ -175,6 +175,28 @@ public class MediaFileRepository
         }
 
         /// <summary>
+        ///     Status setter that also stamps <see cref="MediaFile.LastEncodedAt"/>. Used by the
+        ///     completion paths (both keep and no-savings) so Re-evaluate can reason about
+        ///     "we already tried this" — the empirical anchor that prevents the NoSavings →
+        ///     Unseen → re-encode loop.
+        /// </summary>
+        public async Task SetStatusAndLastEncodedAtAsync(string normalizedPath, MediaFileStatus status, DateTime lastEncodedAt)
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            var file = await context.MediaFiles
+                .FirstOrDefaultAsync(f => f.FilePath == normalizedPath);
+
+            if (file != null)
+            {
+                file.Status = status;
+                file.LastEncodedAt = lastEncodedAt;
+                if (status == MediaFileStatus.Completed)
+                    file.CompletedAt = lastEncodedAt;
+                await SaveChangesWithRetryAsync(context);
+            }
+        }
+
+        /// <summary>
         ///     Increments the failure counter, sets the status to <see cref="MediaFileStatus.Failed" />,
         ///     and records the error message, truncated to 2048 characters to fit the column constraint.
         /// </summary>
@@ -390,6 +412,30 @@ public class MediaFileRepository
         }
 
         /// <summary>
+        ///     Flips every <see cref="MediaFileStatus.NoSavings"/> row back to
+        ///     <see cref="MediaFileStatus.Unseen"/> so the next scan re-queues it.
+        ///     Opt-in only — invoked from the Re-evaluate endpoint when the user ticks the
+        ///     "Retry no-savings encodes" checkbox. Default Re-evaluate behavior leaves
+        ///     these rows alone, since "we already ran ffmpeg and it didn't shrink" is an
+        ///     empirical truth that shouldn't be overridden by the same prediction that
+        ///     queued the file last time.
+        /// </summary>
+        /// <returns>The number of rows flipped.</returns>
+        public async Task<int> ReevaluateNoSavingsAsync()
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            var rows = await context.MediaFiles
+                .Where(f => f.Status == MediaFileStatus.NoSavings)
+                .ToListAsync();
+
+            foreach (var mf in rows)
+                mf.Status = MediaFileStatus.Unseen;
+
+            if (rows.Count > 0) await SaveChangesWithRetryAsync(context);
+            return rows.Count;
+        }
+
+        /// <summary>
         ///     Reverse of <see cref="ReevaluateSkippedAsync"/>: re-evaluates every <see cref="MediaFileStatus.Unseen" />
         ///     row against the supplied predicate. Files for which <paramref name="shouldBeSkipped" /> returns
         ///     <see langword="true" /> are flipped back to <see cref="MediaFileStatus.Skipped" />. Used when encoder
@@ -583,6 +629,11 @@ public class MediaFileRepository
             file.AssignedNodePort = null;
             file.RemoteJobPhase = null;
             file.Status = newStatus;
+            // Stamp LastEncodedAt for the empirical-outcome statuses so re-evaluate / auto-scan
+            // can reason about "we just tried this" — same anchor SetStatusAndLastEncodedAtAsync
+            // uses on the local-completion path.
+            if (newStatus is MediaFileStatus.Completed or MediaFileStatus.NoSavings or MediaFileStatus.Skipped)
+                file.LastEncodedAt = DateTime.UtcNow;
             await SaveChangesWithRetryAsync(context);
         }
 

@@ -1,6 +1,7 @@
 namespace Snacks.Services;
 
 using Microsoft.AspNetCore.SignalR;
+using Microsoft.Extensions.Logging;
 using Snacks.Data;
 using Snacks.Hubs;
 using Snacks.Models;
@@ -137,6 +138,8 @@ public sealed class ClusterService : IHostedService, IDisposable
     /// </summary>
     private readonly EncodeHistoryRepository _encodeHistoryRepo;
 
+    private readonly ILogger<ClusterService>? _log;
+
     public ClusterService(
         TranscodingService transcodingService,
         FfprobeService ffprobeService,
@@ -147,7 +150,8 @@ public sealed class ClusterService : IHostedService, IDisposable
         StateTransitionService stateTransitions,
         IntegrationService integrationService,
         NotificationService notificationService,
-        EncodeHistoryRepository encodeHistoryRepo)
+        EncodeHistoryRepository encodeHistoryRepo,
+        ILogger<ClusterService>? logger = null)
     {
         _transcodingService  = transcodingService;
         _ffprobeService      = ffprobeService;
@@ -159,6 +163,7 @@ public sealed class ClusterService : IHostedService, IDisposable
         _notificationService = notificationService;
         _encodeHistoryRepo   = encodeHistoryRepo;
         _integrationService  = integrationService;
+        _log                 = logger;
 
         transcodingService.SetExternalDispatchGate(() => ShouldDispatchExternal);
 
@@ -1796,15 +1801,27 @@ public sealed class ClusterService : IHostedService, IDisposable
         // never recover it.
         if (noSavings)
         {
+            // Worker reported noSavings=true for this job. Logged structurally so the ops log
+            // shows every silent-skip event with `source=worker` — this is the channel that
+            // hides the cluster mux-pass disappearance bug. After Phase 1 lands, this should
+            // only fire for genuinely-no-savings remote encodes; any spike is a flag that the
+            // worker placement bug regressed or another false-noSavings path opened up.
             Console.WriteLine($"Cluster: No savings for {workItem.FileName} — skipping download");
+            _log?.LogInformation(
+                "RemoteEncodeNoSavings source={Source} jobId={JobId} fileName={FileName} sourceSize={SourceSize} videoCopy={VideoCopy} nodeBaseUrl={NodeBaseUrl}",
+                "worker", jobId, workItem.FileName, workItem.Size, videoCopy, nodeBaseUrl);
             try
             {
-                workItem.Status         = WorkItemStatus.Completed;
+                // WorkItem.NoSavings (terminal in WorkItem.IsTerminal) keeps the queue tile
+                // honest. MediaFile.NoSavings is the sticky DB outcome that Re-evaluate's
+                // Skipped sweep does not touch — preventing the encode → no-savings →
+                // Skipped → flip-back-to-Unseen → re-encode loop the user has been hitting.
+                workItem.Status         = WorkItemStatus.NoSavings;
                 workItem.CompletedAt    = DateTime.UtcNow;
                 workItem.Progress       = 100;
                 workItem.ErrorMessage   = null;
                 workItem.RemoteJobPhase = null;
-                await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Skipped);
+                await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.NoSavings);
                 // Ledger row even on no-savings so the dashboard's encode-time
                 // and per-device utilization reflect the work the worker did.
                 await RecordRemoteEncodeHistoryAsync(workItem, ResolveJobOptions(jobId), outputPath: null, noSavings: true);
@@ -2086,6 +2103,10 @@ public sealed class ClusterService : IHostedService, IDisposable
         catch (Exception ex)
         {
             Console.WriteLine($"Cluster: Download failed for {workItem.FileName}: {ex.Message}");
+            _log?.LogWarning(
+                ex,
+                "DownloadAttemptFailed jobId={JobId} fileName={FileName} nodeBaseUrl={NodeBaseUrl}",
+                jobId, workItem.FileName, nodeBaseUrl);
 
             var retryCount = _downloadRetryCounts.AddOrUpdate(jobId, 1, (_, c) => c + 1);
             const int MaxDownloadRetries = 10;
@@ -2093,6 +2114,12 @@ public sealed class ClusterService : IHostedService, IDisposable
             if (retryCount >= MaxDownloadRetries)
             {
                 Console.WriteLine($"Cluster: Download failed after {MaxDownloadRetries} attempts — re-queuing for fresh encode");
+                // Loud event because this is the channel where a worker→master reverse-network
+                // misconfiguration silently re-encodes the same file forever. The user has no
+                // visible signal otherwise; the log is the only place this surfaces.
+                _log?.LogError(
+                    "DownloadRetriesExhausted jobId={JobId} fileName={FileName} nodeBaseUrl={NodeBaseUrl} attempts={Attempts}",
+                    jobId, workItem.FileName, nodeBaseUrl, MaxDownloadRetries);
                 // Release the node before clearing the assignment
                 if (workItem.AssignedNodeId != null && _nodes.TryGetValue(workItem.AssignedNodeId, out var maxRetryNode))
                 {
@@ -2498,6 +2525,9 @@ public sealed class ClusterService : IHostedService, IDisposable
             if (item.AssignedNodeId != null && !_nodes.ContainsKey(item.AssignedNodeId))
             {
                 Console.WriteLine($"Cluster: Watchdog: {item.FileName} assigned to ghost node {item.AssignedNodeId} — requeueing");
+                _log?.LogWarning(
+                    "WatchdogAction case={Case} jobId={JobId} fileName={FileName} ghostNodeId={GhostNodeId}",
+                    "ghost-node", item.Id, item.FileName, item.AssignedNodeId);
                 await HandleNodeFailureAsync(item.Id);
                 continue;
             }
@@ -2510,6 +2540,9 @@ public sealed class ClusterService : IHostedService, IDisposable
                 && !_remoteJobs.ContainsKey(item.Id))
             {
                 Console.WriteLine($"Cluster: Watchdog: orphaned local-side item {item.FileName} ({sinceUpdate.TotalMinutes:F0}min silent) — requeueing");
+                _log?.LogWarning(
+                    "WatchdogAction case={Case} jobId={JobId} fileName={FileName} silentMinutes={SilentMinutes}",
+                    "local-orphan", item.Id, item.FileName, sinceUpdate.TotalMinutes);
                 _transcodingService.RequeueWorkItem(item);
                 try { await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(item.Path), MediaFileStatus.Queued); }
                 catch (Exception ex) { Console.WriteLine($"Cluster: Watchdog: DB clear failed for {item.FileName}: {ex.Message}"); }
@@ -2523,6 +2556,9 @@ public sealed class ClusterService : IHostedService, IDisposable
                 && sinceUpdate >= stalledThreshold)
             {
                 Console.WriteLine($"Cluster: Watchdog: {item.FileName} stalled on {item.AssignedNodeName} ({sinceUpdate.TotalMinutes:F0}min silent) — requeueing");
+                _log?.LogWarning(
+                    "WatchdogAction case={Case} jobId={JobId} fileName={FileName} nodeName={NodeName} silentMinutes={SilentMinutes}",
+                    "stalled-remote", item.Id, item.FileName, item.AssignedNodeName, sinceUpdate.TotalMinutes);
                 await HandleNodeFailureAsync(item.Id);
             }
         }

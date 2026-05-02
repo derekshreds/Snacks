@@ -87,7 +87,8 @@ public sealed class WorkItem
     private static bool IsTerminal(WorkItemStatus s) => s is WorkItemStatus.Cancelled
                                                           or WorkItemStatus.Stopped
                                                           or WorkItemStatus.Completed
-                                                          or WorkItemStatus.Failed;
+                                                          or WorkItemStatus.Failed
+                                                          or WorkItemStatus.NoSavings;
     private static bool IsActive(WorkItemStatus s)   => s is WorkItemStatus.Uploading
                                                           or WorkItemStatus.Downloading
                                                           or WorkItemStatus.Processing;
@@ -189,6 +190,17 @@ public sealed class WorkItem
     ///     miss the HEVC-at-target case).
     /// </summary>
     public bool? OutputUsedVideoCopy { get; set; }
+
+    /// <summary>
+    ///     Set to <see langword="true"/> by <c>ConvertVideoAsync</c> when the encoder produced an
+    ///     output but the keep predicate decided to discard it (output ≥ source, not a remux,
+    ///     not a configured audio-output growth case). The local <c>ProcessQueueAsync</c>
+    ///     completion path reads this to decide whether to write <c>MediaFileStatus.NoSavings</c>
+    ///     vs <c>MediaFileStatus.Completed</c> — without it, a discarded output would land in
+    ///     Completed and look identical to a real successful encode.
+    /// </summary>
+    /// <remarks>In-memory only; deliberately not persisted (the DB carries the outcome via Status).</remarks>
+    public bool LastEncodeProducedNoSavings { get; set; }
 }
 
 /// <summary> Lifecycle states for a <see cref="WorkItem"/>. </summary>
@@ -221,5 +233,14 @@ public enum WorkItemStatus
     Uploading,
 
     /// <summary> Encoded output is being downloaded from a remote worker node. </summary>
-    Downloading
+    Downloading,
+
+    /// <summary>
+    ///     Encoding finished but the output wasn't kept (no savings, not a remux, not user-configured
+    ///     growth). Surfaced as a distinct queue-tile state — "No savings — encoded but didn't
+    ///     shrink" — instead of overloading <see cref="Completed"/> like the prior code did, which
+    ///     produced the confusing "tile says Completed but the DB says Skipped and Re-evaluate
+    ///     re-queues it" experience. Mirrors <c>MediaFileStatus.NoSavings</c>.
+    /// </summary>
+    NoSavings
 }

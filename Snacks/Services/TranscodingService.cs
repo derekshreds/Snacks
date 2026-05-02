@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.SignalR;
+using Microsoft.Extensions.Logging;
 using Snacks.Data;
 using Snacks.Hubs;
 using Snacks.Models;
@@ -29,6 +30,7 @@ public class TranscodingService
     private readonly FfprobeService _ffprobeService;
     private readonly IHubContext<TranscodingHub> _hubContext;
     private readonly MediaFileRepository _mediaFileRepo;
+    private readonly ILogger<TranscodingService>? _log;
 
     /// <summary>Path to the FFmpeg binary, resolved from the <c>FFMPEG_PATH</c> environment variable.</summary>
     private readonly string _ffmpegPath;
@@ -294,7 +296,8 @@ public class TranscodingService
         NotificationService? notificationService = null,
         IntegrationService? integrationService = null,
         SubtitleExtractionService? subtitleExtractionService = null,
-        EncodeHistoryRepository? encodeHistoryRepo = null)
+        EncodeHistoryRepository? encodeHistoryRepo = null,
+        ILogger<TranscodingService>? logger = null)
     {
         _fileService               = fileService;
         _ffprobeService            = ffprobeService;
@@ -304,6 +307,7 @@ public class TranscodingService
         _integrationService        = integrationService;
         _subtitleExtractionService = subtitleExtractionService;
         _encodeHistoryRepo         = encodeHistoryRepo;
+        _log                       = logger;
         _ffmpegPath          = Environment.GetEnvironmentVariable("FFMPEG_PATH") ?? "ffmpeg";
 
         _ = Task.Run(async () =>
@@ -1674,13 +1678,21 @@ public class TranscodingService
             // with Completed in that case.
             if (workItem.Status != WorkItemStatus.Failed)
             {
-                workItem.Status = WorkItemStatus.Completed;
+                // Distinguish a kept encode from a discarded "no savings" outcome. The flag
+                // is set by ConvertVideoAsync's no-keep branch; without this, a discarded
+                // local encode would land in Completed and feed the same Re-evaluate
+                // flip-back loop the cluster path used to.
+                bool noSavings = workItem.LastEncodeProducedNoSavings;
+                workItem.Status = noSavings ? WorkItemStatus.NoSavings : WorkItemStatus.Completed;
                 workItem.CompletedAt = DateTime.UtcNow;
                 workItem.Progress = 100;
                 Interlocked.Increment(ref _localCompletedJobs);
-                await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Completed);
+                await _mediaFileRepo.SetStatusAndLastEncodedAtAsync(
+                    Path.GetFullPath(workItem.Path),
+                    noSavings ? MediaFileStatus.NoSavings : MediaFileStatus.Completed,
+                    DateTime.UtcNow);
 
-                if (ShouldDispatchExternal)
+                if (!noSavings && ShouldDispatchExternal)
                 {
                     if (_notificationService != null)
                         _ = _notificationService.NotifyEncodeCompletedAsync(Path.GetFileName(workItem.Path), workItem.Size);
@@ -1747,6 +1759,7 @@ public class TranscodingService
         IReadOnlyList<SubtitleExtractionService.OcrMuxResult>? cachedOcrSrts = null,
         string? cachedOcrMuxTmpDir = null,
         bool dropImageSubtitlesOnly = false,
+        bool skipPlacement = false,
         CancellationToken cancellationToken = default)
     {
         if (workItem.Probe == null)
@@ -2127,7 +2140,7 @@ public class TranscodingService
         {
             // Don't clean up the OCR tmp dir here — retries reuse the cached SRTs.
             // HandleConversionFailure is responsible for cleanup on final exhaustion.
-            await HandleConversionFailure(workItem, options, outputPath, ex.Message, stripSubtitles, forceSwDecode, useConservativeHwFlags, ocrMuxSrts, ocrMuxTmpDir, dropImageSubtitlesOnly, cancellationToken: cancellationToken);
+            await HandleConversionFailure(workItem, options, outputPath, ex.Message, stripSubtitles, forceSwDecode, useConservativeHwFlags, ocrMuxSrts, ocrMuxTmpDir, dropImageSubtitlesOnly, skipPlacement, cancellationToken: cancellationToken);
             return;
         }
 
@@ -2135,7 +2148,7 @@ public class TranscodingService
 
         if (!File.Exists(outputPath))
         {
-            await HandleConversionFailure(workItem, options, outputPath, "Output file not found", stripSubtitles, forceSwDecode, useConservativeHwFlags, ocrMuxSrts, ocrMuxTmpDir, dropImageSubtitlesOnly, cancellationToken: cancellationToken);
+            await HandleConversionFailure(workItem, options, outputPath, "Output file not found", stripSubtitles, forceSwDecode, useConservativeHwFlags, ocrMuxSrts, ocrMuxTmpDir, dropImageSubtitlesOnly, skipPlacement, cancellationToken: cancellationToken);
             return;
         }
 
@@ -2202,12 +2215,24 @@ public class TranscodingService
                     $"Size: {FormatSize(workItem.Size)} → {FormatSize(outputSize)}  (+{FormatSize(delta)}, kept due to {reason})");
             }
 
-            await HandleOutputPlacement(outputPath, workItem, options);
+            // Workers must not place — the master is the side that has the user's library
+            // mounted and runs HandleOutputPlacement after download. If a worker ran the
+            // in-place DeleteOriginalFile branch it would strip the [snacks] tag in its temp
+            // dir; the post-encode `*[snacks]*` glob in ClusterNodeJobService would then
+            // return null and falsely report noSavings, vanishing the job from the queue.
+            if (!skipPlacement)
+                await HandleOutputPlacement(outputPath, workItem, options);
         }
         else
         {
             await LogAsync(workItem.Id,
                 "No savings realized. Deleting conversion.");
+
+            // Signals the local-completion path (ProcessQueueAsync) to write NoSavings rather
+            // than Completed. The cluster path doesn't read this — workers report noSavings
+            // directly via the JobCompletion payload — but local encodes flow back through
+            // the same caller that needs to distinguish a kept encode from a discarded one.
+            workItem.LastEncodeProducedNoSavings = true;
 
             try { await _fileService.FileDeleteAsync(outputPath); }
             catch (Exception ex)
@@ -2570,7 +2595,13 @@ public class TranscodingService
     public async Task MarkDispatchSkippedAsync(WorkItem workItem, string reason)
     {
         ArgumentNullException.ThrowIfNull(workItem);
+        // Logged structurally so the ops log captures the silent-skip channel — items
+        // dropped here vanish from the active queue without a Failed/Completed UI signal,
+        // so we want every occurrence in the persistent log.
         Console.WriteLine($"Skipping {workItem.FileName}: {reason}");
+        _log?.LogInformation(
+            "DispatchSkipped jobId={JobId} fileName={FileName} reason={Reason}",
+            workItem.Id, workItem.FileName, reason);
         try
         {
             await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Skipped);
@@ -2629,10 +2660,28 @@ public class TranscodingService
                 perJobOptions.SubtitleLanguagesToKeep.Add(originalLanguage);
         }
 
-        // Final skip check under the merged options. Synthesises a MediaFile shape
-        // from the work item + probe so WouldSkipUnderOptions can run against the
-        // same fields it uses on the persisted DB row.
-        var skipMf = SyntheticMediaFile(workItem, originalLanguage);
+        // Final skip check under the merged options. Prefer the persisted DB
+        // row when available — items restored from DB on startup are queued
+        // lazily with no probe, so a synthetic built from workItem alone
+        // would have null AudioStreams / SubtitleStreams. HasMuxableWork
+        // would then see no work, the ladder would fall through to the
+        // bitrate gate, and an at-target HEVC file with a non-English audio
+        // track that needs muxing would be silently marked Skipped here —
+        // diverging from Re-evaluate, which examines the same DB row and
+        // correctly says "still needs to encode". Use the DB row directly
+        // so both paths agree. Fall back to synthetic only when there's
+        // no DB row at all (force-add path).
+        MediaFile skipMf;
+        if (dbFile != null)
+        {
+            skipMf = dbFile;
+            if (!string.IsNullOrEmpty(originalLanguage))
+                skipMf.OriginalLanguage = originalLanguage;
+        }
+        else
+        {
+            skipMf = SyntheticMediaFile(workItem, originalLanguage);
+        }
         return !WouldSkipUnderOptions(skipMf, perJobOptions);
     }
 
@@ -3479,7 +3528,14 @@ public class TranscodingService
     /// <summary>
     ///     Returns the final "clean" path (without [snacks] tag) for output placement.
     /// </summary>
-    private string GetCleanOutputName(string snacksPath)
+    /// <remarks>
+    ///     <c>internal static</c> so the regression test in
+    ///     <c>RemoteConversionPlacementTests</c> can document the rename behavior — the
+    ///     bug behind cluster mux-pass disappearance was the worker running the rename
+    ///     in its own temp dir, after which <see cref="ClusterNodeJobService.GetOutputFileForJob"/>'s
+    ///     <c>*[snacks]*</c> glob found nothing and falsely reported noSavings.
+    /// </remarks>
+    internal static string GetCleanOutputName(string snacksPath)
     {
         string dir = Path.GetDirectoryName(snacksPath) ?? "";
         string fileName = Path.GetFileNameWithoutExtension(snacksPath).Replace(" [snacks]", "");
@@ -4195,6 +4251,7 @@ public class TranscodingService
         IReadOnlyList<SubtitleExtractionService.OcrMuxResult>? cachedOcrSrts = null,
         string? cachedOcrMuxTmpDir = null,
         bool imageSubtitlesAlreadyDropped = false,
+        bool skipPlacement = false,
         CancellationToken cancellationToken = default)
     {
         await LogAsync(workItem.Id, $"Conversion failed: {reason}");
@@ -4235,6 +4292,7 @@ public class TranscodingService
                 cachedOcrSrts: cachedOcrSrts,
                 cachedOcrMuxTmpDir: cachedOcrMuxTmpDir,
                 dropImageSubtitlesOnly: imageSubtitlesAlreadyDropped,
+                skipPlacement: skipPlacement,
                 cancellationToken: cancellationToken);
             return;
         }
@@ -4255,6 +4313,7 @@ public class TranscodingService
                 cachedOcrSrts: cachedOcrSrts,
                 cachedOcrMuxTmpDir: cachedOcrMuxTmpDir,
                 dropImageSubtitlesOnly: true,
+                skipPlacement: skipPlacement,
                 cancellationToken: cancellationToken);
             return;
         }
@@ -4270,6 +4329,7 @@ public class TranscodingService
                 useConservativeHwFlags: conservativeHwFlagsTried,
                 cachedOcrSrts: cachedOcrSrts,
                 cachedOcrMuxTmpDir: cachedOcrMuxTmpDir,
+                skipPlacement: skipPlacement,
                 cancellationToken: cancellationToken);
             return;
         }
@@ -4298,6 +4358,7 @@ public class TranscodingService
                 cachedOcrSrts: cachedOcrSrts,
                 cachedOcrMuxTmpDir: cachedOcrMuxTmpDir,
                 dropImageSubtitlesOnly: imageSubtitlesAlreadyDropped,
+                skipPlacement: skipPlacement,
                 cancellationToken: cancellationToken);
             return;
         }
@@ -4321,6 +4382,7 @@ public class TranscodingService
                 stripSubtitles: false,
                 cachedOcrSrts: cachedOcrSrts,
                 cachedOcrMuxTmpDir: cachedOcrMuxTmpDir,
+                skipPlacement: skipPlacement,
                 cancellationToken: cancellationToken);
             return;
         }
@@ -4847,20 +4909,34 @@ public class TranscodingService
             workItem.Progress = 100;
             workItem.ErrorMessage = null;
             workItem.RemoteJobPhase = null;
-            await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Completed);
+            await _mediaFileRepo.SetStatusAndLastEncodedAtAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Completed, DateTime.UtcNow);
+            _log?.LogInformation(
+                "RemoteEncodeKept jobId={JobId} fileName={FileName} sourceSize={SourceSize} outputSize={OutputSize} reason={Reason} videoCopy={VideoCopy}",
+                workItem.Id, workItem.FileName, workItem.Size, outputSize, reason, videoCopy);
             if (reason != "savings")
                 Console.WriteLine($"Cluster: Kept {workItem.FileName} despite no savings — {reason}");
         }
         else
         {
             Console.WriteLine($"Cluster: No savings for {workItem.FileName}, deleting output");
+            // Master-side no-savings decision (worker reported the output, master recomputed
+            // and chose to drop). Logged structurally so the ops log captures the empirical
+            // outcome that drives the NoSavings status — the same row Re-evaluate now respects
+            // unless the user opts into "Retry no-savings encodes."
+            _log?.LogInformation(
+                "RemoteEncodeNoSavings source={Source} jobId={JobId} fileName={FileName} sourceSize={SourceSize} outputSize={OutputSize} videoCopy={VideoCopy}",
+                "master", workItem.Id, workItem.FileName, workItem.Size, outputSize, videoCopy);
             try { await _fileService.FileDeleteAsync(outputPath); } catch { }
-            workItem.Status = WorkItemStatus.Completed;
+            // WorkItem.Status = NoSavings keeps the queue tile honest (was Completed before,
+            // which lied to the user when the DB row said Skipped). MediaFile.NoSavings is the
+            // sticky empirical outcome that re-evaluate skips by default.
+            workItem.Status = WorkItemStatus.NoSavings;
             workItem.CompletedAt = DateTime.UtcNow;
+            workItem.OutputSize = outputSize;
             workItem.Progress = 100;
             workItem.ErrorMessage = null;
             workItem.RemoteJobPhase = null;
-            await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Skipped);
+            await _mediaFileRepo.SetStatusAndLastEncodedAtAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.NoSavings, DateTime.UtcNow);
         }
 
         await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
@@ -4954,7 +5030,15 @@ public class TranscodingService
 
     /// <summary>
     ///     Runs the encoding pipeline for a job received from a master node.
-    ///     Registers the work item so logging works, then delegates to <see cref="ConvertVideoAsync"/>.
+    ///     Registers the work item so logging works, then delegates to <see cref="ConvertVideoAsync"/>
+    ///     with <c>skipPlacement: true</c>.
+    ///
+    ///     <para>The worker does not run <see cref="HandleOutputPlacement"/> — it has no view of the
+    ///     master's library and the in-place <c>DeleteOriginalFile=true</c> branch would strip the
+    ///     <c>[snacks]</c> tag from the file in the worker's temp dir. The master then runs
+    ///     <see cref="GetOutputFileForJob"/> with a <c>*[snacks]*</c> glob and gets <see langword="null"/>,
+    ///     reports false noSavings, and the job vanishes into <c>Skipped</c>. Placement is the master's
+    ///     job after download.</para>
     ///     The work item is kept in the dictionary after completion so the output remains accessible for download.
     /// </summary>
     /// <param name="workItem">The work item to encode.</param>
@@ -4966,7 +5050,7 @@ public class TranscodingService
 
         try
         {
-            await ConvertVideoAsync(workItem, options, cancellationToken: cancellationToken);
+            await ConvertVideoAsync(workItem, options, skipPlacement: true, cancellationToken: cancellationToken);
         }
         finally
         {
