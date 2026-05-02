@@ -136,6 +136,13 @@ public class TranscodingService
     private Func<WorkItem, bool>? _shouldSkipLocal;
 
     /// <summary>
+    ///     Optional gate that returns <see langword="true"/> when local encoding is
+    ///     allowed by the master's configured schedule window. Wired by
+    ///     <see cref="ClusterService"/>; null in standalone/tests means "always allowed".
+    /// </summary>
+    private Func<bool>? _localScheduleGate;
+
+    /// <summary>
     ///     Resolves per-device settings for <em>this</em> machine when the
     ///     master is encoding locally. Set by <see cref="ClusterService"/>
     ///     based on <see cref="NodeSettings.DeviceSettings"/> stored under
@@ -1392,6 +1399,14 @@ public class TranscodingService
                 // for any in-flight encodes that are still finishing before we
                 // exit so the scheduler cleans up cleanly.
                 if (_localEncodingPaused)
+                    break;
+
+                // Off-schedule on this machine: leave items in the queue for
+                // the cluster dispatch loop (workers in their own windows can
+                // still pick them up) and exit the local loop. The dispatch
+                // timer's RefreshOffScheduleFlags re-triggers ProcessQueueAsync
+                // when the master's schedule reopens.
+                if (_localScheduleGate != null && !_localScheduleGate())
                     break;
 
                 // Reap completed inflight tasks before checking for queue-empty exit.
@@ -3749,9 +3764,20 @@ public class TranscodingService
                 return (chosenQp, lowPower);
             }
 
+            // Every pass in this mode failed before producing a measurable bitrate
+            // (e.g. iGPUs with no HEVC LP entrypoint — common on pre-Tiger Lake Intel
+            // and on Proxmox LXC where GuC firmware isn't loaded). Fall through to
+            // normal mode; in normal mode, signal incompatibility so the retry chain
+            // skips conservative-HW (a no-op for VAAPI) and goes straight to software.
+            if (lowPower)
+            {
+                await LogAsync(workItem.Id,
+                    $"{modeLabel}: encoder rejected every sample — falling back to normal mode.");
+                continue;
+            }
             await LogAsync(workItem.Id,
-                $"Calibration complete after {maxIterations} passes. Using QP {currentQp} ({modeLabel}).");
-            return (currentQp, lowPower);
+                $"{modeLabel}: encoder rejected every sample — VAAPI cannot encode this file.");
+            return (-1, false);
         }
 
         // Both LP and normal mode failed
@@ -4685,6 +4711,29 @@ public class TranscodingService
     }
 
     /// <summary>
+    ///     Installs the gate that decides whether local encoding is currently
+    ///     allowed by the master's schedule window. <see cref="ClusterService"/>
+    ///     wires this; without it (standalone / tests) local encoding is
+    ///     always allowed.
+    /// </summary>
+    public void SetLocalScheduleGate(Func<bool>? gate) => _localScheduleGate = gate;
+
+    /// <summary>
+    ///     Restarts <see cref="ProcessQueueAsync"/> if it had previously
+    ///     exited because the schedule gate was closed. Idempotent — bails
+    ///     early when the queue is paused or already running.
+    /// </summary>
+    public void WakeFromSchedule()
+    {
+        if (_lastOptions == null || _isPaused || _localEncodingPaused) return;
+        _ = Task.Run(async () =>
+        {
+            try { await ProcessQueueAsync(_lastOptions); }
+            catch (Exception ex) { Console.WriteLine($"Error in ProcessQueueAsync after schedule resume: {ex.Message}"); }
+        });
+    }
+
+    /// <summary>
     ///     Kills any active FFmpeg process, clears the pending queue, and resets all in-memory
     ///     state. Called when the master switches to node mode and must hand off processing.
     /// </summary>
@@ -4944,7 +4993,11 @@ public class TranscodingService
         if (ShouldDispatchExternal)
         {
             if (_notificationService != null)
-                _ = _notificationService.NotifyEncodeCompletedAsync(Path.GetFileName(workItem.Path), new FileInfo(workItem.Path).Length);
+                // workItem.Path may have been deleted by HandleOutputPlacement when
+                // DeleteOriginalFile=true and the source/output extensions differ
+                // (e.g. .mp4 → .mkv) — reading FileInfo.Length here would throw
+                // FileNotFoundException and surface as "Finalize failed: Could not find file …".
+                _ = _notificationService.NotifyEncodeCompletedAsync(Path.GetFileName(workItem.Path), workItem.OutputSize);
             if (_integrationService != null && keep)
                 _ = _integrationService.TriggerRescansAsync(workItem.Path);
         }

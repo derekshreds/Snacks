@@ -132,6 +132,7 @@
                         <li class="nav-item" data-role-visible="master standalone"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#integrationsTab" type="button" role="tab"><i class="fas fa-plug me-1"></i> Integrations</button></li>
                         <li class="nav-item" data-role-visible="node"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#nodeSyncTab" type="button" role="tab"><i class="fas fa-sync me-1"></i> Integration Sync</button></li>
                         <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#clusterTab" type="button" role="tab"><i class="fas fa-network-wired me-1"></i> Cluster</button></li>
+                        <li class="nav-item" data-role-visible="master standalone"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#schedulingTab" type="button" role="tab"><i class="fas fa-clock me-1"></i> Scheduling</button></li>
                         <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#securityTab" type="button" role="tab"><i class="fas fa-lock me-1"></i> Security</button></li>
                         <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#advancedTab" type="button" role="tab"><i class="fas fa-screwdriver-wrench me-1"></i> Advanced</button></li>
                     </ul>
@@ -146,6 +147,7 @@
                     <div class="tab-pane fade"             id="libraryTab"      role="tabpanel" data-role-visible="master standalone">@await Html.PartialAsync("_LibrarySettings")</div>
                     <div class="tab-pane fade"             id="integrationsTab" role="tabpanel" data-role-visible="master standalone">@await Html.PartialAsync("_IntegrationSettings")</div>
                     <div class="tab-pane fade"             id="clusterTab"      role="tabpanel">@await Html.PartialAsync("_ClusterSettings")</div>
+                    <div class="tab-pane fade"             id="schedulingTab"   role="tabpanel" data-role-visible="master standalone">@await Html.PartialAsync("_SchedulingSettings", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })</div>
                     <div class="tab-pane fade"             id="securityTab"     role="tabpanel">@await Html.PartialAsync("_SecuritySettings")</div>
                     <div class="tab-pane fade"             id="advancedTab"     role="tabpanel">@await Html.PartialAsync("_AdvancedSettings")</div>
 

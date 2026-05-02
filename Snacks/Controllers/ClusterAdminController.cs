@@ -155,6 +155,11 @@ public sealed class ClusterAdminController : ControllerBase
             selfVersion          = ClusterDiscoveryService.ClusterVersion,
             localEncodingEnabled = config.LocalEncodingEnabled,
             selfCapabilities     = _clusterService.GetCapabilities(),
+            // Whether the master/self is currently outside its configured
+            // schedule windows. Remote workers carry this on ClusterNode
+            // itself (refreshed on every dispatch tick) — the master/self
+            // card has to read it explicitly here since it's not in _nodes.
+            selfOffSchedule      = !_clusterService.IsNodeWithinScheduleById(config.NodeId),
             // Multi-slot self status: one ActiveJobInfo per local slot the
             // master is currently encoding on. Mirrors the activeJobs[] shape
             // surfaced on remote nodes so the dashboard renders the master's
@@ -284,8 +289,59 @@ public sealed class ClusterAdminController : ControllerBase
         if (string.IsNullOrEmpty(settings.NodeId)) return BadRequest("NodeId is required");
         if (settings.Only4K == true && settings.Exclude4K == true)
             return BadRequest("Only4K and Exclude4K are mutually exclusive");
+
+        if (settings.Schedule != null)
+        {
+            for (int i = 0; i < settings.Schedule.Count; i++)
+            {
+                var w = settings.Schedule[i];
+                if (w.Days == null || w.Days.Count == 0)
+                    return BadRequest($"Schedule window {i + 1} must list at least one day.");
+
+                foreach (var d in w.Days)
+                {
+                    if (d < DayOfWeek.Sunday || d > DayOfWeek.Saturday)
+                        return BadRequest($"Schedule window {i + 1} contains an invalid day-of-week value.");
+                }
+
+                if (!IsValidHHmm(w.Start) || !IsValidHHmm(w.End))
+                    return BadRequest($"Schedule window {i + 1} has an invalid time. Use 24-hour HH:mm (e.g. 22:00).");
+            }
+        }
+
         _clusterService.SaveNodeSettings(settings);
         return new JsonResult(new { success = true });
+    }
+
+    private static bool IsValidHHmm(string? s)
+    {
+        if (string.IsNullOrWhiteSpace(s)) return false;
+        var parts = s.Split(':');
+        if (parts.Length != 2) return false;
+        return int.TryParse(parts[0], out int h) && h >= 0 && h <= 23
+            && int.TryParse(parts[1], out int m) && m >= 0 && m <= 59;
+    }
+
+    /// <summary>
+    ///     Returns the master server's current local time and timezone so the
+    ///     scheduling UI can display a live clock and warn when the server is
+    ///     running on UTC. This is the same clock the dispatcher uses to
+    ///     evaluate schedule windows (<c>DateTime.Now</c>), so what the user
+    ///     sees here matches the gate they're configuring.
+    /// </summary>
+    [HttpGet("master-time")]
+    public IActionResult GetMasterTime()
+    {
+        var tz  = TimeZoneInfo.Local;
+        var now = DateTime.Now;
+        return new JsonResult(new
+        {
+            timeZoneId       = tz.Id,
+            displayName      = tz.IsDaylightSavingTime(now) ? tz.DaylightName : tz.StandardName,
+            utcOffsetMinutes = (int)tz.GetUtcOffset(now).TotalMinutes,
+            localTimeIso     = now.ToString("yyyy-MM-ddTHH:mm:ss"),
+            isUtc            = tz.BaseUtcOffset == TimeSpan.Zero && !tz.SupportsDaylightSavingTime,
+        });
     }
 
     /// <summary> Deletes the per-node encoding override for a specific cluster node. </summary>

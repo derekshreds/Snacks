@@ -785,11 +785,18 @@ public sealed class ClusterService : IHostedService, IDisposable
             _transcodingService.SetLocalEncodingPaused(!_config.LocalEncodingEnabled);
             _transcodingService.SetRemoteJobCanceller(CancelRemoteJobOnNodeAsync);
             _transcodingService.SetRemoteJobChecker(IsRemoteJobAsync);
+            _transcodingService.SetLocalScheduleGate(() => IsNodeWithinScheduleById(_config.NodeId));
             UpdateLocalSkipPredicate();
 
             _dispatchTimer = new Timer(async _ =>
             {
                 if (_cts?.IsCancellationRequested == true) return;
+                // Recompute schedule-window membership before dispatch so the
+                // window-boundary "Off-schedule" badge updates on the same
+                // 2-second cadence as the dispatch tick. Cheap (string parse +
+                // day-of-week compare) so this is fine to run every loop.
+                try { RefreshOffScheduleFlags(); }
+                catch (Exception ex) { Console.WriteLine($"Cluster: schedule refresh error: {ex.Message}"); }
                 try { await RunDispatchAsync(); }
                 catch (Exception ex) { Console.WriteLine($"Cluster: Dispatch error: {ex.Message}"); }
             }, null, TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(2));
@@ -1253,7 +1260,7 @@ public sealed class ClusterService : IHostedService, IDisposable
             bool hasAvailableNodes = _nodes.Values.Any(n =>
                 n.Role == "node"
                 && (n.Status == NodeStatus.Online || n.Status == NodeStatus.Busy)
-                && !n.IsPaused && HasFreeSlot(n));
+                && !n.IsPaused && HasFreeSlot(n) && IsNodeWithinSchedule(n) && IsNodeWarmedUp(n));
             if (!hasAvailableNodes) return;
 
             var globalOptions = LoadEncoderOptions();
@@ -1264,7 +1271,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                 var availableNow = _nodes.Values
                     .Where(n => n.Role == "node"
                         && (n.Status == NodeStatus.Online || n.Status == NodeStatus.Busy)
-                        && !n.IsPaused && HasFreeSlot(n)
+                        && !n.IsPaused && HasFreeSlot(n) && IsNodeWithinSchedule(n) && IsNodeWarmedUp(n)
                         && (!_nodeDispatchCooldowns.TryGetValue(n.NodeId, out var cd) || DateTime.UtcNow >= cd))
                     .ToList();
                 if (availableNow.Count == 0) break;
@@ -2635,6 +2642,86 @@ public sealed class ClusterService : IHostedService, IDisposable
     }
 
     /// <summary>
+    ///     Returns true when <paramref name="node"/> currently sits inside one
+    ///     of its configured schedule windows, or has no schedule at all.
+    ///     Evaluated against the master's local clock — in-flight jobs on a
+    ///     now-off-schedule node still run to completion; this gate only
+    ///     stops <em>new</em> dispatches.
+    /// </summary>
+    private bool IsNodeWithinSchedule(ClusterNode node) => IsNodeWithinScheduleById(node.NodeId);
+
+    /// <summary>
+    ///     How long after a node first appears we hold off on dispatching to
+    ///     it. A freshly-registered node's HTTP endpoints can take a moment
+    ///     to come up; without this, the first dispatch can hang on the
+    ///     heartbeat pre-check inside <see cref="DispatchToNodeAsync"/> long
+    ///     enough to leave items orphaned in <c>Processing</c> until the
+    ///     stuck-item watchdog rescues them five minutes later.
+    /// </summary>
+    private static readonly TimeSpan NodeWarmupGrace = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    ///     <see langword="true"/> once a node has been registered for at
+    ///     least <see cref="NodeWarmupGrace"/>. Excluded from the candidate
+    ///     pool until then so freshly-joined workers don't get hammered
+    ///     before their endpoints are ready.
+    /// </summary>
+    private bool IsNodeWarmedUp(ClusterNode node) =>
+        DateTime.UtcNow - node.RegisteredAt >= NodeWarmupGrace;
+
+    /// <summary>
+    ///     Schedule check by NodeId. Useful for the master/self path where
+    ///     we don't carry a <see cref="ClusterNode"/> in <c>_nodes</c>.
+    /// </summary>
+    public bool IsNodeWithinScheduleById(string nodeId)
+    {
+        var schedule = GetNodeSettings(nodeId)?.Schedule;
+        return ScheduleEvaluator.IsWithinAny(schedule, DateTime.Now);
+    }
+
+    /// <summary>
+    ///     Tracks the master's own off-schedule status across ticks so we can
+    ///     detect the off→on edge and re-trigger local queue processing —
+    ///     without this, items sit pending until the next add/wake event when
+    ///     the master's schedule window reopens.
+    /// </summary>
+    private bool _masterOffSchedule;
+
+    /// <summary>
+    ///     Recomputes <see cref="ClusterNode.OffSchedule"/> for every known
+    ///     worker and rebroadcasts <c>WorkerUpdated</c> for any node whose
+    ///     value flipped. Also tracks the master's own schedule transition
+    ///     so the local encoder can resume on off→on. Called from the
+    ///     master-mode dispatch timer and from the per-node-settings mutation
+    ///     hook so the dashboard reflects window boundaries without polling.
+    ///     Master-only — no-op elsewhere.
+    /// </summary>
+    private void RefreshOffScheduleFlags()
+    {
+        if (!IsMasterMode) return;
+
+        foreach (var node in _nodes.Values)
+        {
+            bool offNow = !IsNodeWithinSchedule(node);
+            if (node.OffSchedule != offNow)
+            {
+                node.OffSchedule = offNow;
+                _ = _hubContext.Clients.All.SendAsync("WorkerUpdated", node);
+            }
+        }
+
+        bool masterOffNow = !IsNodeWithinScheduleById(_config.NodeId);
+        if (_masterOffSchedule && !masterOffNow)
+        {
+            // Schedule window just reopened — kick the local processor so
+            // pending items resume encoding without waiting for an external
+            // wake (queue add, settings change, etc.).
+            _transcodingService.WakeFromSchedule();
+        }
+        _masterOffSchedule = masterOffNow;
+    }
+
+    /// <summary>
     ///     Selects the best available <em>slot</em> — a (node, deviceId) pair —
     ///     for a job. Returns <see langword="null"/> when no slot scores
     ///     positively (every node disabled, codec-incompatible, disk-tight, etc.).
@@ -2644,7 +2731,7 @@ public sealed class ClusterService : IHostedService, IDisposable
         var candidates = _nodes.Values
             .Where(n => n.Role == "node"
                 && (n.Status == NodeStatus.Online || n.Status == NodeStatus.Busy)
-                && !n.IsPaused && HasFreeSlot(n)
+                && !n.IsPaused && HasFreeSlot(n) && IsNodeWithinSchedule(n) && IsNodeWarmedUp(n)
                 && (!_nodeDispatchCooldowns.TryGetValue(n.NodeId, out var cd) || DateTime.UtcNow >= cd))
             .ToList();
 
@@ -3482,6 +3569,12 @@ public sealed class ClusterService : IHostedService, IDisposable
         // Broadcast the full per-node config — small payload, simplifies the
         // client (no diffing required).
         _ = _hubContext.Clients.All.SendAsync("NodeSettingsChanged", _nodeSettingsConfig);
+
+        // A schedule edit can flip a node's off-schedule status immediately —
+        // don't make the user wait up to 2 seconds for the dispatch tick to
+        // catch up before the dashboard badge reflects their change.
+        try { RefreshOffScheduleFlags(); }
+        catch (Exception ex) { Console.WriteLine($"Cluster: schedule refresh after settings save failed: {ex.Message}"); }
 
         // Kick cluster dispatch so a raised cap on a remote node fills its
         // new slot now rather than at the next timer tick. RunDispatchAsync

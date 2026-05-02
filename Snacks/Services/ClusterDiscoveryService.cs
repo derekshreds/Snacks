@@ -41,7 +41,7 @@ public sealed class ClusterDiscoveryService
     };
 
     /// <summary> Protocol version for cluster inter-node communication. </summary>
-    internal const string ClusterVersion = "2.8.2";
+    internal const string ClusterVersion = "2.9.0";
 
     private volatile ClusterConfig       _config;
     private UdpClient?                   _udpListener;
@@ -533,6 +533,15 @@ public sealed class ClusterDiscoveryService
             node.LastHeartbeat = DateTime.UtcNow;
         else
             node.LastHeartbeat = existingNode!.LastHeartbeat;
+
+        // Stamp RegisteredAt on first join so the dispatch warm-up filter
+        // can hold off on sending work for a few seconds. The payload's
+        // RegisteredAt is whatever the remote serialised — useless to us;
+        // master-side wall clock is what the warm-up gate compares against.
+        if (isNew)
+            node.RegisteredAt = DateTime.UtcNow;
+        else
+            node.RegisteredAt = existingNode!.RegisteredAt;
 
         _nodes[node.NodeId] = node;
 

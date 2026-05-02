@@ -69,6 +69,17 @@ public sealed class ClusterNode
 
     /// <summary> Whether this node is paused and not accepting new jobs. </summary>
     public bool IsPaused { get; set; }
+
+    /// <summary>
+    ///     Transient (master-computed) flag indicating that the current
+    ///     wall-clock time falls outside this node's configured schedule
+    ///     windows. Set on every dispatch tick and on settings save, and
+    ///     ridden along with each <c>WorkerUpdated</c> broadcast so the
+    ///     dashboard can render an "Off-schedule" badge without needing
+    ///     its own clock or schedule logic. Always <see langword="false"/>
+    ///     when no schedule is configured.
+    /// </summary>
+    public bool OffSchedule { get; set; }
 }
 
 /// <summary>

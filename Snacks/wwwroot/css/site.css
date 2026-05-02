@@ -1860,3 +1860,49 @@ footer a.text-muted:hover {
     .codec-donut { width: 160px; height: 160px; }
     .dash-file { max-width: 220px; }
 }
+
+/* =========================================================================
+   Per-node scheduling panel — day-of-week chips and section accordion
+   ========================================================================= */
+
+.scheduling-day-chips {
+    display: inline-flex;
+    gap: 4px;
+}
+
+.scheduling-day-chips .day-chip {
+    width: 32px;
+    padding: 0.25rem 0;
+    font-weight: 600;
+    font-size: 0.85rem;
+}
+
+.scheduling-day-chips .day-chip.active {
+    background-color: var(--bs-purple, #6f42c1);
+    color: #fff;
+    border-color: var(--bs-purple, #6f42c1);
+}
+
+.scheduling-node-section > summary {
+    cursor: pointer;
+    list-style: none;
+    user-select: none;
+    background: rgba(0, 0, 0, 0.025);
+}
+
+.scheduling-node-section > summary::-webkit-details-marker { display: none; }
+
+.scheduling-node-section .scheduling-node-caret {
+    transition: transform 0.15s ease;
+    width: 0.75rem;
+}
+
+.scheduling-node-section[open] > summary .scheduling-node-caret {
+    transform: rotate(90deg);
+}
+
+.scheduling-window-row {
+    padding: 0.4rem 0.5rem;
+    border-radius: 6px;
+    background: rgba(0, 0, 0, 0.02);
+}

@@ -59,6 +59,7 @@ import { initAuthPanel,          loadAuthPanel }          from './settings/panel
 import { initExclusionPanel,     loadExclusionPanel }     from './settings/panels/exclusion-panel.js';
 import { initAdvancedPanel,      loadAdvancedPanel }      from './settings/panels/advanced-panel.js';
 import { initNodeSyncPanel,      loadNodeSyncPanel }      from './settings/panels/node-sync-panel.js';
+import { initSchedulingPanel,    loadSchedulingPanel }    from './settings/panels/scheduling-panel.js';
 
 // Side-effect import: dashboard.js calls `registerPage('dashboard', ...)` at
 // module load time so the navigation shell finds it when the user lands on
@@ -161,6 +162,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initExclusionPanel();
     initAdvancedPanel();
     initNodeSyncPanel();
+    initSchedulingPanel();
 
 
     // 4. Initial data loads (shared — not page-specific).
@@ -190,6 +192,11 @@ document.addEventListener('DOMContentLoaded', () => {
             loadAdvancedPanel();
             loadNodeSyncPanel();
         }
+
+        // Scheduling panel reloads on every open so newly-joined nodes (and
+        // any out-of-band schedule changes broadcast via SignalR) are
+        // reflected without requiring a full page refresh.
+        loadSchedulingPanel();
     });
 
     // Closing the settings modal also closes the per-node override dialog,
