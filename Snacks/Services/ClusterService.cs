@@ -785,6 +785,7 @@ public sealed class ClusterService : IHostedService, IDisposable
             _transcodingService.SetLocalEncodingPaused(!_config.LocalEncodingEnabled);
             _transcodingService.SetRemoteJobCanceller(CancelRemoteJobOnNodeAsync);
             _transcodingService.SetRemoteJobChecker(IsRemoteJobAsync);
+            _transcodingService.SetLocalScheduleGate(() => IsNodeWithinScheduleById(_config.NodeId));
             UpdateLocalSkipPredicate();
 
             _dispatchTimer = new Timer(async _ =>
@@ -2660,11 +2661,21 @@ public sealed class ClusterService : IHostedService, IDisposable
     }
 
     /// <summary>
+    ///     Tracks the master's own off-schedule status across ticks so we can
+    ///     detect the off→on edge and re-trigger local queue processing —
+    ///     without this, items sit pending until the next add/wake event when
+    ///     the master's schedule window reopens.
+    /// </summary>
+    private bool _masterOffSchedule;
+
+    /// <summary>
     ///     Recomputes <see cref="ClusterNode.OffSchedule"/> for every known
     ///     worker and rebroadcasts <c>WorkerUpdated</c> for any node whose
-    ///     value flipped. Called from the master-mode dispatch timer and
-    ///     from the per-node-settings mutation hook so the dashboard reflects
-    ///     window boundaries without polling. Master-only — no-op elsewhere.
+    ///     value flipped. Also tracks the master's own schedule transition
+    ///     so the local encoder can resume on off→on. Called from the
+    ///     master-mode dispatch timer and from the per-node-settings mutation
+    ///     hook so the dashboard reflects window boundaries without polling.
+    ///     Master-only — no-op elsewhere.
     /// </summary>
     private void RefreshOffScheduleFlags()
     {
@@ -2679,6 +2690,16 @@ public sealed class ClusterService : IHostedService, IDisposable
                 _ = _hubContext.Clients.All.SendAsync("WorkerUpdated", node);
             }
         }
+
+        bool masterOffNow = !IsNodeWithinScheduleById(_config.NodeId);
+        if (_masterOffSchedule && !masterOffNow)
+        {
+            // Schedule window just reopened — kick the local processor so
+            // pending items resume encoding without waiting for an external
+            // wake (queue add, settings change, etc.).
+            _transcodingService.WakeFromSchedule();
+        }
+        _masterOffSchedule = masterOffNow;
     }
 
     /// <summary>
