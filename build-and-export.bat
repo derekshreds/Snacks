@@ -2,7 +2,7 @@
 REM Snacks - Build and Push to Docker Hub
 REM Builds the Docker image and pushes to derekshreds/snacks-docker
 
-set VERSION=2.8.2
+set VERSION=2.9.0
 
 echo Snacks - Build and Push (v%VERSION%)
 echo ==========================
