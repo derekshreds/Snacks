@@ -4944,7 +4944,11 @@ public class TranscodingService
         if (ShouldDispatchExternal)
         {
             if (_notificationService != null)
-                _ = _notificationService.NotifyEncodeCompletedAsync(Path.GetFileName(workItem.Path), new FileInfo(workItem.Path).Length);
+                // workItem.Path may have been deleted by HandleOutputPlacement when
+                // DeleteOriginalFile=true and the source/output extensions differ
+                // (e.g. .mp4 → .mkv) — reading FileInfo.Length here would throw
+                // FileNotFoundException and surface as "Finalize failed: Could not find file …".
+                _ = _notificationService.NotifyEncodeCompletedAsync(Path.GetFileName(workItem.Path), workItem.OutputSize);
             if (_integrationService != null && keep)
                 _ = _integrationService.TriggerRescansAsync(workItem.Path);
         }
