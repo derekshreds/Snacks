@@ -78,6 +78,21 @@ public sealed class ClusterService : IHostedService, IDisposable
     private readonly ConcurrentDictionary<string, Task>          _activeDispatchTasks = new();
     private readonly ConcurrentDictionary<string, DateTime>      _nodeDispatchCooldowns = new();
     private readonly ConcurrentDictionary<string, int>           _nodeConsecutiveFailures = new();
+
+    /// <summary>
+    ///     Worker-only cache of the master's authoritative cluster view. The
+    ///     worker can't piggyback on the master's hub broadcasts (each node
+    ///     runs its own SignalR hub), so a background timer polls the master's
+    ///     <c>/api/cluster/cluster-state</c> on each heartbeat tick, diffs the
+    ///     result against this cache, and re-broadcasts deltas on the worker's
+    ///     own hub. The dashboard's existing
+    ///     <c>WorkerConnected</c>/<c>WorkerUpdated</c>/<c>WorkerDisconnected</c>/<c>NodeSettingsChanged</c>
+    ///     handlers then patch a worker UI live without the user having to refresh.
+    ///     Both fields stay <see langword="null"/> on master and standalone instances.
+    /// </summary>
+    private List<ClusterNode>?   _cachedMasterNodes;
+    private NodeSettingsConfig?  _cachedMasterNodeSettings;
+    private readonly object      _masterCacheLock = new();
     private readonly string _configPath;
     private readonly string _workDir;
     private readonly JsonSerializerOptions _jsonOptions = new()
@@ -426,6 +441,109 @@ public sealed class ClusterService : IHostedService, IDisposable
     public HttpClient CreateClusterClient() => _discovery.CreateAuthenticatedClient();
 
     /// <summary>
+    ///     Snapshot of the most recent cluster view fetched from the master,
+    ///     or <see langword="null"/> on master/standalone instances or before
+    ///     the worker's first refresh has completed. Used by the admin status
+    ///     endpoint to serve a fresh, periodically-refreshed cluster view to
+    ///     the worker UI without doing an outbound HTTP call on every request.
+    /// </summary>
+    public (IReadOnlyList<ClusterNode>? Nodes, NodeSettingsConfig? NodeSettings) GetCachedMasterClusterState()
+    {
+        lock (_masterCacheLock)
+        {
+            return (_cachedMasterNodes?.ToList(), _cachedMasterNodeSettings);
+        }
+    }
+
+    /// <summary>
+    ///     Polls the master's cluster-state endpoint, diffs the result against
+    ///     <see cref="_cachedMasterNodes"/> / <see cref="_cachedMasterNodeSettings"/>,
+    ///     and re-broadcasts deltas on this worker's SignalR hub so any browser
+    ///     connected to the worker's UI sees the same live updates the master's
+    ///     own UI sees. No-op when the master URL can't be resolved or the
+    ///     fetch fails — last-known-good cache is preserved so the UI keeps
+    ///     showing the most recent state through a transient master outage.
+    /// </summary>
+    private async Task RefreshMasterClusterStateAsync()
+    {
+        var masterUrl = ResolveMasterUrl();
+        if (string.IsNullOrEmpty(masterUrl)) return;
+
+        List<ClusterNode>?  newNodes;
+        NodeSettingsConfig? newSettings;
+        try
+        {
+            using var client = _discovery.CreateAuthenticatedClient();
+            client.Timeout = TimeSpan.FromSeconds(5);
+            using var resp = await client.GetAsync($"{masterUrl.TrimEnd('/')}/api/cluster/cluster-state");
+            if (!resp.IsSuccessStatusCode) return;
+            var body = await resp.Content.ReadAsStringAsync();
+            using var doc = JsonDocument.Parse(body);
+
+            newNodes = doc.RootElement.TryGetProperty("nodes", out var nodesProp)
+                ? JsonSerializer.Deserialize<List<ClusterNode>>(nodesProp.GetRawText(), _jsonOptions)
+                : null;
+            newSettings = doc.RootElement.TryGetProperty("nodeSettings", out var nsProp)
+                ? JsonSerializer.Deserialize<NodeSettingsConfig>(nsProp.GetRawText(), _jsonOptions)
+                : null;
+        }
+        catch
+        {
+            return;
+        }
+
+        if (newNodes == null) return;
+
+        List<ClusterNode>?   prevNodes;
+        NodeSettingsConfig?  prevSettings;
+        lock (_masterCacheLock)
+        {
+            prevNodes    = _cachedMasterNodes;
+            prevSettings = _cachedMasterNodeSettings;
+            _cachedMasterNodes        = newNodes;
+            _cachedMasterNodeSettings = newSettings;
+        }
+
+        // First successful refresh after startup — populate cache silently.
+        // The dashboard's initial /api/cluster-admin/status fetch already
+        // pulled this same data; broadcasting now would just trigger
+        // duplicate "node connected" toasts on a freshly-loaded page.
+        if (prevNodes == null) return;
+
+        // Per-node deltas. WorkerConnected fires only for genuinely new
+        // peers (the dashboard toasts on it); WorkerUpdated for any state
+        // change on a known peer (idempotent re-render); WorkerDisconnected
+        // for peers the master has dropped.
+        foreach (var node in newNodes)
+        {
+            var prev = prevNodes.FirstOrDefault(p => p.NodeId == node.NodeId);
+            if (prev == null)
+            {
+                await _hubContext.Clients.All.SendAsync("WorkerConnected", node);
+            }
+            else if (!JsonNodeEquivalent(prev, node))
+            {
+                await _hubContext.Clients.All.SendAsync("WorkerUpdated", node);
+            }
+        }
+        foreach (var prev in prevNodes)
+        {
+            if (!newNodes.Any(n => n.NodeId == prev.NodeId))
+                await _hubContext.Clients.All.SendAsync("WorkerDisconnected", prev.NodeId);
+        }
+
+        if (newSettings != null && !JsonNodeEquivalent(prevSettings, newSettings))
+            await _hubContext.Clients.All.SendAsync("NodeSettingsChanged", newSettings);
+    }
+
+    private bool JsonNodeEquivalent(object? a, object? b)
+    {
+        if (a == null && b == null) return true;
+        if (a == null || b == null) return false;
+        return JsonSerializer.Serialize(a, _jsonOptions) == JsonSerializer.Serialize(b, _jsonOptions);
+    }
+
+    /// <summary>
     ///     Whether this instance should originate external-facing side effects
     ///     (webhooks, Plex/Jellyfin rescans, etc.). True for standalone and master;
     ///     false for dedicated worker nodes so each event fires exactly once cluster-wide.
@@ -618,6 +736,13 @@ public sealed class ClusterService : IHostedService, IDisposable
                 _nodeJobs.ExpireStaleReceiving(TimeSpan.FromSeconds(_config.StaleReceiveTimeoutSeconds));
                 try { await _nodeJobs.RetryPendingCompletionsAsync(); }
                 catch (Exception ex) { Console.WriteLine($"Cluster: Pending completion retry error: {ex.Message}"); }
+
+                // Refresh the cached master cluster view and rebroadcast
+                // deltas on this worker's SignalR hub so the worker's UI
+                // tracks the master's live state instead of going stale
+                // after the initial page load.
+                try { await RefreshMasterClusterStateAsync(); }
+                catch (Exception ex) { Console.WriteLine($"Cluster: Master state refresh error: {ex.Message}"); }
             }
         }, null, jitter, heartbeatInterval);
 
@@ -905,39 +1030,36 @@ public sealed class ClusterService : IHostedService, IDisposable
         // the chip count reflects "this slot is in use" continuously, not
         // "encoding right now". The worker only reports the encoding phase
         // in reportedActive; the master fills in the upload and download
-        // phases from its own state.
+        // phases from its own state. The per-entry decision lives in
+        // SlotReconciler so the rules can be unit-tested directly.
         var merged = new List<ActiveJobInfo>();
         foreach (var keep in node.ActiveJobs)
         {
-            // Worker is encoding this job — let its progress + phase win.
-            var fromWorker = reportedActive.FirstOrDefault(r => r.JobId == keep.JobId);
-            if (fromWorker != null)
-            {
-                keep.Progress = fromWorker.Progress;
-                keep.Phase    = fromWorker.Phase;
-                if (string.IsNullOrEmpty(keep.FileName)) keep.FileName = fromWorker.FileName;
-                merged.Add(keep);
-                continue;
-            }
+            var (preserve, phaseOverride) = SlotReconciler.ShouldPreserveEntry(
+                keep, reportedActive, _activeUploads, _activeDownloads,
+                completedIds, _remoteJobs, node.NodeId);
+            if (!preserve) continue;
 
-            // Master is uploading the file — keep the slot held.
-            if (_activeUploads.ContainsKey(keep.JobId))
+            // Worker's report wins for entries it's actively encoding —
+            // copy progress + phase + filename from the worker's payload.
+            // For other preserved entries, stamp the master-side phase.
+            if (phaseOverride == null)
             {
-                keep.Phase = "Uploading";
-                merged.Add(keep);
-                continue;
+                var fromWorker = reportedActive.FirstOrDefault(r => r.JobId == keep.JobId);
+                if (fromWorker != null)
+                {
+                    keep.Progress = fromWorker.Progress;
+                    keep.Phase    = fromWorker.Phase;
+                    if (string.IsNullOrEmpty(keep.FileName)) keep.FileName = fromWorker.FileName;
+                }
+                // else: preserved by _remoteJobs ownership (handover gap) —
+                // leave the entry's existing phase alone.
             }
-
-            // Master is downloading the encoded output, OR worker has
-            // signalled completion and master is about to start the
-            // download. Either way, the slot is still consumed by this job.
-            if (_activeDownloads.ContainsKey(keep.JobId) || completedIds.Contains(keep.JobId))
+            else
             {
-                keep.Phase = "Downloading";
-                merged.Add(keep);
-                continue;
+                keep.Phase = phaseOverride;
             }
-            // Otherwise: stale entry — neither side owns this job anymore.
+            merged.Add(keep);
         }
         // Worker-reported jobs the master never dispatched (orphans) — show
         // them so the user can see what the worker thinks it's doing.
@@ -1206,6 +1328,14 @@ public sealed class ClusterService : IHostedService, IDisposable
                 // ActiveJobs is the authoritative per-slot accounting;
                 // ActiveWorkItemId is kept in sync as a "first active" hint
                 // for legacy UI fields.
+                //
+                // _activeUploads is pre-claimed synchronously with the
+                // ActiveJobs.Add so the heartbeat reconciliation that runs
+                // between this loop's awaits sees the slot as held — without
+                // this, the gap between here and DispatchToNodeAsync's body
+                // running on the thread pool lets a heartbeat strip the
+                // entry and the next dispatch tick double-books the slot.
+                _activeUploads.TryAdd(workItem.Id, true);
                 bestNode.ActiveWorkItemId = workItem.Id;
                 bestNode.ActiveJobs.Add(new ActiveJobInfo
                 {
@@ -1231,7 +1361,28 @@ public sealed class ClusterService : IHostedService, IDisposable
                 // the same node can run in parallel. The dictionary is used
                 // for cleanup hygiene only — slot capacity is gated by
                 // HasFreeSlot, not by counting tasks here.
-                var dispatchTask = Task.Run(() => DispatchToNodeAsync(bestNode, workItem, finalOptions, deviceId));
+                //
+                // Outer try/catch releases the pre-claimed slot + upload
+                // entry if Task.Run's body throws before DispatchToNodeAsync
+                // can register its own cleanup paths — otherwise a
+                // synchronous throw would leak the reservation forever.
+                var capturedNode = bestNode;
+                var capturedItem = workItem;
+                var capturedOpts = finalOptions;
+                var capturedDev  = deviceId;
+                var dispatchTask = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await DispatchToNodeAsync(capturedNode, capturedItem, capturedOpts, capturedDev, preClaimed: true);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Cluster: Dispatch task threw for {capturedItem.FileName}: {ex.Message} — releasing pre-claim");
+                        _activeUploads.TryRemove(capturedItem.Id, out _);
+                        ReleaseActiveSlot(capturedNode, capturedItem.Id);
+                    }
+                });
                 _activeDispatchTasks[workItem.Id] = dispatchTask;
             }
 
@@ -1245,10 +1396,17 @@ public sealed class ClusterService : IHostedService, IDisposable
     /// <summary>
     ///     Uploads source file with embedded metadata, verifies the upload.
     ///     The worker node begins encoding autonomously upon successful upload.
+    ///
+    ///     <para><paramref name="preClaimed"/> = <see langword="true"/> when
+    ///     the caller has already inserted <paramref name="workItem"/>'s id
+    ///     into <c>_activeUploads</c> as part of an atomic slot reservation
+    ///     under <c>_dispatchLock</c>. The duplicate-detection block below
+    ///     is then skipped — there is no concurrent dispatch to detect, and
+    ///     re-running TryAdd would falsely trip it.</para>
     /// </summary>
-    private async Task DispatchToNodeAsync(ClusterNode node, WorkItem workItem, EncoderOptions options, string deviceId = "")
+    private async Task DispatchToNodeAsync(ClusterNode node, WorkItem workItem, EncoderOptions options, string deviceId = "", bool preClaimed = false)
     {
-        if (!_activeUploads.TryAdd(workItem.Id, true))
+        if (!preClaimed && !_activeUploads.TryAdd(workItem.Id, true))
         {
             if (_remoteJobs.ContainsKey(workItem.Id))
             {

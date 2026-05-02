@@ -292,12 +292,17 @@ footer a.text-muted:hover {
     border-radius: 10px;
     transition: width 0.6s cubic-bezier(0.4, 0, 0.2, 1);
     background: linear-gradient(90deg, var(--primary-color), var(--info-color));
-    background-size: 200% 100%;
-    animation: shimmer 2s infinite;
     position: relative;
     overflow: hidden;
 }
 
+/* Shimmer + shine carried by a single composite-only translateX overlay.
+ * The original used `background-position` (paint per frame) on the bar
+ * itself; this moves the moving highlight onto a pseudo-element so the
+ * GPU can composite it without repainting. Gradient stops are slightly
+ * widened so the band's plateau is more substantial — it now carries
+ * both the original shine sweep and the subtle motion the shimmer was
+ * producing on the bar itself. */
 .progress-bar::after {
     content: '';
     position: absolute;
@@ -305,14 +310,10 @@ footer a.text-muted:hover {
     left: 0;
     bottom: 0;
     right: 0;
-    background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.15), transparent);
+    background: linear-gradient(90deg, transparent 10%, rgba(255, 255, 255, 0.15) 50%, transparent 90%);
     animation: loading-shine 1.5s infinite;
-}
-
-@keyframes shimmer {
-    0% { background-position: 0% 50%; }
-    50% { background-position: 100% 50%; }
-    100% { background-position: 0% 50%; }
+    will-change: transform;
+    contain: paint;
 }
 
 @keyframes loading-shine {
@@ -359,7 +360,12 @@ footer a.text-muted:hover {
    =========================== */
 .work-item {
     border-left: 4px solid transparent;
-    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    /* Targeted to the two properties the hover state actually animates.
+     * `transition: all` made every SignalR-driven attribute change (class
+     * flips, style updates from updateWorkItemDom) trigger transitions
+     * over every computed-style delta the browser found. */
+    transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1),
+                box-shadow 0.3s cubic-bezier(0.4, 0, 0.2, 1);
     margin-bottom: 1rem;
     padding: 1.25rem;
     background: var(--bg-surface);
@@ -367,6 +373,12 @@ footer a.text-muted:hover {
     box-shadow: var(--shadow-sm);
     position: relative;
     overflow: hidden;
+    /* Skip layout/paint/animation work for rows scrolled out of the
+     * viewport. Onscreen rows render exactly as before; offscreen rows
+     * cost nothing until they scroll into view. The intrinsic size keeps
+     * scrollbar height stable and prevents reflow as rows enter/exit. */
+    content-visibility: auto;
+    contain-intrinsic-size: 0 8rem;
 }
 
 .work-item::before {
@@ -444,6 +456,8 @@ footer a.text-muted:hover {
     display: inline-flex;
     align-items: center;
     gap: 0.375rem;
+    position: relative;
+    isolation: isolate;
 }
 
 .status-pending {
@@ -456,12 +470,32 @@ footer a.text-muted:hover {
     background: rgba(139, 92, 246, 0.15);
     color: #a78bfa;
     border: 1px solid rgba(139, 92, 246, 0.3);
-    animation: pulse-badge 2s ease-in-out infinite;
 }
 
+/* Halo pulse: previously animated `box-shadow` spread (paint per frame).
+ * Now produced by a pseudo-element with a static box-shadow whose
+ * transform/opacity is animated — both composite-only properties, so
+ * the GPU never repaints the halo. */
+.status-processing::after,
+.status-uploading::after,
+.status-downloading::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    pointer-events: none;
+    z-index: -1;
+    animation: pulse-badge 2s ease-in-out infinite;
+    will-change: transform, opacity;
+}
+
+.status-processing::after  { box-shadow: 0 0 0 2px rgba(139, 92, 246, 0.4); }
+.status-uploading::after   { box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.4); }
+.status-downloading::after { box-shadow: 0 0 0 2px rgba(14, 165, 233, 0.4); }
+
 @keyframes pulse-badge {
-    0%, 100% { box-shadow: 0 0 0 0 rgba(139, 92, 246, 0.4); }
-    50% { box-shadow: 0 0 0 6px rgba(139, 92, 246, 0); }
+    0%, 100% { transform: scale(1);    opacity: 0; }
+    50%      { transform: scale(1.03); opacity: 0.4; }
 }
 
 .status-completed {
@@ -492,14 +526,12 @@ footer a.text-muted:hover {
     background: rgba(59, 130, 246, 0.15);
     color: #60a5fa;
     border: 1px solid rgba(59, 130, 246, 0.3);
-    animation: pulse-badge 2s ease-in-out infinite;
 }
 
 .status-downloading {
     background: rgba(14, 165, 233, 0.15);
     color: #38bdf8;
     border: 1px solid rgba(14, 165, 233, 0.3);
-    animation: pulse-badge 2s ease-in-out infinite;
 }
 
 /* ===========================

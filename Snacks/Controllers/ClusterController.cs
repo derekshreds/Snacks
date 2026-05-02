@@ -141,6 +141,35 @@ public sealed class ClusterController : ControllerBase
     }
 
     /// <summary>
+    ///     Returns the master's full cluster view — the list of all nodes the
+    ///     master is currently tracking plus the master-side per-node settings
+    ///     (concurrency overrides, 4K routing flags). Workers proxy this through
+    ///     their own admin status endpoint so a browser viewing a worker's UI
+    ///     sees the same accurate cluster state the master sees: true effective
+    ///     concurrency caps, slot fill, busy/online status, and version of
+    ///     every peer node — instead of the worker's stale local
+    ///     <c>_nodes</c> map (which only contains entries the worker discovered
+    ///     directly and is never reconciled against the master's heartbeats).
+    /// </summary>
+    [HttpGet("cluster-state")]
+    public IActionResult GetClusterState()
+    {
+        // The master's own _nodes only contains peers; include BuildSelfNode
+        // here so a worker proxying this endpoint sees the master in its
+        // cluster view too. Without it, the worker UI's remote-card list
+        // would silently drop the master when the proxy kicks in.
+        var nodes = _clusterService.GetNodes().ToList();
+        var self  = _clusterService.BuildSelfNode();
+        if (!nodes.Any(n => n.NodeId == self.NodeId)) nodes.Add(self);
+
+        return Ok(new
+        {
+            nodes,
+            nodeSettings = _clusterService.GetNodeSettingsConfig(),
+        });
+    }
+
+    /// <summary>
     ///     Returns the master's current integration credentials (Plex / Jellyfin / Sonarr /
     ///     Radarr / TVDB / TMDb) so a worker can use them during original-language lookups
     ///     and sidecar OCR. Workers pull this endpoint before every encode.
