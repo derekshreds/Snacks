@@ -84,4 +84,13 @@ public sealed class JobCompletion
 
     /// <summary> Whether encoding produced no size savings and the output was discarded. </summary>
     public bool NoSavings { get; set; }
+
+    /// <summary>
+    ///     Whether the worker's encode used <c>-c:v copy</c> (mux pass or HEVC-at-target copy).
+    ///     The master needs this to make the same keep/delete decision the worker made; without
+    ///     it, the master would have to recompute mux-pass eligibility from probe + options and
+    ///     would miss the secondary HEVC-at-target-bitrate copy path that <c>CalculateBitrates</c>
+    ///     enables independently of <c>EncodingMode</c>.
+    /// </summary>
+    public bool VideoCopy { get; set; }
 }

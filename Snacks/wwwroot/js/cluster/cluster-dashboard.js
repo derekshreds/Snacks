@@ -74,6 +74,7 @@ export class ClusterDashboard {
         this._localEncoding = true;
         this._selfCaps      = null;
         this._selfActive    = [];   // ActiveJobInfo[] for the local machine's slots
+        this._selfVersion   = null;
         this._localDone     = 0;
         this._localFailed   = 0;
 
@@ -226,6 +227,7 @@ export class ClusterDashboard {
             this._localEncoding = status.localEncodingEnabled !== false;
             this._selfCaps      = status.selfCapabilities  || null;
             this._selfActive    = status.localActiveJobs    || [];
+            this._selfVersion   = status.selfVersion        || null;
             this._localDone     = status.localCompletedJobs || 0;
             this._localFailed   = status.localFailedJobs    || 0;
 
@@ -327,7 +329,7 @@ export class ClusterDashboard {
                     </div>
                     <div class="text-muted small">
                         <div>${escapeHtml(this._role)} &bull; ${escapeHtml(selfOs)}${selfGpu ? ' / ' + escapeHtml(selfGpu) : ''}</div>
-                        <div style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(selfStatus)}</div>
+                        <div style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(selfStatus)}${this._selfVersion ? ` &bull; v${escapeHtml(this._selfVersion)}` : ''}</div>
                         <div class="mt-1">Jobs: ${this._localDone} done, ${this._localFailed} failed</div>
                         ${this._role === 'master' ? `
                         <div class="d-flex gap-1 mt-1">
@@ -427,7 +429,7 @@ export class ClusterDashboard {
                     </div>
                     <div class="text-muted small">
                         <div>${escapeHtml(node.role)} &bull; ${escapeHtml(osInfo)}${gpuInfo ? ' / ' + escapeHtml(gpuInfo) : ''}</div>
-                        <div style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(statusName)}</div>
+                        <div style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(statusName)}${node.version ? ` &bull; v${escapeHtml(node.version)}` : ''}</div>
                         <div class="mt-1">Jobs: ${node.completedJobs || 0} done, ${node.failedJobs || 0} failed</div>
                         ${canControl ? `
                             <div class="d-flex gap-1 mt-1">

@@ -89,11 +89,13 @@ public sealed class SettingsRoundTripTests
         using var db   = new InMemoryDb();
         var       repo = db.CreateRepository();
 
+        var seededAt = new DateTime(2024, 6, 1, 12, 0, 0, DateTimeKind.Utc);
         await SeedAsync(db, new MediaFile
         {
-            FilePath     = "/lib/a.mkv", Directory = "/lib", FileName = "a.mkv", BaseName = "a",
-            Status       = MediaFileStatus.Skipped,
-            AudioStreams = "[{\"l\":\"eng\",\"c\":\"aac\",\"ch\":2}]",
+            FilePath      = "/lib/a.mkv", Directory = "/lib", FileName = "a.mkv", BaseName = "a",
+            Status        = MediaFileStatus.Skipped,
+            AudioStreams  = "[{\"l\":\"eng\",\"c\":\"aac\",\"ch\":2}]",
+            LastScannedAt = seededAt,
         });
 
         // Predicate says "no, this should NOT stay skipped."
@@ -102,7 +104,10 @@ public sealed class SettingsRoundTripTests
         flipped.Should().Be(1);
         var row = await GetByPathAsync(db, "/lib/a.mkv");
         row!.Status.Should().Be(MediaFileStatus.Unseen);
-        row.LastScannedAt.Should().BeNull();
+        // LastScannedAt must survive the flip — the cached stream summaries on the row are
+        // still valid, and clearing LastScannedAt previously triggered a probe storm on
+        // every Re-evaluate. The next scan can re-use the cached probe data.
+        row.LastScannedAt.Should().Be(seededAt);
     }
 
 

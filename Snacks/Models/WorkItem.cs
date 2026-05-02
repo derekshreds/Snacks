@@ -180,6 +180,15 @@ public sealed class WorkItem
     ///     after the slot has been released. Null until scheduled.
     /// </summary>
     public string? DispatchedDeviceId { get; set; }
+
+    /// <summary>
+    ///     Whether the encode used <c>-c:v copy</c> (mux pass or HEVC-at-target-bitrate copy).
+    ///     Set by <c>ConvertVideoAsync</c> when the output is kept; null otherwise. The cluster
+    ///     completion path forwards this to the master so its keep/delete recompute uses the
+    ///     worker's actual flag instead of recomputing only the mux-pass branch (which would
+    ///     miss the HEVC-at-target case).
+    /// </summary>
+    public bool? OutputUsedVideoCopy { get; set; }
 }
 
 /// <summary> Lifecycle states for a <see cref="WorkItem"/>. </summary>

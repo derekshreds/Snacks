@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Mvc;
 using Snacks.Models;
 using Snacks.Models.Requests;
 using Snacks.Services;
+using System.Text.Json;
 
 namespace Snacks.Controllers;
 
@@ -17,6 +18,12 @@ public sealed class ClusterAdminController : ControllerBase
     private readonly ClusterService     _clusterService;
     private readonly TranscodingService _transcodingService;
     private readonly AutoScanService    _autoScanService;
+
+    private static readonly JsonSerializerOptions _jsonOpts = new()
+    {
+        PropertyNameCaseInsensitive = true,
+        PropertyNamingPolicy        = JsonNamingPolicy.CamelCase,
+    };
 
     public ClusterAdminController(
         ClusterService clusterService,
@@ -92,28 +99,71 @@ public sealed class ClusterAdminController : ControllerBase
     /// <summary>
     ///     Returns the current cluster operational status including node capabilities,
     ///     local job counters, and the list of connected nodes.
+    ///
+    ///     <para>When this instance is running as a worker node, the
+    ///     <c>nodes</c> list is proxied from the master's authoritative
+    ///     <c>/api/cluster/cluster-state</c> endpoint instead of the worker's
+    ///     local <c>_nodes</c> map. The worker only ever heartbeats with the
+    ///     master directly, so its local map is missing peer workers and
+    ///     contains stale concurrency caps and busy/online state. Fetching
+    ///     from the master gives the browser viewing the worker's UI the
+    ///     same view the master has — true effective concurrency, correct
+    ///     per-device slot fill, accurate paused/online status, and the
+    ///     version of every peer. On master-fetch failure the call falls
+    ///     back to the worker's local view so the page still loads during
+    ///     a transient master outage.</para>
     /// </summary>
     [HttpGet("status")]
-    public IActionResult GetStatus()
+    public async Task<IActionResult> GetStatus()
     {
         var config = _clusterService.GetConfig();
+
+        IReadOnlyList<ClusterNode> nodes = _clusterService.GetNodes();
+        if (config.Enabled && config.Role == "node")
+        {
+            // Prefer the background-refreshed cache (kept current by the
+            // worker's heartbeat-tick poll of master's cluster-state). On
+            // cold start the cache hasn't been populated yet — fall back
+            // to a one-shot proxy fetch so the first page load is correct.
+            var (cachedNodes, _) = _clusterService.GetCachedMasterClusterState();
+            if (cachedNodes != null)
+            {
+                nodes = cachedNodes;
+            }
+            else
+            {
+                var proxied = await TryFetchMasterClusterStateAsync();
+                if (proxied?.Nodes != null) nodes = proxied.Nodes;
+            }
+        }
+
+        // localActiveJobs source: workers route encodes through the node-job
+        // service, which tracks both encoding-in-progress and the
+        // upload-in-flight phase. Using ClusterService.GetActiveJobs here on
+        // workers makes the self-card chips reflect a slot the moment a file
+        // starts uploading — not only once encoding begins.
+        var localActive = config.Role == "node"
+            ? _clusterService.GetActiveJobs()
+            : _transcodingService.GetActiveLocalJobs();
+
         return new JsonResult(new
         {
             enabled              = config.Enabled,
             role                 = config.Role,
             nodeName             = config.NodeName,
             nodeId               = config.NodeId,
+            selfVersion          = ClusterDiscoveryService.ClusterVersion,
             localEncodingEnabled = config.LocalEncodingEnabled,
             selfCapabilities     = _clusterService.GetCapabilities(),
             // Multi-slot self status: one ActiveJobInfo per local slot the
             // master is currently encoding on. Mirrors the activeJobs[] shape
             // surfaced on remote nodes so the dashboard renders the master's
             // self-card with the same per-device chips and progress bars.
-            localActiveJobs      = _transcodingService.GetActiveLocalJobs(),
+            localActiveJobs      = localActive,
             localCompletedJobs   = _transcodingService.LocalCompletedJobs,
             localFailedJobs      = _transcodingService.LocalFailedJobs,
-            nodeCount            = _clusterService.GetNodes().Count + 1,
-            nodes                = _clusterService.GetNodes()
+            nodeCount            = nodes.Count + 1,
+            nodes                = nodes,
         });
     }
 
@@ -161,9 +211,67 @@ public sealed class ClusterAdminController : ControllerBase
      *  Node and Folder Settings
      ******************************************************************/
 
-    /// <summary> Returns all per-node encoding override configurations. </summary>
+    /// <summary>
+    ///     Returns all per-node encoding override configurations.
+    ///
+    ///     <para>On worker nodes the master's config is proxied through —
+    ///     workers don't carry NodeSettings in their own state, and the UI
+    ///     needs the master's overrides to render correct concurrency caps
+    ///     on every node card. Falls back to the worker's empty local view
+    ///     if the master can't be reached.</para>
+    /// </summary>
     [HttpGet("node-settings")]
-    public IActionResult GetNodeSettings() => new JsonResult(_clusterService.GetNodeSettingsConfig());
+    public async Task<IActionResult> GetNodeSettings()
+    {
+        var config = _clusterService.GetConfig();
+        if (config.Enabled && config.Role == "node")
+        {
+            var (_, cachedSettings) = _clusterService.GetCachedMasterClusterState();
+            if (cachedSettings != null) return new JsonResult(cachedSettings);
+
+            var proxied = await TryFetchMasterClusterStateAsync();
+            if (proxied?.NodeSettings != null) return new JsonResult(proxied.NodeSettings);
+        }
+        return new JsonResult(_clusterService.GetNodeSettingsConfig());
+    }
+
+    /******************************************************************
+     *  Master-state proxy (worker mode)
+     ******************************************************************/
+
+    private sealed class MasterClusterState
+    {
+        public List<ClusterNode>?    Nodes        { get; set; }
+        public NodeSettingsConfig?   NodeSettings { get; set; }
+    }
+
+    /// <summary>
+    ///     Fetches the master's full cluster view via the shared-secret
+    ///     <c>/api/cluster/cluster-state</c> endpoint. Returns <see langword="null"/>
+    ///     if the master URL isn't resolvable, the call fails, the response
+    ///     isn't valid JSON, or the round trip exceeds the short timeout.
+    ///     Callers fall back to the worker's local view in any of those cases
+    ///     so the UI still loads during a master outage.
+    /// </summary>
+    private async Task<MasterClusterState?> TryFetchMasterClusterStateAsync()
+    {
+        var masterUrl = _clusterService.ResolveMasterUrl();
+        if (string.IsNullOrEmpty(masterUrl)) return null;
+
+        try
+        {
+            using var client = _clusterService.CreateClusterClient();
+            client.Timeout = TimeSpan.FromSeconds(5);
+            using var resp = await client.GetAsync($"{masterUrl.TrimEnd('/')}/api/cluster/cluster-state");
+            if (!resp.IsSuccessStatusCode) return null;
+            var body = await resp.Content.ReadAsStringAsync();
+            return JsonSerializer.Deserialize<MasterClusterState>(body, _jsonOpts);
+        }
+        catch
+        {
+            return null;
+        }
+    }
 
     /// <summary>
     ///     Saves encoding overrides for a specific cluster node. The <c>Only4K</c> and

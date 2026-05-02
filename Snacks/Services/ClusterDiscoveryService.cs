@@ -41,7 +41,7 @@ public sealed class ClusterDiscoveryService
     };
 
     /// <summary> Protocol version for cluster inter-node communication. </summary>
-    internal const string ClusterVersion = "2.8.0";
+    internal const string ClusterVersion = "2.8.1";
 
     private volatile ClusterConfig       _config;
     private UdpClient?                   _udpListener;

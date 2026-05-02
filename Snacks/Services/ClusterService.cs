@@ -58,6 +58,17 @@ public sealed class ClusterService : IHostedService, IDisposable
     private readonly ConcurrentDictionary<string, int>         _downloadRetryCounts = new();
     private readonly ConcurrentDictionary<string, CancellationTokenSource> _jobCts = new();
     private readonly ConcurrentDictionary<string, StateTransitionService.TransitionScope> _activeTransitions = new();
+
+    /// <summary>
+    ///     Snapshot of the encoder options each remote job was dispatched under, keyed by jobId.
+    ///     Read by the completion path so the master interprets the worker's reply against the
+    ///     same options the worker actually used. Without this, every read of
+    ///     <c>_transcodingService.GetLastOptions()</c> picked up whatever was current on the
+    ///     master at that moment — a settings save, a Re-evaluate, or any in-flight options
+    ///     mutation between dispatch and completion would silently flip the keep/delete and
+    ///     output-path decisions for jobs already encoding.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, EncoderOptions> _dispatchedOptions = new();
     /// <summary>
     ///     Tracks in-flight dispatch tasks keyed by work-item ID so the loop
     ///     can reap completed ones for hygiene. Multiple dispatches to the
@@ -67,6 +78,21 @@ public sealed class ClusterService : IHostedService, IDisposable
     private readonly ConcurrentDictionary<string, Task>          _activeDispatchTasks = new();
     private readonly ConcurrentDictionary<string, DateTime>      _nodeDispatchCooldowns = new();
     private readonly ConcurrentDictionary<string, int>           _nodeConsecutiveFailures = new();
+
+    /// <summary>
+    ///     Worker-only cache of the master's authoritative cluster view. The
+    ///     worker can't piggyback on the master's hub broadcasts (each node
+    ///     runs its own SignalR hub), so a background timer polls the master's
+    ///     <c>/api/cluster/cluster-state</c> on each heartbeat tick, diffs the
+    ///     result against this cache, and re-broadcasts deltas on the worker's
+    ///     own hub. The dashboard's existing
+    ///     <c>WorkerConnected</c>/<c>WorkerUpdated</c>/<c>WorkerDisconnected</c>/<c>NodeSettingsChanged</c>
+    ///     handlers then patch a worker UI live without the user having to refresh.
+    ///     Both fields stay <see langword="null"/> on master and standalone instances.
+    /// </summary>
+    private List<ClusterNode>?   _cachedMasterNodes;
+    private NodeSettingsConfig?  _cachedMasterNodeSettings;
+    private readonly object      _masterCacheLock = new();
     private readonly string _configPath;
     private readonly string _workDir;
     private readonly JsonSerializerOptions _jsonOptions = new()
@@ -415,6 +441,131 @@ public sealed class ClusterService : IHostedService, IDisposable
     public HttpClient CreateClusterClient() => _discovery.CreateAuthenticatedClient();
 
     /// <summary>
+    ///     Local-encoding pause state — true when the master is allowed to
+    ///     run encodes on its own hardware, false when the user has paused
+    ///     local encoding from the dashboard. Used to compute the master's
+    ///     <see cref="ClusterNode.IsPaused"/> in cluster-state responses.
+    /// </summary>
+    public bool IsLocalEncodingEnabled => _config.LocalEncodingEnabled;
+
+    /// <summary> Count of jobs this instance finished encoding locally. </summary>
+    public int LocalCompletedJobs => _transcodingService.LocalCompletedJobs;
+
+    /// <summary> Count of jobs this instance failed to encode locally. </summary>
+    public int LocalFailedJobs => _transcodingService.LocalFailedJobs;
+
+    /// <summary>
+    ///     The current local-encoding active-jobs list. Returned to workers
+    ///     via cluster-state as the master's <see cref="ClusterNode.ActiveJobs"/>
+    ///     so a worker UI's master card shows the same per-device slot fill
+    ///     the master's own UI shows.
+    /// </summary>
+    public List<ActiveJobInfo> GetEnrichedSelfActiveJobs() => _transcodingService.GetActiveLocalJobs();
+
+    /// <summary>
+    ///     Snapshot of the most recent cluster view fetched from the master,
+    ///     or <see langword="null"/> on master/standalone instances or before
+    ///     the worker's first refresh has completed. Used by the admin status
+    ///     endpoint to serve a fresh, periodically-refreshed cluster view to
+    ///     the worker UI without doing an outbound HTTP call on every request.
+    /// </summary>
+    public (IReadOnlyList<ClusterNode>? Nodes, NodeSettingsConfig? NodeSettings) GetCachedMasterClusterState()
+    {
+        lock (_masterCacheLock)
+        {
+            return (_cachedMasterNodes?.ToList(), _cachedMasterNodeSettings);
+        }
+    }
+
+    /// <summary>
+    ///     Polls the master's cluster-state endpoint, diffs the result against
+    ///     <see cref="_cachedMasterNodes"/> / <see cref="_cachedMasterNodeSettings"/>,
+    ///     and re-broadcasts deltas on this worker's SignalR hub so any browser
+    ///     connected to the worker's UI sees the same live updates the master's
+    ///     own UI sees. No-op when the master URL can't be resolved or the
+    ///     fetch fails — last-known-good cache is preserved so the UI keeps
+    ///     showing the most recent state through a transient master outage.
+    /// </summary>
+    private async Task RefreshMasterClusterStateAsync()
+    {
+        var masterUrl = ResolveMasterUrl();
+        if (string.IsNullOrEmpty(masterUrl)) return;
+
+        List<ClusterNode>?  newNodes;
+        NodeSettingsConfig? newSettings;
+        try
+        {
+            using var client = _discovery.CreateAuthenticatedClient();
+            client.Timeout = TimeSpan.FromSeconds(5);
+            using var resp = await client.GetAsync($"{masterUrl.TrimEnd('/')}/api/cluster/cluster-state");
+            if (!resp.IsSuccessStatusCode) return;
+            var body = await resp.Content.ReadAsStringAsync();
+            using var doc = JsonDocument.Parse(body);
+
+            newNodes = doc.RootElement.TryGetProperty("nodes", out var nodesProp)
+                ? JsonSerializer.Deserialize<List<ClusterNode>>(nodesProp.GetRawText(), _jsonOptions)
+                : null;
+            newSettings = doc.RootElement.TryGetProperty("nodeSettings", out var nsProp)
+                ? JsonSerializer.Deserialize<NodeSettingsConfig>(nsProp.GetRawText(), _jsonOptions)
+                : null;
+        }
+        catch
+        {
+            return;
+        }
+
+        if (newNodes == null) return;
+
+        List<ClusterNode>?   prevNodes;
+        NodeSettingsConfig?  prevSettings;
+        lock (_masterCacheLock)
+        {
+            prevNodes    = _cachedMasterNodes;
+            prevSettings = _cachedMasterNodeSettings;
+            _cachedMasterNodes        = newNodes;
+            _cachedMasterNodeSettings = newSettings;
+        }
+
+        // First successful refresh after startup — populate cache silently.
+        // The dashboard's initial /api/cluster-admin/status fetch already
+        // pulled this same data; broadcasting now would just trigger
+        // duplicate "node connected" toasts on a freshly-loaded page.
+        if (prevNodes == null) return;
+
+        // Per-node deltas. WorkerConnected fires only for genuinely new
+        // peers (the dashboard toasts on it); WorkerUpdated for any state
+        // change on a known peer (idempotent re-render); WorkerDisconnected
+        // for peers the master has dropped.
+        foreach (var node in newNodes)
+        {
+            var prev = prevNodes.FirstOrDefault(p => p.NodeId == node.NodeId);
+            if (prev == null)
+            {
+                await _hubContext.Clients.All.SendAsync("WorkerConnected", node);
+            }
+            else if (!JsonNodeEquivalent(prev, node))
+            {
+                await _hubContext.Clients.All.SendAsync("WorkerUpdated", node);
+            }
+        }
+        foreach (var prev in prevNodes)
+        {
+            if (!newNodes.Any(n => n.NodeId == prev.NodeId))
+                await _hubContext.Clients.All.SendAsync("WorkerDisconnected", prev.NodeId);
+        }
+
+        if (newSettings != null && !JsonNodeEquivalent(prevSettings, newSettings))
+            await _hubContext.Clients.All.SendAsync("NodeSettingsChanged", newSettings);
+    }
+
+    private bool JsonNodeEquivalent(object? a, object? b)
+    {
+        if (a == null && b == null) return true;
+        if (a == null || b == null) return false;
+        return JsonSerializer.Serialize(a, _jsonOptions) == JsonSerializer.Serialize(b, _jsonOptions);
+    }
+
+    /// <summary>
     ///     Whether this instance should originate external-facing side effects
     ///     (webhooks, Plex/Jellyfin rescans, etc.). True for standalone and master;
     ///     false for dedicated worker nodes so each event fires exactly once cluster-wide.
@@ -458,6 +609,13 @@ public sealed class ClusterService : IHostedService, IDisposable
 
     /// <summary> Sets the job ID being received during file transfer. </summary>
     public void SetReceivingJob(string? jobId) => _nodeJobs.SetReceivingJob(jobId);
+
+    /// <summary>
+    ///     Records the device the master assigned for an incoming job so the
+    ///     worker's self-card chip counts the slot as occupied during the
+    ///     upload phase, not only once encoding starts.
+    /// </summary>
+    public void RegisterReceivingDevice(string jobId, string? deviceId) => _nodeJobs.RegisterReceivingDevice(jobId, deviceId);
 
     /// <summary> Returns the per-job semaphore that serializes ReceiveFile requests. </summary>
     public SemaphoreSlim GetReceiveLock(string jobId) => _nodeJobs.GetReceiveLock(jobId);
@@ -607,6 +765,13 @@ public sealed class ClusterService : IHostedService, IDisposable
                 _nodeJobs.ExpireStaleReceiving(TimeSpan.FromSeconds(_config.StaleReceiveTimeoutSeconds));
                 try { await _nodeJobs.RetryPendingCompletionsAsync(); }
                 catch (Exception ex) { Console.WriteLine($"Cluster: Pending completion retry error: {ex.Message}"); }
+
+                // Refresh the cached master cluster view and rebroadcast
+                // deltas on this worker's SignalR hub so the worker's UI
+                // tracks the master's live state instead of going stale
+                // after the initial page load.
+                try { await RefreshMasterClusterStateAsync(); }
+                catch (Exception ex) { Console.WriteLine($"Cluster: Master state refresh error: {ex.Message}"); }
             }
         }, null, jitter, heartbeatInterval);
 
@@ -894,39 +1059,36 @@ public sealed class ClusterService : IHostedService, IDisposable
         // the chip count reflects "this slot is in use" continuously, not
         // "encoding right now". The worker only reports the encoding phase
         // in reportedActive; the master fills in the upload and download
-        // phases from its own state.
+        // phases from its own state. The per-entry decision lives in
+        // SlotReconciler so the rules can be unit-tested directly.
         var merged = new List<ActiveJobInfo>();
         foreach (var keep in node.ActiveJobs)
         {
-            // Worker is encoding this job — let its progress + phase win.
-            var fromWorker = reportedActive.FirstOrDefault(r => r.JobId == keep.JobId);
-            if (fromWorker != null)
-            {
-                keep.Progress = fromWorker.Progress;
-                keep.Phase    = fromWorker.Phase;
-                if (string.IsNullOrEmpty(keep.FileName)) keep.FileName = fromWorker.FileName;
-                merged.Add(keep);
-                continue;
-            }
+            var (preserve, phaseOverride) = SlotReconciler.ShouldPreserveEntry(
+                keep, reportedActive, _activeUploads, _activeDownloads,
+                completedIds, _remoteJobs, node.NodeId);
+            if (!preserve) continue;
 
-            // Master is uploading the file — keep the slot held.
-            if (_activeUploads.ContainsKey(keep.JobId))
+            // Worker's report wins for entries it's actively encoding —
+            // copy progress + phase + filename from the worker's payload.
+            // For other preserved entries, stamp the master-side phase.
+            if (phaseOverride == null)
             {
-                keep.Phase = "Uploading";
-                merged.Add(keep);
-                continue;
+                var fromWorker = reportedActive.FirstOrDefault(r => r.JobId == keep.JobId);
+                if (fromWorker != null)
+                {
+                    keep.Progress = fromWorker.Progress;
+                    keep.Phase    = fromWorker.Phase;
+                    if (string.IsNullOrEmpty(keep.FileName)) keep.FileName = fromWorker.FileName;
+                }
+                // else: preserved by _remoteJobs ownership (handover gap) —
+                // leave the entry's existing phase alone.
             }
-
-            // Master is downloading the encoded output, OR worker has
-            // signalled completion and master is about to start the
-            // download. Either way, the slot is still consumed by this job.
-            if (_activeDownloads.ContainsKey(keep.JobId) || completedIds.Contains(keep.JobId))
+            else
             {
-                keep.Phase = "Downloading";
-                merged.Add(keep);
-                continue;
+                keep.Phase = phaseOverride;
             }
-            // Otherwise: stale entry — neither side owns this job anymore.
+            merged.Add(keep);
         }
         // Worker-reported jobs the master never dispatched (orphans) — show
         // them so the user can see what the worker thinks it's doing.
@@ -1001,11 +1163,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                 // Tell the worker to kill any straggler encode for this job
                 // before requeuing — otherwise a confused worker that's still
                 // encoding silently could double-process the same job.
-                try { await client.DeleteAsync($"{baseUrl}/api/cluster/jobs/{job.Id}"); }
-                catch (Exception graceEx)
-                {
-                    Console.WriteLine($"Cluster: Grace-cancel DELETE failed for {job.Id}: {graceEx.Message}");
-                }
+                _ = DeleteWorkerResourceWithRetryAsync(baseUrl, job.Id, "jobs");
 
                 await HandleNodeFailureAsync(job.Id);
                 node.ActiveJobs.RemoveAll(j => j.JobId == job.Id);
@@ -1031,12 +1189,8 @@ public sealed class ClusterService : IHostedService, IDisposable
                 continue;
             }
             Console.WriteLine($"Cluster: Node {node.Hostname} is working on unknown job {reported.JobId} — telling it to cancel");
-            try
-            {
-                await client.DeleteAsync($"{baseUrl}/api/cluster/jobs/{reported.JobId}");
-                await client.DeleteAsync($"{baseUrl}/api/cluster/files/{reported.JobId}");
-            }
-            catch (Exception ex) { Console.WriteLine($"Cluster: Failed to cancel unknown job {reported.JobId}: {ex.Message}"); }
+            _ = DeleteWorkerResourceWithRetryAsync(baseUrl, reported.JobId, "jobs");
+            _ = DeleteWorkerResourceWithRetryAsync(baseUrl, reported.JobId, "files");
         }
     }
 
@@ -1203,6 +1357,14 @@ public sealed class ClusterService : IHostedService, IDisposable
                 // ActiveJobs is the authoritative per-slot accounting;
                 // ActiveWorkItemId is kept in sync as a "first active" hint
                 // for legacy UI fields.
+                //
+                // _activeUploads is pre-claimed synchronously with the
+                // ActiveJobs.Add so the heartbeat reconciliation that runs
+                // between this loop's awaits sees the slot as held — without
+                // this, the gap between here and DispatchToNodeAsync's body
+                // running on the thread pool lets a heartbeat strip the
+                // entry and the next dispatch tick double-books the slot.
+                _activeUploads.TryAdd(workItem.Id, true);
                 bestNode.ActiveWorkItemId = workItem.Id;
                 bestNode.ActiveJobs.Add(new ActiveJobInfo
                 {
@@ -1219,11 +1381,37 @@ public sealed class ClusterService : IHostedService, IDisposable
                 // after the slot has been released back to the pool.
                 workItem.DispatchedDeviceId = deviceId;
 
+                // Snapshot the dispatched options under the jobId so the completion path can
+                // read back exactly what the worker was dispatched with — even if the master's
+                // _lastOptions has shifted since (settings save, Re-evaluate, etc.).
+                _dispatchedOptions[workItem.Id] = finalOptions.Clone();
+
                 // Track each dispatch task per-jobId so multiple uploads to
                 // the same node can run in parallel. The dictionary is used
                 // for cleanup hygiene only — slot capacity is gated by
                 // HasFreeSlot, not by counting tasks here.
-                var dispatchTask = Task.Run(() => DispatchToNodeAsync(bestNode, workItem, finalOptions, deviceId));
+                //
+                // Outer try/catch releases the pre-claimed slot + upload
+                // entry if Task.Run's body throws before DispatchToNodeAsync
+                // can register its own cleanup paths — otherwise a
+                // synchronous throw would leak the reservation forever.
+                var capturedNode = bestNode;
+                var capturedItem = workItem;
+                var capturedOpts = finalOptions;
+                var capturedDev  = deviceId;
+                var dispatchTask = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await DispatchToNodeAsync(capturedNode, capturedItem, capturedOpts, capturedDev, preClaimed: true);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Cluster: Dispatch task threw for {capturedItem.FileName}: {ex.Message} — releasing pre-claim");
+                        _activeUploads.TryRemove(capturedItem.Id, out _);
+                        ReleaseActiveSlot(capturedNode, capturedItem.Id);
+                    }
+                });
                 _activeDispatchTasks[workItem.Id] = dispatchTask;
             }
 
@@ -1237,10 +1425,17 @@ public sealed class ClusterService : IHostedService, IDisposable
     /// <summary>
     ///     Uploads source file with embedded metadata, verifies the upload.
     ///     The worker node begins encoding autonomously upon successful upload.
+    ///
+    ///     <para><paramref name="preClaimed"/> = <see langword="true"/> when
+    ///     the caller has already inserted <paramref name="workItem"/>'s id
+    ///     into <c>_activeUploads</c> as part of an atomic slot reservation
+    ///     under <c>_dispatchLock</c>. The duplicate-detection block below
+    ///     is then skipped — there is no concurrent dispatch to detect, and
+    ///     re-running TryAdd would falsely trip it.</para>
     /// </summary>
-    private async Task DispatchToNodeAsync(ClusterNode node, WorkItem workItem, EncoderOptions options, string deviceId = "")
+    private async Task DispatchToNodeAsync(ClusterNode node, WorkItem workItem, EncoderOptions options, string deviceId = "", bool preClaimed = false)
     {
-        if (!_activeUploads.TryAdd(workItem.Id, true))
+        if (!preClaimed && !_activeUploads.TryAdd(workItem.Id, true))
         {
             if (_remoteJobs.ContainsKey(workItem.Id))
             {
@@ -1447,8 +1642,7 @@ public sealed class ClusterService : IHostedService, IDisposable
             if (receivedBytes != workItem.Size)
             {
                 Console.WriteLine($"Cluster: Upload verification failed for {workItem.FileName} — expected {workItem.Size}, node has {receivedBytes}");
-                try { await client.DeleteAsync($"{baseUrl}/api/cluster/files/{workItem.Id}"); }
-                catch (Exception delEx) { Console.WriteLine($"Cluster: Cleanup DELETE failed for {workItem.Id} on {baseUrl}: {delEx.Message} — worker will be auto-reset on next dispatch"); }
+                _ = DeleteWorkerResourceWithRetryAsync(baseUrl, workItem.Id);
                 throw new Exception("Upload verification failed");
             }
 
@@ -1488,8 +1682,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                 // Node timed out mid-upload — requeue the work item
                 Console.WriteLine($"Cluster: Upload cancelled due to node timeout for {workItem.FileName} — re-queuing");
                 await CompleteActiveTransitionAsync(workItem.Id);
-                try { await _discovery.CreateAuthenticatedClient().DeleteAsync($"{baseUrl}/api/cluster/files/{workItem.Id}"); }
-                catch (Exception delEx) { Console.WriteLine($"Cluster: Cleanup DELETE failed for {workItem.Id} on {baseUrl}: {delEx.Message} — worker will be auto-reset on next dispatch"); }
+                _ = DeleteWorkerResourceWithRetryAsync(baseUrl, workItem.Id);
                 workItem.AssignedNodeId   = null;
                 workItem.AssignedNodeName = null;
                 workItem.RemoteJobPhase   = null;
@@ -1508,8 +1701,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                 // User-initiated cancellation — don't re-queue, let CancelWorkItemAsync handle status
                 Console.WriteLine($"Cluster: Upload cancelled by user for {workItem.FileName}");
                 await CompleteActiveTransitionAsync(workItem.Id);
-                try { await _discovery.CreateAuthenticatedClient().DeleteAsync($"{baseUrl}/api/cluster/files/{workItem.Id}"); }
-                catch (Exception delEx) { Console.WriteLine($"Cluster: Cleanup DELETE failed for {workItem.Id} on {baseUrl}: {delEx.Message} — worker will be auto-reset on next dispatch"); }
+                _ = DeleteWorkerResourceWithRetryAsync(baseUrl, workItem.Id);
                 _remoteJobs.TryRemove(workItem.Id, out _);
                 ReleaseActiveSlot(node, workItem.Id);
                 UpdateNodeStatus(node.NodeId, node.ActiveJobs.Count > 0 ? NodeStatus.Busy : NodeStatus.Online);
@@ -1522,8 +1714,7 @@ public sealed class ClusterService : IHostedService, IDisposable
             workItem.ErrorMessage = $"Dispatch failed: {ex.Message}";
             await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
             await CompleteActiveTransitionAsync(workItem.Id);
-            try { await _discovery.CreateAuthenticatedClient().DeleteAsync($"{baseUrl}/api/cluster/files/{workItem.Id}"); }
-            catch (Exception delEx) { Console.WriteLine($"Cluster: Cleanup DELETE failed for {workItem.Id} on {baseUrl}: {delEx.Message} — worker will be auto-reset on next dispatch"); }
+            _ = DeleteWorkerResourceWithRetryAsync(baseUrl, workItem.Id);
 
             workItem.AssignedNodeId   = null;
             workItem.AssignedNodeName = null;
@@ -1582,7 +1773,7 @@ public sealed class ClusterService : IHostedService, IDisposable
     ///     and performs file placement. Separates download from validation so that
     ///     download failures trigger re-downloads, not re-encodes.
     /// </summary>
-    public async Task HandleRemoteCompletionAsync(string jobId, string nodeBaseUrl, bool noSavings = false)
+    public async Task HandleRemoteCompletionAsync(string jobId, string nodeBaseUrl, bool noSavings = false, bool videoCopy = false)
     {
         if (!_remoteJobs.TryGetValue(jobId, out var workItem))
         {
@@ -1598,31 +1789,49 @@ public sealed class ClusterService : IHostedService, IDisposable
             return;
         }
 
-        // Encoding produced no savings — skip download and mark as skipped
+        // Encoding produced no savings — skip download and mark as skipped. Wrapped in
+        // try/finally so a DB / SignalR / ledger throw still tears down the in-memory
+        // tracking; otherwise the workItem would orphan in _remoteJobs with
+        // Status=Completed and the watchdog (which only sweeps active states) would
+        // never recover it.
         if (noSavings)
         {
             Console.WriteLine($"Cluster: No savings for {workItem.FileName} — skipping download");
-            workItem.Status         = WorkItemStatus.Completed;
-            workItem.CompletedAt    = DateTime.UtcNow;
-            workItem.Progress       = 100;
-            workItem.ErrorMessage   = null;
-            workItem.RemoteJobPhase = null;
-            await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Skipped);
-            // Ledger row even on no-savings so the dashboard's encode-time
-            // and per-device utilization reflect the work the worker did.
-            await RecordRemoteEncodeHistoryAsync(workItem, _transcodingService.GetLastOptions() ?? new EncoderOptions(), outputPath: null, noSavings: true);
-            await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
-
-            _remoteJobs.TryRemove(jobId, out _);
-            _downloadRetryCounts.TryRemove(jobId, out _);
-            if (_jobCts.TryRemove(jobId, out var skipCts)) skipCts.Dispose();
-
-            if (workItem.AssignedNodeId != null && _nodes.TryGetValue(workItem.AssignedNodeId, out var skipNode))
+            try
             {
-                skipNode.CompletedJobs++;
-                ReleaseActiveSlot(skipNode, jobId);
-                if (skipNode.ActiveJobs.Count == 0 && skipNode.Status != NodeStatus.Paused)
-                    skipNode.Status = NodeStatus.Online;
+                workItem.Status         = WorkItemStatus.Completed;
+                workItem.CompletedAt    = DateTime.UtcNow;
+                workItem.Progress       = 100;
+                workItem.ErrorMessage   = null;
+                workItem.RemoteJobPhase = null;
+                await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Skipped);
+                // Ledger row even on no-savings so the dashboard's encode-time
+                // and per-device utilization reflect the work the worker did.
+                await RecordRemoteEncodeHistoryAsync(workItem, ResolveJobOptions(jobId), outputPath: null, noSavings: true);
+                await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Cluster: No-savings finalize threw for {jobId}: {ex.Message} — proceeding to cleanup anyway.");
+            }
+            finally
+            {
+                _remoteJobs.TryRemove(jobId, out _);
+                _dispatchedOptions.TryRemove(jobId, out _);
+                _activeUploads.TryRemove(jobId, out _);
+                _downloadRetryCounts.TryRemove(jobId, out _);
+                _downloadRetryCounts.TryRemove($"_idle_grace_{jobId}", out _);
+                _downloadRetryCounts.TryRemove($"_validation_{jobId}", out _);
+                if (_jobCts.TryRemove(jobId, out var skipCts)) skipCts.Dispose();
+
+                if (workItem.AssignedNodeId != null && _nodes.TryGetValue(workItem.AssignedNodeId, out var skipNode))
+                {
+                    skipNode.CompletedJobs++;
+                    ReleaseActiveSlot(skipNode, jobId);
+                    if (skipNode.ActiveJobs.Count == 0 && skipNode.Status != NodeStatus.Paused)
+                        skipNode.Status = NodeStatus.Online;
+                }
+                _ = DeleteWorkerResourceWithRetryAsync(nodeBaseUrl, jobId);
             }
             return;
         }
@@ -1631,53 +1840,65 @@ public sealed class ClusterService : IHostedService, IDisposable
 
         try
         {
-            if (!File.Exists(workItem.Path))
+            // Top-level safety net: every fire-and-forget caller (Task.Run from the
+            // controller, heartbeat re-fire, dispatch retry) would otherwise silently
+            // swallow exceptions thrown anywhere in the pipeline below. Log them so
+            // the failure is observable; the watchdog + worker self-heal recovers the
+            // work item state on the next tick.
+            try
             {
-                Console.WriteLine($"Cluster: Source file {workItem.Path} no longer exists — discarding remote result");
-                workItem.Status       = WorkItemStatus.Failed;
-                workItem.ErrorMessage = "Source file was removed during encoding";
-                workItem.CompletedAt  = DateTime.UtcNow;
-                _remoteJobs.TryRemove(jobId, out _);
-                await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Failed);
-                await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
-                try { await _discovery.CreateAuthenticatedClient().DeleteAsync($"{nodeBaseUrl}/api/cluster/files/{jobId}"); }
-                catch (Exception delEx) { Console.WriteLine($"Cluster: Cleanup DELETE failed for {jobId} on {nodeBaseUrl}: {delEx.Message} — worker will be auto-reset on next dispatch"); }
-                return;
+                if (!File.Exists(workItem.Path))
+                {
+                    Console.WriteLine($"Cluster: Source file {workItem.Path} no longer exists — discarding remote result");
+                    workItem.Status       = WorkItemStatus.Failed;
+                    workItem.ErrorMessage = "Source file was removed during encoding";
+                    workItem.CompletedAt  = DateTime.UtcNow;
+                    _remoteJobs.TryRemove(jobId, out _);
+                    _dispatchedOptions.TryRemove(jobId, out _);
+                    await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Failed);
+                    await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
+                    _ = DeleteWorkerResourceWithRetryAsync(nodeBaseUrl, jobId);
+                    return;
+                }
+
+                // Phase 1: Download
+                var downloadSucceeded = await DownloadOutputAsync(jobId, nodeBaseUrl, workItem);
+                if (!downloadSucceeded) return; // Will retry via pending completions
+
+                // Phase 2: Validate
+                var options = ResolveJobOptions(jobId);
+                var ext     = options.Format == "mp4" ? ".mp4" : ".mkv";
+                var baseName = Path.GetFileNameWithoutExtension(workItem.FileName);
+                var outputFileName = $"{baseName} [snacks]{ext}";
+                string outputDir;
+                if (!string.IsNullOrEmpty(options.EncodeDirectory))
+                    outputDir = options.EncodeDirectory;
+                else if (!string.IsNullOrEmpty(options.OutputDirectory))
+                    outputDir = options.OutputDirectory;
+                else
+                    outputDir = _fileService.GetDirectory(workItem.Path);
+                var outputPath = Path.Combine(outputDir, outputFileName);
+
+                var validation = await ValidateOutputAsync(jobId, workItem, outputPath);
+
+                if (validation == OutputValidation.Success)
+                {
+                    await FinalizeCompletionAsync(jobId, workItem, outputPath, options, nodeBaseUrl, videoCopy);
+                }
+                else if (validation == OutputValidation.DownloadCorrupt)
+                {
+                    // Re-download, NOT re-encode
+                    await RetryDownloadAsync(jobId, nodeBaseUrl, workItem);
+                }
+                else // validation == OutputValidation.EncodeCorrupt
+                {
+                    // Output is fundamentally broken — re-encode
+                    await RequeueForEncodingAsync(jobId, workItem, nodeBaseUrl);
+                }
             }
-
-            // Phase 1: Download
-            var downloadSucceeded = await DownloadOutputAsync(jobId, nodeBaseUrl, workItem);
-            if (!downloadSucceeded) return; // Will retry via pending completions
-
-            // Phase 2: Validate
-            var options = _transcodingService.GetLastOptions() ?? new EncoderOptions();
-            var ext     = options.Format == "mp4" ? ".mp4" : ".mkv";
-            var baseName = Path.GetFileNameWithoutExtension(workItem.FileName);
-            var outputFileName = $"{baseName} [snacks]{ext}";
-            string outputDir;
-            if (!string.IsNullOrEmpty(options.EncodeDirectory))
-                outputDir = options.EncodeDirectory;
-            else if (!string.IsNullOrEmpty(options.OutputDirectory))
-                outputDir = options.OutputDirectory;
-            else
-                outputDir = _fileService.GetDirectory(workItem.Path);
-            var outputPath = Path.Combine(outputDir, outputFileName);
-
-            var validation = await ValidateOutputAsync(jobId, workItem, outputPath);
-
-            if (validation == OutputValidation.Success)
+            catch (Exception ex)
             {
-                await FinalizeCompletionAsync(jobId, workItem, outputPath, options, nodeBaseUrl);
-            }
-            else if (validation == OutputValidation.DownloadCorrupt)
-            {
-                // Re-download, NOT re-encode
-                await RetryDownloadAsync(jobId, nodeBaseUrl, workItem);
-            }
-            else // validation == OutputValidation.EncodeCorrupt
-            {
-                // Output is fundamentally broken — re-encode
-                await RequeueForEncodingAsync(jobId, workItem, nodeBaseUrl);
+                Console.WriteLine($"Cluster: HandleRemoteCompletionAsync unhandled exception for {jobId}: {ex}");
             }
         }
         finally
@@ -1696,6 +1917,58 @@ public sealed class ClusterService : IHostedService, IDisposable
                     dlNode.Status = NodeStatus.Online;
             }
         }
+    }
+
+    /// <summary>
+    ///     Returns the options the job was dispatched under, or the master's current
+    ///     <c>GetLastOptions()</c> as a fallback when the snapshot is missing (e.g. crash
+    ///     recovery rebuilt <c>_remoteJobs</c> without a corresponding dispatch). The
+    ///     fallback preserves the old behavior; the snapshot fixes it for live jobs.
+    /// </summary>
+    private EncoderOptions ResolveJobOptions(string jobId) =>
+        _dispatchedOptions.TryGetValue(jobId, out var snap)
+            ? snap
+            : (_transcodingService.GetLastOptions() ?? new EncoderOptions());
+
+    /// <summary>
+    ///     Tells a worker to drop its cached output / job state for <paramref name="jobId"/>.
+    ///     Retries transient failures with bounded backoff before giving up — the prior
+    ///     fire-and-forget shape would silently leave workers holding orphan jobs whenever
+    ///     a network blip ate the single DELETE attempt. Idempotent: the worker's own
+    ///     duplicate-job detection makes repeats safe.
+    /// </summary>
+    /// <param name="nodeBaseUrl">Base URL of the worker.</param>
+    /// <param name="jobId">Job ID whose worker-side file/state should be dropped.</param>
+    /// <param name="resource">Either <c>"files"</c> or <c>"jobs"</c> — both endpoints accept DELETE.</param>
+    private async Task<bool> DeleteWorkerResourceWithRetryAsync(string nodeBaseUrl, string jobId, string resource = "files")
+    {
+        // 5s, 15s, 45s — total ~65s before giving up. Most transient TCP / DNS / 502
+        // hiccups clear inside the first hop; the second is for a heartbeat-window
+        // outage; the third is to survive a brief worker restart.
+        TimeSpan[] delays = { TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(45) };
+        var url = $"{nodeBaseUrl}/api/cluster/{resource}/{jobId}";
+
+        for (int attempt = 0; attempt < delays.Length + 1; attempt++)
+        {
+            try
+            {
+                var response = await _discovery.CreateAuthenticatedClient().DeleteAsync(url);
+                // 404 means the worker already dropped it — consider that success.
+                if (response.IsSuccessStatusCode || response.StatusCode == System.Net.HttpStatusCode.NotFound)
+                    return true;
+                Console.WriteLine($"Cluster: Cleanup DELETE for {jobId} on {nodeBaseUrl} returned {(int)response.StatusCode}; retrying.");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Cluster: Cleanup DELETE attempt {attempt + 1} failed for {jobId} on {nodeBaseUrl}: {ex.Message}");
+            }
+
+            if (attempt < delays.Length)
+                await Task.Delay(delays[attempt]);
+        }
+
+        Console.WriteLine($"Cluster: Cleanup DELETE giving up for {jobId} on {nodeBaseUrl} — worker will be auto-reset on next dispatch.");
+        return false;
     }
 
     /// <summary>
@@ -1787,7 +2060,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
             }
 
-            var options  = _transcodingService.GetLastOptions() ?? new EncoderOptions();
+            var options  = ResolveJobOptions(jobId);
             var ext      = options.Format == "mp4" ? ".mp4" : ".mkv";
             var baseName = Path.GetFileNameWithoutExtension(workItem.FileName);
             var outputFileName = $"{baseName} [snacks]{ext}";
@@ -1828,6 +2101,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                         maxRetryNode.Status = NodeStatus.Online;
                 }
                 _remoteJobs.TryRemove(jobId, out _);
+                _dispatchedOptions.TryRemove(jobId, out _);
                 _downloadRetryCounts.TryRemove(jobId, out _);
                 if (_jobCts.TryRemove(jobId, out var maxRetryCts))
                     maxRetryCts.Dispose();
@@ -1895,7 +2169,7 @@ public sealed class ClusterService : IHostedService, IDisposable
     }
 
     /// <summary>Finalizes a successfully validated output.</summary>
-    private async Task FinalizeCompletionAsync(string jobId, WorkItem workItem, string outputPath, EncoderOptions options, string nodeBaseUrl)
+    private async Task FinalizeCompletionAsync(string jobId, WorkItem workItem, string outputPath, EncoderOptions options, string nodeBaseUrl, bool videoCopy)
     {
         // Remove from in-flight tracking BEFORE any side effect that mutates
         // shared state observable to other completion paths. HandleRemoteCompletion
@@ -1906,31 +2180,69 @@ public sealed class ClusterService : IHostedService, IDisposable
         // master itself just deleted, marking the work item failed even though
         // encoding succeeded.
         _remoteJobs.TryRemove(jobId, out _);
+        _dispatchedOptions.TryRemove(jobId, out _);
+        _activeUploads.TryRemove(jobId, out _);
         _downloadRetryCounts.TryRemove(jobId, out _);
+        _downloadRetryCounts.TryRemove($"_idle_grace_{jobId}", out _);
         _downloadRetryCounts.TryRemove($"_validation_{jobId}", out _);
 
-        // WAL: Downloading → Completed
-        var completeScope = await _stateTransitions.BeginAsync(jobId, "Downloading", "Completed");
-
-        // Record encode-history BEFORE HandleRemoteCompletion runs — that step
-        // moves/renames the output, after which the original outputPath may
-        // be invalid for FileInfo lookups.
-        await RecordRemoteEncodeHistoryAsync(workItem, options, outputPath, noSavings: false);
-
-        await _transcodingService.HandleRemoteCompletion(workItem, outputPath, options);
-        await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Completed);
-
-        await completeScope.CompleteAsync();
-        _activeTransitions.TryRemove(jobId, out _);
-
-        try { await _discovery.CreateAuthenticatedClient().DeleteAsync($"{nodeBaseUrl}/api/cluster/files/{jobId}"); }
-        catch (Exception ex) { Console.WriteLine($"Cluster: Cleanup DELETE failed for {jobId} on {nodeBaseUrl}: {ex.Message} — worker will be auto-reset on next dispatch"); }
-
-        if (workItem.AssignedNodeId != null)
+        // Wrap the WAL transition + completion side effects so any throw still runs the
+        // worker-side DELETE and slot release. Without this guard, a WAL exception (e.g.
+        // a duplicate "Downloading→Completed" transition from a heartbeat re-fire) would
+        // leave the worker holding the orphan job forever and the slot reserved.
+        bool finalized = false;
+        try
         {
-            if (_nodes.TryGetValue(workItem.AssignedNodeId, out var node))
+            // WAL: Downloading → Completed
+            var completeScope = await _stateTransitions.BeginAsync(jobId, "Downloading", "Completed");
+
+            // Record encode-history BEFORE HandleRemoteCompletion runs — that step
+            // moves/renames the output, after which the original outputPath may
+            // be invalid for FileInfo lookups.
+            await RecordRemoteEncodeHistoryAsync(workItem, options, outputPath, noSavings: false);
+
+            await _transcodingService.HandleRemoteCompletion(workItem, outputPath, options, videoCopy);
+            await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Completed);
+
+            await completeScope.CompleteAsync();
+            _activeTransitions.TryRemove(jobId, out _);
+            finalized = true;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Cluster: FinalizeCompletionAsync threw for {jobId}: {ex.Message} — running cleanup anyway so the worker is released.");
+
+            // Mark the workItem Failed so it doesn't sit forever as Downloading-with-
+            // AssignedNodeId — that shape escapes every watchdog case (a) needs a ghost
+            // node, (b) needs no AssignedNodeId, (c) needs _remoteJobs membership.
+            // Without this, a throw between TryRemove and HandleRemoteCompletion's
+            // Status=Completed update would orphan the work item permanently.
+            try
             {
-                node.CompletedJobs++;
+                workItem.Status = WorkItemStatus.Failed;
+                workItem.ErrorMessage = $"Finalize failed: {ex.Message}";
+                workItem.CompletedAt = DateTime.UtcNow;
+                workItem.AssignedNodeId = null;
+                workItem.AssignedNodeName = null;
+                workItem.RemoteJobPhase = null;
+                await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Failed);
+                await _transcodingService.MarkWorkItemFailed(workItem.Id, workItem.ErrorMessage);
+            }
+            catch (Exception markEx)
+            {
+                Console.WriteLine($"Cluster: Failed to mark {jobId} Failed after finalize throw: {markEx.Message}");
+            }
+        }
+        finally
+        {
+            // Always tell the worker to drop its copy + free the master-side slot, even if
+            // the WAL transition or output placement threw above. The worker's idempotent
+            // DELETE handler is safe to hit repeatedly.
+            _ = DeleteWorkerResourceWithRetryAsync(nodeBaseUrl, jobId);
+
+            if (workItem.AssignedNodeId != null && _nodes.TryGetValue(workItem.AssignedNodeId, out var node))
+            {
+                if (finalized) node.CompletedJobs++;
                 ReleaseActiveSlot(node, jobId);
                 // Other slots may still be encoding — keep status Busy in that case.
                 node.Status = node.IsPaused      ? NodeStatus.Paused
@@ -1940,11 +2252,13 @@ public sealed class ClusterService : IHostedService, IDisposable
                 node.ActiveProgress = node.ActiveJobs.FirstOrDefault()?.Progress ?? 0;
                 _ = _hubContext.Clients.All.SendAsync("WorkerUpdated", node);
             }
+
+            if (_jobCts.TryRemove(jobId, out var completedCts))
+                completedCts.Dispose();
         }
 
-        if (_jobCts.TryRemove(jobId, out var completedCts))
-            completedCts.Dispose();
-        Console.WriteLine($"Cluster: Remote job {workItem.FileName} completed successfully");
+        if (finalized)
+            Console.WriteLine($"Cluster: Remote job {workItem.FileName} completed successfully");
     }
 
     /// <summary>Schedules a re-download of a corrupt output file without deleting the node's copy.</summary>
@@ -1967,8 +2281,7 @@ public sealed class ClusterService : IHostedService, IDisposable
     private async Task RequeueForEncodingAsync(string jobId, WorkItem workItem, string nodeBaseUrl)
     {
         await CompleteActiveTransitionAsync(jobId);
-        try { await _discovery.CreateAuthenticatedClient().DeleteAsync($"{nodeBaseUrl}/api/cluster/files/{jobId}"); }
-        catch (Exception ex) { Console.WriteLine($"Cluster: Cleanup DELETE failed for {jobId} on {nodeBaseUrl}: {ex.Message} — worker will be auto-reset on next dispatch"); }
+        _ = DeleteWorkerResourceWithRetryAsync(nodeBaseUrl, jobId);
         var prevNodeId = workItem.AssignedNodeId;
 
         // Release the slot before clearing the assignment
@@ -1976,6 +2289,9 @@ public sealed class ClusterService : IHostedService, IDisposable
             ReleaseActiveSlot(requeueNode, jobId);
 
         _remoteJobs.TryRemove(jobId, out _);
+        // Don't clear _dispatchedOptions — RequeueWorkItem puts the item back on the queue
+        // with the same id, and the next dispatch overwrites the entry with fresh options.
+        // (Re-encoding under stale options would mis-match the next dispatch's choice.)
         _downloadRetryCounts.TryRemove(jobId, out _);
         _downloadRetryCounts.TryRemove($"_validation_{jobId}", out _);
         if (_jobCts.TryRemove(jobId, out var cts))
@@ -2039,24 +2355,17 @@ public sealed class ClusterService : IHostedService, IDisposable
         // Symmetric cleanup — match HandleNodeFailureAsync
         _activeUploads.TryRemove(jobId, out _);
         _activeDownloads.TryRemove(jobId, out _);
+        _dispatchedOptions.TryRemove(jobId, out _);
         _downloadRetryCounts.TryRemove(jobId, out _);
         _downloadRetryCounts.TryRemove($"_idle_grace_{jobId}", out _);
         _downloadRetryCounts.TryRemove($"_validation_{jobId}", out _);
 
         if (_nodes.TryGetValue(nodeId, out var node))
         {
-            try
-            {
-                var client  = _discovery.CreateAuthenticatedClient();
-                var baseUrl = NodeBaseUrl(node);
-                await client.DeleteAsync($"{baseUrl}/api/cluster/jobs/{jobId}");
-                await client.DeleteAsync($"{baseUrl}/api/cluster/files/{jobId}");
-                Console.WriteLine($"Cluster: Sent cancel for job {jobId} to {node.Hostname}");
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Cluster: Failed to cancel job on node: {ex.Message}");
-            }
+            var baseUrl = NodeBaseUrl(node);
+            _ = DeleteWorkerResourceWithRetryAsync(baseUrl, jobId, "jobs");
+            _ = DeleteWorkerResourceWithRetryAsync(baseUrl, jobId, "files");
+            Console.WriteLine($"Cluster: Sent cancel for job {jobId} to {node.Hostname}");
 
             UpdateNodeStatus(nodeId, NodeStatus.Online);
         }
@@ -2068,11 +2377,24 @@ public sealed class ClusterService : IHostedService, IDisposable
     /// </summary>
     private async Task HandleNodeFailureAsync(string jobId)
     {
-        // Don't interfere with an active download — let it complete or fail on its own
+        // Don't interfere with an active download that is genuinely making progress —
+        // let it complete or fail on its own. But if the download has been wedged with
+        // no LastUpdatedAt advancement (no chunks received) past the freshness window,
+        // force-clear the leaked _activeDownloads entry so we can recover. The previous
+        // unconditional early-exit deadlocked the watchdog: a hung HttpClient.SendAsync
+        // never throws, the finally that clears _activeDownloads never runs, and every
+        // subsequent watchdog call returned right here.
         if (_activeDownloads.ContainsKey(jobId))
         {
-            Console.WriteLine($"Cluster: Skipping failure handling for {jobId} — download in progress");
-            return;
+            var freshnessWindow = TimeSpan.FromMinutes(2);
+            DateTime? lastTouch = _remoteJobs.TryGetValue(jobId, out var probe) ? probe.LastUpdatedAt : (DateTime?)null;
+            if (lastTouch.HasValue && DateTime.UtcNow - lastTouch.Value < freshnessWindow)
+            {
+                Console.WriteLine($"Cluster: Skipping failure handling for {jobId} — download in progress (last activity {(DateTime.UtcNow - lastTouch.Value).TotalSeconds:0}s ago)");
+                return;
+            }
+            Console.WriteLine($"Cluster: Forcing _activeDownloads cleanup for {jobId} — wedged download (last activity {(lastTouch.HasValue ? (DateTime.UtcNow - lastTouch.Value).TotalMinutes.ToString("0") : "unknown")}min ago)");
+            _activeDownloads.TryRemove(jobId, out _);
         }
 
         if (!_remoteJobs.TryRemove(jobId, out var workItem)) return;
@@ -2113,6 +2435,7 @@ public sealed class ClusterService : IHostedService, IDisposable
             workItem.AssignedNodeId   = null;
             workItem.AssignedNodeName = null;
             workItem.RemoteJobPhase   = null;
+            _dispatchedOptions.TryRemove(jobId, out _);
             await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Failed);
             await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
             await _transcodingService.MarkWorkItemFailed(workItem.Id, workItem.ErrorMessage);
@@ -2122,6 +2445,8 @@ public sealed class ClusterService : IHostedService, IDisposable
             workItem.AssignedNodeId   = null;
             workItem.AssignedNodeName = null;
             workItem.RemoteJobPhase   = null;
+            // Don't clear _dispatchedOptions on requeue — same id will get a fresh entry
+            // written on the next dispatch.
             await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Queued);
             _transcodingService.RequeueWorkItem(workItem);
         }
@@ -2476,14 +2801,9 @@ public sealed class ClusterService : IHostedService, IDisposable
             _downloadRetryCounts.TryRemove($"_validation_{jobId}", out _);
 
             // Tell the worker to cancel and clean up
-            try
-            {
-                var client  = _discovery.CreateAuthenticatedClient();
-                var baseUrl = NodeBaseUrl(node);
-                await client.DeleteAsync($"{baseUrl}/api/cluster/jobs/{jobId}");
-                await client.DeleteAsync($"{baseUrl}/api/cluster/files/{jobId}");
-            }
-            catch { }
+            var cancelBaseUrl = NodeBaseUrl(node);
+            _ = DeleteWorkerResourceWithRetryAsync(cancelBaseUrl, jobId, "jobs");
+            _ = DeleteWorkerResourceWithRetryAsync(cancelBaseUrl, jobId, "files");
 
             // Clear DB assignment and requeue
             workItem.AssignedNodeId   = null;
@@ -2783,6 +3103,11 @@ public sealed class ClusterService : IHostedService, IDisposable
                         workItem.RemoteFailureCount = mediaFile.RemoteFailureCount;
                         workItem.ErrorMessage       = null;
                         _remoteJobs[workItem.Id]    = workItem;
+                        // Snapshot reconstructed options so the completion path uses the same
+                        // folder/node-overridden options as the original dispatch (best
+                        // approximation post-crash; ResolveOptionsForJob rebuilds from current
+                        // settings + the job's persisted folder/node assignment).
+                        _dispatchedOptions[workItem.Id] = ResolveOptionsForJob(mediaFile.FilePath, mediaFile.AssignedNodeId);
                         if (mediaFile.RemoteFailureCount > 0)
                             _downloadRetryCounts[workItem.Id] = mediaFile.RemoteFailureCount * 3;
                         await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
@@ -2814,6 +3139,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                         // lower bound rather than the (much larger) queue age.
                         workItem.StartedAt      ??= DateTime.UtcNow;
                         _remoteJobs[workItem.Id]  = workItem;
+                        _dispatchedOptions[workItem.Id] = ResolveOptionsForJob(mediaFile.FilePath, mediaFile.AssignedNodeId);
                         await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
                         continue;
                     }
@@ -2837,6 +3163,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                         workItem.RemoteFailureCount = mediaFile.RemoteFailureCount;
                         workItem.ErrorMessage       = null;
                         _remoteJobs[workItem.Id]    = workItem;
+                        _dispatchedOptions[workItem.Id] = ResolveOptionsForJob(mediaFile.FilePath, mediaFile.AssignedNodeId);
                         if (mediaFile.RemoteFailureCount > 0)
                             _downloadRetryCounts[workItem.Id] = mediaFile.RemoteFailureCount * 3;
                         await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
@@ -2867,6 +3194,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                         await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
 
                         var options = ResolveOptionsForJob(mediaFile.FilePath, mediaFile.AssignedNodeId);
+                        _dispatchedOptions[workItem.Id] = options;
                         var nodeForDispatch = _nodes.Values.FirstOrDefault(n => n.NodeId == mediaFile.AssignedNodeId)
                             ?? new ClusterNode
                             {

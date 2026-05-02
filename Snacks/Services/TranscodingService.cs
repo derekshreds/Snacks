@@ -2178,23 +2178,26 @@ public class TranscodingService
         await LogAsync(workItem.Id,
             $"Converted successfully in {DateTime.Now.Subtract(startTime).TotalMinutes:0.00} minutes.");
 
-        // Configured audio fan-out can grow the file past any video savings; user opted
-        // into that growth, so we exempt it from the savings gate and keep the output.
-        bool userConfiguredGrowth = options.AudioOutputs is { Count: > 0 };
+        var (keep, reason) = ShouldKeepEncodedOutput(options, workItem, workItem.Size, outputSize, videoCopy);
 
-        if (savings > 0 || videoCopy || userConfiguredGrowth)
+        // Stash the actual videoCopy outcome so the cluster completion path can forward it
+        // to the master verbatim — without this, the master's recompute can only see the
+        // mux-pass branch and would miss the HEVC-at-target-bitrate copy that
+        // CalculateBitrates enables independently.
+        workItem.OutputUsedVideoCopy = keep ? videoCopy : null;
+
+        if (keep)
         {
             // Show both sizes explicitly so users don't misread the savings number
             // as the output size.
-            if (savings > 0)
+            if (reason == "savings")
             {
                 await LogAsync(workItem.Id,
                     $"Size: {FormatSize(workItem.Size)} → {FormatSize(outputSize)}  (saved {FormatSize((long)(savings * 1048576))}, {percent:P0})");
             }
             else
             {
-                long delta  = outputSize - workItem.Size;
-                var  reason = userConfiguredGrowth ? "configured audio outputs" : "remux";
+                long delta = outputSize - workItem.Size;
                 await LogAsync(workItem.Id,
                     $"Size: {FormatSize(workItem.Size)} → {FormatSize(outputSize)}  (+{FormatSize(delta)}, kept due to {reason})");
             }
@@ -2698,6 +2701,46 @@ public class TranscodingService
 
         return false;
     }
+
+    /// <summary>
+    ///     Decides whether an encoded output should be kept (placed at the destination) or
+    ///     discarded as a no-savings encode. Shared by the local <see cref="ConvertVideoAsync"/>
+    ///     and the cluster <see cref="HandleRemoteCompletion"/> paths so they don't diverge.
+    ///
+    ///     <para>An output is kept when any of: (a) it's smaller than the source, (b) it was
+    ///     a mux pass (video stream copied — output is the user's intended remux even if size
+    ///     is similar), or (c) the user configured audio fan-out (opt-in growth).</para>
+    ///
+    ///     <paramref name="videoCopyHint"/> is set by the local path which knows directly
+    ///     whether ffmpeg was invoked with <c>-c:v copy</c>; the cluster path passes
+    ///     <see langword="null"/> and the helper recomputes mux-pass eligibility from options
+    ///     plus the work item's probe.
+    /// </summary>
+    internal static (bool Keep, string Reason) ShouldKeepEncodedOutput(
+        EncoderOptions options, WorkItem workItem, long sourceSize, long outputSize, bool? videoCopyHint = null)
+    {
+        if (outputSize < sourceSize) return (true, "savings");
+
+        bool userConfiguredGrowth = options.AudioOutputs is { Count: > 0 };
+        if (userConfiguredGrowth) return (true, "configured audio outputs");
+
+        bool videoCopy = videoCopyHint ?? IsMuxPass(options, workItem);
+        if (videoCopy) return (true, "remux");
+
+        return (false, "no savings");
+    }
+
+    /// <summary>
+    ///     Companion to <see cref="ShouldKeepEncodedOutput"/>. Mirrors the local
+    ///     <c>isMuxPass</c> computation in <see cref="ConvertVideoAsync"/> so the cluster
+    ///     completion path can decide keep-vs-delete without the worker's <c>videoCopy</c>
+    ///     flag in hand.
+    /// </summary>
+    internal static bool IsMuxPass(EncoderOptions options, WorkItem workItem) =>
+        options.EncodingMode != EncodingMode.Transcode
+        && workItem.Probe != null
+        && HasMuxableWork(options, workItem.Probe)
+        && (options.EncodingMode == EncodingMode.MuxOnly || MeetsBitrateTarget(workItem, options));
 
     /// <summary>
     ///     Mirrors the scan-phase skip-gate check: <see langword="true"/> when the source is
@@ -4781,7 +4824,7 @@ public class TranscodingService
     /// <param name="workItem"> The work item that was encoded remotely. </param>
     /// <param name="outputPath"> Local path to the encoded output file transferred from the node. </param>
     /// <param name="options"> The encoder options that were used for the job. </param>
-    public async Task HandleRemoteCompletion(WorkItem workItem, string outputPath, EncoderOptions options)
+    public async Task HandleRemoteCompletion(WorkItem workItem, string outputPath, EncoderOptions options, bool videoCopy = false)
     {
         var outputSize = new FileInfo(outputPath).Length;
         float savings = (workItem.Size - outputSize) / 1048576f;
@@ -4790,11 +4833,13 @@ public class TranscodingService
 
         Console.WriteLine($"Cluster: Remote encode of {workItem.FileName}: {FormatSize(workItem.Size)} → {FormatSize(outputSize)} (saved {FormatSize((long)(savings * 1048576))}, {percent:P0})");
 
-        // Mirrors the local savings gate: configured audio fan-out is allowed to grow
-        // the file past any video savings since the user opted into that output.
-        bool userConfiguredGrowth = options.AudioOutputs is { Count: > 0 };
+        // Shared keep/delete decision with the local path. videoCopy is the worker's actual
+        // ffmpeg-copy outcome propagated through JobCompletion; passing it (rather than letting
+        // the helper recompute IsMuxPass) catches the HEVC-at-target-bitrate copy case that
+        // CalculateBitrates enables independently of EncodingMode.
+        var (keep, reason) = ShouldKeepEncodedOutput(options, workItem, workItem.Size, outputSize, videoCopy);
 
-        if (savings > 0 || userConfiguredGrowth)
+        if (keep)
         {
             await HandleOutputPlacement(outputPath, workItem, options);
             workItem.Status = WorkItemStatus.Completed;
@@ -4803,6 +4848,8 @@ public class TranscodingService
             workItem.ErrorMessage = null;
             workItem.RemoteJobPhase = null;
             await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Completed);
+            if (reason != "savings")
+                Console.WriteLine($"Cluster: Kept {workItem.FileName} despite no savings — {reason}");
         }
         else
         {
@@ -4822,7 +4869,7 @@ public class TranscodingService
         {
             if (_notificationService != null)
                 _ = _notificationService.NotifyEncodeCompletedAsync(Path.GetFileName(workItem.Path), new FileInfo(workItem.Path).Length);
-            if (_integrationService != null && (savings > 0 || userConfiguredGrowth))
+            if (_integrationService != null && keep)
                 _ = _integrationService.TriggerRescansAsync(workItem.Path);
         }
     }

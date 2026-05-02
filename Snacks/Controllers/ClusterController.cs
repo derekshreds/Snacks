@@ -141,6 +141,50 @@ public sealed class ClusterController : ControllerBase
     }
 
     /// <summary>
+    ///     Returns the master's full cluster view — the list of all nodes the
+    ///     master is currently tracking plus the master-side per-node settings
+    ///     (concurrency overrides, 4K routing flags). Workers proxy this through
+    ///     their own admin status endpoint so a browser viewing a worker's UI
+    ///     sees the same accurate cluster state the master sees: true effective
+    ///     concurrency caps, slot fill, busy/online status, and version of
+    ///     every peer node — instead of the worker's stale local
+    ///     <c>_nodes</c> map (which only contains entries the worker discovered
+    ///     directly and is never reconciled against the master's heartbeats).
+    /// </summary>
+    [HttpGet("cluster-state")]
+    public IActionResult GetClusterState()
+    {
+        // The master's own _nodes only contains peers; include BuildSelfNode
+        // here so a worker proxying this endpoint sees the master in its
+        // cluster view too. Without it, the worker UI's remote-card list
+        // would silently drop the master when the proxy kicks in.
+        //
+        // BuildSelfNode hardcodes Status=Online and leaves ActiveJobs empty
+        // — fine for handshake (the master's status is computed master-side
+        // from active-job count) but wrong for cluster-state, where workers
+        // render this entry directly as a node card. Stamp the runtime state
+        // here so the master's card on a worker UI shows the same Busy /
+        // Paused status and per-device slot fill the master's own UI shows.
+        var self = _clusterService.BuildSelfNode();
+        self.ActiveJobs     = _clusterService.GetEnrichedSelfActiveJobs();
+        self.IsPaused       = !_clusterService.IsLocalEncodingEnabled;
+        self.Status         = self.IsPaused
+            ? Models.NodeStatus.Paused
+            : (self.ActiveJobs.Count > 0 ? Models.NodeStatus.Busy : Models.NodeStatus.Online);
+        self.CompletedJobs  = _clusterService.LocalCompletedJobs;
+        self.FailedJobs     = _clusterService.LocalFailedJobs;
+
+        var nodes = _clusterService.GetNodes().ToList();
+        if (!nodes.Any(n => n.NodeId == self.NodeId)) nodes.Add(self);
+
+        return Ok(new
+        {
+            nodes,
+            nodeSettings = _clusterService.GetNodeSettingsConfig(),
+        });
+    }
+
+    /// <summary>
     ///     Returns the master's current integration credentials (Plex / Jellyfin / Sonarr /
     ///     Radarr / TVDB / TMDb) so a worker can use them during original-language lookups
     ///     and sidecar OCR. Workers pull this endpoint before every encode.
@@ -235,6 +279,10 @@ public sealed class ClusterController : ControllerBase
         try
         {
             System.IO.File.WriteAllText(metadataPath, JsonSerializer.Serialize(metadata, _jsonOptions));
+            // Record the assigned device so the worker self-card's per-device
+            // chip counts this slot as occupied during the upload phase, not
+            // only once encoding actually starts.
+            _clusterService.RegisterReceivingDevice(jobId, metadata.DeviceId);
             Console.WriteLine($"Cluster: Registered metadata for job {jobId}");
             return Ok(new { registered = true });
         }
@@ -276,6 +324,32 @@ public sealed class ClusterController : ControllerBase
     }
 
     /// <summary>
+    ///     Lookup endpoint for workers to ask the master "do you still have this job tracked?"
+    ///     Always returns 200 with <c>{ tracked, phase, recovering }</c> so a real 404 from
+    ///     this URL means "endpoint doesn't exist on this master" (i.e. talking to an older
+    ///     build) and the worker can fall back to its pre-probe retry behavior instead of
+    ///     dropping a legitimate pending completion.
+    ///
+    ///     <para><c>recovering: true</c> tells the worker the master is still rebuilding
+    ///     <c>_remoteJobs</c> from the DB after a restart — workers must NOT drop on
+    ///     <c>tracked: false</c> in that window because the job may simply not have been
+    ///     re-attached yet.</para>
+    /// </summary>
+    /// <param name="jobId"> The job ID to look up. </param>
+    [HttpGet("jobs/{jobId}")]
+    public IActionResult LookupJob(string jobId)
+    {
+        var phase = _clusterService.GetRemoteJobPhase(jobId);
+        return Ok(new
+        {
+            jobId,
+            tracked    = phase != null,
+            phase      = phase,
+            recovering = !_clusterService.RecoveryCompleteTask.IsCompleted,
+        });
+    }
+
+    /// <summary>
     ///     Reports that encoding completed on a worker node. The master initiates the output
     ///     download in the background and returns immediately so the worker's POST does not time
     ///     out. The node URL is derived from the registered node's IP rather than the request
@@ -295,14 +369,19 @@ public sealed class ClusterController : ControllerBase
             return Unauthorized(new { error = "Unknown node" });
 
         bool noSavings = false;
-        if (body.TryGetProperty("completion", out var completionProp) &&
-            completionProp.TryGetProperty("noSavings", out var noSavingsProp))
-            noSavings = noSavingsProp.GetBoolean();
+        bool videoCopy = false;
+        if (body.TryGetProperty("completion", out var completionProp))
+        {
+            if (completionProp.TryGetProperty("noSavings", out var noSavingsProp))
+                noSavings = noSavingsProp.GetBoolean();
+            if (completionProp.TryGetProperty("videoCopy", out var videoCopyProp))
+                videoCopy = videoCopyProp.GetBoolean();
+        }
 
         var config = _clusterService.GetConfig();
         var scheme = config.UseHttps ? "https" : "http";
         var nodeBaseUrl = $"{scheme}://{node.IpAddress}:{node.Port}";
-        _ = Task.Run(() => _clusterService.HandleRemoteCompletionAsync(jobId, nodeBaseUrl, noSavings));
+        _ = Task.Run(() => _clusterService.HandleRemoteCompletionAsync(jobId, nodeBaseUrl, noSavings, videoCopy));
         return Ok();
     }
 

@@ -368,6 +368,12 @@ public sealed class ClusterFileTransferService
                 offset              += chunkData.Length;
                 consecutiveFailures  = 0;
 
+                // Always Touch — the watchdog's orphan-threshold gate keys off LastUpdatedAt,
+                // and a download that is making progress but can't compute a percent (no
+                // X-Total-Size header, or status not Downloading) was previously invisible
+                // to the watchdog and could be reaped while still active.
+                workItem.Touch();
+
                 // Update progress. Reassert RemoteJobPhase so concurrent writers can't
                 // leave it stale — the UI picks transfer vs encode progress off the phase,
                 // and a null phase flips the bar to workItem.Progress.
@@ -396,6 +402,10 @@ public sealed class ClusterFileTransferService
                     $"{ex.Message} — retrying in {delay}s...");
 
                 workItem.ErrorMessage = $"Download retry {consecutiveFailures} — {ex.Message}";
+                // Touch on retry too: a long backoff (12+ failures × 60s = 12+ minutes) would
+                // otherwise let the watchdog's freshness window expire on a download that's
+                // still actively retrying.
+                workItem.Touch();
                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem, ct);
 
                 if (consecutiveFailures >= MaxConsecutiveFailures)
