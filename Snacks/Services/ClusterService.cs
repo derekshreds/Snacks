@@ -1260,7 +1260,7 @@ public sealed class ClusterService : IHostedService, IDisposable
             bool hasAvailableNodes = _nodes.Values.Any(n =>
                 n.Role == "node"
                 && (n.Status == NodeStatus.Online || n.Status == NodeStatus.Busy)
-                && !n.IsPaused && HasFreeSlot(n) && IsNodeWithinSchedule(n));
+                && !n.IsPaused && HasFreeSlot(n) && IsNodeWithinSchedule(n) && IsNodeWarmedUp(n));
             if (!hasAvailableNodes) return;
 
             var globalOptions = LoadEncoderOptions();
@@ -1271,7 +1271,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                 var availableNow = _nodes.Values
                     .Where(n => n.Role == "node"
                         && (n.Status == NodeStatus.Online || n.Status == NodeStatus.Busy)
-                        && !n.IsPaused && HasFreeSlot(n) && IsNodeWithinSchedule(n)
+                        && !n.IsPaused && HasFreeSlot(n) && IsNodeWithinSchedule(n) && IsNodeWarmedUp(n)
                         && (!_nodeDispatchCooldowns.TryGetValue(n.NodeId, out var cd) || DateTime.UtcNow >= cd))
                     .ToList();
                 if (availableNow.Count == 0) break;
@@ -2651,6 +2651,25 @@ public sealed class ClusterService : IHostedService, IDisposable
     private bool IsNodeWithinSchedule(ClusterNode node) => IsNodeWithinScheduleById(node.NodeId);
 
     /// <summary>
+    ///     How long after a node first appears we hold off on dispatching to
+    ///     it. A freshly-registered node's HTTP endpoints can take a moment
+    ///     to come up; without this, the first dispatch can hang on the
+    ///     heartbeat pre-check inside <see cref="DispatchToNodeAsync"/> long
+    ///     enough to leave items orphaned in <c>Processing</c> until the
+    ///     stuck-item watchdog rescues them five minutes later.
+    /// </summary>
+    private static readonly TimeSpan NodeWarmupGrace = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    ///     <see langword="true"/> once a node has been registered for at
+    ///     least <see cref="NodeWarmupGrace"/>. Excluded from the candidate
+    ///     pool until then so freshly-joined workers don't get hammered
+    ///     before their endpoints are ready.
+    /// </summary>
+    private bool IsNodeWarmedUp(ClusterNode node) =>
+        DateTime.UtcNow - node.RegisteredAt >= NodeWarmupGrace;
+
+    /// <summary>
     ///     Schedule check by NodeId. Useful for the master/self path where
     ///     we don't carry a <see cref="ClusterNode"/> in <c>_nodes</c>.
     /// </summary>
@@ -2712,7 +2731,7 @@ public sealed class ClusterService : IHostedService, IDisposable
         var candidates = _nodes.Values
             .Where(n => n.Role == "node"
                 && (n.Status == NodeStatus.Online || n.Status == NodeStatus.Busy)
-                && !n.IsPaused && HasFreeSlot(n) && IsNodeWithinSchedule(n)
+                && !n.IsPaused && HasFreeSlot(n) && IsNodeWithinSchedule(n) && IsNodeWarmedUp(n)
                 && (!_nodeDispatchCooldowns.TryGetValue(n.NodeId, out var cd) || DateTime.UtcNow >= cd))
             .ToList();
 

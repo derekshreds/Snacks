@@ -534,6 +534,15 @@ public sealed class ClusterDiscoveryService
         else
             node.LastHeartbeat = existingNode!.LastHeartbeat;
 
+        // Stamp RegisteredAt on first join so the dispatch warm-up filter
+        // can hold off on sending work for a few seconds. The payload's
+        // RegisteredAt is whatever the remote serialised — useless to us;
+        // master-side wall clock is what the warm-up gate compares against.
+        if (isNew)
+            node.RegisteredAt = DateTime.UtcNow;
+        else
+            node.RegisteredAt = existingNode!.RegisteredAt;
+
         _nodes[node.NodeId] = node;
 
         if (isNew)
