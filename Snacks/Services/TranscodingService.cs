@@ -2660,10 +2660,28 @@ public class TranscodingService
                 perJobOptions.SubtitleLanguagesToKeep.Add(originalLanguage);
         }
 
-        // Final skip check under the merged options. Synthesises a MediaFile shape
-        // from the work item + probe so WouldSkipUnderOptions can run against the
-        // same fields it uses on the persisted DB row.
-        var skipMf = SyntheticMediaFile(workItem, originalLanguage);
+        // Final skip check under the merged options. Prefer the persisted DB
+        // row when available — items restored from DB on startup are queued
+        // lazily with no probe, so a synthetic built from workItem alone
+        // would have null AudioStreams / SubtitleStreams. HasMuxableWork
+        // would then see no work, the ladder would fall through to the
+        // bitrate gate, and an at-target HEVC file with a non-English audio
+        // track that needs muxing would be silently marked Skipped here —
+        // diverging from Re-evaluate, which examines the same DB row and
+        // correctly says "still needs to encode". Use the DB row directly
+        // so both paths agree. Fall back to synthetic only when there's
+        // no DB row at all (force-add path).
+        MediaFile skipMf;
+        if (dbFile != null)
+        {
+            skipMf = dbFile;
+            if (!string.IsNullOrEmpty(originalLanguage))
+                skipMf.OriginalLanguage = originalLanguage;
+        }
+        else
+        {
+            skipMf = SyntheticMediaFile(workItem, originalLanguage);
+        }
         return !WouldSkipUnderOptions(skipMf, perJobOptions);
     }
 
