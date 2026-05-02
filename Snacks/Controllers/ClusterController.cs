@@ -276,6 +276,32 @@ public sealed class ClusterController : ControllerBase
     }
 
     /// <summary>
+    ///     Lookup endpoint for workers to ask the master "do you still have this job tracked?"
+    ///     Always returns 200 with <c>{ tracked, phase, recovering }</c> so a real 404 from
+    ///     this URL means "endpoint doesn't exist on this master" (i.e. talking to an older
+    ///     build) and the worker can fall back to its pre-probe retry behavior instead of
+    ///     dropping a legitimate pending completion.
+    ///
+    ///     <para><c>recovering: true</c> tells the worker the master is still rebuilding
+    ///     <c>_remoteJobs</c> from the DB after a restart — workers must NOT drop on
+    ///     <c>tracked: false</c> in that window because the job may simply not have been
+    ///     re-attached yet.</para>
+    /// </summary>
+    /// <param name="jobId"> The job ID to look up. </param>
+    [HttpGet("jobs/{jobId}")]
+    public IActionResult LookupJob(string jobId)
+    {
+        var phase = _clusterService.GetRemoteJobPhase(jobId);
+        return Ok(new
+        {
+            jobId,
+            tracked    = phase != null,
+            phase      = phase,
+            recovering = !_clusterService.RecoveryCompleteTask.IsCompleted,
+        });
+    }
+
+    /// <summary>
     ///     Reports that encoding completed on a worker node. The master initiates the output
     ///     download in the background and returns immediately so the worker's POST does not time
     ///     out. The node URL is derived from the registered node's IP rather than the request
@@ -295,14 +321,19 @@ public sealed class ClusterController : ControllerBase
             return Unauthorized(new { error = "Unknown node" });
 
         bool noSavings = false;
-        if (body.TryGetProperty("completion", out var completionProp) &&
-            completionProp.TryGetProperty("noSavings", out var noSavingsProp))
-            noSavings = noSavingsProp.GetBoolean();
+        bool videoCopy = false;
+        if (body.TryGetProperty("completion", out var completionProp))
+        {
+            if (completionProp.TryGetProperty("noSavings", out var noSavingsProp))
+                noSavings = noSavingsProp.GetBoolean();
+            if (completionProp.TryGetProperty("videoCopy", out var videoCopyProp))
+                videoCopy = videoCopyProp.GetBoolean();
+        }
 
         var config = _clusterService.GetConfig();
         var scheme = config.UseHttps ? "https" : "http";
         var nodeBaseUrl = $"{scheme}://{node.IpAddress}:{node.Port}";
-        _ = Task.Run(() => _clusterService.HandleRemoteCompletionAsync(jobId, nodeBaseUrl, noSavings));
+        _ = Task.Run(() => _clusterService.HandleRemoteCompletionAsync(jobId, nodeBaseUrl, noSavings, videoCopy));
         return Ok();
     }
 

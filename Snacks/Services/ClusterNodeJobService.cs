@@ -621,7 +621,7 @@ public sealed class ClusterNodeJobService
         if (encodingSucceeded && masterUrl != null)
         {
             if (!noSavings)
-                await PersistCompletedJobAsync(workItem.Id, masterUrl, selfUrl: null, outputFileName: workItem.FileName);
+                await PersistCompletedJobAsync(workItem.Id, masterUrl, selfUrl: null, outputFileName: workItem.FileName, videoCopy: workItem.OutputUsedVideoCopy ?? false);
 
             for (int attempt = 0; attempt < 10; attempt++)
             {
@@ -634,6 +634,7 @@ public sealed class ClusterNodeJobService
                         JobId          = workItem.Id,
                         Success        = true,
                         NoSavings      = noSavings,
+                        VideoCopy      = workItem.OutputUsedVideoCopy ?? false,
                         OutputFileName = workItem.FileName
                     };
                     var content = new StringContent(
@@ -706,7 +707,9 @@ public sealed class ClusterNodeJobService
     /// <param name="jobId">The completed job ID to persist.</param>
     /// <param name="masterUrl">The master's base URL, stored for retry requests.</param>
     /// <param name="selfUrl">This node's base URL, included in completion callbacks.</param>
-    public async Task PersistCompletedJobAsync(string jobId, string masterUrl, string? selfUrl, string? outputFileName = null)
+    /// <param name="outputFileName">Output file name (defaults to the active job's source name).</param>
+    /// <param name="videoCopy">Whether the encode used <c>-c:v copy</c>; persisted so worker restarts replay the same flag to the master.</param>
+    public async Task PersistCompletedJobAsync(string jobId, string masterUrl, string? selfUrl, string? outputFileName = null, bool videoCopy = false)
     {
         await _pendingCompletionsLock.WaitAsync();
         try
@@ -722,7 +725,8 @@ public sealed class ClusterNodeJobService
                     OutputFileName = outputFileName
                                   ?? (_activeJobs.TryGetValue(jobId, out var act) ? act.Item.FileName : null)
                                   ?? "",
-                    Timestamp      = DateTime.UtcNow
+                    Timestamp      = DateTime.UtcNow,
+                    VideoCopy      = videoCopy,
                 };
                 var json = JsonSerializer.Serialize(completions.Values, _jsonOptions);
                 await File.WriteAllTextAsync(_pendingCompletionsPath, json);
@@ -790,6 +794,17 @@ public sealed class ClusterNodeJobService
     ///     Re-posts all persisted pending completions to the master. Takes a snapshot under
     ///     the lock, then iterates outside the lock to avoid holding it during network I/O.
     ///     Called on each heartbeat cycle to recover from lost completion notifications.
+    ///
+    ///     <para>Each entry is probed with <c>GET /api/cluster/jobs/{jobId}</c> first. A 404
+    ///     means the master has no record — the job is orphaned (master finished and cleaned
+    ///     up, or master lost it across a restart) and the entry is dropped locally so the
+    ///     worker reclaims disk and stops re-POSTing. A 200 means the master is still
+    ///     tracking — re-POST <c>/complete</c> in case the original notification was lost.
+    ///     Any other status (5xx, network blip) leaves the entry alone for the next heartbeat.</para>
+    ///
+    ///     <para>These jobs aren't holding encoding slots — encoding already finished — so
+    ///     there's no upside to waiting hours before deciding orphan vs. active. The probe
+    ///     is one cheap GET per entry per heartbeat.</para>
     /// </summary>
     public async Task RetryPendingCompletionsAsync()
     {
@@ -809,11 +824,87 @@ public sealed class ClusterNodeJobService
             try
             {
                 var client  = CreateAuthenticatedClient();
+
+                // Step 1: ask the master if it still has this job tracked. Protocol:
+                //   200 + {tracked: false}  → drop locally (master forgot the job).
+                //   200 + {tracked: true}   → master is still tracking; re-POST /complete.
+                //   404                     → old master that doesn't have this endpoint
+                //                             yet — DON'T drop; fall back to the pre-probe
+                //                             behavior of just re-POSTing the completion.
+                //   other / network         → skip this heartbeat, retry next.
+                bool? masterTracksJob = null;
+                bool endpointMissing  = false;
+                try
+                {
+                    var probe = await client.GetAsync($"{completion.MasterUrl}/api/cluster/jobs/{completion.JobId}");
+                    if (probe.StatusCode == System.Net.HttpStatusCode.NotFound)
+                    {
+                        endpointMissing = true;
+                    }
+                    else if (probe.IsSuccessStatusCode)
+                    {
+                        var body = await probe.Content.ReadAsStringAsync();
+                        try
+                        {
+                            using var doc = JsonDocument.Parse(body);
+                            // Master is mid-recovery — its _remoteJobs hasn't been rebuilt
+                            // from the DB yet, so a tracked=false answer is unreliable.
+                            // Skip this heartbeat and let recovery finish.
+                            if (doc.RootElement.TryGetProperty("recovering", out var rec)
+                                && rec.ValueKind == JsonValueKind.True)
+                            {
+                                continue;
+                            }
+                            if (doc.RootElement.TryGetProperty("tracked", out var t) && t.ValueKind == JsonValueKind.False)
+                                masterTracksJob = false;
+                            else if (doc.RootElement.TryGetProperty("tracked", out var t2) && t2.ValueKind == JsonValueKind.True)
+                                masterTracksJob = true;
+                        }
+                        catch { /* malformed body — treat as unknown, skip this heartbeat */ }
+                    }
+                    else
+                    {
+                        // 5xx or unexpected — leave for next heartbeat.
+                        continue;
+                    }
+                }
+                catch (Exception probeEx)
+                {
+                    Console.WriteLine($"Cluster: Probe of {completion.JobId} failed: {probeEx.Message} — will retry on next heartbeat.");
+                    continue;
+                }
+
+                if (masterTracksJob == false)
+                {
+                    var ageMin = (DateTime.UtcNow - completion.Timestamp).TotalMinutes;
+                    Console.WriteLine($"Cluster: Master has no record of {completion.JobId} ({ageMin:0}min old) — dropping orphan locally.");
+                    await RemoveCompletedJobAsync(completion.JobId);
+                    try
+                    {
+                        var tempDir = GetNodeTempDirectory(completion.JobId);
+                        if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
+                    }
+                    catch (Exception cleanupEx)
+                    {
+                        Console.WriteLine($"Cluster: Cleanup of orphaned {completion.JobId} temp dir failed: {cleanupEx.Message}");
+                    }
+                    CleanupJobFiles(completion.JobId);
+                    continue;
+                }
+
+                // masterTracksJob == true → re-POST below.
+                // endpointMissing       → fall back to re-POST (older master).
+                // masterTracksJob == null → unparseable body, retry next heartbeat.
+                if (masterTracksJob == null && !endpointMissing)
+                    continue;
+
+                // Step 2: master is tracking. Re-POST /complete in case the original was lost.
                 var selfUrl = $"{(Config.UseHttps ? "https" : "http")}://{ClusterDiscoveryService.GetLocalIpAddress()}:{_discoveryService.GetListeningPort()}";
                 var completionPayload = new JobCompletion
                 {
                     JobId          = completion.JobId,
                     Success        = true,
+                    VideoCopy      = completion.VideoCopy,
                     OutputFileName = completion.OutputFileName
                 };
                 var content = new StringContent(

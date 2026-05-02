@@ -378,7 +378,10 @@ public class MediaFileRepository
             {
                 if (shouldStaySkipped(mf)) continue;
                 mf.Status = MediaFileStatus.Unseen;
-                mf.LastScannedAt = null;
+                // Keep LastScannedAt — the cached AudioStreams/SubtitleStreams/Bitrate/Codec are still
+                // on the row, and the scanner's freshness check uses LastScannedAt to skip re-probing.
+                // Wiping it forced a probe storm on every Re-evaluate, which is what made this an
+                // expensive recovery action when settings changed.
                 flipped++;
             }
 

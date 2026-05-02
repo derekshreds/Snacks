@@ -33,4 +33,13 @@ public sealed class PendingCompletion
     ///     Used for diagnostics and potential TTL-based cleanup.
     /// </summary>
     public DateTime Timestamp { get; set; } = DateTime.UtcNow;
+
+    /// <summary>
+    ///     Whether the encode used <c>-c:v copy</c> (mux pass or HEVC-at-target copy).
+    ///     Persisted so a worker-restart-then-retry sends the correct flag to the master,
+    ///     which uses it as the keep/delete decision input. Without persistence, the
+    ///     post-restart re-POST would default to <c>false</c> and the master would have
+    ///     to recompute mux-pass eligibility on its own.
+    /// </summary>
+    public bool VideoCopy { get; set; }
 }
