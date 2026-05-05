@@ -29,6 +29,22 @@ public sealed class TransferThrottle : IDisposable
     // tight without chattering. See plan doc for trade-off rationale.
     private const int ReplenishMs = 100;
 
+    // Bandwidth acquires are sliced into pieces this size so a single call
+    // never asks the bucket for more permits than it can hold. The bucket's
+    // TokenLimit is the byte-equivalent of one second of throughput, so a
+    // request larger than that throws ArgumentOutOfRangeException — which
+    // breaks any chunk size larger than the configured MB/s cap. 1 MB is
+    // small enough to fit the smallest meaningful cap (1 MB/s) and big
+    // enough to keep acquire overhead negligible.
+    private const int BandwidthSliceBytes = 1024 * 1024;
+
+    // Poll interval for concurrency-semaphore waits. We don't WaitAsync
+    // unbounded because a settings change can dispose the semaphore out from
+    // under a pending waiter (SemaphoreSlim.Dispose does not wake queued
+    // waiters), leaving a job stuck in "Uploading" forever. Re-reading the
+    // field every PollMs lets a cap raise / "unlimited" toggle take effect.
+    private const int ConcurrencyPollMs = 500;
+
     private readonly NetworkingSettingsService _settings;
 
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _perNodeUploadSems    = new();
@@ -122,45 +138,90 @@ public sealed class TransferThrottle : IDisposable
     /// </summary>
     public async Task<IAsyncDisposable> AcquireUploadAsync(string nodeId, CancellationToken ct)
     {
-        var globalSem = _globalUploadSem;
-        var perNodeSem = GetPerNodeSemaphore(_perNodeUploadSems, nodeId, _snapshot.MaxConcurrentUploadsPerNode);
-
-        if (globalSem != null) await globalSem.WaitAsync(ct).ConfigureAwait(false);
-        if (perNodeSem != null)
+        SemaphoreSlim? heldGlobal  = await PollAcquireAsync(() => _globalUploadSem, ct).ConfigureAwait(false);
+        SemaphoreSlim? heldPerNode = null;
+        try
         {
-            try { await perNodeSem.WaitAsync(ct).ConfigureAwait(false); }
-            catch { globalSem?.Release(); throw; }
+            heldPerNode = await PollAcquireAsync(
+                () => GetPerNodeSemaphore(_perNodeUploadSems, nodeId, _snapshot.MaxConcurrentUploadsPerNode), ct)
+                .ConfigureAwait(false);
+        }
+        catch
+        {
+            SafeRelease(heldGlobal);
+            throw;
         }
 
+        var releaseGlobal  = heldGlobal;
+        var releasePerNode = heldPerNode;
         return new ReleaseHandle(() =>
         {
             // Live setting changes dispose the old semaphores on replace.
-            // Swallowing ObjectDisposedException is correct because a
-            // disposed semaphore implicitly drops its accounting — there's
-            // nothing to "release" once the limiter is gone.
-            SafeRelease(perNodeSem);
-            SafeRelease(globalSem);
+            // SafeRelease swallows ObjectDisposedException because a disposed
+            // semaphore implicitly drops its accounting — there's nothing
+            // to release once the limiter is gone.
+            SafeRelease(releasePerNode);
+            SafeRelease(releaseGlobal);
         });
     }
 
     /// <summary> Symmetric with <see cref="AcquireUploadAsync"/> for downloads. </summary>
     public async Task<IAsyncDisposable> AcquireDownloadAsync(string nodeId, CancellationToken ct)
     {
-        var globalSem = _globalDownloadSem;
-        var perNodeSem = GetPerNodeSemaphore(_perNodeDownloadSems, nodeId, _snapshot.MaxConcurrentDownloadsPerNode);
-
-        if (globalSem != null) await globalSem.WaitAsync(ct).ConfigureAwait(false);
-        if (perNodeSem != null)
+        SemaphoreSlim? heldGlobal  = await PollAcquireAsync(() => _globalDownloadSem, ct).ConfigureAwait(false);
+        SemaphoreSlim? heldPerNode = null;
+        try
         {
-            try { await perNodeSem.WaitAsync(ct).ConfigureAwait(false); }
-            catch { SafeRelease(globalSem); throw; }
+            heldPerNode = await PollAcquireAsync(
+                () => GetPerNodeSemaphore(_perNodeDownloadSems, nodeId, _snapshot.MaxConcurrentDownloadsPerNode), ct)
+                .ConfigureAwait(false);
+        }
+        catch
+        {
+            SafeRelease(heldGlobal);
+            throw;
         }
 
+        var releaseGlobal  = heldGlobal;
+        var releasePerNode = heldPerNode;
         return new ReleaseHandle(() =>
         {
-            SafeRelease(perNodeSem);
-            SafeRelease(globalSem);
+            SafeRelease(releasePerNode);
+            SafeRelease(releaseGlobal);
         });
+    }
+
+    /// <summary>
+    ///     Polls <paramref name="resolver"/> in a loop, attempting a non-blocking
+    ///     <see cref="SemaphoreSlim.Wait(int)"/> each iteration. Returns the
+    ///     semaphore that was successfully entered, or <see langword="null"/>
+    ///     if the resolver reports "unlimited" (the user removed the cap
+    ///     mid-wait). Non-blocking Wait(0) is critical: SemaphoreSlim.Dispose
+    ///     does NOT wake an awaited WaitAsync, so a job that was queued on a
+    ///     semaphore which then got rebuilt by a settings change would hang
+    ///     forever. Polling re-resolves the limiter every <see cref="ConcurrencyPollMs"/>
+    ///     so cap raises and "unlimited" toggles take effect.
+    /// </summary>
+    private static async Task<SemaphoreSlim?> PollAcquireAsync(
+        Func<SemaphoreSlim?> resolver, CancellationToken ct)
+    {
+        while (true)
+        {
+            ct.ThrowIfCancellationRequested();
+            var sem = resolver();
+            if (sem == null) return null;
+
+            try
+            {
+                if (sem.Wait(0)) return sem;
+            }
+            catch (ObjectDisposedException)
+            {
+                // Limiter rebuilt under us. Loop and re-resolve immediately.
+                continue;
+            }
+            await Task.Delay(ConcurrencyPollMs, ct).ConfigureAwait(false);
+        }
     }
 
     private static void SafeRelease(SemaphoreSlim? sem)
@@ -180,36 +241,66 @@ public sealed class TransferThrottle : IDisposable
     public async Task AcquireUploadBandwidthAsync(string nodeId, int bytes, CancellationToken ct)
     {
         if (bytes <= 0) return;
-
-        var global = _globalUploadRate;
-        var perNode = GetPerNodeRateLimiter(_perNodeUploadRates, nodeId, _snapshot.MaxUploadMBpsPerNode);
-
-        if (global != null)
-        {
-            using var lease = await global.AcquireAsync(bytes, ct).ConfigureAwait(false);
-            // No body — leasing IS the wait; lease disposes immediately.
-        }
-        if (perNode != null)
-        {
-            using var lease = await perNode.AcquireAsync(bytes, ct).ConfigureAwait(false);
-        }
+        await AcquireSlicedAsync(
+            () => _globalUploadRate,
+            () => GetPerNodeRateLimiter(_perNodeUploadRates, nodeId, _snapshot.MaxUploadMBpsPerNode),
+            bytes, ct).ConfigureAwait(false);
     }
 
     /// <summary> Symmetric with <see cref="AcquireUploadBandwidthAsync"/> for downloads. </summary>
     public async Task AcquireDownloadBandwidthAsync(string nodeId, int bytes, CancellationToken ct)
     {
         if (bytes <= 0) return;
+        await AcquireSlicedAsync(
+            () => _globalDownloadRate,
+            () => GetPerNodeRateLimiter(_perNodeDownloadRates, nodeId, _snapshot.MaxDownloadMBpsPerNode),
+            bytes, ct).ConfigureAwait(false);
+    }
 
-        var global = _globalDownloadRate;
-        var perNode = GetPerNodeRateLimiter(_perNodeDownloadRates, nodeId, _snapshot.MaxDownloadMBpsPerNode);
+    /// <summary>
+    ///     Acquires <paramref name="bytes"/> in 1 MB slices, re-resolving the
+    ///     limiters each iteration so a settings change mid-transfer takes
+    ///     effect on the very next slice rather than blocking on a disposed
+    ///     bucket. <see cref="ObjectDisposedException"/> from a limiter that
+    ///     was replaced during the await is swallowed — the next iteration
+    ///     reads the new (possibly null) limiter and proceeds accordingly.
+    /// </summary>
+    private static async Task AcquireSlicedAsync(
+        Func<RateLimiter?> globalResolver,
+        Func<RateLimiter?> perNodeResolver,
+        int bytes, CancellationToken ct)
+    {
+        int remaining = bytes;
+        while (remaining > 0)
+        {
+            ct.ThrowIfCancellationRequested();
+            int take = Math.Min(BandwidthSliceBytes, remaining);
+            var global  = globalResolver();
+            var perNode = perNodeResolver();
+            if (global == null && perNode == null)
+            {
+                // Both caps removed (or never set). The remaining bytes are
+                // unmetered; bail out instead of looping uselessly.
+                return;
+            }
 
-        if (global != null)
-        {
-            using var lease = await global.AcquireAsync(bytes, ct).ConfigureAwait(false);
-        }
-        if (perNode != null)
-        {
-            using var lease = await perNode.AcquireAsync(bytes, ct).ConfigureAwait(false);
+            if (global != null)
+            {
+                try
+                {
+                    using var lease = await global.AcquireAsync(take, ct).ConfigureAwait(false);
+                }
+                catch (ObjectDisposedException) { /* limiter swapped out by settings change — re-read on next slice */ }
+            }
+            if (perNode != null)
+            {
+                try
+                {
+                    using var lease = await perNode.AcquireAsync(take, ct).ConfigureAwait(false);
+                }
+                catch (ObjectDisposedException) { /* same — limiter rebuilt under us */ }
+            }
+            remaining -= take;
         }
     }
 

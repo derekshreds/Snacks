@@ -133,6 +133,26 @@ public sealed class TransferThrottleTests : IDisposable
     }
 
     [Fact]
+    public async Task Bandwidth_acquire_handles_chunk_larger_than_rate_cap()
+    {
+        // Regression: with the old TokenLimit = bytesPerSecond, asking the
+        // bucket for a chunk-sized lease (50 MB at default chunk size) on a
+        // small cap (10 MB/s, TokenLimit = 10 MB) threw ArgumentOutOfRangeException
+        // and broke every transfer. Internal slicing decouples the two.
+        var settings = MakeSettings(new NetworkingSettings { MaxUploadMBps = 10 });
+        using var t = new TransferThrottle(settings);
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        // Single 50 MB acquire — the size of one default upload chunk.
+        await t.AcquireUploadBandwidthAsync(NodeA, 50 * 1024 * 1024, default);
+        sw.Stop();
+
+        // 10 MB/s cap, 10 MB bucket pre-filled. First 10 MB is instant; the
+        // remaining 40 MB pace at 10 MB/s ≈ 4 s. Allow generous CI variance.
+        sw.Elapsed.Should().BeGreaterThan(TimeSpan.FromMilliseconds(2500));
+    }
+
+    [Fact]
     public async Task Bandwidth_unlimited_returns_immediately()
     {
         var settings = MakeSettings(new NetworkingSettings { MaxUploadMBps = 0 });
@@ -170,6 +190,56 @@ public sealed class TransferThrottleTests : IDisposable
         second.Should().NotBeNull();
         await second.DisposeAsync();
         await first.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Stuck_concurrency_waiter_recovers_when_cap_is_lifted_to_unlimited()
+    {
+        // Regression: a job that was queued on the per-node concurrency gate
+        // would hang forever if the user lifted the cap to 0 (unlimited)
+        // while it waited — SemaphoreSlim.Dispose does not wake queued
+        // WaitAsync calls. The poll-based acquire re-reads the resolver and
+        // bails out the moment the cap goes away.
+        var settings = MakeSettings(new NetworkingSettings { MaxConcurrentUploadsPerNode = 1 });
+        using var t = new TransferThrottle(settings);
+
+        var first = await t.AcquireUploadAsync(NodeA, default);
+        var blocked = t.AcquireUploadAsync(NodeA, default);
+
+        await Task.Delay(50);
+        blocked.IsCompleted.Should().BeFalse();
+
+        // Lift the cap to unlimited mid-wait. The blocked acquire must complete
+        // even though the old semaphore is disposed and never released.
+        settings.Save(new NetworkingSettings { MaxConcurrentUploadsPerNode = 0 });
+
+        var unblocked = await blocked.WaitAsync(TimeSpan.FromSeconds(3));
+        unblocked.Should().NotBeNull();
+        await unblocked.DisposeAsync();
+        await first.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Bandwidth_acquire_survives_cap_removed_mid_transfer()
+    {
+        // Regression: an in-flight upload chunk's AcquireSlicedAsync held a
+        // reference to the old RateLimiter; when the user dropped the cap to
+        // 0 during the chunk, the limiter was disposed and the next slice's
+        // AcquireAsync threw ObjectDisposedException, killing the upload.
+        var settings = MakeSettings(new NetworkingSettings { MaxUploadMBps = 5 });
+        using var t = new TransferThrottle(settings);
+
+        // Kick off a large acquire that would normally take ~10s under a 5MB/s cap.
+        var bandwidthTask = t.AcquireUploadBandwidthAsync(NodeA, 50 * 1024 * 1024, default);
+
+        await Task.Delay(100);
+        bandwidthTask.IsCompleted.Should().BeFalse();
+
+        // Drop the cap to unlimited. The slice loop must re-read the limiter
+        // and finish without throwing.
+        settings.Save(new NetworkingSettings { MaxUploadMBps = 0 });
+
+        await bandwidthTask.WaitAsync(TimeSpan.FromSeconds(3));
     }
 
     [Fact]

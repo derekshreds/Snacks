@@ -1288,9 +1288,15 @@ public sealed class ClusterService : IHostedService, IDisposable
             // upload-and-handoff finished. Per-job (_activeUploads) and
             // per-slot (HasFreeSlot via node.ActiveJobs) accounting now make
             // that lock unnecessary.
+            //
+            // Uploading / Downloading are also accepted: dispatch flips status
+            // to Uploading right after a successful reservation, so without
+            // this the very first dispatch in a tick would knock the node out
+            // of the candidate pool for the rest of that tick — silently
+            // serialising every multi-slot node to one upload at a time.
             bool hasAvailableNodes = _nodes.Values.Any(n =>
                 n.Role == "node"
-                && (n.Status == NodeStatus.Online || n.Status == NodeStatus.Busy)
+                && IsDispatchableStatus(n.Status)
                 && !n.IsPaused && HasFreeSlot(n) && IsNodeWithinSchedule(n) && IsNodeWarmedUp(n));
             if (!hasAvailableNodes) return;
 
@@ -1301,7 +1307,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                 // Recompute available workers each iteration (slots fill as we dispatch)
                 var availableNow = _nodes.Values
                     .Where(n => n.Role == "node"
-                        && (n.Status == NodeStatus.Online || n.Status == NodeStatus.Busy)
+                        && IsDispatchableStatus(n.Status)
                         && !n.IsPaused && HasFreeSlot(n) && IsNodeWithinSchedule(n) && IsNodeWarmedUp(n)
                         && (!_nodeDispatchCooldowns.TryGetValue(n.NodeId, out var cd) || DateTime.UtcNow >= cd))
                     .ToList();
@@ -2698,6 +2704,20 @@ public sealed class ClusterService : IHostedService, IDisposable
         _slotLedger.UsedDeviceSlots(node.NodeId, deviceId);
 
     /// <summary>
+    ///     Statuses that are still candidates for new dispatches. Online and
+    ///     Busy are the obvious ones; Uploading and Downloading are included
+    ///     because dispatch synchronously stamps a node's status to those
+    ///     values the moment a job is reserved on it, and a multi-slot node
+    ///     would otherwise self-evict from the candidate pool after its
+    ///     first dispatch in a tick. Capacity is enforced by HasFreeSlot.
+    /// </summary>
+    private static bool IsDispatchableStatus(NodeStatus s) =>
+        s == NodeStatus.Online
+        || s == NodeStatus.Busy
+        || s == NodeStatus.Uploading
+        || s == NodeStatus.Downloading;
+
+    /// <summary>
     ///     <see langword="true"/> if the node has at least one device with a
     ///     free slot under the user's enable + concurrency overrides. Returns
     ///     <see langword="false"/> when capabilities haven't been reported
@@ -2809,7 +2829,7 @@ public sealed class ClusterService : IHostedService, IDisposable
     {
         var candidates = _nodes.Values
             .Where(n => n.Role == "node"
-                && (n.Status == NodeStatus.Online || n.Status == NodeStatus.Busy)
+                && IsDispatchableStatus(n.Status)
                 && !n.IsPaused && HasFreeSlot(n) && IsNodeWithinSchedule(n) && IsNodeWarmedUp(n)
                 && (!_nodeDispatchCooldowns.TryGetValue(n.NodeId, out var cd) || DateTime.UtcNow >= cd))
             .ToList();
