@@ -60,6 +60,7 @@ import { initExclusionPanel,     loadExclusionPanel }     from './settings/panel
 import { initAdvancedPanel,      loadAdvancedPanel }      from './settings/panels/advanced-panel.js';
 import { initNodeSyncPanel,      loadNodeSyncPanel }      from './settings/panels/node-sync-panel.js';
 import { initSchedulingPanel,    loadSchedulingPanel }    from './settings/panels/scheduling-panel.js';
+import { initNetworkingPanel }                             from './settings/panels/networking-panel.js';
 
 // Side-effect import: dashboard.js calls `registerPage('dashboard', ...)` at
 // module load time so the navigation shell finds it when the user lands on
@@ -163,6 +164,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initAdvancedPanel();
     initNodeSyncPanel();
     initSchedulingPanel();
+    initNetworkingPanel();
 
 
     // 4. Initial data loads (shared — not page-specific).

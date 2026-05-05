@@ -19,7 +19,11 @@ public sealed class ClusterFileTransferService
      *  Constants
      ******************************************************************/
 
-    /// <summary> Chunk size for file transfers (50 MB). </summary>
+    /// <summary>
+    ///     Default chunk size used when no <see cref="Cluster.TransferThrottle"/>
+    ///     is supplied. The throttle's user-configurable chunk size overrides
+    ///     this when one is wired in by <c>ClusterService</c>.
+    /// </summary>
     internal const int ChunkSize = 50 * 1024 * 1024;
 
     /******************************************************************
@@ -28,6 +32,7 @@ public sealed class ClusterFileTransferService
 
     private readonly IHubContext<TranscodingHub> _hubContext;
     private readonly IHttpClientFactory          _httpClientFactory;
+    private readonly Cluster.TransferThrottle?   _throttle;
     private readonly JsonSerializerOptions       _jsonOptions = new()
     {
         PropertyNameCaseInsensitive = true,
@@ -42,12 +47,21 @@ public sealed class ClusterFileTransferService
     /// <summary> Creates a new <see cref="ClusterFileTransferService"/> with the required dependencies. </summary>
     /// <param name="hubContext"> SignalR hub context for broadcasting progress updates to connected clients. </param>
     /// <param name="httpClientFactory"> Factory for creating <see cref="HttpClient"/> instances. </param>
+    /// <param name="throttle">
+    ///     Optional bandwidth/concurrency gate. When <see langword="null"/>
+    ///     (e.g. on slave nodes that don't dispatch), transfers run at full
+    ///     speed with the constant <see cref="ChunkSize"/>. Master-side
+    ///     callers pass the configured throttle so user-set bandwidth caps
+    ///     and chunk size apply.
+    /// </param>
     public ClusterFileTransferService(
         IHubContext<TranscodingHub> hubContext,
-        IHttpClientFactory httpClientFactory)
+        IHttpClientFactory httpClientFactory,
+        Cluster.TransferThrottle? throttle = null)
     {
         _hubContext        = hubContext;
         _httpClientFactory = httpClientFactory;
+        _throttle          = throttle;
     }
 
     /******************************************************************
@@ -76,12 +90,15 @@ public sealed class ClusterFileTransferService
         HttpClient client, string baseUrl, WorkItem workItem, CancellationToken ct = default)
     {
         var totalSize = workItem.Size;
+        // The throttle's chunk size is user-configurable (Networking tab);
+        // fall back to the historical 50MB constant when no throttle is wired.
+        int chunkSize = _throttle?.ChunkSizeBytes ?? ChunkSize;
         Console.WriteLine(
             $"Cluster: Uploading {workItem.FileName} ({totalSize / 1048576}MB) to " +
-            $"{workItem.AssignedNodeName} in {ChunkSize / 1048576}MB chunks...");
+            $"{workItem.AssignedNodeName} in {chunkSize / 1048576}MB chunks...");
 
         long rawOffset = await GetNodeReceivedBytesAsync(client, baseUrl, workItem.Id);
-        long offset    = (rawOffset / ChunkSize) * ChunkSize;
+        long offset    = (rawOffset / chunkSize) * chunkSize;
 
         if (rawOffset >= totalSize)
         {
@@ -129,7 +146,7 @@ public sealed class ClusterFileTransferService
         {
             ct.ThrowIfCancellationRequested();
 
-            var chunkLength = (int)Math.Min(ChunkSize, totalSize - offset);
+            var chunkLength = (int)Math.Min(chunkSize, totalSize - offset);
             var chunkBuffer = new byte[chunkLength];
             var bytesRead   = 0;
 
@@ -140,6 +157,12 @@ public sealed class ClusterFileTransferService
                 if (read == 0) break;
                 bytesRead += read;
             }
+
+            // Bandwidth gate: wait for enough tokens to send this chunk's
+            // bytes through the cluster-wide and per-node upload buckets.
+            // No-op when the user hasn't set a cap.
+            if (_throttle != null && !string.IsNullOrEmpty(workItem.AssignedNodeId))
+                await _throttle.AcquireUploadBandwidthAsync(workItem.AssignedNodeId, bytesRead, ct);
 
             var chunkHash = Convert.ToHexString(
                 SHA256.HashData(chunkBuffer.AsSpan(0, bytesRead))).ToLower();
@@ -173,7 +196,7 @@ public sealed class ClusterFileTransferService
                         if (statusCode == 409)
                         {
                             var realOffset = await GetNodeReceivedBytesAsync(client, baseUrl, workItem.Id);
-                            var aligned = (realOffset / ChunkSize) * ChunkSize;
+                            var aligned = (realOffset / chunkSize) * chunkSize;
                             Console.WriteLine(
                                 $"Cluster: Offset mismatch at {offset / 1048576}MB — " +
                                 $"node has {realOffset / 1048576}MB, re-aligning to {aligned / 1048576}MB");
@@ -288,6 +311,7 @@ public sealed class ClusterFileTransferService
         HttpClient client, string nodeBaseUrl, string jobId, string outputPath,
         WorkItem workItem, CancellationToken ct = default)
     {
+        int chunkSize = _throttle?.ChunkSizeBytes ?? ChunkSize;
         long   offset                    = 0;
         long   totalSize                 = 0;
         int    consecutiveFailures       = 0;
@@ -299,7 +323,7 @@ public sealed class ClusterFileTransferService
         if (File.Exists(outputPath))
         {
             long rawOffset = new FileInfo(outputPath).Length;
-            offset = (rawOffset / ChunkSize) * ChunkSize;
+            offset = (rawOffset / chunkSize) * chunkSize;
             if (offset > 0)
             {
                 using (var truncStream = new FileStream(
@@ -346,6 +370,12 @@ public sealed class ClusterFileTransferService
                         throw new Exception("Empty chunk received before download complete");
                     break;
                 }
+
+                // Bandwidth gate: account for bytes pulled across the wire.
+                // Symmetric with the upload-side gate. Master-side only — when
+                // the throttle is null (slave-only deployments) this is a no-op.
+                if (_throttle != null && !string.IsNullOrEmpty(workItem.AssignedNodeId))
+                    await _throttle.AcquireDownloadBandwidthAsync(workItem.AssignedNodeId, chunkData.Length, ct);
 
                 // Verify chunk hash
                 if (!string.IsNullOrEmpty(expectedHash))
@@ -418,7 +448,7 @@ public sealed class ClusterFileTransferService
                 // Re-check if partial file still exists (could have been cleaned up).
                 // Align to chunk boundary to discard any partially-written chunk.
                 if (File.Exists(outputPath))
-                    offset = (new FileInfo(outputPath).Length / ChunkSize) * ChunkSize;
+                    offset = (new FileInfo(outputPath).Length / chunkSize) * chunkSize;
             }
         }
 

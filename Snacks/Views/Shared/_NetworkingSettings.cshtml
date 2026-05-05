@@ -1,0 +1,80 @@
+@{
+    string formPrefix = ViewData["FormPrefix"]?.ToString() ?? "settings";
+}
+
+<div class="encoder-panel rounded">
+    <h6 class="fw-bold mb-3"><i class="fas fa-network-wired me-2 text-primary"></i>Cluster Transfer Throttling</h6>
+
+    <div class="form-text mb-3">
+        Master-only controls for upload and download concurrency and bandwidth.
+        Set any cap to <code>0</code> for unlimited. Changes take effect on the next chunk —
+        no restart required.
+    </div>
+
+    <h6 class="fw-bold mt-3 mb-2"><i class="fas fa-arrows-up-to-line me-2 text-secondary"></i>Concurrency Caps</h6>
+
+    <div class="row g-3 mb-3">
+        <div class="col-md-6">
+            <label class="form-label small text-muted">Max concurrent uploads (cluster-wide)</label>
+            <input type="number" min="0" class="form-control form-control-sm" id="@(formPrefix)NetMaxConcurrentUploads" />
+            <div class="form-text">0 = unlimited.</div>
+        </div>
+        <div class="col-md-6">
+            <label class="form-label small text-muted">Max concurrent uploads per node</label>
+            <input type="number" min="0" class="form-control form-control-sm" id="@(formPrefix)NetMaxConcurrentUploadsPerNode" />
+            <div class="form-text">Default <code>1</code>. Stops a single node from receiving multiple files in parallel.</div>
+        </div>
+        <div class="col-md-6">
+            <label class="form-label small text-muted">Max concurrent downloads (cluster-wide)</label>
+            <input type="number" min="0" class="form-control form-control-sm" id="@(formPrefix)NetMaxConcurrentDownloads" />
+        </div>
+        <div class="col-md-6">
+            <label class="form-label small text-muted">Max concurrent downloads per node</label>
+            <input type="number" min="0" class="form-control form-control-sm" id="@(formPrefix)NetMaxConcurrentDownloadsPerNode" />
+        </div>
+    </div>
+
+    <h6 class="fw-bold mt-3 mb-2"><i class="fas fa-gauge-high me-2 text-secondary"></i>Bandwidth Caps (MB/s)</h6>
+
+    <div class="row g-3 mb-3">
+        <div class="col-md-6">
+            <label class="form-label small text-muted">Max upload bandwidth (cluster-wide)</label>
+            <input type="number" min="0" class="form-control form-control-sm" id="@(formPrefix)NetMaxUploadMBps" />
+            <div class="form-text">Cap on total bytes-per-second the master sends across all uploads.</div>
+        </div>
+        <div class="col-md-6">
+            <label class="form-label small text-muted">Max upload bandwidth per node</label>
+            <input type="number" min="0" class="form-control form-control-sm" id="@(formPrefix)NetMaxUploadMBpsPerNode" />
+            <div class="form-text">Whichever cap is slower (cluster vs per-node) wins.</div>
+        </div>
+        <div class="col-md-6">
+            <label class="form-label small text-muted">Max download bandwidth (cluster-wide)</label>
+            <input type="number" min="0" class="form-control form-control-sm" id="@(formPrefix)NetMaxDownloadMBps" />
+        </div>
+        <div class="col-md-6">
+            <label class="form-label small text-muted">Max download bandwidth per node</label>
+            <input type="number" min="0" class="form-control form-control-sm" id="@(formPrefix)NetMaxDownloadMBpsPerNode" />
+        </div>
+    </div>
+
+    <h6 class="fw-bold mt-3 mb-2"><i class="fas fa-puzzle-piece me-2 text-secondary"></i>Chunking</h6>
+
+    <div class="row g-3 mb-3">
+        <div class="col-md-6">
+            <label class="form-label small text-muted">Upload chunk size (MB)</label>
+            <input type="number" min="4" max="256" class="form-control form-control-sm" id="@(formPrefix)NetChunkSizeMB" />
+            <div class="form-text">
+                4–256 MB. Smaller chunks improve rate-limit smoothness but add HTTP overhead.
+                If a bandwidth cap is set, very large chunks (>>cap) will create visible
+                pause-and-burst behaviour.
+            </div>
+        </div>
+    </div>
+
+    <div class="d-flex gap-2 mt-3">
+        <button type="button" class="btn btn-primary btn-sm" id="@(formPrefix)NetSaveBtn">
+            <i class="fas fa-save me-1"></i> Save
+        </button>
+        <span id="@(formPrefix)NetSaveStatus" class="text-muted small align-self-center"></span>
+    </div>
+</div>

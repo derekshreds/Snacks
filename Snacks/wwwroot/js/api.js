@@ -261,6 +261,13 @@ export const notificationsApi = {
 /**
  * Plex / Jellyfin / Sonarr / Radarr integration config and test-connection.
  */
+export const networkingApi = {
+    /** Fetches the master's transfer-throttling config. */
+    getConfig:  ()        => getJson('/api/networking'),
+    /** Persists transfer-throttling config. Returns 400 on validation errors. */
+    saveConfig: (config)  => postJson('/api/networking', config),
+};
+
 export const integrationsApi = {
     /** Fetches the full integrations config (all four providers). */
     getConfig:    ()                 => getJson('/api/integrations/config'),

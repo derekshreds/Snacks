@@ -165,6 +165,19 @@ public sealed class MediaFile
     public string? RemoteJobPhase { get; set; }
 
     /// <summary>
+    ///     The <c>HardwareDevice.DeviceId</c> the master allocated for this job
+    ///     at dispatch time (e.g. "intel", "nvidia", "cpu"). Persisted so the
+    ///     <c>SlotLedger</c> can rebuild its per-device occupancy after a master
+    ///     restart without having to query worker heartbeats — the master
+    ///     remembers exactly which slot it had pinned the job to.
+    ///
+    ///     <para>Cleared on completion, failure, or re-queue alongside the
+    ///     other Remote* fields. Null for jobs that never went through the
+    ///     cluster path (local-only encodes).</para>
+    /// </summary>
+    public string? DispatchedDeviceId { get; set; }
+
+    /// <summary>
     ///     Number of remote encoding failures for this file.
     ///     After 3 failures, the job is marked as permanently failed.
     /// </summary>
