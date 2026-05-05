@@ -859,6 +859,68 @@ public sealed class ClusterController : ControllerBase
     }
 
     /// <summary>
+    ///     Lists subtitle sidecar files (.srt/.ass/.vtt) produced by a remote encode that
+    ///     sit alongside the main output in the job's temp directory. The master pulls this
+    ///     list after the main download succeeds so the sidecars can ride home with the
+    ///     output before the worker temp dir is wiped by <c>CleanupFiles</c>.
+    /// </summary>
+    /// <param name="jobId"> The job ID whose sidecars to enumerate. </param>
+    [HttpGet("files/{jobId}/sidecars")]
+    public IActionResult ListSidecars(string jobId)
+    {
+        var outputPath = _clusterService.GetOutputFileForJob(jobId);
+        if (outputPath == null)
+            return new JsonResult(new { sidecars = Array.Empty<string>() });
+
+        var dir      = Path.GetDirectoryName(outputPath);
+        var baseName = Path.GetFileNameWithoutExtension(outputPath);
+        if (string.IsNullOrEmpty(dir) || string.IsNullOrEmpty(baseName))
+            return new JsonResult(new { sidecars = Array.Empty<string>() });
+
+        string[] exts = { ".srt", ".ass", ".vtt" };
+        var matches = Directory
+            .EnumerateFiles(dir, baseName + ".*")
+            .Where(p => exts.Contains(Path.GetExtension(p), StringComparer.OrdinalIgnoreCase))
+            .Select(Path.GetFileName)
+            .ToArray();
+
+        return new JsonResult(new { sidecars = matches });
+    }
+
+    /// <summary>
+    ///     Streams a single sidecar file by its filename (no path components). Restricted to
+    ///     <c>.srt</c>/<c>.ass</c>/<c>.vtt</c> in the job's temp directory; rejects anything
+    ///     that would escape via path traversal or invalid filename characters.
+    /// </summary>
+    /// <param name="jobId"> The job ID whose sidecar to serve. </param>
+    /// <param name="name"> The sidecar's basename (e.g. <c>"Movie [snacks].eng.srt"</c>). </param>
+    [HttpGet("files/{jobId}/sidecars/{name}")]
+    public IActionResult DownloadSidecar(string jobId, string name)
+    {
+        if (string.IsNullOrEmpty(name) || name.Contains("..") ||
+            name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+            return BadRequest(new { error = "Invalid sidecar name" });
+
+        string[] exts = { ".srt", ".ass", ".vtt" };
+        if (!exts.Contains(Path.GetExtension(name), StringComparer.OrdinalIgnoreCase))
+            return BadRequest(new { error = "Unsupported sidecar extension" });
+
+        // Re-root the requested name under the job's temp directory and assert the resolved
+        // path stays inside it. Belt-and-suspenders alongside the filename validation above.
+        var tempDir  = _clusterService.GetNodeTempDirectory(jobId);
+        var rooted   = Path.GetFullPath(tempDir);
+        var fullPath = Path.GetFullPath(Path.Combine(rooted, name));
+        if (!fullPath.StartsWith(rooted, StringComparison.OrdinalIgnoreCase))
+            return BadRequest(new { error = "Path escape" });
+
+        if (!System.IO.File.Exists(fullPath))
+            return NotFound(new { error = "Sidecar not found" });
+
+        var fs = new FileStream(fullPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+        return File(fs, "application/octet-stream");
+    }
+
+    /// <summary>
     ///     Cleans up temp files for a completed or cancelled job. Called by the master after
     ///     it has successfully downloaded the encoded output.
     /// </summary>

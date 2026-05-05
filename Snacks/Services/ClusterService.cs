@@ -2186,6 +2186,21 @@ public sealed class ClusterService : IHostedService, IDisposable
                 if (dlThrottleHandle != null) await dlThrottleHandle.DisposeAsync();
             }
 
+            // Pull subtitle sidecars (.srt/.ass/.vtt) so they ride along with the main output
+            // when HandleOutputPlacement → MoveSidecarsAlongsideAsync moves/renames it. Best
+            // effort: a sidecar fetch failure is logged but does not fail the job — the encode
+            // itself succeeded, and the worker copy will be deleted on cleanup either way.
+            try
+            {
+                var sidecarDir = Path.GetDirectoryName(outputPath);
+                if (!string.IsNullOrEmpty(sidecarDir))
+                    await DownloadSidecarsFromNodeAsync(jobId, nodeBaseUrl, sidecarDir, dlClient, dlToken);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Cluster: Sidecar fetch failed for {workItem.FileName} (non-fatal): {ex.Message}");
+            }
+
             return true;
         }
         catch (Exception ex)
@@ -2247,6 +2262,56 @@ public sealed class ClusterService : IHostedService, IDisposable
                 });
             }
             return false;
+        }
+    }
+
+    /// <summary>
+    ///     Pulls subtitle sidecar files (.srt/.ass/.vtt) the worker wrote alongside the encoded
+    ///     output and writes them next to <paramref name="destDir"/> using the worker's basenames
+    ///     unchanged. Since those basenames are derived from the same <c>[snacks]</c> output name
+    ///     that the master just downloaded, <see cref="TranscodingService.HandleOutputPlacement"/>
+    ///     → <c>MoveSidecarsAlongsideAsync</c> will pick them up automatically when it moves or
+    ///     renames the main output. Non-fatal: any per-file failure is logged and skipped.
+    /// </summary>
+    private async Task DownloadSidecarsFromNodeAsync(
+        string jobId, string nodeBaseUrl, string destDir, HttpClient client, CancellationToken ct)
+    {
+        var listUrl = $"{nodeBaseUrl.TrimEnd('/')}/api/cluster/files/{jobId}/sidecars";
+        using var listResp = await client.GetAsync(listUrl, ct);
+        if (!listResp.IsSuccessStatusCode) return;
+
+        using var doc = JsonDocument.Parse(await listResp.Content.ReadAsStringAsync(ct));
+        if (!doc.RootElement.TryGetProperty("sidecars", out var arr) || arr.ValueKind != JsonValueKind.Array)
+            return;
+
+        string[] exts = { ".srt", ".ass", ".vtt" };
+        foreach (var elem in arr.EnumerateArray())
+        {
+            var name = elem.GetString();
+            if (string.IsNullOrEmpty(name)) continue;
+
+            // Defense in depth: the worker is trusted but a bug there shouldn't let it
+            // write outside destDir on the master, and only known sidecar extensions are
+            // accepted to keep this endpoint from being a generic file pull.
+            if (name.Contains("..") || name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+                continue;
+            if (!exts.Contains(Path.GetExtension(name), StringComparer.OrdinalIgnoreCase))
+                continue;
+
+            try
+            {
+                var dlUrl = $"{nodeBaseUrl.TrimEnd('/')}/api/cluster/files/{jobId}/sidecars/{Uri.EscapeDataString(name)}";
+                using var dlResp = await client.GetAsync(dlUrl, HttpCompletionOption.ResponseHeadersRead, ct);
+                if (!dlResp.IsSuccessStatusCode) continue;
+
+                var dst = Path.Combine(destDir, name);
+                await using var fs = File.Create(dst);
+                await dlResp.Content.CopyToAsync(fs, ct);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Cluster: Sidecar download failed for {name} (job {jobId}): {ex.Message}");
+            }
         }
     }
 
