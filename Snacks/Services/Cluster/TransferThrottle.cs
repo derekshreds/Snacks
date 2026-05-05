@@ -9,14 +9,18 @@ namespace Snacks.Services.Cluster;
 ///     Master-side gate for cluster file transfers. Two independent layers:
 ///
 ///     <list type="bullet">
-///         <item><description><b>Concurrency caps</b> — gate how many uploads/downloads can be in flight at once, cluster-wide and per-node, via <see cref="SemaphoreSlim"/>.</description></item>
+///         <item><description><b>Concurrency caps</b> — gate how many uploads/downloads can be in flight at once, cluster-wide and per-node. Tracked via atomic in-flight counters; cap is read fresh from the live settings snapshot on every acquire attempt.</description></item>
 ///         <item><description><b>Bandwidth caps</b> — gate the rate at which bytes flow, cluster-wide and per-node, via <see cref="TokenBucketRateLimiter"/>. Each chunk acquires tokens equal to its byte count before the master sends it.</description></item>
 ///     </list>
 ///
-///     <para>A cap of <c>0</c> means "unlimited" and the corresponding limiter
-///     is bypassed entirely (no acquire). Settings are re-read live, so saving
-///     a new cap rebuilds the bandwidth limiters and the next chunk picks up
-///     the new rate without waiting for the current chunk to finish.</para>
+///     <para>A cap of <c>0</c> means "unlimited" and the corresponding gate
+///     is bypassed entirely (no acquire). Settings changes take effect on the
+///     next acquire attempt without rebuilding any state — the in-flight
+///     counter simply gets compared against the new cap on the next CAS try.
+///     Holders that are over the new cap stay in flight until they release
+///     naturally; new acquires queue until the counter drops below the new
+///     cap. This is the only way to safely live-mutate a concurrency cap
+///     without losing track of who's currently holding a slot.</para>
 ///
 ///     <para>This service is orthogonal to the <c>SlotLedger</c>: the ledger
 ///     decides whether a job can be dispatched at all (per-device hardware
@@ -26,7 +30,7 @@ namespace Snacks.Services.Cluster;
 public sealed class TransferThrottle : IDisposable
 {
     // Replenishment cadence for the token buckets. 100ms keeps cap accuracy
-    // tight without chattering. See plan doc for trade-off rationale.
+    // tight without chattering.
     private const int ReplenishMs = 100;
 
     // Bandwidth acquires are sliced into pieces this size so a single call
@@ -38,27 +42,37 @@ public sealed class TransferThrottle : IDisposable
     // enough to keep acquire overhead negligible.
     private const int BandwidthSliceBytes = 1024 * 1024;
 
-    // Poll interval for concurrency-semaphore waits. We don't WaitAsync
-    // unbounded because a settings change can dispose the semaphore out from
-    // under a pending waiter (SemaphoreSlim.Dispose does not wake queued
-    // waiters), leaving a job stuck in "Uploading" forever. Re-reading the
-    // field every PollMs lets a cap raise / "unlimited" toggle take effect.
-    private const int ConcurrencyPollMs = 500;
+    // Poll interval for concurrency acquires that are over-cap. Re-checks
+    // the live cap and the in-flight count every tick. 250ms keeps latency
+    // tolerable when a slot frees up; the cost is one CAS read per waiter
+    // per tick, which is negligible.
+    private const int ConcurrencyPollMs = 250;
 
     private readonly NetworkingSettingsService _settings;
 
-    private readonly ConcurrentDictionary<string, SemaphoreSlim> _perNodeUploadSems    = new();
-    private readonly ConcurrentDictionary<string, SemaphoreSlim> _perNodeDownloadSems  = new();
-    private readonly ConcurrentDictionary<string, RateLimiter>   _perNodeUploadRates   = new();
-    private readonly ConcurrentDictionary<string, RateLimiter>   _perNodeDownloadRates = new();
+    // Concurrency counters. A single mutable int per scope, mutated only via
+    // Interlocked.CompareExchange so a save→read race can't double-grant a
+    // slot. Per-node counters are lazily added; never removed except by
+    // ForgetNode (which is fine — a stale counter at 0 occupies ~16 bytes).
+    private readonly Counter _globalUploadInFlight   = new();
+    private readonly Counter _globalDownloadInFlight = new();
+    private readonly ConcurrentDictionary<string, Counter> _perNodeUploadInFlight   = new();
+    private readonly ConcurrentDictionary<string, Counter> _perNodeDownloadInFlight = new();
 
-    // Global limiters are guarded by simple locks so save→rebuild is atomic
-    // with the next acquire.
-    private readonly object _globalLock = new();
-    private SemaphoreSlim?  _globalUploadSem;     // null when MaxConcurrentUploads == 0
-    private SemaphoreSlim?  _globalDownloadSem;
-    private RateLimiter?    _globalUploadRate;    // null when MaxUploadMBps == 0
+    // Bandwidth limiters. Replaced on settings change; the slice loop in
+    // AcquireSlicedAsync re-reads each iteration so a swap mid-chunk takes
+    // effect on the next 1 MB slice rather than killing the upload.
+    private readonly object _bandwidthLock = new();
+    private RateLimiter?    _globalUploadRate;
     private RateLimiter?    _globalDownloadRate;
+    private readonly ConcurrentDictionary<string, RateLimiter> _perNodeUploadRates   = new();
+    private readonly ConcurrentDictionary<string, RateLimiter> _perNodeDownloadRates = new();
+
+    // Tracks the configured per-node MB/s caps each per-node bucket was
+    // built with. When a settings change moves the cap, we rebuild the
+    // affected buckets; an unchanged cap leaves them alone.
+    private readonly ConcurrentDictionary<string, int> _perNodeUploadRateCaps   = new();
+    private readonly ConcurrentDictionary<string, int> _perNodeDownloadRateCaps = new();
 
     private NetworkingSettings _snapshot;
 
@@ -66,46 +80,50 @@ public sealed class TransferThrottle : IDisposable
     {
         _settings = settings;
         _snapshot = settings.Get();
-        ApplySettings(_snapshot);
+        ApplyBandwidth(_snapshot, previous: null);
         settings.Changed += OnSettingsChanged;
     }
 
     private void OnSettingsChanged(NetworkingSettings updated)
     {
+        var previous = _snapshot;
         _snapshot = updated;
-        ApplySettings(updated);
+        ApplyBandwidth(updated, previous);
+        // Concurrency caps need no rebuild — counters are persistent and
+        // every acquire re-reads the cap from _snapshot.
     }
 
-    private void ApplySettings(NetworkingSettings v)
+    /// <summary>
+    ///     Rebuilds bandwidth limiters that were affected by a settings change.
+    ///     Per-node buckets whose configured cap is unchanged are kept; this
+    ///     avoids resetting the bucket fill on unrelated saves (e.g. saving
+    ///     a chunk-size change shouldn't disrupt an active transfer's pacing).
+    /// </summary>
+    private void ApplyBandwidth(NetworkingSettings v, NetworkingSettings? previous)
     {
-        lock (_globalLock)
+        lock (_bandwidthLock)
         {
-            ReplaceSemaphore(ref   _globalUploadSem,    v.MaxConcurrentUploads);
-            ReplaceSemaphore(ref   _globalDownloadSem,  v.MaxConcurrentDownloads);
-            ReplaceRateLimiter(ref _globalUploadRate,   v.MaxUploadMBps);
-            ReplaceRateLimiter(ref _globalDownloadRate, v.MaxDownloadMBps);
+            if (previous == null || previous.MaxUploadMBps != v.MaxUploadMBps)
+                ReplaceRateLimiter(ref _globalUploadRate, v.MaxUploadMBps);
+            if (previous == null || previous.MaxDownloadMBps != v.MaxDownloadMBps)
+                ReplaceRateLimiter(ref _globalDownloadRate, v.MaxDownloadMBps);
         }
-        // Per-node limiters are rebuilt on next acquire — easier than
-        // reconciling against the live node set, and cheap because they're
-        // lazy-created. Old per-node limiters dispose when replaced.
-        FlushPerNode(_perNodeUploadSems);
-        FlushPerNode(_perNodeDownloadSems);
-        FlushPerNode(_perNodeUploadRates);
-        FlushPerNode(_perNodeDownloadRates);
+
+        if (previous == null || previous.MaxUploadMBpsPerNode != v.MaxUploadMBpsPerNode)
+            FlushPerNodeRates(_perNodeUploadRates, _perNodeUploadRateCaps);
+        if (previous == null || previous.MaxDownloadMBpsPerNode != v.MaxDownloadMBpsPerNode)
+            FlushPerNodeRates(_perNodeDownloadRates, _perNodeDownloadRateCaps);
     }
 
-    private static void FlushPerNode<T>(ConcurrentDictionary<string, T> dict) where T : IDisposable
+    private static void FlushPerNodeRates(
+        ConcurrentDictionary<string, RateLimiter> dict,
+        ConcurrentDictionary<string, int> capDict)
     {
         foreach (var kv in dict.ToArray())
         {
             if (dict.TryRemove(kv.Key, out var stale)) stale.Dispose();
+            capDict.TryRemove(kv.Key, out _);
         }
-    }
-
-    private static void ReplaceSemaphore(ref SemaphoreSlim? slot, int cap)
-    {
-        slot?.Dispose();
-        slot = cap > 0 ? new SemaphoreSlim(cap, cap) : null;
     }
 
     private static void ReplaceRateLimiter(ref RateLimiter? slot, int megabytesPerSecond)
@@ -117,9 +135,7 @@ public sealed class TransferThrottle : IDisposable
     private static RateLimiter BuildBucket(int megabytesPerSecond)
     {
         long bytesPerSecond = (long)megabytesPerSecond * 1024 * 1024;
-        // Bucket capacity = 1 second of headroom. TokensPerPeriod = bytesPerSecond/10
-        // so the bucket refills the full second over 10 ticks of 100ms.
-        long perPeriod = Math.Max(1, bytesPerSecond / (1000 / ReplenishMs));
+        long perPeriod      = Math.Max(1, bytesPerSecond / (1000 / ReplenishMs));
         return new TokenBucketRateLimiter(new TokenBucketRateLimiterOptions
         {
             TokenLimit           = (int)Math.Min(int.MaxValue, bytesPerSecond),
@@ -138,99 +154,108 @@ public sealed class TransferThrottle : IDisposable
     /// </summary>
     public async Task<IAsyncDisposable> AcquireUploadAsync(string nodeId, CancellationToken ct)
     {
-        SemaphoreSlim? heldGlobal  = await PollAcquireAsync(() => _globalUploadSem, ct).ConfigureAwait(false);
-        SemaphoreSlim? heldPerNode = null;
+        Action? globalRelease = await AcquireCounterAsync(
+            _globalUploadInFlight, () => _snapshot.MaxConcurrentUploads, ct).ConfigureAwait(false);
+
+        Action? perNodeRelease;
         try
         {
-            heldPerNode = await PollAcquireAsync(
-                () => GetPerNodeSemaphore(_perNodeUploadSems, nodeId, _snapshot.MaxConcurrentUploadsPerNode), ct)
-                .ConfigureAwait(false);
+            perNodeRelease = await AcquireCounterAsync(
+                GetCounter(_perNodeUploadInFlight, nodeId),
+                () => _snapshot.MaxConcurrentUploadsPerNode, ct).ConfigureAwait(false);
         }
         catch
         {
-            SafeRelease(heldGlobal);
+            globalRelease?.Invoke();
             throw;
         }
 
-        var releaseGlobal  = heldGlobal;
-        var releasePerNode = heldPerNode;
         return new ReleaseHandle(() =>
         {
-            // Live setting changes dispose the old semaphores on replace.
-            // SafeRelease swallows ObjectDisposedException because a disposed
-            // semaphore implicitly drops its accounting — there's nothing
-            // to release once the limiter is gone.
-            SafeRelease(releasePerNode);
-            SafeRelease(releaseGlobal);
+            perNodeRelease?.Invoke();
+            globalRelease?.Invoke();
         });
     }
 
     /// <summary> Symmetric with <see cref="AcquireUploadAsync"/> for downloads. </summary>
     public async Task<IAsyncDisposable> AcquireDownloadAsync(string nodeId, CancellationToken ct)
     {
-        SemaphoreSlim? heldGlobal  = await PollAcquireAsync(() => _globalDownloadSem, ct).ConfigureAwait(false);
-        SemaphoreSlim? heldPerNode = null;
+        Action? globalRelease = await AcquireCounterAsync(
+            _globalDownloadInFlight, () => _snapshot.MaxConcurrentDownloads, ct).ConfigureAwait(false);
+
+        Action? perNodeRelease;
         try
         {
-            heldPerNode = await PollAcquireAsync(
-                () => GetPerNodeSemaphore(_perNodeDownloadSems, nodeId, _snapshot.MaxConcurrentDownloadsPerNode), ct)
-                .ConfigureAwait(false);
+            perNodeRelease = await AcquireCounterAsync(
+                GetCounter(_perNodeDownloadInFlight, nodeId),
+                () => _snapshot.MaxConcurrentDownloadsPerNode, ct).ConfigureAwait(false);
         }
         catch
         {
-            SafeRelease(heldGlobal);
+            globalRelease?.Invoke();
             throw;
         }
 
-        var releaseGlobal  = heldGlobal;
-        var releasePerNode = heldPerNode;
         return new ReleaseHandle(() =>
         {
-            SafeRelease(releasePerNode);
-            SafeRelease(releaseGlobal);
+            perNodeRelease?.Invoke();
+            globalRelease?.Invoke();
         });
     }
 
     /// <summary>
-    ///     Polls <paramref name="resolver"/> in a loop, attempting a non-blocking
-    ///     <see cref="SemaphoreSlim.Wait(int)"/> each iteration. Returns the
-    ///     semaphore that was successfully entered, or <see langword="null"/>
-    ///     if the resolver reports "unlimited" (the user removed the cap
-    ///     mid-wait). Non-blocking Wait(0) is critical: SemaphoreSlim.Dispose
-    ///     does NOT wake an awaited WaitAsync, so a job that was queued on a
-    ///     semaphore which then got rebuilt by a settings change would hang
-    ///     forever. Polling re-resolves the limiter every <see cref="ConcurrencyPollMs"/>
-    ///     so cap raises and "unlimited" toggles take effect.
+    ///     Acquires a slot on <paramref name="counter"/> while the live cap
+    ///     from <paramref name="capResolver"/> has headroom. Returns
+    ///     <see langword="null"/> when the cap is <c>0</c> (unlimited) — the
+    ///     caller short-circuits the release path on null. Otherwise returns
+    ///     a release action that decrements the counter exactly once.
+    ///
+    ///     <para>Implementation: a CAS-only acquire avoids the increment-and-rollback
+    ///     pattern that would let a transient over-cap state confuse other
+    ///     waiters. The cap is re-read every iteration so a live settings
+    ///     change (raise, lower, or unlimited) takes effect on the next poll
+    ///     without any explicit "wake" from the writer.</para>
     /// </summary>
-    private static async Task<SemaphoreSlim?> PollAcquireAsync(
-        Func<SemaphoreSlim?> resolver, CancellationToken ct)
+    private static async Task<Action?> AcquireCounterAsync(
+        Counter counter, Func<int> capResolver, CancellationToken ct)
     {
         while (true)
         {
             ct.ThrowIfCancellationRequested();
-            var sem = resolver();
-            if (sem == null) return null;
 
-            try
+            int cap = capResolver();
+            if (cap <= 0)
             {
-                if (sem.Wait(0)) return sem;
+                // Unlimited: take no slot, return no release action.
+                return null;
             }
-            catch (ObjectDisposedException)
+
+            // CAS-only acquire: read current, only commit increment if it
+            // would land at-or-below cap. Lost CAS races spin without sleep
+            // because they imply someone else just grabbed/released a slot
+            // and we should re-evaluate immediately.
+            int current = Volatile.Read(ref counter.Value);
+            if (current < cap)
             {
-                // Limiter rebuilt under us. Loop and re-resolve immediately.
+                int prev = Interlocked.CompareExchange(ref counter.Value, current + 1, current);
+                if (prev == current)
+                {
+                    var c = counter; // capture for the closure
+                    return () => Interlocked.Decrement(ref c.Value);
+                }
+                // CAS lost — retry without sleeping; the new value is
+                // already in `prev` but reading it again is cheap and keeps
+                // the loop body simple.
                 continue;
             }
+
+            // At cap. Sleep before re-checking so we don't spin a CPU.
             await Task.Delay(ConcurrencyPollMs, ct).ConfigureAwait(false);
         }
     }
 
-    private static void SafeRelease(SemaphoreSlim? sem)
-    {
-        if (sem == null) return;
-        try { sem.Release(); }
-        catch (ObjectDisposedException) { /* limiter was rebuilt under us; the slot is implicitly freed */ }
-        catch (SemaphoreFullException)  { /* already at max — defensive, shouldn't happen with our pairing */ }
-    }
+    private static Counter GetCounter(ConcurrentDictionary<string, Counter> dict, string nodeId) =>
+        dict.GetOrAdd(nodeId, _ => new Counter());
 
     /// <summary>
     ///     Awaits enough tokens to send <paramref name="bytes"/> through the
@@ -243,7 +268,7 @@ public sealed class TransferThrottle : IDisposable
         if (bytes <= 0) return;
         await AcquireSlicedAsync(
             () => _globalUploadRate,
-            () => GetPerNodeRateLimiter(_perNodeUploadRates, nodeId, _snapshot.MaxUploadMBpsPerNode),
+            () => GetPerNodeRateLimiter(_perNodeUploadRates, _perNodeUploadRateCaps, nodeId, _snapshot.MaxUploadMBpsPerNode),
             bytes, ct).ConfigureAwait(false);
     }
 
@@ -253,7 +278,7 @@ public sealed class TransferThrottle : IDisposable
         if (bytes <= 0) return;
         await AcquireSlicedAsync(
             () => _globalDownloadRate,
-            () => GetPerNodeRateLimiter(_perNodeDownloadRates, nodeId, _snapshot.MaxDownloadMBpsPerNode),
+            () => GetPerNodeRateLimiter(_perNodeDownloadRates, _perNodeDownloadRateCaps, nodeId, _snapshot.MaxDownloadMBpsPerNode),
             bytes, ct).ConfigureAwait(false);
     }
 
@@ -279,8 +304,6 @@ public sealed class TransferThrottle : IDisposable
             var perNode = perNodeResolver();
             if (global == null && perNode == null)
             {
-                // Both caps removed (or never set). The remaining bytes are
-                // unmetered; bail out instead of looping uselessly.
                 return;
             }
 
@@ -290,7 +313,7 @@ public sealed class TransferThrottle : IDisposable
                 {
                     using var lease = await global.AcquireAsync(take, ct).ConfigureAwait(false);
                 }
-                catch (ObjectDisposedException) { /* limiter swapped out by settings change — re-read on next slice */ }
+                catch (ObjectDisposedException) { /* swapped under us — re-read on next slice */ }
             }
             if (perNode != null)
             {
@@ -298,36 +321,55 @@ public sealed class TransferThrottle : IDisposable
                 {
                     using var lease = await perNode.AcquireAsync(take, ct).ConfigureAwait(false);
                 }
-                catch (ObjectDisposedException) { /* same — limiter rebuilt under us */ }
+                catch (ObjectDisposedException) { /* same */ }
             }
             remaining -= take;
         }
     }
 
     /// <summary>
-    ///     Drops the per-node limiters for a removed node. Called from
-    ///     <c>ClusterService</c> when a node disconnects permanently.
+    ///     Drops the per-node counters and rate-limiters for a removed node.
+    ///     Called from <c>ClusterService</c> when a node disconnects permanently.
+    ///     Concurrency counters at 0 would not leak meaningfully on their own,
+    ///     but we clear them anyway so a node rejoin starts from a clean slate.
     /// </summary>
     public void ForgetNode(string nodeId)
     {
-        if (_perNodeUploadSems.TryRemove(nodeId, out var s1)) s1.Dispose();
-        if (_perNodeDownloadSems.TryRemove(nodeId, out var s2)) s2.Dispose();
+        _perNodeUploadInFlight.TryRemove(nodeId, out _);
+        _perNodeDownloadInFlight.TryRemove(nodeId, out _);
         if (_perNodeUploadRates.TryRemove(nodeId, out var r1)) r1.Dispose();
         if (_perNodeDownloadRates.TryRemove(nodeId, out var r2)) r2.Dispose();
-    }
-
-    private static SemaphoreSlim? GetPerNodeSemaphore(
-        ConcurrentDictionary<string, SemaphoreSlim> dict, string nodeId, int cap)
-    {
-        if (cap <= 0) return null;
-        return dict.GetOrAdd(nodeId, _ => new SemaphoreSlim(cap, cap));
+        _perNodeUploadRateCaps.TryRemove(nodeId, out _);
+        _perNodeDownloadRateCaps.TryRemove(nodeId, out _);
     }
 
     private static RateLimiter? GetPerNodeRateLimiter(
-        ConcurrentDictionary<string, RateLimiter> dict, string nodeId, int megabytesPerSecond)
+        ConcurrentDictionary<string, RateLimiter> dict,
+        ConcurrentDictionary<string, int> capDict,
+        string nodeId, int megabytesPerSecond)
     {
-        if (megabytesPerSecond <= 0) return null;
-        return dict.GetOrAdd(nodeId, _ => BuildBucket(megabytesPerSecond));
+        if (megabytesPerSecond <= 0)
+        {
+            // Cap removed for this scope. If a stale bucket exists from a
+            // prior cap, dispose it now so the next non-zero cap rebuilds.
+            if (dict.TryRemove(nodeId, out var stale)) stale.Dispose();
+            capDict.TryRemove(nodeId, out _);
+            return null;
+        }
+        // Cap-aware GetOrAdd: if an existing bucket was built for a
+        // different cap, replace it. Buckets are rebuilt only when the cap
+        // numerically changes; saving an unrelated setting leaves them.
+        if (dict.TryGetValue(nodeId, out var existing)
+            && capDict.TryGetValue(nodeId, out var existingCap)
+            && existingCap == megabytesPerSecond)
+        {
+            return existing;
+        }
+        var fresh = BuildBucket(megabytesPerSecond);
+        if (dict.TryRemove(nodeId, out var oldOne)) oldOne.Dispose();
+        dict[nodeId] = fresh;
+        capDict[nodeId] = megabytesPerSecond;
+        return fresh;
     }
 
     /// <summary>
@@ -339,14 +381,22 @@ public sealed class TransferThrottle : IDisposable
     public void Dispose()
     {
         _settings.Changed -= OnSettingsChanged;
-        _globalUploadSem?.Dispose();
-        _globalDownloadSem?.Dispose();
         _globalUploadRate?.Dispose();
         _globalDownloadRate?.Dispose();
-        FlushPerNode(_perNodeUploadSems);
-        FlushPerNode(_perNodeDownloadSems);
-        FlushPerNode(_perNodeUploadRates);
-        FlushPerNode(_perNodeDownloadRates);
+        foreach (var kv in _perNodeUploadRates.ToArray())
+            if (_perNodeUploadRates.TryRemove(kv.Key, out var r)) r.Dispose();
+        foreach (var kv in _perNodeDownloadRates.ToArray())
+            if (_perNodeDownloadRates.TryRemove(kv.Key, out var r)) r.Dispose();
+    }
+
+    /// <summary>
+    ///     Reference-typed integer wrapper so per-node counters can be mutated
+    ///     by ref via Interlocked. <see cref="ConcurrentDictionary{TKey,TValue}"/>
+    ///     hands back values, not refs, so a raw <c>int</c> wouldn't work.
+    /// </summary>
+    private sealed class Counter
+    {
+        public int Value;
     }
 
     private sealed class ReleaseHandle : IAsyncDisposable
