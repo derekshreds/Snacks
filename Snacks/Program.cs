@@ -180,6 +180,7 @@ builder.Services.AddSingleton<EncodeHistoryRepository>();
 
 builder.Services.AddSingleton<FfprobeService>();
 builder.Services.AddSingleton<FileService>();
+builder.Services.AddSingleton<LogArchiveService>();
 builder.Services.AddSingleton<ConfigFileService>();
 builder.Services.AddHttpClient();
 builder.Services.AddSingleton<NotificationService>();

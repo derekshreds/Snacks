@@ -66,6 +66,7 @@ import { initNetworkingPanel }                             from './settings/pane
 // module load time so the navigation shell finds it when the user lands on
 // (or navigates to) /dashboard.
 import './dashboard/dashboard.js';
+import './cluster-logs/cluster-logs.js';
 
 
 // ---------------------------------------------------------------------------

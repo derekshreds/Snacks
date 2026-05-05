@@ -37,17 +37,23 @@ public sealed class ClusterController : ControllerBase
     /// <param name="integrationService"> Source of master-side integration credentials served to workers. </param>
     /// <param name="hubContext"> SignalR hub context for pushing transfer progress to the UI. </param>
     private readonly EncodeHistoryRepository      _historyRepo;
+    private readonly FileService                  _fileService;
+    private readonly LogArchiveService            _logArchive;
 
     public ClusterController(
         ClusterService clusterService,
         IntegrationService integrationService,
         IHubContext<TranscodingHub> hubContext,
-        EncodeHistoryRepository historyRepo)
+        EncodeHistoryRepository historyRepo,
+        FileService fileService,
+        LogArchiveService logArchive)
     {
         _clusterService     = clusterService;
         _integrationService = integrationService;
         _hubContext         = hubContext;
         _historyRepo        = historyRepo;
+        _fileService        = fileService;
+        _logArchive         = logArchive;
     }
 
     /******************************************************************
@@ -1069,6 +1075,70 @@ public sealed class ClusterController : ControllerBase
         var deleted = await _historyRepo.ClearAllAsync();
         await _hubContext.Clients.All.SendAsync("EncodeHistoryCleared");
         return Ok(new { success = true, deleted });
+    }
+
+    /******************************************************************
+     *  Diagnostics — log tail and ZIP export
+     *
+     *  These endpoints let the master fetch this node's operations logs
+     *  for the cluster-logs viewer and the per-node "Download logs"
+     *  button. Logs may contain file paths and job names but no
+     *  credentials — the cluster shared-secret gate is sufficient for
+     *  this surface.
+     ******************************************************************/
+
+    /// <summary>
+    ///     Returns the tail of this node's most recent <c>snacks-*.log</c>.
+    ///     Mirrors <c>DiagnosticsController.GetLogTail</c> for the master's
+    ///     cluster-logs viewer.
+    /// </summary>
+    [HttpGet("diagnostics/log")]
+    public IActionResult GetLogTail([FromQuery] int lines = 200)
+    {
+        var clamped = Math.Clamp(lines, 1, 5000);
+        var logsDir = Path.Combine(_fileService.GetWorkingDirectory(), "logs");
+
+        try
+        {
+            var (latest, tail) = _logArchive.ReadLatestLogTail(logsDir, clamped);
+            if (latest == null || tail == null)
+                return new JsonResult(new { logsDir, available = false, lines = Array.Empty<string>() });
+
+            return new JsonResult(new
+            {
+                logsDir,
+                available    = true,
+                logFile      = latest.Name,
+                lastWriteUtc = latest.LastWriteTimeUtc,
+                lineCount    = tail.Length,
+                lines        = tail,
+            });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { error = ex.Message });
+        }
+    }
+
+    /// <summary>
+    ///     Streams a ZIP of every <c>*.log</c> under this node's logs directory
+    ///     (operations logs + per-job FFmpeg logs) for diagnostic export.
+    /// </summary>
+    [HttpGet("diagnostics/logs.zip")]
+    public IActionResult GetLogsZip()
+    {
+        var logsDir = Path.Combine(_fileService.GetWorkingDirectory(), "logs");
+        var config  = _clusterService.GetConfig();
+        var stamp   = DateTime.UtcNow.ToString("yyyyMMdd-HHmmss");
+        var safe    = string.Join('_', (config.NodeName ?? "node").Split(Path.GetInvalidFileNameChars()));
+
+        // See DiagnosticsController.GetLogsZip — ZipArchive's sync writes
+        // can't go straight to Response.Body, so build into a MemoryStream
+        // first.
+        var buffer = new MemoryStream();
+        _logArchive.WriteLogsZip(buffer, logsDir);
+        buffer.Position = 0;
+        return File(buffer, "application/zip", $"snacks-logs-{safe}-{stamp}.zip");
     }
 
 }
