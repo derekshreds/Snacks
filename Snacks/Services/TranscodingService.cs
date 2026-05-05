@@ -1759,7 +1759,7 @@ public class TranscodingService
     /// <param name="workItem">The item to encode.</param>
     /// <param name="options">Encoding options (may be mutated by retry logic).</param>
     /// <param name="stripSubtitles">When <c>true</c>, forces <c>-sn</c> to drop all subtitle streams.</param>
-    /// <param name="forceSwDecode">When <c>true</c>, disables VAAPI hardware decoding while keeping VAAPI encoding.</param>
+    /// <param name="forceSwDecode">When <c>true</c>, disables hardware decoding while keeping HW encoding. VAAPI: drops <c>-hwaccel vaapi</c> and routes SW frames in via hwupload. NVIDIA: drops the explicit <c>-c:v src_cuvid</c> decoder so the file falls back to <c>-hwaccel cuda</c>'s auto-attach (which can in turn fall back to a SW decoder).</param>
     /// <param name="useConservativeHwFlags">When <c>true</c>, drops optional hw-encoder flags that older GPUs reject (NVENC temporal AQ, QSV lookahead/extbrc). Set by the retry chain after an encoder-feature failure.</param>
     /// <param name="cachedOcrSrts">OCR'd SRT results from an earlier attempt. When non-null, the OCR pass is skipped and these files are muxed as-is.</param>
     /// <param name="cachedOcrMuxTmpDir">Temp dir that owns the files in <paramref name="cachedOcrSrts"/>. Paired with the cache so cleanup still fires on success / exhaustion.</param>
@@ -1941,6 +1941,22 @@ public class TranscodingService
         }
 
         string initFlags = useVaapi ? GetInitFlags(hwAccel, canHwDecode) : GetInitFlags(hwAccel);
+
+        // Explicitly select the NVDEC (cuvid) decoder on the nvidia path. `-hwaccel cuda` alone
+        // is just a hint — on some driver/setup combinations (datacenter Windows drivers, vGPU
+        // profiles, etc.) ffmpeg silently falls back to the software decoder while NVENC keeps
+        // working, which pegs the CPU. Forcing the cuvid decoder makes NVDEC engagement
+        // deterministic. Skip on mux pass (no decode), software fallback, or when forceSwDecode
+        // disabled HW decode for retry. If the source codec has no cuvid mapping or NVDEC
+        // refuses the profile, the retry path drops the explicit decoder.
+        bool isNvidia = hwAccel.Equals("nvidia", StringComparison.OrdinalIgnoreCase);
+        if (isNvidia && !videoCopy && !forceSwDecode && !encoder.StartsWith("lib"))
+        {
+            var srcCodec = workItem.Probe?.Streams?.FirstOrDefault(s => s.CodecType == "video")?.CodecName;
+            string cuvid = GetNvidiaInputDecoder(srcCodec);
+            if (!string.IsNullOrEmpty(cuvid))
+                initFlags = $"{initFlags} {cuvid}";
+        }
         // After tonemap the frame is 8-bit SDR; p010 would waste bandwidth on the hwupload.
         string vaapiFormat = (is10Bit && !tonemap) ? "p010" : "nv12";
         string vfFlag = VideoFilterBuilder.Emit(
@@ -3435,6 +3451,27 @@ public class TranscodingService
     }
 
     /// <summary>
+    ///     Returns the explicit NVDEC (cuvid) input decoder flag for the given source codec, or
+    ///     <see cref="string.Empty"/> when none applies. Forces NVDEC instead of relying on
+    ///     <c>-hwaccel cuda</c>'s auto-attach, which silently falls back to a software decoder
+    ///     on some driver/setup combinations (datacenter Windows drivers, vGPU profiles, etc.).
+    /// </summary>
+    internal static string GetNvidiaInputDecoder(string? sourceCodec) =>
+        (sourceCodec?.ToLowerInvariant()) switch
+        {
+            "h264"       => "-c:v h264_cuvid",
+            "hevc"       => "-c:v hevc_cuvid",
+            "av1"        => "-c:v av1_cuvid",
+            "vp9"        => "-c:v vp9_cuvid",
+            "vp8"        => "-c:v vp8_cuvid",
+            "vc1"        => "-c:v vc1_cuvid",
+            "mpeg2video" => "-c:v mpeg2_cuvid",
+            "mpeg4"      => "-c:v mpeg4_cuvid",
+            "mjpeg"      => "-c:v mjpeg_cuvid",
+            _ => ""
+        };
+
+    /// <summary>
     ///     Maps the user's encoder preference and hardware acceleration setting to the
     ///     concrete FFmpeg encoder name (e.g., <c>"hevc_vaapi"</c>, <c>"hevc_nvenc"</c>, <c>"libx265"</c>).
     /// </summary>
@@ -4360,21 +4397,30 @@ public class TranscodingService
             return;
         }
 
-        // Retry 3: Software decode + VAAPI encode for hwaccel filter graph errors
-        // This keeps GPU encoding but avoids the problematic hardware decoder that crashes
-        // on mid-stream format/resolution changes
+        // Retry 3: Software decode + HW encode for hwaccel filter graph / decoder errors.
+        // VAAPI: drops -hwaccel vaapi and routes SW frames into the encoder via hwupload.
+        // NVIDIA: drops the explicit -c:v <src>_cuvid (cuvid decoder rejected the profile,
+        // or nvcuvid isn't loaded on this driver/setup); -hwaccel cuda's auto-attach + native
+        // decoder still runs, so NVENC keeps the GPU encode path.
         bool isHwaccelError = reason.Contains("hwaccel", StringComparison.OrdinalIgnoreCase)
             || reason.Contains("filter graph", StringComparison.OrdinalIgnoreCase)
             || reason.Contains("Impossible to convert", StringComparison.OrdinalIgnoreCase)
             || reason.Contains("hwupload", StringComparison.OrdinalIgnoreCase)
-            || reason.Contains("Reconfiguring filter", StringComparison.OrdinalIgnoreCase);
+            || reason.Contains("Reconfiguring filter", StringComparison.OrdinalIgnoreCase)
+            || reason.Contains("cuvid", StringComparison.OrdinalIgnoreCase)
+            || reason.Contains("nvcuvid", StringComparison.OrdinalIgnoreCase)
+            || reason.Contains("ffnvcodec", StringComparison.OrdinalIgnoreCase)
+            || reason.Contains("Failed to get HW config", StringComparison.OrdinalIgnoreCase);
 
         bool isVaapi = IsVaapiAcceleration(options.HardwareAcceleration);
+        bool isNvidia = options.HardwareAcceleration.Equals("nvidia", StringComparison.OrdinalIgnoreCase);
 
-        if (isHwaccelError && isVaapi && !swDecodeWasForced)
+        if (isHwaccelError && (isVaapi || isNvidia) && !swDecodeWasForced)
         {
             await LogAsync(workItem.Id,
-                "Retrying with software decode + VAAPI encode...");
+                isNvidia
+                    ? "Retrying without explicit NVDEC decoder (falling back to -hwaccel cuda auto-attach)..."
+                    : "Retrying with software decode + VAAPI encode...");
             workItem.Progress = 0;
             await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
             await ConvertVideoAsync(workItem, options,

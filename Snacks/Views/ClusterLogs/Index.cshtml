@@ -1,0 +1,50 @@
+@{
+    ViewData["Title"] = "Cluster Logs";
+    ViewData["Page"]  = "cluster-logs";
+    Layout = "~/Views/Shared/_Layout.cshtml";
+}
+
+<div class="cluster-logs-page">
+
+    <div class="d-flex align-items-center justify-content-between mb-3 flex-wrap gap-2">
+        <div>
+            <h3 class="mb-0"><i class="fas fa-file-lines me-2 text-primary"></i>Cluster Logs</h3>
+            <small class="text-muted">Live tail of any node's operations log. Bundle and download for diagnostics.</small>
+        </div>
+    </div>
+
+    <div class="card mb-3">
+        <div class="card-body d-flex flex-wrap align-items-center gap-2">
+            <label for="clusterLogNode" class="form-label mb-0 me-1">Node</label>
+            <select id="clusterLogNode" class="form-select form-select-sm" style="max-width: 280px;"></select>
+
+            <label for="clusterLogLines" class="form-label mb-0 ms-3 me-1">Lines</label>
+            <select id="clusterLogLines" class="form-select form-select-sm" style="max-width: 100px;">
+                <option value="100">100</option>
+                <option value="200" selected>200</option>
+                <option value="500">500</option>
+                <option value="1000">1000</option>
+                <option value="5000">5000</option>
+            </select>
+
+            <div class="form-check form-switch ms-3">
+                <input class="form-check-input" type="checkbox" id="clusterLogAutoRefresh" checked>
+                <label class="form-check-label" for="clusterLogAutoRefresh">Auto-refresh</label>
+            </div>
+
+            <button id="clusterLogRefreshBtn" class="btn btn-sm btn-outline-secondary ms-auto">
+                <i class="fas fa-arrows-rotate me-1"></i>Refresh
+            </button>
+            <a id="clusterLogDownloadBtn" class="btn btn-sm btn-outline-primary" href="/api/diagnostics/logs.zip" download>
+                <i class="fas fa-file-archive me-1"></i>Download .zip
+            </a>
+        </div>
+    </div>
+
+    <div id="clusterLogStatus" class="small text-muted mb-2" style="min-height: 1.4em;"></div>
+
+    <div id="clusterLogError" class="alert alert-warning d-none" role="alert"></div>
+
+    <pre id="clusterLogContent" class="cluster-log-content" style="max-height: 70vh; overflow: auto; padding: 0.75rem; background: var(--bs-body-bg); border: 1px solid var(--bs-border-color); border-radius: 0.375rem; font-size: 0.8rem; line-height: 1.4;"></pre>
+
+</div>

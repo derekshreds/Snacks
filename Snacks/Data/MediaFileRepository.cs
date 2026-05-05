@@ -351,6 +351,7 @@ public class MediaFileRepository
                  .SetProperty(f => f.AssignedNodePort, (int?)null)
                  .SetProperty(f => f.RemoteWorkItemId, (string?)null)
                  .SetProperty(f => f.RemoteJobPhase, (string?)null)
+                 .SetProperty(f => f.DispatchedDeviceId, (string?)null)
                  .SetProperty(f => f.RemoteFailureCount, 0));
         }
 
@@ -575,7 +576,8 @@ public class MediaFileRepository
         /// <param name="nodePort"> The port the remote node is listening on. </param>
         /// <param name="phase"> The initial phase label for the remote job (e.g., "Uploading"). </param>
         public async Task AssignToRemoteNodeAsync(string normalizedPath, string workItemId,
-            string nodeId, string nodeName, string nodeIp, int nodePort, string phase)
+            string nodeId, string nodeName, string nodeIp, int nodePort, string phase,
+            string? dispatchedDeviceId = null)
         {
             using var context = await _contextFactory.CreateDbContextAsync();
             var file = await context.MediaFiles.FirstOrDefaultAsync(f => f.FilePath == normalizedPath);
@@ -588,6 +590,12 @@ public class MediaFileRepository
             file.AssignedNodeIp = nodeIp;
             file.AssignedNodePort = nodePort;
             file.RemoteJobPhase = phase;
+            // Persisted so SlotLedger recovery rebuilds the same per-device
+            // occupancy after a master restart. Only updated when caller
+            // supplies a value — older callers (or callers that don't yet
+            // know the device) leave the field untouched.
+            if (!string.IsNullOrEmpty(dispatchedDeviceId))
+                file.DispatchedDeviceId = dispatchedDeviceId;
             await SaveChangesWithRetryAsync(context);
         }
 
@@ -628,6 +636,10 @@ public class MediaFileRepository
             file.AssignedNodeIp = null;
             file.AssignedNodePort = null;
             file.RemoteJobPhase = null;
+            // DispatchedDeviceId is cleared on every clear-assignment so a
+            // re-queued job picks a fresh slot on the next dispatch tick
+            // rather than pinning to whatever the previous attempt used.
+            file.DispatchedDeviceId = null;
             file.Status = newStatus;
             // Stamp LastEncodedAt for the empirical-outcome statuses so re-evaluate / auto-scan
             // can reason about "we just tried this" — same anchor SetStatusAndLastEncodedAtAsync

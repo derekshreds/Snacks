@@ -223,4 +223,40 @@ public sealed class HardwareEncoderTests
     {
         TranscodingService.ResolveDownscaleHeight(target).Should().Be(expected);
     }
+
+
+    /// <summary>
+    ///     Rows: (source codec, expected cuvid flag). The cuvid mapping forces NVDEC for
+    ///     codecs FFmpeg's cuvid family supports; everything else (unknown/unsupported)
+    ///     returns empty so the caller falls back to <c>-hwaccel cuda</c>'s auto-attach.
+    /// </summary>
+    public static IEnumerable<object[]> CuvidDecoderRows() => new[]
+    {
+        new object[] { "h264",       "-c:v h264_cuvid"  },
+        new object[] { "hevc",       "-c:v hevc_cuvid"  },
+        new object[] { "av1",        "-c:v av1_cuvid"   },
+        new object[] { "vp9",        "-c:v vp9_cuvid"   },
+        new object[] { "vp8",        "-c:v vp8_cuvid"   },
+        new object[] { "vc1",        "-c:v vc1_cuvid"   },
+        new object[] { "mpeg2video", "-c:v mpeg2_cuvid" },
+        new object[] { "mpeg4",      "-c:v mpeg4_cuvid" },
+        new object[] { "mjpeg",      "-c:v mjpeg_cuvid" },
+        // Case-insensitive — codec strings can come back from ffprobe in any case.
+        new object[] { "HEVC",       "-c:v hevc_cuvid"  },
+        new object[] { "H264",       "-c:v h264_cuvid"  },
+        // Unknown / unsupported codecs return empty so the caller leaves the existing
+        // -hwaccel cuda init flags alone.
+        new object[] { "prores",     ""                  },
+        new object[] { "ffv1",       ""                  },
+        new object[] { "h264_mvc",   ""                  },   // 3D Blu-ray — not a cuvid input
+        new object[] { "",           ""                  },
+        new object[] { null!,        ""                  },
+    };
+
+    [Theory]
+    [MemberData(nameof(CuvidDecoderRows))]
+    public void GetNvidiaInputDecoder_maps_codec_to_cuvid_flag(string? sourceCodec, string expected)
+    {
+        TranscodingService.GetNvidiaInputDecoder(sourceCodec).Should().Be(expected);
+    }
 }

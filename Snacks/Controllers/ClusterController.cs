@@ -37,17 +37,23 @@ public sealed class ClusterController : ControllerBase
     /// <param name="integrationService"> Source of master-side integration credentials served to workers. </param>
     /// <param name="hubContext"> SignalR hub context for pushing transfer progress to the UI. </param>
     private readonly EncodeHistoryRepository      _historyRepo;
+    private readonly FileService                  _fileService;
+    private readonly LogArchiveService            _logArchive;
 
     public ClusterController(
         ClusterService clusterService,
         IntegrationService integrationService,
         IHubContext<TranscodingHub> hubContext,
-        EncodeHistoryRepository historyRepo)
+        EncodeHistoryRepository historyRepo,
+        FileService fileService,
+        LogArchiveService logArchive)
     {
         _clusterService     = clusterService;
         _integrationService = integrationService;
         _hubContext         = hubContext;
         _historyRepo        = historyRepo;
+        _fileService        = fileService;
+        _logArchive         = logArchive;
     }
 
     /******************************************************************
@@ -853,6 +859,68 @@ public sealed class ClusterController : ControllerBase
     }
 
     /// <summary>
+    ///     Lists subtitle sidecar files (.srt/.ass/.vtt) produced by a remote encode that
+    ///     sit alongside the main output in the job's temp directory. The master pulls this
+    ///     list after the main download succeeds so the sidecars can ride home with the
+    ///     output before the worker temp dir is wiped by <c>CleanupFiles</c>.
+    /// </summary>
+    /// <param name="jobId"> The job ID whose sidecars to enumerate. </param>
+    [HttpGet("files/{jobId}/sidecars")]
+    public IActionResult ListSidecars(string jobId)
+    {
+        var outputPath = _clusterService.GetOutputFileForJob(jobId);
+        if (outputPath == null)
+            return new JsonResult(new { sidecars = Array.Empty<string>() });
+
+        var dir      = Path.GetDirectoryName(outputPath);
+        var baseName = Path.GetFileNameWithoutExtension(outputPath);
+        if (string.IsNullOrEmpty(dir) || string.IsNullOrEmpty(baseName))
+            return new JsonResult(new { sidecars = Array.Empty<string>() });
+
+        string[] exts = { ".srt", ".ass", ".vtt" };
+        var matches = Directory
+            .EnumerateFiles(dir, baseName + ".*")
+            .Where(p => exts.Contains(Path.GetExtension(p), StringComparer.OrdinalIgnoreCase))
+            .Select(Path.GetFileName)
+            .ToArray();
+
+        return new JsonResult(new { sidecars = matches });
+    }
+
+    /// <summary>
+    ///     Streams a single sidecar file by its filename (no path components). Restricted to
+    ///     <c>.srt</c>/<c>.ass</c>/<c>.vtt</c> in the job's temp directory; rejects anything
+    ///     that would escape via path traversal or invalid filename characters.
+    /// </summary>
+    /// <param name="jobId"> The job ID whose sidecar to serve. </param>
+    /// <param name="name"> The sidecar's basename (e.g. <c>"Movie [snacks].eng.srt"</c>). </param>
+    [HttpGet("files/{jobId}/sidecars/{name}")]
+    public IActionResult DownloadSidecar(string jobId, string name)
+    {
+        if (string.IsNullOrEmpty(name) || name.Contains("..") ||
+            name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+            return BadRequest(new { error = "Invalid sidecar name" });
+
+        string[] exts = { ".srt", ".ass", ".vtt" };
+        if (!exts.Contains(Path.GetExtension(name), StringComparer.OrdinalIgnoreCase))
+            return BadRequest(new { error = "Unsupported sidecar extension" });
+
+        // Re-root the requested name under the job's temp directory and assert the resolved
+        // path stays inside it. Belt-and-suspenders alongside the filename validation above.
+        var tempDir  = _clusterService.GetNodeTempDirectory(jobId);
+        var rooted   = Path.GetFullPath(tempDir);
+        var fullPath = Path.GetFullPath(Path.Combine(rooted, name));
+        if (!fullPath.StartsWith(rooted, StringComparison.OrdinalIgnoreCase))
+            return BadRequest(new { error = "Path escape" });
+
+        if (!System.IO.File.Exists(fullPath))
+            return NotFound(new { error = "Sidecar not found" });
+
+        var fs = new FileStream(fullPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+        return File(fs, "application/octet-stream");
+    }
+
+    /// <summary>
     ///     Cleans up temp files for a completed or cancelled job. Called by the master after
     ///     it has successfully downloaded the encoded output.
     /// </summary>
@@ -1069,6 +1137,70 @@ public sealed class ClusterController : ControllerBase
         var deleted = await _historyRepo.ClearAllAsync();
         await _hubContext.Clients.All.SendAsync("EncodeHistoryCleared");
         return Ok(new { success = true, deleted });
+    }
+
+    /******************************************************************
+     *  Diagnostics — log tail and ZIP export
+     *
+     *  These endpoints let the master fetch this node's operations logs
+     *  for the cluster-logs viewer and the per-node "Download logs"
+     *  button. Logs may contain file paths and job names but no
+     *  credentials — the cluster shared-secret gate is sufficient for
+     *  this surface.
+     ******************************************************************/
+
+    /// <summary>
+    ///     Returns the tail of this node's most recent <c>snacks-*.log</c>.
+    ///     Mirrors <c>DiagnosticsController.GetLogTail</c> for the master's
+    ///     cluster-logs viewer.
+    /// </summary>
+    [HttpGet("diagnostics/log")]
+    public IActionResult GetLogTail([FromQuery] int lines = 200)
+    {
+        var clamped = Math.Clamp(lines, 1, 5000);
+        var logsDir = Path.Combine(_fileService.GetWorkingDirectory(), "logs");
+
+        try
+        {
+            var (latest, tail) = _logArchive.ReadLatestLogTail(logsDir, clamped);
+            if (latest == null || tail == null)
+                return new JsonResult(new { logsDir, available = false, lines = Array.Empty<string>() });
+
+            return new JsonResult(new
+            {
+                logsDir,
+                available    = true,
+                logFile      = latest.Name,
+                lastWriteUtc = latest.LastWriteTimeUtc,
+                lineCount    = tail.Length,
+                lines        = tail,
+            });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { error = ex.Message });
+        }
+    }
+
+    /// <summary>
+    ///     Streams a ZIP of every <c>*.log</c> under this node's logs directory
+    ///     (operations logs + per-job FFmpeg logs) for diagnostic export.
+    /// </summary>
+    [HttpGet("diagnostics/logs.zip")]
+    public IActionResult GetLogsZip()
+    {
+        var logsDir = Path.Combine(_fileService.GetWorkingDirectory(), "logs");
+        var config  = _clusterService.GetConfig();
+        var stamp   = DateTime.UtcNow.ToString("yyyyMMdd-HHmmss");
+        var safe    = string.Join('_', (config.NodeName ?? "node").Split(Path.GetInvalidFileNameChars()));
+
+        // See DiagnosticsController.GetLogsZip — ZipArchive's sync writes
+        // can't go straight to Response.Body, so build into a MemoryStream
+        // first.
+        var buffer = new MemoryStream();
+        _logArchive.WriteLogsZip(buffer, logsDir);
+        buffer.Position = 0;
+        return File(buffer, "application/zip", $"snacks-logs-{safe}-{stamp}.zip");
     }
 
 }

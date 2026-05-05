@@ -261,6 +261,13 @@ export const notificationsApi = {
 /**
  * Plex / Jellyfin / Sonarr / Radarr integration config and test-connection.
  */
+export const networkingApi = {
+    /** Fetches the master's transfer-throttling config. */
+    getConfig:  ()        => getJson('/api/networking'),
+    /** Persists transfer-throttling config. Returns 400 on validation errors. */
+    saveConfig: (config)  => postJson('/api/networking', config),
+};
+
 export const integrationsApi = {
     /** Fetches the full integrations config (all four providers). */
     getConfig:    ()                 => getJson('/api/integrations/config'),
@@ -380,6 +387,40 @@ export const dashboardApi = {
      * broadcasts a SignalR event so connected dashboards refresh.
      */
     clearHistory: () => deleteJson('/api/dashboard/history'),
+};
+
+
+// ---------------------------------------------------------------------------
+// Diagnostics — operations log tail and ZIP export
+// ---------------------------------------------------------------------------
+
+/**
+ * Read-only access to the persistent operations log written by Serilog.
+ * Both endpoints accept an optional `nodeId`; the master proxies remote
+ * lookups through the cluster shared-secret channel. The cluster-logs page
+ * uses `getLogTail` for the live tail and `logsZipUrl` for the download
+ * anchor's href.
+ */
+export const diagnosticsApi = {
+    /**
+     * Fetches the tail of the most recent `snacks-*.log` for `nodeId` (or the
+     * local node when omitted). Returns `{ available, logFile, lastWriteUtc,
+     * lineCount, lines[] }` on success, or `{ available: false, lines: [] }`
+     * when no log file exists yet.
+     */
+    getLogTail: (nodeId, lines = 200) => {
+        const params = new URLSearchParams({ lines: String(lines) });
+        if (nodeId) params.set('nodeId', nodeId);
+        return getJson('/api/diagnostics/log?' + params.toString());
+    },
+
+    /**
+     * Builds the URL for downloading a ZIP of `nodeId`'s `logs/` directory
+     * (operations + per-job FFmpeg logs). Used as the `href` of an
+     * `<a download>` so the browser handles the file save.
+     */
+    logsZipUrl: (nodeId) =>
+        '/api/diagnostics/logs.zip' + (nodeId ? `?nodeId=${encodeURIComponent(nodeId)}` : ''),
 };
 
 

@@ -180,6 +180,7 @@ builder.Services.AddSingleton<EncodeHistoryRepository>();
 
 builder.Services.AddSingleton<FfprobeService>();
 builder.Services.AddSingleton<FileService>();
+builder.Services.AddSingleton<LogArchiveService>();
 builder.Services.AddSingleton<ConfigFileService>();
 builder.Services.AddHttpClient();
 builder.Services.AddSingleton<NotificationService>();
@@ -192,6 +193,16 @@ builder.Services.AddSingleton<TranscodingService>();
 builder.Services.AddSingleton<StateTransitionService>();
 builder.Services.AddSingleton<ClusterService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<ClusterService>());
+// SlotLedger is owned by ClusterService; expose the same instance via DI so
+// downstream services (transfer throttle, future watchdogs) resolve to the
+// dispatcher's authoritative store rather than constructing their own.
+builder.Services.AddSingleton<Snacks.Services.Slots.SlotLedger>(sp =>
+    sp.GetRequiredService<ClusterService>().SlotLedger);
+// Master-only networking config (transfer concurrency + bandwidth caps).
+// Slaves resolve the same singleton but never read it — only the master's
+// transfer code consults it.
+builder.Services.AddSingleton<NetworkingSettingsService>();
+builder.Services.AddSingleton<Snacks.Services.Cluster.TransferThrottle>();
 builder.Services.AddScoped<ClusterAuthFilter>();
 builder.Services.AddScoped<LocalNetworkOnlyFilter>();
 builder.Services.AddSingleton<AutoScanService>();
