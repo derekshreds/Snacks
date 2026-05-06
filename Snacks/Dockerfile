@@ -34,7 +34,12 @@ RUN apt-get update && apt-get install -y \
 # don't switch USER here — the entrypoint decides at runtime based on PUID:
 # when set, it drops privileges with gosu; when unset, it stays root to
 # preserve back-compat with deployments that need direct /dev/dri access.
-RUN useradd -m -u 1000 -s /bin/bash snacks && \
+#
+# Ubuntu Noble's base image ships an "ubuntu" user at UID 1000 — drop it
+# first so our useradd -u 1000 doesn't collide. The entrypoint can still
+# remap to any PUID/PGID at runtime.
+RUN userdel -r ubuntu 2>/dev/null || true && \
+    useradd -m -u 1000 -s /bin/bash snacks && \
     (usermod -aG video snacks  || true) && \
     (usermod -aG render snacks || true)
 
