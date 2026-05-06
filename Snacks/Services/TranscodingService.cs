@@ -1859,6 +1859,7 @@ public class TranscodingService
                 var folderOverride = ResolveFolderOverride(workItem.Path);
                 var perJobOptions = EncoderOptionsOverride.ApplyOverrides(current, folderOverride, null);
                 perJobOptions.HardwareAcceleration = deviceId == "cpu" ? "none" : deviceId;
+                perJobOptions.HardwareDevicePath   = deviceId == "cpu" ? null : GetDevicePathForDeviceId(deviceId);
 
                 // Pre-dispatch finalisation: resolve any missing OriginalLanguage live,
                 // merge it into the per-job keep lists, and re-run the skip ladder under
@@ -2401,7 +2402,7 @@ public class TranscodingService
         string hwAccel = options.HardwareAcceleration;
         if (!videoCopy && !encoder.StartsWith("lib") && encoder != "copy")
         {
-            string testHwFlags = GetInitFlags(hwAccel);
+            string testHwFlags = GetInitFlags(hwAccel, options.HardwareDevicePath);
             if (!await TestEncoderAsync(testHwFlags, encoder))
             {
                 string swEncoder = GetSoftwareFallbackEncoder(options);
@@ -2505,7 +2506,7 @@ public class TranscodingService
             encoder = GetEncoder(options);
             if (!encoder.StartsWith("lib") && encoder != "copy")
             {
-                string testHwFlags = GetInitFlags(hwAccel);
+                string testHwFlags = GetInitFlags(hwAccel, options.HardwareDevicePath);
                 if (!await TestEncoderAsync(testHwFlags, encoder))
                 {
                     string swEncoder = GetSoftwareFallbackEncoder(options);
@@ -2531,7 +2532,9 @@ public class TranscodingService
                 "Using software decode + VAAPI encode (hwaccel decode disabled)");
         }
 
-        string initFlags = useVaapi ? GetInitFlags(hwAccel, canHwDecode) : GetInitFlags(hwAccel);
+        string initFlags = useVaapi
+            ? GetInitFlags(hwAccel, options.HardwareDevicePath, canHwDecode)
+            : GetInitFlags(hwAccel, options.HardwareDevicePath);
 
         // Explicitly select the NVDEC (cuvid) decoder on the nvidia path. `-hwaccel cuda` alone
         // is just a hint — on some driver/setup combinations (datacenter Windows drivers, vGPU
@@ -3753,35 +3756,62 @@ public class TranscodingService
             // Linux
             await LogVaapiInfoAsync();
 
-            // VAAPI (Intel iGPU and AMD GPUs on Linux) — probe both drivers.
-            if (File.Exists("/dev/dri/renderD128"))
+            // VAAPI (Intel iGPU and AMD GPUs on Linux) — walk every render node, not
+            // just renderD128. On hybrid laptops (e.g. Pop!_OS with system76-power in
+            // hybrid/nvidia/compute mode) the NVIDIA card can claim renderD128 while
+            // the iGPU lands on renderD129. The legacy single-node probe failed against
+            // the NVIDIA node (no iHD/i965 VAAPI support there) and silently skipped
+            // VAAPI entirely, even though a perfectly good iGPU was sitting on the
+            // next render node over.
+            var renderNodes = EnumerateRenderNodes();
+            var originalLibvaDriver = Environment.GetEnvironmentVariable("LIBVA_DRIVER_NAME");
+            try
             {
-                var driversToTry = new[] { "iHD", "i965" };
-                foreach (var driver in driversToTry)
+                foreach (var nodePath in renderNodes)
                 {
-                    Console.WriteLine($"Auto-detect: Trying VAAPI with {driver} driver...");
-                    Environment.SetEnvironmentVariable("LIBVA_DRIVER_NAME", driver);
-
-                    var hwInit = "-init_hw_device vaapi=hw:/dev/dri/renderD128 -filter_hw_device hw";
-                    bool hevcOk = await TestEncoderAsync(hwInit, "hevc_vaapi");
-                    bool h264Ok = await TestEncoderAsync(hwInit, "h264_vaapi");
-                    bool av1Ok  = await TestEncoderAsync(hwInit, "av1_vaapi");
-
-                    if (hevcOk || h264Ok || av1Ok)
+                    var driversToTry = new[] { "iHD", "i965" };
+                    bool nodeMatched = false;
+                    foreach (var driver in driversToTry)
                     {
-                        Console.WriteLine($"Auto-detect: VAAPI available with {driver} driver (hevc={hevcOk}, h264={h264Ok}, av1={av1Ok})");
-                        devices.Add(new HardwareDevice
+                        Console.WriteLine($"Auto-detect: Trying VAAPI on {nodePath} with {driver} driver...");
+                        Environment.SetEnvironmentVariable("LIBVA_DRIVER_NAME", driver);
+
+                        var hwInit = $"-init_hw_device vaapi=hw:{nodePath} -filter_hw_device hw";
+                        bool hevcOk = await TestEncoderAsync(hwInit, "hevc_vaapi");
+                        bool h264Ok = await TestEncoderAsync(hwInit, "h264_vaapi");
+                        bool av1Ok  = await TestEncoderAsync(hwInit, "av1_vaapi");
+
+                        if (hevcOk || h264Ok || av1Ok)
                         {
-                            DeviceId           = "intel",
-                            DisplayName        = "Intel VAAPI",
-                            SupportedCodecs    = BuildSupportedCodecs(hevcOk, h264Ok, av1Ok),
-                            Encoders           = BuildIntelEncoders(hevcOk, h264Ok, av1Ok, qsv: false),
-                            DefaultConcurrency = DefaultConcurrencyFor("intel"),
-                            IsHardware         = true,
-                        });
-                        break;
+                            Console.WriteLine($"Auto-detect: VAAPI available on {nodePath} with {driver} driver (hevc={hevcOk}, h264={h264Ok}, av1={av1Ok})");
+                            devices.Add(new HardwareDevice
+                            {
+                                DeviceId           = "intel",
+                                DisplayName        = "Intel VAAPI",
+                                SupportedCodecs    = BuildSupportedCodecs(hevcOk, h264Ok, av1Ok),
+                                Encoders           = BuildIntelEncoders(hevcOk, h264Ok, av1Ok, qsv: false),
+                                DefaultConcurrency = DefaultConcurrencyFor("intel"),
+                                IsHardware         = true,
+                                DevicePath         = nodePath,
+                            });
+                            nodeMatched = true;
+                            break;
+                        }
                     }
+                    // First working render node wins — stop probing the rest. We only
+                    // expose one VAAPI device family right now (DeviceId="intel"), so
+                    // there's no way to surface a second VAAPI GPU through the existing
+                    // slot-pool model. If/when the model grows per-card devices, drop
+                    // this break and let every node register its own HardwareDevice.
+                    if (nodeMatched) break;
                 }
+            }
+            finally
+            {
+                // Restore whatever LIBVA_DRIVER_NAME the host set (or unset, if it
+                // wasn't set at all) so we don't leak driver state into later ffmpeg
+                // invocations that don't go through GetInitFlags.
+                Environment.SetEnvironmentVariable("LIBVA_DRIVER_NAME", originalLibvaDriver);
             }
 
             if (await TestEncoderAsync("-hwaccel cuda", "hevc_nvenc"))
@@ -3866,7 +3896,28 @@ public class TranscodingService
     }
 
     /// <summary>
-    ///     Logs VAAPI diagnostic info (vainfo output) for troubleshooting.
+    ///     Returns every <c>/dev/dri/renderD*</c> node sorted by the trailing index so
+    ///     iteration is deterministic — important for both reproducible probe order on
+    ///     hybrid systems and stable test expectations. Returns an empty array when the
+    ///     <c>/dev/dri</c> directory is missing (Windows, macOS, container without GPU
+    ///     passthrough).
+    /// </summary>
+    internal static string[] EnumerateRenderNodes()
+    {
+        if (!Directory.Exists("/dev/dri")) return Array.Empty<string>();
+        return Directory.GetFiles("/dev/dri", "renderD*")
+            .OrderBy(p =>
+            {
+                var name = Path.GetFileName(p);
+                return int.TryParse(name.AsSpan("renderD".Length), out var n) ? n : int.MaxValue;
+            })
+            .ToArray();
+    }
+
+    /// <summary>
+    ///     Logs VAAPI diagnostic info (vainfo output) for troubleshooting. On hybrid
+    ///     systems with multiple render nodes, vainfo runs against the first node — the
+    ///     detection probe loop covers the rest.
     /// </summary>
     private async Task LogVaapiInfoAsync()
     {
@@ -3877,11 +3928,10 @@ public class TranscodingService
 
         try
         {
-            if (File.Exists("/dev/dri/renderD128"))
-                Console.WriteLine("Auto-detect: /dev/dri/renderD128 exists");
-            else
+            var renderNodes = EnumerateRenderNodes();
+            if (renderNodes.Length == 0)
             {
-                Console.WriteLine("Auto-detect: /dev/dri/renderD128 NOT FOUND");
+                Console.WriteLine("Auto-detect: no /dev/dri/renderD* nodes found");
                 if (Directory.Exists("/dev/dri"))
                 {
                     var entries = Directory.GetFileSystemEntries("/dev/dri");
@@ -3892,9 +3942,12 @@ public class TranscodingService
                 return;
             }
 
+            Console.WriteLine($"Auto-detect: render nodes found: {string.Join(", ", renderNodes)}");
+            var firstNode = renderNodes[0];
+
             var psi = new ProcessStartInfo("vainfo")
             {
-                Arguments = "--display drm --device /dev/dri/renderD128",
+                Arguments = $"--display drm --device {firstNode}",
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
@@ -3909,7 +3962,7 @@ public class TranscodingService
             process.WaitForExit(5000);
 
             var output = !string.IsNullOrEmpty(stdout) ? stdout : stderr;
-            Console.WriteLine($"Auto-detect vainfo output:\n{output.Substring(0, Math.Min(output.Length, 1000))}");
+            Console.WriteLine($"Auto-detect vainfo ({firstNode}) output:\n{output.Substring(0, Math.Min(output.Length, 1000))}");
         }
         catch (Exception ex)
         {
@@ -3978,12 +4031,26 @@ public class TranscodingService
     /// <summary>
     ///     Resolves "auto" to a concrete hardware acceleration type.
     ///     For explicit selections, returns as-is.
+    ///
+    ///     <para>Once a concrete device family is in hand, also fills in
+    ///     <see cref="EncoderOptions.HardwareDevicePath"/> from the locally detected
+    ///     <see cref="HardwareDevice.DevicePath"/> so VAAPI jobs target the render
+    ///     node detection picked instead of falling back to the legacy renderD128
+    ///     default. Skips the path lookup when the caller pre-set a path (e.g. a
+    ///     test fixture exercising a specific node) or when the family doesn't
+    ///     map to a node path (NVIDIA, Windows QSV/AMF, Apple, CPU).</para>
     /// </summary>
     private async Task ResolveHardwareAccelerationAsync(EncoderOptions options)
     {
         if (options.HardwareAcceleration.Equals("auto", StringComparison.OrdinalIgnoreCase))
         {
             options.HardwareAcceleration = await DetectHardwareAccelerationAsync();
+        }
+
+        if (options.HardwareDevicePath == null
+            && !string.Equals(options.HardwareAcceleration, "none", StringComparison.OrdinalIgnoreCase))
+        {
+            options.HardwareDevicePath = GetDevicePathForDeviceId(options.HardwareAcceleration);
         }
     }
 
@@ -4018,23 +4085,42 @@ public class TranscodingService
     ///     forcing hardware decode (software decode + VAAPI encode mode).
     /// </summary>
     internal static string GetInitFlags(string hardwareAcceleration, bool hwDecode = true)
-        => GetInitFlags(hardwareAcceleration, RuntimeInformation.IsOSPlatform(OSPlatform.Windows), hwDecode);
+        => GetInitFlags(hardwareAcceleration, devicePath: null, RuntimeInformation.IsOSPlatform(OSPlatform.Windows), hwDecode);
+
+    /// <summary>
+    ///     Path-aware overload. <paramref name="devicePath"/> selects the VAAPI render
+    ///     node (e.g. <c>/dev/dri/renderD129</c>); <see langword="null"/> falls back to
+    ///     <c>/dev/dri/renderD128</c> for compatibility with the legacy single-node
+    ///     assumption. Use this overload from the dispatch path so jobs land on the
+    ///     same node detection picked.
+    /// </summary>
+    internal static string GetInitFlags(string hardwareAcceleration, string? devicePath, bool hwDecode = true)
+        => GetInitFlags(hardwareAcceleration, devicePath, RuntimeInformation.IsOSPlatform(OSPlatform.Windows), hwDecode);
 
     /// <summary>
     ///     Pure overload that takes <paramref name="isWindows"/> explicitly so unit tests can
     ///     exercise the VAAPI / QSV / AMF branches independently of the test host OS.
     /// </summary>
     internal static string GetInitFlags(string hardwareAcceleration, bool isWindows, bool hwDecode)
+        => GetInitFlags(hardwareAcceleration, devicePath: null, isWindows, hwDecode);
+
+    /// <summary>
+    ///     Pure overload with explicit OS gate AND device-path injection. The four VAAPI
+    ///     branches use <paramref name="devicePath"/> when set, falling back to renderD128
+    ///     so single-GPU machines get the same flag string they always have.
+    /// </summary>
+    internal static string GetInitFlags(string hardwareAcceleration, string? devicePath, bool isWindows, bool hwDecode)
     {
+        var node = string.IsNullOrEmpty(devicePath) ? "/dev/dri/renderD128" : devicePath;
         return hardwareAcceleration.ToLower() switch
         {
             "intel" when isWindows => "-y -hwaccel qsv -hwaccel_output_format qsv -qsv_device auto",
             "amd" when isWindows => "-y -hwaccel auto",
             // Software decode + VAAPI encode: init the device but don't force hwaccel decode
-            "intel" when !hwDecode => "-y -init_hw_device vaapi=hw:/dev/dri/renderD128 -filter_hw_device hw",
-            "amd" when !hwDecode => "-y -init_hw_device vaapi=hw:/dev/dri/renderD128 -filter_hw_device hw",
-            "intel" => "-y -init_hw_device vaapi=hw:/dev/dri/renderD128 -hwaccel vaapi -hwaccel_output_format vaapi -filter_hw_device hw",
-            "amd" => "-y -init_hw_device vaapi=hw:/dev/dri/renderD128 -hwaccel vaapi -hwaccel_output_format vaapi -filter_hw_device hw",
+            "intel" when !hwDecode => $"-y -init_hw_device vaapi=hw:{node} -filter_hw_device hw",
+            "amd" when !hwDecode => $"-y -init_hw_device vaapi=hw:{node} -filter_hw_device hw",
+            "intel" => $"-y -init_hw_device vaapi=hw:{node} -hwaccel vaapi -hwaccel_output_format vaapi -filter_hw_device hw",
+            "amd" => $"-y -init_hw_device vaapi=hw:{node} -hwaccel vaapi -hwaccel_output_format vaapi -filter_hw_device hw",
             "nvidia" => "-y -hwaccel cuda",
             "apple" => "-y -hwaccel videotoolbox",
             _ => "-y"
@@ -4216,7 +4302,7 @@ public class TranscodingService
         }
 
         bool canHwDecode = CanVaapiDecode(workItem.Probe);
-        string initFlags = GetInitFlags(options.HardwareAcceleration, canHwDecode);
+        string initFlags = GetInitFlags(options.HardwareAcceleration, options.HardwareDevicePath, canHwDecode);
         string encoder = GetEncoder(options);
         // Use p010 for 10-bit content, nv12 for 8-bit
         bool is10Bit = workItem.Probe?.Streams?.Any(s =>
@@ -4510,7 +4596,7 @@ public class TranscodingService
             samples.Add((FormatSeekTime(seekSec), dur));
         }
 
-        string initFlags = GetInitFlags(options.HardwareAcceleration);
+        string initFlags = GetInitFlags(options.HardwareAcceleration, options.HardwareDevicePath);
         long currentBv = targetKbps;
 
         for (int iter = 1; iter <= maxIterations; iter++)
@@ -4674,7 +4760,7 @@ public class TranscodingService
         string startTime = lengthInMinutes > 20 ? "00:10:00" : "00:00:00";
         string duration = lengthInMinutes > 20 ? "00:10:00" : $"00:{Math.Min(lengthInMinutes, 10):D2}:00";
         
-        string command = $"{GetInitFlags(options.HardwareAcceleration)} -ss {startTime} -i \"{inputPath}\" " +
+        string command = $"{GetInitFlags(options.HardwareAcceleration, options.HardwareDevicePath)} -ss {startTime} -i \"{inputPath}\" " +
                         $"-t {duration} -vf cropdetect=24:2:8 -f null -";
 
         var cropValues = new ConcurrentDictionary<string, int>();
@@ -5314,7 +5400,23 @@ public class TranscodingService
         Encoders           = new List<string>(src.Encoders),
         DefaultConcurrency = src.DefaultConcurrency,
         IsHardware         = src.IsHardware,
+        DevicePath         = src.DevicePath,
     };
+
+    /// <summary>
+    ///     Returns the locally detected <see cref="HardwareDevice.DevicePath"/> for the
+    ///     given device id, or <see langword="null"/> if the device has no node path
+    ///     (NVIDIA, Windows QSV/AMF, Apple, CPU) or hasn't been detected yet. Dispatch
+    ///     sites stamp the result onto <see cref="EncoderOptions.HardwareDevicePath"/>
+    ///     so per-job ffmpeg invocations target the same render node detection picked.
+    /// </summary>
+    public string? GetDevicePathForDeviceId(string deviceId)
+    {
+        if (_detectedDevices == null) return null;
+        var match = _detectedDevices.FirstOrDefault(d =>
+            string.Equals(d.DeviceId, deviceId, StringComparison.OrdinalIgnoreCase));
+        return match?.DevicePath;
+    }
 
     /// <summary>
     ///     Registers a per-job progress callback for forwarding progress to the master.

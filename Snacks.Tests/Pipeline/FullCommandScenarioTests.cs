@@ -101,8 +101,8 @@ public sealed class FullCommandScenarioTests
         bool hasFilter = cropExpr != null || scaleExpr != null || tonemap;
 
         string init = useVaapi && hasFilter
-            ? TranscodingService.GetInitFlags(options.HardwareAcceleration, hwDecode: false)
-            : TranscodingService.GetInitFlags(options.HardwareAcceleration);
+            ? TranscodingService.GetInitFlags(options.HardwareAcceleration, options.HardwareDevicePath, hwDecode: false)
+            : TranscodingService.GetInitFlags(options.HardwareAcceleration, options.HardwareDevicePath);
 
         var (target, min, max, _) = TranscodingService.CalculateBitrates(workItem, options);
 
@@ -550,6 +550,46 @@ public sealed class FullCommandScenarioTests
 
         // VAAPI takes no -preset.
         cmd.Should().NotContain("-preset medium");
+    }
+
+
+    // =====================================================================
+    //  Scenario 7b: Hybrid GPU laptop (Pop!_OS) — iGPU lands on renderD129
+    //  because the NVIDIA card claimed renderD128. Detection records the
+    //  iGPU's actual node path on the device, dispatch copies it onto
+    //  EncoderOptions.HardwareDevicePath, and ffmpeg's init flags must
+    //  target renderD129 — not the legacy renderD128 default.
+    // =====================================================================
+
+    [LinuxOnlyFact]
+    public void Scenario_Intel_VAAPI_uses_renderD129_when_dispatched_to_iGPU_on_second_node()
+    {
+        var probe = new ProbeBuilder()
+            .Video(codec: "h264", width: 1920, height: 1080)
+            .Audio(codec: "ac3", channels: 6, lang: "eng")
+            .Build();
+
+        var opts = new EncoderOptions
+        {
+            Format                = "mkv",
+            Encoder               = "libx265",
+            FfmpegQualityPreset   = "medium",
+            HardwareAcceleration  = "intel",
+            HardwareDevicePath    = "/dev/dri/renderD129",
+            TargetBitrate         = 4000,
+            PreserveOriginalAudio = true,
+            AudioOutputs          = new(),
+        };
+        var item = new WorkItem { Bitrate = 8000, IsHevc = false, Probe = probe };
+
+        var cmd = BuildScenarioCommand(probe, opts, item);
+
+        AssertWellFormed(cmd, "mkv", "/source/in.mkv", "/output/out.mkv");
+
+        cmd.Should().Contain("-init_hw_device vaapi=hw:/dev/dri/renderD129");
+        cmd.Should().NotContain("vaapi=hw:/dev/dri/renderD128");
+        cmd.Should().Contain("-hwaccel vaapi");
+        cmd.Should().Contain("-c:v hevc_vaapi");
     }
 
 

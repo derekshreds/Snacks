@@ -520,6 +520,13 @@ public sealed class ClusterNodeJobService
         // where the scheduler intended (and not on whichever device "auto"
         // would have picked locally). CPU jobs map to "none".
         options.HardwareAcceleration = active.DeviceId == "cpu" ? "none" : active.DeviceId;
+        // Also resolve the local VAAPI render-node path so jobs land on the iGPU
+        // even when it's on /dev/dri/renderD129 (hybrid laptops where the NVIDIA
+        // card claims renderD128). Master-side selection is by family ("intel"),
+        // not by node path; the worker maps that back to its own detected path.
+        options.HardwareDevicePath = active.DeviceId == "cpu"
+            ? null
+            : _transcodingService.GetDevicePathForDeviceId(active.DeviceId);
 
         var encodingSucceeded = false;
         var shared            = TryReadSharedSentinel(workItem.Id);

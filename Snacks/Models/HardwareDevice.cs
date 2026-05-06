@@ -46,6 +46,19 @@ public sealed class HardwareDevice
 
     /// <summary> <see langword="true"/> for hardware-backed devices, <see langword="false"/> for the CPU device. </summary>
     public bool IsHardware { get; set; } = true;
+
+    /// <summary>
+    ///     Filesystem path to the underlying device node when one applies (Linux VAAPI:
+    ///     <c>/dev/dri/renderD128</c>, <c>/dev/dri/renderD129</c>, …). <see langword="null"/>
+    ///     for vendor families that don't use a device-node selector (NVIDIA cuda, Windows
+    ///     QSV/AMF/NVENC, macOS VideoToolbox, the synthetic CPU device).
+    ///
+    ///     <para>Detection records whichever render node passed the VAAPI probe; dispatch
+    ///     copies it onto <see cref="EncoderOptions.HardwareDevicePath"/> so the ffmpeg
+    ///     init flags target the correct GPU on hybrid systems where the iGPU isn't
+    ///     necessarily on renderD128.</para>
+    /// </summary>
+    public string? DevicePath { get; set; }
 }
 
 /// <summary>
