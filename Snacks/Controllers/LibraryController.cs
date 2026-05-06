@@ -117,8 +117,10 @@ public sealed class LibraryController : ControllerBase
     }
 
     /// <summary>
-    ///     Returns all video files found under the given directory, optionally recursing into
-    ///     subdirectories.
+    ///     Returns all media files (video + music) found under the given directory,
+    ///     optionally recursing into subdirectories. Each entry carries a <c>kind</c>
+    ///     field (<c>"Video"</c> or <c>"Music"</c>) so the browser can show distinct
+    ///     icons and counts.
     /// </summary>
     /// <param name="directoryPath"> The root directory to search. </param>
     /// <param name="recursive"> Whether to recurse into subdirectories. Defaults to <see langword="true"/>. </param>
@@ -136,19 +138,20 @@ public sealed class LibraryController : ControllerBase
                 allDirs.AddRange(Directory.GetDirectories(directoryPath, "*", SearchOption.AllDirectories));
 
             var relativeRoot = _fileService.AllowAllPaths() ? directoryPath : _fileService.GetUploadsDirectory();
-            var videoFiles   = _fileService.GetAllVideoFiles(allDirs)
-                .Select(f => new
+            var mediaFiles   = _fileService.GetAllMediaFiles(allDirs)
+                .Select(t => new
                 {
-                    path         = f,
-                    name         = Path.GetFileName(f),
-                    size         = new FileInfo(f).Length,
-                    modified     = new FileInfo(f).LastWriteTime,
-                    relativePath = Path.GetRelativePath(relativeRoot, f)
+                    path         = t.Path,
+                    name         = Path.GetFileName(t.Path),
+                    size         = new FileInfo(t.Path).Length,
+                    modified     = new FileInfo(t.Path).LastWriteTime,
+                    relativePath = Path.GetRelativePath(relativeRoot, t.Path),
+                    kind         = t.Kind.ToString(),
                 })
                 .OrderBy(f => f.relativePath)
                 .ToArray();
 
-            return new JsonResult(new { files = videoFiles });
+            return new JsonResult(new { files = mediaFiles });
         }
         catch (Exception ex)
         {

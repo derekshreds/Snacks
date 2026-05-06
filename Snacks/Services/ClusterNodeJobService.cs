@@ -394,6 +394,7 @@ public sealed class ClusterNodeJobService
                 Length    = metadata.Duration,
                 IsHevc    = metadata.IsHevc,
                 Is4K      = metadata.Is4K,
+                Kind      = metadata.Kind,
                 Probe     = metadata.Probe,
                 Status    = WorkItemStatus.Processing,
                 StartedAt = DateTime.UtcNow,

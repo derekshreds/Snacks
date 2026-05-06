@@ -439,7 +439,7 @@ function renderRecentTable(rows) {
         return `
             <tr>
                 <td class="dash-file">
-                    <span class="dash-fileicon"><i class="fas fa-film"></i></span>
+                    <span class="dash-fileicon"><i class="fas ${(r.kind === 'Music' || r.kind === 1) ? 'fa-music' : 'fa-film'}"></i></span>
                     <div class="dash-filename" title="${escapeHtml(r.fileName)}">${escapeHtml(r.fileName)}</div>
                 </td>
                 <td class="dash-codec">
@@ -500,8 +500,17 @@ function renderHero(summary, daily) {
 
     document.getElementById('heroFiles').textContent = summary.totalEncodes.toLocaleString();
     const skipped = summary.noSavingsEncodes || 0;
-    document.getElementById('heroFilesSub').textContent =
-        skipped > 0 ? `${skipped} no-savings, ${summary.fourKEncodes} were 4K` : `${summary.fourKEncodes} were 4K`;
+    const videoCount = summary.videoEncodes || 0;
+    const musicCount = summary.musicEncodes || 0;
+    let filesSub;
+    if (currentKind === 'all' && videoCount > 0 && musicCount > 0) {
+        filesSub = `${videoCount.toLocaleString()} video · ${musicCount.toLocaleString()} music`;
+    } else {
+        filesSub = skipped > 0
+            ? `${skipped} no-savings, ${summary.fourKEncodes} were 4K`
+            : `${summary.fourKEncodes} were 4K`;
+    }
+    document.getElementById('heroFilesSub').textContent = filesSub;
 
     document.getElementById('heroHours').textContent = fmtHoursMinutes(summary.totalEncodeSeconds);
     document.getElementById('heroHoursSub').textContent =
@@ -534,18 +543,34 @@ async function fetchJson(url) {
 let currentRange = 30;
 let refreshTimer = null;
 
+/**
+ * Selected media-type filter — drives the &kind=… query parameter on every
+ * dashboard endpoint. Persisted to localStorage so the user's choice survives
+ * page swaps. <c>'all'</c> means "no filter"; the API treats anything other
+ * than "video" or "music" as no filter.
+ */
+let currentKind = (() => {
+    try { return localStorage.getItem('dashboardKind') || 'all'; }
+    catch { return 'all'; }
+})();
+
+/** Returns the &kind=… suffix to append to dashboard API URLs (empty for "all"). */
+function kindQS() {
+    return currentKind === 'all' ? '' : `&kind=${encodeURIComponent(currentKind)}`;
+}
+
 async function refresh() {
     const days = currentRange;
     document.getElementById('savingsChartCaption').textContent = `last ${days} days`;
     try {
         const [summary, daily, devices, codecs, nodes, recent, top] = await Promise.all([
-            fetchJson('/api/dashboard/summary'),
-            fetchJson(`/api/dashboard/savings-over-time?days=${days}`),
-            fetchJson(`/api/dashboard/device-utilization?days=${days}`),
-            fetchJson(`/api/dashboard/codec-mix?days=${days}`),
-            fetchJson(`/api/dashboard/node-throughput?days=${days}`),
-            fetchJson('/api/dashboard/recent?limit=25'),
-            fetchJson(`/api/dashboard/top-savings?limit=10&days=${days}`),
+            fetchJson(`/api/dashboard/summary?_=1${kindQS()}`),
+            fetchJson(`/api/dashboard/savings-over-time?days=${days}${kindQS()}`),
+            fetchJson(`/api/dashboard/device-utilization?days=${days}${kindQS()}`),
+            fetchJson(`/api/dashboard/codec-mix?days=${days}${kindQS()}`),
+            fetchJson(`/api/dashboard/node-throughput?days=${days}${kindQS()}`),
+            fetchJson(`/api/dashboard/recent?limit=25${kindQS()}`),
+            fetchJson(`/api/dashboard/top-savings?limit=10&days=${days}${kindQS()}`),
         ]);
 
         renderHero(summary, daily);
@@ -592,6 +617,29 @@ function onRangeClick(e) {
     refresh();
 }
 
+/**
+ * Click handler for the kind pills (All/Video/Music). Persists selection so
+ * the choice survives across page swaps and reloads.
+ */
+function onKindClick(e) {
+    const btn = e.target.closest('.kind-btn');
+    if (!btn) return;
+    const next = btn.dataset.kind || 'all';
+    if (next === currentKind) return;
+    document.querySelectorAll('.kind-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    currentKind = next;
+    try { localStorage.setItem('dashboardKind', next); } catch {}
+    refresh();
+}
+
+/** Sets the active class on the kind pill that matches the persisted selection. */
+function syncKindButtons() {
+    document.querySelectorAll('.kind-btn').forEach(b => {
+        b.classList.toggle('active', b.dataset.kind === currentKind);
+    });
+}
+
 registerPage('dashboard', {
     mount: () => {
         // The dashboard root receives the delegated range-click listener.
@@ -599,7 +647,9 @@ registerPage('dashboard', {
         // automatically on unmount when the DOM is replaced.
         const root = document.querySelector('.dashboard-page');
         root?.addEventListener('click', onRangeClick);
+        root?.addEventListener('click', onKindClick);
 
+        syncKindButtons();
         window.addEventListener('snacks:encode-history-changed', onHistoryChanged);
 
         refresh();

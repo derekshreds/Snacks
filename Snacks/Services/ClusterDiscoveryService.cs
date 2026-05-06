@@ -619,8 +619,35 @@ public sealed class ClusterDiscoveryService
             // back to the singleton "any local job running" check so they keep
             // their current dispatch behaviour.
             CanAcceptJobs          = _transcodingService.GetActiveWorkItem() == null,
-            Devices                = _transcodingService.GetDetectedDevices(),
+            Devices                = BuildDevicesWithMusic(),
+            SupportsMusic          = true,
         };
+    }
+
+    /// <summary>
+    ///     Returns the worker's hardware devices augmented with a synthetic
+    ///     <c>music</c> device so the master's existing per-device slot
+    ///     accounting can track music dispatches uniformly. The device
+    ///     advertises a single supported codec (<c>music</c>) so the video
+    ///     dispatcher's codec-match scoring rejects it for video work; the
+    ///     master's music dispatcher routes only music jobs to it.
+    /// </summary>
+    private List<Models.HardwareDevice> BuildDevicesWithMusic()
+    {
+        var devices = _transcodingService.GetDetectedDevices();
+        if (!devices.Any(d => d.DeviceId == "music"))
+        {
+            devices.Add(new Models.HardwareDevice
+            {
+                DeviceId           = "music",
+                DisplayName        = "Music (CPU)",
+                SupportedCodecs    = new() { "music" },
+                Encoders           = new() { "libmp3lame", "aac", "libopus", "libvorbis", "flac" },
+                DefaultConcurrency = 2,
+                IsHardware         = false,
+            });
+        }
+        return devices;
     }
 
     /// <summary> Builds and caches the list of encoder identifiers supported by this node's hardware. </summary>

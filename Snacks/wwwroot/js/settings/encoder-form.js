@@ -30,6 +30,25 @@ const ENCODER_MAP = {
     av1:  'libsvtav1',
 };
 
+/**
+ * Returns the music codec string for a given music container format. The
+ * server's MusicEncoderArgs.ResolveEncoder maps these onward to ffmpeg
+ * encoder names (libmp3lame, aac, libopus, libvorbis, flac).
+ *
+ * @param {string} format
+ * @returns {string}
+ */
+function musicCodecForFormat(format) {
+    switch ((format ?? '').toLowerCase()) {
+        case 'mp3':  return 'libmp3lame';
+        case 'm4a':  return 'aac';
+        case 'opus': return 'libopus';
+        case 'ogg':  return 'libvorbis';
+        case 'flac': return 'flac';
+        default:     return 'aac';
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -278,6 +297,21 @@ export function getEncoderOptions(prefix = 'settings') {
         DownscaleTarget:     str('DownscaleTarget', '1080p'),
         TonemapHdrToSdr:     bool('TonemapHdrToSdr'),
         FfmpegQualityPreset: str('FfmpegQualityPreset', 'medium'),
+
+        // Music — nested object on EncoderOptions, codec is derived from the format selector.
+        Music: {
+            Format:                   str('MusicFormat', 'm4a'),
+            Codec:                    musicCodecForFormat(str('MusicFormat', 'm4a')),
+            BitrateKbps:              num('MusicBitrate', 192),
+            SampleRatePolicy:         str('MusicSampleRate', 'Source'),
+            ChannelPolicy:            str('MusicChannels', 'Source'),
+            SkipIfAlreadyTargetCodec: bool('MusicSkipIfTarget', true),
+            BitrateMatchTolerancePct: Math.max(0, num('MusicTolerance', 15)),
+            CopyMetadataAndArt:       bool('MusicCopyMetadata', true),
+            DeleteOriginalFile:       bool('MusicDeleteOriginal'),
+            MasterMusicConcurrency:   Math.max(1, num('MusicConcurrency', 2)),
+            DispatchToCluster:        bool('MusicCluster', true),
+        },
     };
 
     // Best-effort auto-save. A failure here doesn't block the return value;
@@ -383,6 +417,41 @@ export async function restoreEncoderOptions(prefix = 'settings') {
         // Chip inputs — use explicit defaults so a fresh install gets sane values.
         setChipValues(`${prefix}AudioLanguagesToKeepChips`,    pick('AudioLanguagesToKeep')    ?? ['en']);
         setChipValues(`${prefix}SubtitleLanguagesToKeepChips`, pick('SubtitleLanguagesToKeep') ?? ['en']);
+
+        // Music settings (nested object). Pre-pivot settings.json files have no
+        // Music block — fall back to defaults so the panel renders with the
+        // documented out-of-the-box values.
+        const music = pick('Music') ?? {};
+        const mPick = (...keys) => {
+            for (const k of keys) {
+                if (music[k] !== undefined) return music[k];
+                const lower = k.charAt(0).toLowerCase() + k.slice(1);
+                if (music[lower] !== undefined) return music[lower];
+            }
+            return undefined;
+        };
+
+        set('MusicFormat',         mPick('Format')                   ?? 'm4a');
+        set('MusicBitrate',        mPick('BitrateKbps')              ?? 192);
+        set('MusicSampleRate',     mPick('SampleRatePolicy')         ?? 'Source');
+        set('MusicChannels',       mPick('ChannelPolicy')            ?? 'Source');
+        set('MusicSkipIfTarget',   mPick('SkipIfAlreadyTargetCodec') ?? true);
+        set('MusicTolerance',      mPick('BitrateMatchTolerancePct') ?? 15);
+        set('MusicCopyMetadata',   mPick('CopyMetadataAndArt')       ?? true);
+        set('MusicDeleteOriginal', mPick('DeleteOriginalFile')       ?? false);
+        set('MusicConcurrency',    mPick('MasterMusicConcurrency')   ?? 2);
+        set('MusicCluster',        mPick('DispatchToCluster')        ?? true);
+
+        // Hide the bitrate row when the format is FLAC (lossless).
+        const formatEl  = el(prefix, 'MusicFormat');
+        const bitrateEl = el(prefix, 'MusicBitrate')?.closest('[data-music-bitrate-row]');
+        if (formatEl && bitrateEl) {
+            const refreshBitrateRow = () => {
+                bitrateEl.style.display = formatEl.value === 'flac' ? 'none' : '';
+            };
+            refreshBitrateRow();
+            formatEl.addEventListener('change', refreshBitrateRow);
+        }
 
     } catch { /* silent — restore is best-effort */ }
 }

@@ -48,6 +48,14 @@ public sealed class JobMetadata
     public bool Is4K { get; set; }
 
     /// <summary>
+    ///     Distinguishes a video job from a music (audio-only) job. Pre-pivot
+    ///     master builds don't send this field — workers default-deserialize
+    ///     it to <see cref="MediaKind.Video"/>, preserving existing behaviour
+    ///     for compatibility.
+    /// </summary>
+    public MediaKind Kind { get; set; } = MediaKind.Video;
+
+    /// <summary>
     ///     SHA256 hash of the source file for end-to-end integrity verification.
     ///     The node computes this after upload and rejects the job if it doesn't match,
     ///     protecting against network corruption that could produce invalid output.

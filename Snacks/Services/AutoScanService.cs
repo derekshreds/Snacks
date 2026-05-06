@@ -484,15 +484,15 @@ public sealed class AutoScanService : IHostedService, IDisposable
 
             var globalOptions = LoadEncoderOptions();
 
-            var allVideoFiles = new List<string>();
+            var allMediaFiles = new List<string>();
             foreach (var dir in _config.Directories)
             {
                 var directories = _fileService.RecursivelyFindDirectories(dir.Path);
-                var files       = _fileService.GetAllVideoFiles(directories);
-                allVideoFiles.AddRange(files);
+                var files       = _fileService.GetAllMediaFiles(directories).Select(t => t.Path);
+                allMediaFiles.AddRange(files);
             }
 
-            var scannedDirs = allVideoFiles
+            var scannedDirs = allMediaFiles
                 .Select(f => Path.GetDirectoryName(f) ?? "")
                 .Distinct()
                 .ToList();
@@ -505,7 +505,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
             lock (_configLock) { exclusions = _config.ExclusionRules; }
 
             var newFiles = new List<string>();
-            foreach (var file in allVideoFiles)
+            foreach (var file in allMediaFiles)
             {
                 ct.ThrowIfCancellationRequested();
                 var normalizedPath = Path.GetFullPath(file);
@@ -572,9 +572,24 @@ public sealed class AutoScanService : IHostedService, IDisposable
 
                 var dir         = Path.GetDirectoryName(file) ?? "";
                 var baseName    = Path.GetFileNameWithoutExtension(file);
+                // Recognize a [snacks] companion of either kind: a music source's
+                // companion is in a music container (.m4a/.mp3/...), a video
+                // source's is a video container (.mkv/.mp4/...). The IsVideoFile/
+                // IsMusicFile helpers both reject [snacks]-suffixed paths, so
+                // probe the extension via GetMediaKind directly here.
                 var snacksFiles = Directory.Exists(dir)
                     ? Directory.GetFiles(dir, $"{baseName} [snacks].*")
-                        .Where(f => _fileService.IsVideoFile(f))
+                        .Where(f =>
+                        {
+                            var ext = Path.GetExtension(f).TrimStart('.').ToLowerInvariant();
+                            // Mirror the FileService extension lists. We can't call IsVideoFile/
+                            // IsMusicFile because those reject the [snacks] suffix outright.
+                            return ext is "mkv" or "mp4" or "ts" or "wmv" or "avi" or "m4v"
+                                          or "mpeg" or "mov" or "3gp" or "webm" or "flv"
+                                          or "mp3" or "m4a" or "flac" or "aac" or "ogg" or "opus"
+                                          or "wav" or "wma" or "alac" or "ape" or "aiff" or "dsf"
+                                          or "dff" or "mka" or "mp2";
+                        })
                         .ToList()
                     : new List<string>();
 
@@ -631,7 +646,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
             _config.LastScanNewFiles = newFileCount;
             SaveConfig();
 
-            await _hubContext.Clients.All.SendAsync("AutoScanCompleted", newFileCount, allVideoFiles.Count);
+            await _hubContext.Clients.All.SendAsync("AutoScanCompleted", newFileCount, allMediaFiles.Count);
 
             // Auto-scan only runs on the master, so this is naturally master-only.
             _ = _notificationService.NotifyScanCompletedAsync(newFileCount);

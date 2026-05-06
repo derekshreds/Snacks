@@ -1360,8 +1360,21 @@ public sealed class ClusterService : IHostedService, IDisposable
                         inFlightPaths.Add(Path.GetFullPath(uploadItem.Path));
                 }
 
+                bool anyMusicWorker = availableNow.Any(n => n.Capabilities?.SupportsMusic == true);
+                bool clusterMusicEnabled = globalOptions.Music?.DispatchToCluster ?? true;
+
                 var workItem = _transcodingService.DequeueForRemoteProcessing(item =>
                 {
+                    // Music items take a different routing path — the 4K worker checks
+                    // are video-only. Eligible only when (a) cluster dispatch is enabled
+                    // for music, and (b) at least one worker advertises SupportsMusic.
+                    if (item.Kind == MediaKind.Music)
+                    {
+                        if (!clusterMusicEnabled || !anyMusicWorker) return false;
+                        if (inFlightPaths.Contains(Path.GetFullPath(item.Path))) return false;
+                        return true;
+                    }
+
                     // Master's 4K preference only hogs an item type when no worker
                     // shares that preference — otherwise a worker configured the same
                     // way as the master would sit idle forever while master monopolised
@@ -1739,6 +1752,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                 Bitrate  = workItem.Bitrate,
                 IsHevc   = workItem.IsHevc,
                 Is4K     = workItem.Is4K,
+                Kind     = workItem.Kind,
                 // Empty deviceId for legacy nodes — they auto-pick on the worker side.
                 DeviceId                     = string.IsNullOrEmpty(deviceId) ? null : deviceId,
                 DeviceMaxConcurrency         = deviceMaxConcurrency,
@@ -2856,9 +2870,24 @@ public sealed class ClusterService : IHostedService, IDisposable
     {
         if (device.DeviceId == "cpu") return 1;
 
-        var ns = GetNodeSettings(node.NodeId);
-        if (ns?.DeviceSettings != null
-            && ns.DeviceSettings.TryGetValue(device.DeviceId, out var s)
+        // The synthetic music device reflects the master's global music concurrency
+        // setting unless a per-node override is configured. The worker reports a
+        // sensible default (2) but the master is the authoritative scheduler.
+        if (device.DeviceId == "music")
+        {
+            var ns = GetNodeSettings(node.NodeId);
+            if (ns?.DeviceSettings != null
+                && ns.DeviceSettings.TryGetValue("music", out var ms)
+                && ms.MaxConcurrency.HasValue)
+            {
+                return Math.Max(0, ms.MaxConcurrency.Value);
+            }
+            return Math.Max(0, LoadEncoderOptions().Music?.MasterMusicConcurrency ?? device.DefaultConcurrency);
+        }
+
+        var nsDev = GetNodeSettings(node.NodeId);
+        if (nsDev?.DeviceSettings != null
+            && nsDev.DeviceSettings.TryGetValue(device.DeviceId, out var s)
             && s.MaxConcurrency.HasValue)
         {
             return Math.Max(0, s.MaxConcurrency.Value);
@@ -3056,6 +3085,21 @@ public sealed class ClusterService : IHostedService, IDisposable
     /// </summary>
     private int ScoreSlot(ClusterNode node, HardwareDevice device, WorkItem workItem, EncoderOptions options)
     {
+        // Music routing: the synthetic "music" device only encodes music jobs, and
+        // music jobs only target it. This keeps GPU video slots free for video and
+        // prevents music items from accidentally landing on a video-only score path.
+        bool isMusicJob    = workItem.Kind == MediaKind.Music;
+        bool isMusicDevice = device.DeviceId == "music";
+        if (isMusicJob != isMusicDevice) return -100;
+        if (isMusicJob && isMusicDevice)
+        {
+            if (!options.Music.DispatchToCluster) return -100;
+            if (node.Capabilities?.SupportsMusic != true) return -100;
+            // Prefer least-loaded music nodes; the score decreases as occupancy rises.
+            int musicUsed = UsedDeviceSlots(node, "music");
+            return Math.Max(1, 100 - musicUsed * 10);
+        }
+
         var ns = GetNodeSettings(node.NodeId);
         if (ns != null)
         {
@@ -3655,7 +3699,8 @@ public sealed class ClusterService : IHostedService, IDisposable
                                     Duration = workItem.Length,
                                     Bitrate  = workItem.Bitrate,
                                     IsHevc   = workItem.IsHevc,
-                                    Is4K     = workItem.Is4K
+                                    Is4K     = workItem.Is4K,
+                                    Kind     = workItem.Kind,
                                 };
 
                                 var uploadClient = _discovery.CreateAuthenticatedClient();

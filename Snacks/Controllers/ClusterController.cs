@@ -1120,55 +1120,70 @@ public sealed class ClusterController : ControllerBase
      *  Endpoint shapes mirror <see cref="DashboardController"/> exactly.
      ******************************************************************/
 
+    /// <summary>
+    ///     Parses the optional <c>kind</c> query parameter for media-type filtering.
+    ///     Mirrors <c>DashboardController.ParseKind</c> exactly.
+    /// </summary>
+    private static MediaKind? ParseDashboardKind(string? kind)
+    {
+        if (string.IsNullOrWhiteSpace(kind)) return null;
+        return kind.Trim().ToLowerInvariant() switch
+        {
+            "video" => MediaKind.Video,
+            "music" => MediaKind.Music,
+            _       => null,
+        };
+    }
+
     /// <summary> Lifetime totals for the hero strip. </summary>
     [HttpGet("dashboard/summary")]
-    public async Task<IActionResult> DashboardSummary()
-        => Ok(await _historyRepo.GetSummaryAsync());
+    public async Task<IActionResult> DashboardSummary([FromQuery] string? kind = null)
+        => Ok(await _historyRepo.GetSummaryAsync(ParseDashboardKind(kind)));
 
     /// <summary> Daily savings rollup for the time-series chart. </summary>
     [HttpGet("dashboard/savings-over-time")]
-    public async Task<IActionResult> DashboardSavingsOverTime([FromQuery] int days = 30)
+    public async Task<IActionResult> DashboardSavingsOverTime([FromQuery] int days = 30, [FromQuery] string? kind = null)
     {
         days = Math.Clamp(days, 1, 365);
-        return Ok(await _historyRepo.GetSavingsOverTimeAsync(days));
+        return Ok(await _historyRepo.GetSavingsOverTimeAsync(days, ParseDashboardKind(kind)));
     }
 
     /// <summary> Per-device totals for the device utilization stripe. </summary>
     [HttpGet("dashboard/device-utilization")]
-    public async Task<IActionResult> DashboardDeviceUtilization([FromQuery] int days = 30)
+    public async Task<IActionResult> DashboardDeviceUtilization([FromQuery] int days = 30, [FromQuery] string? kind = null)
     {
         days = Math.Clamp(days, 1, 365);
-        return Ok(await _historyRepo.GetDeviceUtilizationAsync(days));
+        return Ok(await _historyRepo.GetDeviceUtilizationAsync(days, ParseDashboardKind(kind)));
     }
 
     /// <summary> Output codec mix donut data. </summary>
     [HttpGet("dashboard/codec-mix")]
-    public async Task<IActionResult> DashboardCodecMix([FromQuery] int days = 30)
+    public async Task<IActionResult> DashboardCodecMix([FromQuery] int days = 30, [FromQuery] string? kind = null)
     {
         days = Math.Clamp(days, 1, 365);
-        return Ok(await _historyRepo.GetCodecMixAsync(days));
+        return Ok(await _historyRepo.GetCodecMixAsync(days, ParseDashboardKind(kind)));
     }
 
     /// <summary> Per-node throughput leaderboard. </summary>
     [HttpGet("dashboard/node-throughput")]
-    public async Task<IActionResult> DashboardNodeThroughput([FromQuery] int days = 30)
+    public async Task<IActionResult> DashboardNodeThroughput([FromQuery] int days = 30, [FromQuery] string? kind = null)
     {
         days = Math.Clamp(days, 1, 365);
-        return Ok(await _historyRepo.GetNodeThroughputAsync(days));
+        return Ok(await _historyRepo.GetNodeThroughputAsync(days, ParseDashboardKind(kind)));
     }
 
     /// <summary> Most recent N completed encodes. </summary>
     [HttpGet("dashboard/recent")]
-    public async Task<IActionResult> DashboardRecent([FromQuery] int limit = 25)
-        => Ok(await _historyRepo.GetRecentAsync(limit));
+    public async Task<IActionResult> DashboardRecent([FromQuery] int limit = 25, [FromQuery] string? kind = null)
+        => Ok(await _historyRepo.GetRecentAsync(limit, ParseDashboardKind(kind)));
 
     /// <summary> Top compression wins. </summary>
     [HttpGet("dashboard/top-savings")]
-    public async Task<IActionResult> DashboardTopSavings([FromQuery] int limit = 10, [FromQuery] int days = 365)
+    public async Task<IActionResult> DashboardTopSavings([FromQuery] int limit = 10, [FromQuery] int days = 365, [FromQuery] string? kind = null)
     {
         limit = Math.Clamp(limit, 1, 100);
         days  = Math.Clamp(days, 1, 365);
-        return Ok(await _historyRepo.GetTopSavingsAsync(limit, days));
+        return Ok(await _historyRepo.GetTopSavingsAsync(limit, days, ParseDashboardKind(kind)));
     }
 
     /// <summary>

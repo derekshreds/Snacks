@@ -52,12 +52,17 @@ public class EncodeHistoryRepository
 
     /// <summary>
     ///     Top-line stats for the dashboard hero strip: lifetime totals
-    ///     across every completed encode in the ledger.
+    ///     across every completed encode in the ledger. Optional
+    ///     <paramref name="kind"/> scopes the totals to video-only or
+    ///     music-only when the dashboard's media-type filter is active.
     /// </summary>
-    public async Task<HistorySummary> GetSummaryAsync()
+    public async Task<HistorySummary> GetSummaryAsync(MediaKind? kind = null)
     {
         using var context = await _contextFactory.CreateDbContextAsync();
-        var stats = await context.EncodeHistory
+        var query = context.EncodeHistory.AsQueryable();
+        if (kind.HasValue) query = query.Where(e => e.Kind == kind.Value);
+
+        var stats = await query
             .GroupBy(_ => 1)
             .Select(g => new HistorySummary
             {
@@ -68,6 +73,8 @@ public class EncodeHistoryRepository
                 TotalContentSeconds = g.Sum(e => e.DurationSeconds),
                 FourKEncodes      = g.Count(e => e.Is4K),
                 NoSavingsEncodes  = g.Count(e => e.Outcome == "NoSavings"),
+                VideoEncodes      = g.Count(e => e.Kind == MediaKind.Video),
+                MusicEncodes      = g.Count(e => e.Kind == MediaKind.Music),
             })
             .FirstOrDefaultAsync();
 
@@ -79,14 +86,16 @@ public class EncodeHistoryRepository
     ///     Returns one bucket per UTC day in the requested range, including
     ///     empty days so the chart x-axis stays continuous.
     /// </summary>
-    public async Task<List<DailyAggregate>> GetSavingsOverTimeAsync(int days)
+    public async Task<List<DailyAggregate>> GetSavingsOverTimeAsync(int days, MediaKind? kind = null)
     {
         if (days <= 0) days = 30;
         var cutoff = DateTime.UtcNow.Date.AddDays(-days + 1);
 
         using var context = await _contextFactory.CreateDbContextAsync();
-        var rows = await context.EncodeHistory
-            .Where(e => e.CompletedAt >= cutoff)
+        var query = context.EncodeHistory.Where(e => e.CompletedAt >= cutoff);
+        if (kind.HasValue) query = query.Where(e => e.Kind == kind.Value);
+
+        var rows = await query
             .GroupBy(e => e.CompletedAt.Date)
             .Select(g => new DailyAggregate
             {
@@ -116,14 +125,16 @@ public class EncodeHistoryRepository
     ///     workload stripe — total encode hours, files done, and bytes
     ///     saved per device family.
     /// </summary>
-    public async Task<List<DeviceAggregate>> GetDeviceUtilizationAsync(int days)
+    public async Task<List<DeviceAggregate>> GetDeviceUtilizationAsync(int days, MediaKind? kind = null)
     {
         if (days <= 0) days = 30;
         var cutoff = DateTime.UtcNow.Date.AddDays(-days + 1);
 
         using var context = await _contextFactory.CreateDbContextAsync();
-        return await context.EncodeHistory
-            .Where(e => e.CompletedAt >= cutoff)
+        var query = context.EncodeHistory.Where(e => e.CompletedAt >= cutoff);
+        if (kind.HasValue) query = query.Where(e => e.Kind == kind.Value);
+
+        return await query
             .GroupBy(e => e.DeviceId)
             .Select(g => new DeviceAggregate
             {
@@ -141,14 +152,16 @@ public class EncodeHistoryRepository
     ///     Output codec breakdown over the trailing window — feeds the
     ///     dashboard donut chart.
     /// </summary>
-    public async Task<List<CodecAggregate>> GetCodecMixAsync(int days)
+    public async Task<List<CodecAggregate>> GetCodecMixAsync(int days, MediaKind? kind = null)
     {
         if (days <= 0) days = 30;
         var cutoff = DateTime.UtcNow.Date.AddDays(-days + 1);
 
         using var context = await _contextFactory.CreateDbContextAsync();
-        return await context.EncodeHistory
-            .Where(e => e.CompletedAt >= cutoff)
+        var query = context.EncodeHistory.Where(e => e.CompletedAt >= cutoff);
+        if (kind.HasValue) query = query.Where(e => e.Kind == kind.Value);
+
+        return await query
             .GroupBy(e => e.EncodedCodec)
             .Select(g => new CodecAggregate
             {
@@ -164,14 +177,16 @@ public class EncodeHistoryRepository
     ///     Per-node throughput over the trailing window. Drives the
     ///     "where did the work get done" leaderboard.
     /// </summary>
-    public async Task<List<NodeAggregate>> GetNodeThroughputAsync(int days)
+    public async Task<List<NodeAggregate>> GetNodeThroughputAsync(int days, MediaKind? kind = null)
     {
         if (days <= 0) days = 30;
         var cutoff = DateTime.UtcNow.Date.AddDays(-days + 1);
 
         using var context = await _contextFactory.CreateDbContextAsync();
-        return await context.EncodeHistory
-            .Where(e => e.CompletedAt >= cutoff)
+        var query = context.EncodeHistory.Where(e => e.CompletedAt >= cutoff);
+        if (kind.HasValue) query = query.Where(e => e.Kind == kind.Value);
+
+        return await query
             .GroupBy(e => new { e.NodeId, e.NodeHostname })
             .Select(g => new NodeAggregate
             {
@@ -188,13 +203,16 @@ public class EncodeHistoryRepository
     /// <summary>
     ///     Most recent N encodes for the dashboard's recent-activity table.
     /// </summary>
-    public async Task<List<EncodeHistory>> GetRecentAsync(int limit)
+    public async Task<List<EncodeHistory>> GetRecentAsync(int limit, MediaKind? kind = null)
     {
         if (limit <= 0) limit = 25;
         if (limit > 200) limit = 200;
 
         using var context = await _contextFactory.CreateDbContextAsync();
-        return await context.EncodeHistory
+        var query = context.EncodeHistory.AsQueryable();
+        if (kind.HasValue) query = query.Where(e => e.Kind == kind.Value);
+
+        return await query
             .OrderByDescending(e => e.CompletedAt)
             .Take(limit)
             .ToListAsync();
@@ -217,7 +235,7 @@ public class EncodeHistoryRepository
     ///     bytes saved. Surfaces the most "look how much we shrunk this"
     ///     stories for the leaderboard.
     /// </summary>
-    public async Task<List<EncodeHistory>> GetTopSavingsAsync(int limit, int days)
+    public async Task<List<EncodeHistory>> GetTopSavingsAsync(int limit, int days, MediaKind? kind = null)
     {
         if (limit <= 0) limit = 10;
         if (limit > 100) limit = 100;
@@ -225,8 +243,10 @@ public class EncodeHistoryRepository
         var cutoff = DateTime.UtcNow.Date.AddDays(-days + 1);
 
         using var context = await _contextFactory.CreateDbContextAsync();
-        return await context.EncodeHistory
-            .Where(e => e.CompletedAt >= cutoff && e.Outcome == "Completed")
+        var query = context.EncodeHistory.Where(e => e.CompletedAt >= cutoff && e.Outcome == "Completed");
+        if (kind.HasValue) query = query.Where(e => e.Kind == kind.Value);
+
+        return await query
             .OrderByDescending(e => e.BytesSaved)
             .Take(limit)
             .ToListAsync();
@@ -243,6 +263,10 @@ public sealed class HistorySummary
     public double TotalContentSeconds { get; set; }
     public int    FourKEncodes        { get; set; }
     public int    NoSavingsEncodes    { get; set; }
+    /// <summary>Encode count attributed to <see cref="MediaKind.Video"/> rows. Used by the dashboard hero subtitle to surface a "video / music" split.</summary>
+    public int    VideoEncodes        { get; set; }
+    /// <summary>Encode count attributed to <see cref="MediaKind.Music"/> rows.</summary>
+    public int    MusicEncodes        { get; set; }
 }
 
 /// <summary>Per-day rollup for the savings time-series chart.</summary>

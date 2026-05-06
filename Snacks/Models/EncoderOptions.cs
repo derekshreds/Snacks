@@ -192,6 +192,19 @@ public sealed class EncoderOptions
     public string HardwareAcceleration { get; set; } = "auto";
 
     /******************************************************************
+     *  Music (audio-only files)
+     ******************************************************************/
+
+    /// <summary>
+    ///     Settings for music (audio-only) file transcoding. Music encoding shares the
+    ///     queue, scheduler, cluster dispatcher, and analytics with video, but has its
+    ///     own encoder pipeline (<c>ConvertMusicAsync</c>) and an independent slot pool
+    ///     so it never competes with GPU video slots. Pre-pivot <c>settings.json</c>
+    ///     files load with this initialized to defaults.
+    /// </summary>
+    public MusicEncoderOptions Music { get; set; } = new();
+
+    /******************************************************************
      *  Cloning
      ******************************************************************/
 
@@ -234,6 +247,7 @@ public sealed class EncoderOptions
         OutputDirectory            = OutputDirectory,
         EncodeDirectory            = EncodeDirectory,
         HardwareAcceleration       = HardwareAcceleration,
+        Music                      = Music.Clone(),
     };
 
     /******************************************************************

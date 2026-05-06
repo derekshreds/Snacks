@@ -212,25 +212,36 @@ export class LibraryBrowser {
             const data = await libraryApi.getFiles(directoryPath, false);
 
             if (data.files.length === 0) {
-                container.innerHTML = '<div class="text-muted text-center py-4"><i class="fas fa-file-video fa-2x mb-2"></i><br>No video files in this folder</div>';
+                container.innerHTML = '<div class="text-muted text-center py-4"><i class="fas fa-photo-film fa-2x mb-2"></i><br>No media files in this folder</div>';
                 return;
             }
 
-            container.innerHTML = data.files.map(file => `
-                <div class="file-item p-2 border-bottom" data-path="${escapeHtml(file.path)}">
+            const videoCount = data.files.filter(f => (f.kind ?? 'Video') !== 'Music').length;
+            const musicCount = data.files.length - videoCount;
+            const breakdownHtml = (videoCount && musicCount)
+                ? `<div class="text-muted small mb-2 px-2">${videoCount} video · ${musicCount} music</div>`
+                : '';
+
+            container.innerHTML = breakdownHtml + data.files.map(file => {
+                const isMusic = (file.kind ?? 'Video') === 'Music';
+                const icon  = isMusic ? 'fa-music'      : 'fa-file-video';
+                const tone  = isMusic ? 'text-info'     : 'text-primary';
+                return `
+                <div class="file-item p-2 border-bottom" data-path="${escapeHtml(file.path)}" data-kind="${escapeHtml(file.kind ?? 'Video')}">
                     <div class="form-check d-flex align-items-center">
                         <input class="form-check-input me-3" type="checkbox" value="${escapeHtml(file.path)}" id="file-${file.path.replace(/[^a-zA-Z0-9]/g, '_')}">
                         <label class="form-check-label w-100" for="file-${file.path.replace(/[^a-zA-Z0-9]/g, '_')}">
                             <div class="d-flex justify-content-between align-items-center">
                                 <div>
-                                    <i class="fas fa-file-video text-primary me-2"></i>
+                                    <i class="fas ${icon} ${tone} me-2"></i>
                                     <strong>${escapeHtml(file.name)}</strong>
                                 </div>
                                 <small class="text-muted">${formatFileSize(file.size)}</small>
                             </div>
                         </label>
                     </div>
-                </div>`).join('');
+                </div>`;
+            }).join('');
 
             container.querySelectorAll('input[type="checkbox"]').forEach(checkbox => {
                 checkbox.addEventListener('change', () => {

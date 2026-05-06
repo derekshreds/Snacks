@@ -62,6 +62,29 @@ public class TranscodingService
     /// </summary>
     private readonly ConcurrentDictionary<string, ActiveLocalJob> _activeLocalJobs = new();
 
+    /// <summary>
+    ///     Sentinel <see cref="ActiveLocalJob.DeviceId"/> for music encodes. They
+    ///     occupy <see cref="_activeLocalJobs"/> so cancel/kill plumbing works
+    ///     uniformly, but <see cref="TryAcquireLocalDeviceSlot"/> only counts
+    ///     entries against <see cref="HardwareDevice.DeviceId"/>s — and "music"
+    ///     is never a hardware device — so music never tilts the GPU caps and
+    ///     vice versa. The real music gate is <see cref="_musicSlots"/>.
+    /// </summary>
+    private const string MusicDeviceId = "music";
+
+    /// <summary>
+    ///     CPU-only concurrency cap for music encodes, sized from
+    ///     <c>EncoderOptions.Music.MasterMusicConcurrency</c>. Resized live by
+    ///     <see cref="UpdateOptions"/> when the user adjusts the slider.
+    /// </summary>
+    private SemaphoreSlim _musicSlots = new(2, int.MaxValue);
+
+    /// <summary>Current configured music concurrency. Used to detect setting changes for resize.</summary>
+    private int _musicSlotCapacity = 2;
+
+    /// <summary>Serializes music-slot resize against acquire/release on the scheduler.</summary>
+    private readonly object _musicSlotsLock = new();
+
     /// <summary>Lock protecting per-job <see cref="ActiveLocalJob.Process"/> publication.</summary>
     private readonly object _activeLock = new();
 
@@ -424,6 +447,12 @@ public class TranscodingService
     /// <returns>The work item ID (may be a previously existing ID if the file was already tracked).</returns>
     public async Task<string> AddFileAsync(string filePath, EncoderOptions options, bool force = false, CancellationToken cancellationToken = default)
     {
+        // Music files take a much leaner code path — no HDR/4K/HW-accel logic, no
+        // per-track audio profiles, no subtitle handling. Dispatch on extension here
+        // so the video path below stays unchanged.
+        if (_fileService.GetMediaKind(filePath) == MediaKind.Music)
+            return await AddMusicFileAsync(filePath, options, force, cancellationToken);
+
         try
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -476,7 +505,8 @@ public class TranscodingService
                 Bitrate = bitrate,
                 Length = length,
                 IsHevc = isHevc,
-                Probe = probe
+                Probe = probe,
+                Kind = MediaKind.Video,
             };
 
             // Don't add items that already meet the requirements.
@@ -713,11 +743,200 @@ public class TranscodingService
     }
 
     /// <summary>
-    ///     Adds all video files in a directory to the encoding queue.
+    ///     Music-aware counterpart to <see cref="AddFileAsync"/>. Probes the file,
+    ///     applies the music-specific skip ladder (codec+bitrate match, lossy-to-lossless
+    ///     guard), then creates a <see cref="MediaFile"/> row and a <see cref="WorkItem"/>
+    ///     tagged with <see cref="MediaKind.Music"/> and queues it. Music jobs run on the
+    ///     dedicated <see cref="_musicSlots"/> pool so they never compete with GPU video slots.
+    /// </summary>
+    private async Task<string> AddMusicFileAsync(
+        string filePath, EncoderOptions options, bool force, CancellationToken cancellationToken)
+    {
+        try
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var fileInfo = new FileInfo(filePath);
+            var probe    = await _ffprobeService.ProbeAsync(filePath, cancellationToken);
+
+            double length = 0;
+            if (double.TryParse(probe.Format?.Duration, out var d)) length = d;
+
+            var sourceCodec  = MusicEncoderArgs.GetSourceCodec(probe);
+            var sourceKbps   = MusicEncoderArgs.GetSourceBitrateKbps(probe);
+            var sourceChans  = MusicEncoderArgs.GetSourceChannels(probe);
+
+            var workItem = new WorkItem
+            {
+                FileName = _fileService.GetFileName(filePath),
+                Path     = filePath,
+                Size     = fileInfo.Length,
+                Bitrate  = sourceKbps,
+                Length   = length,
+                Probe    = probe,
+                Kind     = MediaKind.Music,
+            };
+
+            var music = options.Music;
+            var targetEncoder = MusicEncoderArgs.ResolveEncoder(music.Codec);
+            bool targetLossless = MusicEncoderArgs.IsLossless(targetEncoder);
+            bool sourceLossy    = MusicEncoderArgs.IsLossy(sourceCodec);
+            var normalizedPath  = Path.GetFullPath(filePath);
+
+            async Task MarkSkippedInDb(string reason)
+            {
+                Console.WriteLine($"Skipping {workItem.FileName}: {reason}");
+                await _mediaFileRepo.UpsertAsync(new MediaFile
+                {
+                    FilePath      = normalizedPath,
+                    Directory     = Path.GetDirectoryName(normalizedPath) ?? "",
+                    FileName      = Path.GetFileName(normalizedPath),
+                    BaseName      = Path.GetFileNameWithoutExtension(normalizedPath),
+                    FileSize      = fileInfo.Length,
+                    Bitrate       = sourceKbps,
+                    Codec         = sourceCodec,
+                    Duration      = length,
+                    Kind          = MediaKind.Music,
+                    Status        = MediaFileStatus.Skipped,
+                    LastScannedAt = DateTime.UtcNow,
+                    FileMtime     = fileInfo.LastWriteTimeUtc.Ticks,
+                });
+            }
+
+            // Lossy → lossless: re-encoding can't recover quality, so it just bloats files.
+            // Always skip with a clear reason; user can force via per-folder override.
+            if (sourceLossy && targetLossless && !force)
+            {
+                await MarkSkippedInDb("lossy-to-lossless avoided (no quality recovery possible)");
+                return workItem.Id;
+            }
+
+            // Codec + bitrate match — re-encoding lossy → lossy at near-target loses quality
+            // without saving meaningful space. Lossless source + lossless target is also a noop.
+            if (music.SkipIfAlreadyTargetCodec && !force)
+            {
+                bool codecMatch = string.Equals(sourceCodec, targetEncoder, StringComparison.OrdinalIgnoreCase)
+                    || (sourceCodec.Equals("aac", StringComparison.OrdinalIgnoreCase) && targetEncoder.Equals("aac", StringComparison.OrdinalIgnoreCase))
+                    || (sourceCodec.Equals("flac", StringComparison.OrdinalIgnoreCase) && targetEncoder.Equals("flac", StringComparison.OrdinalIgnoreCase));
+
+                if (codecMatch && sourceKbps > 0 && !targetLossless)
+                {
+                    int tolerance = Math.Max(0, music.BitrateMatchTolerancePct);
+                    long lower = music.BitrateKbps * (100L - tolerance) / 100;
+                    long upper = music.BitrateKbps * (100L + tolerance) / 100;
+                    if (sourceKbps >= lower && sourceKbps <= upper)
+                    {
+                        await MarkSkippedInDb($"already {sourceCodec} at {sourceKbps}kbps (target {music.BitrateKbps}kbps ±{tolerance}%)");
+                        return workItem.Id;
+                    }
+                }
+                else if (codecMatch && targetLossless && string.Equals(sourceCodec, "flac", StringComparison.OrdinalIgnoreCase))
+                {
+                    await MarkSkippedInDb("already flac (lossless target matches source)");
+                    return workItem.Id;
+                }
+            }
+
+            var dbFile = await _mediaFileRepo.GetByPathAsync(normalizedPath);
+
+            if (_workItems.Values.Any(w =>
+                Path.GetFullPath(w.Path).Equals(normalizedPath, StringComparison.OrdinalIgnoreCase) &&
+                w.Status is WorkItemStatus.Pending or WorkItemStatus.Processing
+                    or WorkItemStatus.Uploading or WorkItemStatus.Downloading))
+            {
+                return workItem.Id;
+            }
+
+            if (dbFile != null)
+            {
+                // Change detection mirrors the video path — a >10% size change or
+                // >30s duration change means the file was replaced, so reset and
+                // start fresh. Without this a corrected re-rip would be skipped
+                // because the prior row still says Completed/Failed.
+                double sizeDelta     = dbFile.FileSize > 0 ? Math.Abs(1.0 - (double)fileInfo.Length / dbFile.FileSize) : 0;
+                double durationDelta = dbFile.Duration > 0 && length > 0 ? Math.Abs(dbFile.Duration - length) : 0;
+                bool fileChanged     = sizeDelta > 0.10 || durationDelta > 30;
+
+                if (fileChanged)
+                {
+                    Console.WriteLine($"Music file changed on disk: {workItem.FileName} (size: {dbFile.FileSize}→{fileInfo.Length}) — resetting");
+                    await _mediaFileRepo.ResetFileAsync(normalizedPath);
+                }
+                else if (!force && dbFile.Status is MediaFileStatus.Cancelled)
+                {
+                    Console.WriteLine($"Skipping {workItem.FileName}: previously cancelled by user");
+                    return workItem.Id;
+                }
+                else if (!force && dbFile.Status is MediaFileStatus.Failed && dbFile.FailureCount >= 3)
+                {
+                    // Music encodes are fast and the pipeline is new — give a few retry
+                    // attempts before giving up so a transient bug or one-off ffmpeg
+                    // hiccup doesn't permanently bench a track. After 3 strikes the user
+                    // has to fix something or explicitly force-retry.
+                    Console.WriteLine($"Skipping {workItem.FileName}: failed {dbFile.FailureCount} times — permanent fail");
+                    return workItem.Id;
+                }
+                else if (!force && dbFile.Status is MediaFileStatus.Completed)
+                {
+                    Console.WriteLine($"Skipping {workItem.FileName}: already completed");
+                    return workItem.Id;
+                }
+            }
+
+            if (force)
+            {
+                var existing = _workItems.Values.FirstOrDefault(w =>
+                    Path.GetFullPath(w.Path).Equals(normalizedPath, StringComparison.OrdinalIgnoreCase));
+                if (existing != null)
+                    _workItems.TryRemove(existing.Id, out _);
+            }
+
+            await _mediaFileRepo.UpsertAsync(new MediaFile
+            {
+                FilePath      = normalizedPath,
+                Directory     = Path.GetDirectoryName(normalizedPath) ?? "",
+                FileName      = Path.GetFileName(normalizedPath),
+                BaseName      = Path.GetFileNameWithoutExtension(normalizedPath),
+                FileSize      = fileInfo.Length,
+                Bitrate       = sourceKbps,
+                Codec         = sourceCodec,
+                Duration      = length,
+                Kind          = MediaKind.Music,
+                Status        = MediaFileStatus.Queued,
+                LastScannedAt = DateTime.UtcNow,
+                FileMtime     = fileInfo.LastWriteTimeUtc.Ticks,
+            });
+
+            Console.WriteLine($"Queuing music {workItem.FileName}: {sourceCodec} {sourceKbps}kbps {sourceChans}ch → {music.Codec} {music.BitrateKbps}kbps");
+
+            _workItems[workItem.Id] = workItem;
+            lock (_queueLock)
+            {
+                _workQueue.Add(workItem);
+                _workQueue.Sort((a, b) => b.Bitrate.CompareTo(a.Bitrate));
+            }
+
+            await _hubContext.Clients.All.SendAsync("WorkItemAdded", workItem);
+
+            _ = Task.Run(async () =>
+            {
+                try { await ProcessQueueAsync(options); }
+                catch (Exception ex) { Console.WriteLine($"Error in ProcessQueueAsync: {ex.Message}"); }
+            });
+
+            return workItem.Id;
+        }
+        catch (Exception ex)
+        {
+            throw new Exception($"Failed to add music file: {ex.Message}", ex);
+        }
+    }
+
+    /// <summary>
+    ///     Adds all media files (video + music) in a directory to the encoding queue.
     ///     Files are probed sequentially to avoid overwhelming NAS storage.
     ///     Encoding starts as soon as the first file is scanned — no waiting for the full batch.
     /// </summary>
-    /// <param name="directoryPath">The directory to scan for video files.</param>
+    /// <param name="directoryPath">The directory to scan for media files.</param>
     /// <param name="options">Encoder options to apply to all files.</param>
     /// <param name="recursive">When <c>true</c>, subdirectories are also scanned.</param>
     /// <returns>A summary message with the count of files added.</returns>
@@ -732,13 +951,13 @@ public class TranscodingService
         {
             directories = new List<string> { directoryPath };
         }
-        var videoFiles = _fileService.GetAllVideoFiles(directories);
+        var mediaFiles = _fileService.GetAllMediaFiles(directories);
 
         // Probe files sequentially to avoid overwhelming NAS storage.
         // Each file triggers queue processing via AddFileAsync, so encoding
         // starts as soon as the first file is scanned — no waiting for the full scan.
         int addedCount = 0;
-        foreach (var file in videoFiles)
+        foreach (var (file, _) in mediaFiles)
         {
             try
             {
@@ -769,15 +988,92 @@ public class TranscodingService
         var directories = recursive
             ? _fileService.RecursivelyFindDirectories(directoryPath)
             : new List<string> { directoryPath };
-        var videoFiles = _fileService.GetAllVideoFiles(directories);
+        var mediaFiles = _fileService.GetAllMediaFiles(directories);
 
-        var results = new List<FileAnalysisResult>(videoFiles.Count);
-        foreach (var file in videoFiles)
+        var results = new List<FileAnalysisResult>(mediaFiles.Count);
+        foreach (var (file, kind) in mediaFiles)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            results.Add(await AnalyzeFileAsync(file, options, cancellationToken));
+            results.Add(kind == MediaKind.Music
+                ? await AnalyzeMusicFileAsync(file, options, cancellationToken)
+                : await AnalyzeFileAsync(file, options, cancellationToken));
         }
         return results;
+    }
+
+    /// <summary>
+    ///     Music dry-run prediction. Mirrors the skip ladder in
+    ///     <c>AddMusicFileAsync</c> so the analyze modal sees the same outcome the
+    ///     real run would produce. Lossy → lossless and codec+bitrate matches are
+    ///     surfaced as <c>Skip</c>; everything else is <c>Queue</c>.
+    /// </summary>
+    private async Task<FileAnalysisResult> AnalyzeMusicFileAsync(string filePath, EncoderOptions options, CancellationToken cancellationToken)
+    {
+        var result = new FileAnalysisResult
+        {
+            FilePath = filePath,
+            FileName = _fileService.GetFileName(filePath),
+        };
+
+        try
+        {
+            var fileInfo = new FileInfo(filePath);
+            result.SizeBytes = fileInfo.Length;
+
+            var probe = await _ffprobeService.ProbeAsync(filePath, cancellationToken);
+            double length = 0;
+            if (double.TryParse(probe.Format?.Duration, out var d)) length = d;
+
+            result.Duration    = length;
+            result.Codec       = MusicEncoderArgs.GetSourceCodec(probe);
+            result.BitrateKbps = MusicEncoderArgs.GetSourceBitrateKbps(probe);
+
+            var music         = options.Music;
+            var targetEncoder = MusicEncoderArgs.ResolveEncoder(music.Codec);
+            bool targetLossless = MusicEncoderArgs.IsLossless(targetEncoder);
+            bool sourceLossy    = MusicEncoderArgs.IsLossy(result.Codec);
+
+            if (sourceLossy && targetLossless)
+            {
+                result.Decision = "Skip";
+                result.Reason   = "lossy → lossless avoided (no quality recovery)";
+                return result;
+            }
+
+            bool codecMatch = string.Equals(result.Codec, targetEncoder, StringComparison.OrdinalIgnoreCase);
+            if (music.SkipIfAlreadyTargetCodec && codecMatch)
+            {
+                if (targetLossless)
+                {
+                    result.Decision = "Skip";
+                    result.Reason   = "already in target lossless codec";
+                    return result;
+                }
+                if (result.BitrateKbps > 0)
+                {
+                    int tolerance = Math.Max(0, music.BitrateMatchTolerancePct);
+                    long lower = music.BitrateKbps * (100L - tolerance) / 100;
+                    long upper = music.BitrateKbps * (100L + tolerance) / 100;
+                    if (result.BitrateKbps >= lower && result.BitrateKbps <= upper)
+                    {
+                        result.Decision = "Skip";
+                        result.Reason   = $"already {result.Codec} at {result.BitrateKbps}kbps (target {music.BitrateKbps}±{tolerance}%)";
+                        return result;
+                    }
+                }
+            }
+
+            result.Decision         = "Queue";
+            result.Reason           = $"transcode → {music.Codec} {music.BitrateKbps}kbps";
+            result.EncodeTargetKbps = music.BitrateKbps;
+            return result;
+        }
+        catch (Exception ex)
+        {
+            result.Decision = "Error";
+            result.Reason   = ex.Message;
+            return result;
+        }
     }
 
     /// <summary>
@@ -1221,7 +1517,11 @@ public class TranscodingService
             var encodedSize = workItem.OutputSize ?? 0;
             var noSavings   = encodedSize == 0 || encodedSize >= workItem.Size;
             var encodeStart = workItem.StartedAt ?? workItem.CreatedAt;
-            var srcCodec    = workItem.Probe?.Streams?.FirstOrDefault(s => s.CodecType == "video")?.CodecName ?? "";
+            bool isMusic    = workItem.Kind == MediaKind.Music;
+            var srcStream   = workItem.Probe?.Streams?.FirstOrDefault(s =>
+                s.CodecType == (isMusic ? "audio" : "video"));
+            var srcCodec    = srcStream?.CodecName ?? "";
+            var encodedCodec = isMusic ? options.Music.Codec : options.Codec;
 
             var record = new EncodeHistory
             {
@@ -1232,7 +1532,7 @@ public class TranscodingService
                 EncodedSizeBytes    = noSavings ? 0 : encodedSize,
                 BytesSaved          = noSavings ? 0 : Math.Max(0, workItem.Size - encodedSize),
                 OriginalCodec       = srcCodec,
-                EncodedCodec        = options.Codec,
+                EncodedCodec        = encodedCodec,
                 OriginalBitrateKbps = workItem.Bitrate,
                 EncodedBitrateKbps  = workItem.Length > 0 && encodedSize > 0
                     ? (long)(encodedSize * 8.0 / 1024.0 / workItem.Length)
@@ -1244,6 +1544,7 @@ public class TranscodingService
                 NodeHostname        = _localNodeIdentity.Hostname,
                 WasRemote           = false,
                 Is4K                = workItem.Is4K,
+                Kind                = workItem.Kind,
                 StartedAt           = encodeStart,
                 CompletedAt         = DateTime.UtcNow,
                 Outcome             = noSavings ? "NoSavings" : "Completed",
@@ -1412,14 +1713,22 @@ public class TranscodingService
                 // Reap completed inflight tasks before checking for queue-empty exit.
                 inflight.RemoveAll(t => t.IsCompleted);
 
-                bool queueEmpty;
+                var current = _lastOptions ?? options;
+
+                bool anyVideoPending, anyMusicPending;
                 lock (_queueLock)
                 {
                     _workQueue.RemoveAll(w => w.Status is WorkItemStatus.Cancelled or WorkItemStatus.Stopped);
-                    queueEmpty = !_workQueue.Any(w =>
+                    anyVideoPending = _workQueue.Any(w =>
+                        w.Kind == MediaKind.Video &&
                         w.Status == WorkItemStatus.Pending &&
                         (_shouldSkipLocal == null || !_shouldSkipLocal(w)));
+                    anyMusicPending = _workQueue.Any(w =>
+                        w.Kind == MediaKind.Music &&
+                        w.Status == WorkItemStatus.Pending);
                 }
+
+                bool queueEmpty = !anyVideoPending && !anyMusicPending;
 
                 if (queueEmpty && inflight.Count == 0) break;
 
@@ -1432,12 +1741,80 @@ public class TranscodingService
                     continue;
                 }
 
+                bool dispatched = false;
+
+                // ───── MUSIC DISPATCH ─────
+                // Music encodes run on a dedicated CPU-only slot pool that's
+                // independent of the per-device video pool — a queue full of
+                // music files can't starve a 4K HEVC encode and vice versa.
+                if (anyMusicPending)
+                {
+                    SemaphoreSlim slots;
+                    lock (_musicSlotsLock) { slots = _musicSlots; }
+                    if (await slots.WaitAsync(0))
+                    {
+                        WorkItem? musicItem;
+                        lock (_queueLock)
+                        {
+                            musicItem = _workQueue.FirstOrDefault(w =>
+                                w.Kind == MediaKind.Music &&
+                                w.Status == WorkItemStatus.Pending);
+                            if (musicItem != null) _workQueue.Remove(musicItem);
+                        }
+
+                        if (musicItem == null)
+                        {
+                            // Race: another path consumed it. Release the slot.
+                            slots.Release();
+                        }
+                        else if (musicItem.Status is WorkItemStatus.Cancelled or WorkItemStatus.Stopped)
+                        {
+                            slots.Release();
+                            _workItems.TryRemove(musicItem.Id, out _);
+                        }
+                        else
+                        {
+                            var musicFolderOverride = ResolveFolderOverride(musicItem.Path);
+                            var musicPerJobOptions = EncoderOptionsOverride.ApplyOverrides(current, musicFolderOverride, null);
+
+                            var musicActive = new ActiveLocalJob
+                            {
+                                Item     = musicItem,
+                                Cts      = new CancellationTokenSource(),
+                                DeviceId = MusicDeviceId,
+                            };
+                            _activeLocalJobs[musicItem.Id] = musicActive;
+                            musicItem.DispatchedDeviceId = MusicDeviceId;
+
+                            var releaseSlots = slots; // capture the semaphore this job acquired against
+                            var musicTask = Task.Run(async () =>
+                            {
+                                try { await ProcessMusicWorkItemAsync(musicItem, musicPerJobOptions, musicActive); }
+                                finally
+                                {
+                                    try { releaseSlots.Release(); } catch { /* disposed during shutdown */ }
+                                    WakeScheduler();
+                                }
+                            });
+                            inflight.Add(musicTask);
+                            dispatched = true;
+                        }
+                    }
+                }
+
+                // ───── VIDEO DISPATCH ─────
+                if (!anyVideoPending)
+                {
+                    if (!dispatched)
+                        await WaitForSchedulerProgressAsync(inflight);
+                    continue;
+                }
+
                 // Pick a device that has free capacity right now. The check
                 // reads the current count of in-flight encodes per device
                 // and the user's current cap from the settings provider, so
                 // a cap change applied while we're looping takes effect on
                 // the very next iteration with no semaphore rebuilding.
-                var current = _lastOptions ?? options;
                 var deviceId = TryAcquireLocalDeviceSlot(current);
                 if (deviceId == null)
                 {
@@ -1446,15 +1823,17 @@ public class TranscodingService
                     // mid-run would only take effect after the running encode
                     // finished, defeating the user's "let two run at once"
                     // intent.
-                    await WaitForSchedulerProgressAsync(inflight);
+                    if (!dispatched)
+                        await WaitForSchedulerProgressAsync(inflight);
                     continue;
                 }
 
-                // Pick the next pending item this device can encode.
+                // Pick the next pending video item this device can encode.
                 WorkItem? workItem;
                 lock (_queueLock)
                 {
                     workItem = _workQueue.FirstOrDefault(w =>
+                        w.Kind == MediaKind.Video &&
                         w.Status == WorkItemStatus.Pending &&
                         (_shouldSkipLocal == null || !_shouldSkipLocal(w)) &&
                         DeviceCanEncode(deviceId, w, current));
@@ -1465,7 +1844,8 @@ public class TranscodingService
                 {
                     // No item fits this device right now. Wait for inflight
                     // progress or settings-wake before reconsidering.
-                    await WaitForSchedulerProgressAsync(inflight);
+                    if (!dispatched)
+                        await WaitForSchedulerProgressAsync(inflight);
                     continue;
                 }
 
@@ -1748,6 +2128,217 @@ public class TranscodingService
         }
 
         await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
+    }
+
+    /// <summary>
+    ///     Music-only counterpart to <see cref="ProcessWorkItemAsync"/>. Drives the
+    ///     status/hub/watchdog plumbing around <see cref="ConvertMusicAsync"/> and
+    ///     records analytics on completion. The dedicated music slot semaphore is
+    ///     released by the dispatcher's wrapping continuation, not this method.
+    /// </summary>
+    private async Task ProcessMusicWorkItemAsync(WorkItem workItem, EncoderOptions options, ActiveLocalJob active)
+    {
+        try
+        {
+            workItem.Status    = WorkItemStatus.Processing;
+            workItem.StartedAt = DateTime.UtcNow;
+            workItem.Progress  = 0;
+            await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
+            await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Processing);
+
+            if (_notificationService != null && ShouldDispatchExternal)
+                _ = _notificationService.NotifyEncodeStartedAsync(Path.GetFileName(workItem.Path));
+
+            if (workItem.Probe == null)
+            {
+                workItem.Probe = await _ffprobeService.ProbeAsync(workItem.Path);
+                if (workItem.Length <= 0 && workItem.Probe?.Format?.Duration != null)
+                    workItem.Length = _ffprobeService.DurationStringToSeconds(workItem.Probe.Format.Duration);
+            }
+
+            using var watchdogCts = new CancellationTokenSource();
+            var watchdogTask = Task.Run(async () =>
+            {
+                try
+                {
+                    while (!watchdogCts.IsCancellationRequested)
+                    {
+                        await Task.Delay(TimeSpan.FromSeconds(30), watchdogCts.Token);
+                        if ((DateTime.UtcNow - workItem.LastUpdatedAt) > TimeSpan.FromMinutes(15))
+                        {
+                            await LogAsync(workItem.Id, "Watchdog: no music progress for 15 min — aborting job");
+                            active.Cts.Cancel();
+                            return;
+                        }
+                    }
+                }
+                catch (OperationCanceledException) { }
+            });
+
+            try
+            {
+                await ConvertMusicAsync(workItem, options, active.Cts.Token);
+            }
+            finally
+            {
+                watchdogCts.Cancel();
+                try { await watchdogTask; } catch { }
+            }
+
+            if (workItem.Status != WorkItemStatus.Failed)
+            {
+                bool noSavings = workItem.LastEncodeProducedNoSavings;
+                workItem.Status = noSavings ? WorkItemStatus.NoSavings : WorkItemStatus.Completed;
+                workItem.CompletedAt = DateTime.UtcNow;
+                workItem.Progress = 100;
+                Interlocked.Increment(ref _localCompletedJobs);
+                await _mediaFileRepo.SetStatusAndLastEncodedAtAsync(
+                    Path.GetFullPath(workItem.Path),
+                    noSavings ? MediaFileStatus.NoSavings : MediaFileStatus.Completed,
+                    DateTime.UtcNow);
+
+                if (!noSavings && _notificationService != null && ShouldDispatchExternal)
+                    _ = _notificationService.NotifyEncodeCompletedAsync(Path.GetFileName(workItem.Path), workItem.Size);
+
+                _ = RecordLocalEncodeHistoryAsync(workItem, options, active.DeviceId);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Cancelled — clean up partial output if it exists.
+            try
+            {
+                var outputPath = GetMusicOutputPath(workItem, options);
+                await _fileService.FileDeleteAsync(outputPath);
+            }
+            catch { }
+        }
+        catch (Exception ex)
+        {
+            Interlocked.Increment(ref _localFailedJobs);
+            workItem.Status = WorkItemStatus.Failed;
+            workItem.ErrorMessage = ex.Message;
+            workItem.CompletedAt = DateTime.UtcNow;
+            await _mediaFileRepo.IncrementFailureCountAsync(Path.GetFullPath(workItem.Path), ex.Message);
+
+            if (_notificationService != null && ShouldDispatchExternal)
+                _ = _notificationService.NotifyEncodeFailedAsync(Path.GetFileName(workItem.Path), ex.Message);
+        }
+        finally
+        {
+            _activeLocalJobs.TryRemove(workItem.Id, out _);
+            try { active.Cts.Dispose(); } catch { }
+        }
+
+        await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
+    }
+
+    /// <summary>
+    ///     Resolves the destination path for a music encode. Mirrors
+    ///     <see cref="GetOutputPath"/> for video but uses the music-specific
+    ///     extension and <see cref="MusicEncoderOptions.OutputDirectory"/>.
+    /// </summary>
+    private string GetMusicOutputPath(WorkItem workItem, EncoderOptions options)
+    {
+        var music = options.Music;
+        var fileName = _fileService.RemoveExtension(workItem.FileName);
+        var extension = "." + MusicEncoderArgs.ExtensionForFormat(music.Format);
+        var snacksName = $"{fileName} [snacks]{extension}";
+
+        if (!string.IsNullOrEmpty(music.OutputDirectory))
+            return Path.Combine(music.OutputDirectory, snacksName);
+
+        var originalDir = _fileService.GetDirectory(workItem.Path);
+        return Path.Combine(originalDir, snacksName);
+    }
+
+    /// <summary>
+    ///     Encodes a music file via ffmpeg. Significantly leaner than
+    ///     <c>ConvertVideoAsync</c>: no HDR detection, no hardware acceleration,
+    ///     no per-track audio profiles, no subtitle handling, no retry chain.
+    ///     On output ≥ source the encode is classified as no-savings and the
+    ///     output is discarded — same semantics as the video path.
+    /// </summary>
+    private async Task ConvertMusicAsync(WorkItem workItem, EncoderOptions options, CancellationToken cancellationToken)
+    {
+        if (workItem.Probe == null)
+            workItem.Probe = await _ffprobeService.ProbeAsync(workItem.Path, cancellationToken);
+
+        var outputPath = GetMusicOutputPath(workItem, options);
+        var outputDir  = Path.GetDirectoryName(outputPath);
+        if (!string.IsNullOrEmpty(outputDir) && !Directory.Exists(outputDir))
+            Directory.CreateDirectory(outputDir);
+
+        // Pre-clean any stale [snacks] output from a prior run; ffmpeg's -y also
+        // overwrites, but an explicit delete avoids ambiguity if the prior file
+        // was corrupt and ffmpeg's overwrite-in-place behavior on the user's NAS
+        // is finicky.
+        try { await _fileService.FileDeleteAsync(outputPath); } catch { }
+
+        var command = MusicEncoderArgs.Build(workItem.Path, outputPath, options.Music, workItem.Probe);
+        await LogAsync(workItem.Id, $"Music encode: ffmpeg {command}");
+        await RunFfmpegAsync(command, workItem, cancellationToken);
+
+        if (!File.Exists(outputPath))
+            throw new Exception("Music encode failed: output file not produced");
+
+        var outFileInfo = new FileInfo(outputPath);
+        if (outFileInfo.Length == 0)
+        {
+            try { await _fileService.FileDeleteAsync(outputPath); } catch { }
+            throw new Exception("Music encode failed: output file is empty");
+        }
+
+        // Validate output duration vs source (within 1s tolerance) — catches
+        // partial encodes where ffmpeg returned 0 but the file is truncated.
+        try
+        {
+            var outProbe = await _ffprobeService.ProbeAsync(outputPath, cancellationToken);
+            if (double.TryParse(outProbe.Format?.Duration, out var outDur)
+                && workItem.Length > 0
+                && Math.Abs(outDur - workItem.Length) > 1.0)
+            {
+                try { await _fileService.FileDeleteAsync(outputPath); } catch { }
+                throw new Exception($"Music encode failed: output duration {outDur:F1}s differs from source {workItem.Length:F1}s");
+            }
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception)
+        {
+            // Probe failure on output — treat as encode failure.
+            try { await _fileService.FileDeleteAsync(outputPath); } catch { }
+            throw;
+        }
+
+        workItem.OutputSize = outFileInfo.Length;
+
+        // No-savings classification: discard output if encoded >= source unless
+        // the user is doing a lossy → lossless intentional re-encode. A lossless
+        // FLAC output of an MP3 will always be larger; that's by design and
+        // shouldn't count as no-savings — but the AddMusicFileAsync skip ladder
+        // already prevents that case from running, so here we treat "encoded
+        // >= source" as discardable across the board.
+        if (outFileInfo.Length >= workItem.Size)
+        {
+            workItem.LastEncodeProducedNoSavings = true;
+            try { await _fileService.FileDeleteAsync(outputPath); } catch { }
+            await LogAsync(workItem.Id, $"Music encode produced no savings: {outFileInfo.Length} ≥ {workItem.Size} bytes — discarded");
+            return;
+        }
+
+        // Optional: delete original after successful encode.
+        if (options.Music.DeleteOriginalFile)
+        {
+            try
+            {
+                await _fileService.FileDeleteAsync(workItem.Path);
+                await LogAsync(workItem.Id, $"Deleted original: {workItem.FileName}");
+            }
+            catch (Exception ex)
+            {
+                await LogAsync(workItem.Id, $"Failed to delete original: {ex.Message}");
+            }
+        }
     }
 
     /// <summary>
@@ -4506,9 +5097,34 @@ public class TranscodingService
 
     /// <summary>
     ///     Updates the cached encoder options so that queued items pick up
-    ///     settings changes without needing a new scan.
+    ///     settings changes without needing a new scan. Also re-sizes the
+    ///     music-slot semaphore live, mirroring the per-device cap behavior
+    ///     for video — without this, raising <c>MasterMusicConcurrency</c>
+    ///     mid-run would only take effect after the queue drained.
     /// </summary>
-    public void UpdateOptions(EncoderOptions options) => _lastOptions = options;
+    public void UpdateOptions(EncoderOptions options)
+    {
+        _lastOptions = options;
+        ResizeMusicSlots(options.Music.MasterMusicConcurrency);
+        WakeScheduler();
+    }
+
+    /// <summary>
+    ///     Replaces <see cref="_musicSlots"/> with a fresh semaphore at the
+    ///     requested capacity. Live in-flight music encodes still hold their
+    ///     "old" semaphore and release into it when they finish — that's fine,
+    ///     because the new semaphore is what new acquisitions use.
+    /// </summary>
+    private void ResizeMusicSlots(int target)
+    {
+        target = Math.Max(1, Math.Min(target, 32));
+        lock (_musicSlotsLock)
+        {
+            if (target == _musicSlotCapacity) return;
+            _musicSlotCapacity = target;
+            _musicSlots = new SemaphoreSlim(target, int.MaxValue);
+        }
+    }
 
     /// <summary>
     ///     Resolves and persists <see cref="MediaFile.OriginalLanguage"/> for every row in
@@ -4875,6 +5491,7 @@ public class TranscodingService
             Length   = dbFile.Duration,
             IsHevc   = dbFile.IsHevc,
             Is4K     = dbFile.Is4K,
+            Kind     = dbFile.Kind,
             Probe    = null // Lazily probed when processing starts
         };
 
@@ -5112,6 +5729,7 @@ public class TranscodingService
                 Length = length,
                 IsHevc = isHevc,
                 Is4K = probe.Streams.Any(s => s.CodecType == "video" && s.Width > 1920),
+                Kind = _fileService.GetMediaKind(filePath) ?? MediaKind.Video,
                 Probe = probe,
                 Status = WorkItemStatus.Processing,
                 StartedAt = DateTime.UtcNow

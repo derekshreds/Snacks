@@ -95,6 +95,15 @@ public sealed class EncodeHistory
     /// <summary> Whether the source was 4K — useful for filtering the dashboard to UHD wins. </summary>
     public bool Is4K { get; set; }
 
+    /// <summary>
+    ///     Whether this row records a video encode or a music encode. Powers the
+    ///     dashboard's media-type filter chip — without it, every aggregation would
+    ///     blend video and music savings into a single line, and a 90%-reduction
+    ///     <c>flac → AAC</c> encode would dominate the "top compression wins"
+    ///     leaderboard against any video encode.
+    /// </summary>
+    public MediaKind Kind { get; set; } = MediaKind.Video;
+
     /// <summary> UTC timestamp when encoding started. </summary>
     public DateTime StartedAt { get; set; }
 

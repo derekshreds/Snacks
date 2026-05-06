@@ -11,7 +11,7 @@
             <div class="modal-header">
                 <h5 class="modal-title">
                     <i class="fas fa-folder-open me-2"></i>
-                    Video Library Browser
+                    Media Library Browser
                 </h5>
                 <button type="button" class="btn-close" onclick="document.getElementById('libraryModal').classList.remove('open')"></button>
             </div>
@@ -29,7 +29,7 @@
                     </div>
                     <div class="col-lg-8">
                         <div class="d-flex justify-content-between align-items-center mb-3">
-                            <h6><i class="fas fa-file-video me-2"></i>Video Files</h6>
+                            <h6><i class="fas fa-photo-film me-2"></i>Media Files</h6>
                             <div>
                                 <button id="selectAllFiles" class="btn btn-sm btn-outline-secondary me-2">
                                     <i class="fas fa-check-square me-1"></i> Select All
@@ -125,6 +125,7 @@
                     <ul class="nav nav-tabs settings-tabs" role="tablist">
                         <li class="nav-item" data-role-visible="master standalone"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#generalTab" type="button" role="tab"><i class="fas fa-sliders me-1"></i> General</button></li>
                         <li class="nav-item" data-role-visible="master standalone"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#audioTab" type="button" role="tab"><i class="fas fa-volume-high me-1"></i> Audio</button></li>
+                        <li class="nav-item" data-role-visible="master standalone"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#musicTab" type="button" role="tab"><i class="fas fa-music me-1"></i> Music</button></li>
                         <li class="nav-item" data-role-visible="master standalone"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#subtitleTab" type="button" role="tab"><i class="fas fa-closed-captioning me-1"></i> Subtitles</button></li>
                         <li class="nav-item" data-role-visible="master standalone"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#muxTab" type="button" role="tab"><i class="fas fa-layer-group me-1"></i> Mux</button></li>
                         <li class="nav-item" data-role-visible="master standalone"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#videoTab" type="button" role="tab"><i class="fas fa-film me-1"></i> Video</button></li>
@@ -142,6 +143,7 @@
                 <div class="tab-content mt-3">
                     <div class="tab-pane fade show active" id="generalTab"      role="tabpanel" data-role-visible="master standalone">@await Html.PartialAsync("_GeneralSettings", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })</div>
                     <div class="tab-pane fade"             id="audioTab"        role="tabpanel" data-role-visible="master standalone">@await Html.PartialAsync("_AudioSettings", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })</div>
+                    <div class="tab-pane fade"             id="musicTab"        role="tabpanel" data-role-visible="master standalone">@await Html.PartialAsync("_MusicSettings", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })</div>
                     <div class="tab-pane fade"             id="subtitleTab"     role="tabpanel" data-role-visible="master standalone">@await Html.PartialAsync("_SubtitleSettings", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })</div>
                     <div class="tab-pane fade"             id="muxTab"          role="tabpanel" data-role-visible="master standalone">@await Html.PartialAsync("_MuxSettings", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })</div>
                     <div class="tab-pane fade"             id="videoTab"        role="tabpanel" data-role-visible="master standalone">@await Html.PartialAsync("_VideoSettings", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })</div>

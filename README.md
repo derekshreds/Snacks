@@ -3,9 +3,9 @@
 </p>
 
 <h1 align="center">Snacks</h1>
-<p align="center"><strong>Automated Video Library Encoder</strong></p>
+<p align="center"><strong>Automated Media Library Transcoder</strong></p>
 <p align="center">
-  Batch transcode your entire video library with hardware acceleration.<br>
+  Batch transcode your entire video <em>and</em> music library with hardware acceleration.<br>
   Runs on your NAS via Docker or locally on Windows as a desktop app.
 </p>
 
