@@ -904,17 +904,21 @@ public class FfprobeService
 
         try
         {
-            // Split only on ':' first to preserve fractional seconds in the last component
+            // Split only on ':' first to preserve fractional seconds in the last component.
+            // ffprobe/ffmpeg always emit '.' as the decimal separator regardless of host
+            // locale, so parse against InvariantCulture — current-culture parsing on
+            // (e.g.) de-DE would treat the '.' as a thousands separator and either fail
+            // or return a value 10^N too large.
             string[] colonParts = input.Split(':');
             if (colonParts.Length >= 3)
             {
-                return double.Parse(colonParts[0]) * 3600
-                     + double.Parse(colonParts[1]) * 60
-                     + double.Parse(colonParts[2]); // "SS.ff" parsed as a decimal
+                return double.Parse(colonParts[0], NumberStyles.Float, CultureInfo.InvariantCulture) * 3600
+                     + double.Parse(colonParts[1], NumberStyles.Float, CultureInfo.InvariantCulture) * 60
+                     + double.Parse(colonParts[2], NumberStyles.Float, CultureInfo.InvariantCulture);
             }
             else
             {
-                return double.Parse(input);
+                return double.Parse(input, NumberStyles.Float, CultureInfo.InvariantCulture);
             }
         }
         catch

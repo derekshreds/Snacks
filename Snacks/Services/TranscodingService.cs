@@ -5,6 +5,7 @@ using Snacks.Hubs;
 using Snacks.Models;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 
@@ -759,7 +760,7 @@ public class TranscodingService
             var probe    = await _ffprobeService.ProbeAsync(filePath, cancellationToken);
 
             double length = 0;
-            if (double.TryParse(probe.Format?.Duration, out var d)) length = d;
+            if (double.TryParse(probe.Format?.Duration, NumberStyles.Float, CultureInfo.InvariantCulture, out var d)) length = d;
 
             var sourceCodec  = MusicEncoderArgs.GetSourceCodec(probe);
             var sourceKbps   = MusicEncoderArgs.GetSourceBitrateKbps(probe);
@@ -1022,7 +1023,7 @@ public class TranscodingService
 
             var probe = await _ffprobeService.ProbeAsync(filePath, cancellationToken);
             double length = 0;
-            if (double.TryParse(probe.Format?.Duration, out var d)) length = d;
+            if (double.TryParse(probe.Format?.Duration, NumberStyles.Float, CultureInfo.InvariantCulture, out var d)) length = d;
 
             result.Duration    = length;
             result.Codec       = MusicEncoderArgs.GetSourceCodec(probe);
@@ -2295,7 +2296,7 @@ public class TranscodingService
         try
         {
             var outProbe = await _ffprobeService.ProbeAsync(outputPath, cancellationToken);
-            if (double.TryParse(outProbe.Format?.Duration, out var outDur)
+            if (double.TryParse(outProbe.Format?.Duration, NumberStyles.Float, CultureInfo.InvariantCulture, out var outDur)
                 && workItem.Length > 0
                 && Math.Abs(outDur - workItem.Length) > 1.0)
             {
@@ -4553,7 +4554,7 @@ public class TranscodingService
                 double measuredSeconds = int.Parse(timeMatch.Groups[1].Value) * 3600
                                         + int.Parse(timeMatch.Groups[2].Value) * 60
                                         + int.Parse(timeMatch.Groups[3].Value)
-                                        + double.Parse("0." + timeMatch.Groups[4].Value);
+                                        + double.Parse("0." + timeMatch.Groups[4].Value, NumberStyles.Float, CultureInfo.InvariantCulture);
                 if (measuredSeconds < 1) return 0;
                 return (long)(videoKb * 8 / measuredSeconds);
             }
