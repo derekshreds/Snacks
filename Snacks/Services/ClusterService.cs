@@ -90,6 +90,18 @@ public sealed class ClusterService : IHostedService, IDisposable
     ///     output-path decisions for jobs already encoding.
     /// </summary>
     private readonly ConcurrentDictionary<string, EncoderOptions> _dispatchedOptions = new();
+
+    /// <summary>
+    ///     Tracks jobs accepted under shared-storage mode keyed by jobId. Holds
+    ///     the master's expected output path so <c>HandleRemoteCompletionAsync</c>
+    ///     can skip the download phase and finalize from the shared file directly.
+    ///     Cleared as part of normal job teardown (completion, cancel, or dispatch
+    ///     failure) — never persisted, since a master crash invalidates the in-flight
+    ///     job and recovery re-dispatches under whichever mode is currently
+    ///     negotiated.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, string> _sharedJobOutputPaths = new();
+
     /// <summary>
     ///     Tracks in-flight dispatch tasks keyed by work-item ID so the loop
     ///     can reap completed ones for hygiene. Multiple dispatches to the
@@ -400,6 +412,15 @@ public sealed class ClusterService : IHostedService, IDisposable
 
     /// <summary> Returns the current cluster configuration. </summary>
     public ClusterConfig GetConfig() => _config;
+
+    /// <summary>
+    ///     Returns the master's expected shared-storage output path for a job, or
+    ///     <see langword="null"/> if the job is not running in shared-storage mode.
+    ///     Set by <c>DispatchToNodeAsync</c> after the node accepts shared mode and
+    ///     consulted by <c>HandleRemoteCompletionAsync</c> to skip the download phase.
+    /// </summary>
+    public string? GetSharedOutputPathForJob(string jobId) =>
+        _sharedJobOutputPaths.TryGetValue(jobId, out var p) ? p : null;
 
     /// <summary> Toggles local encoding on the master without affecting remote dispatch. </summary>
     public void SetLocalEncodingEnabled(bool enabled)
@@ -1679,51 +1700,99 @@ public sealed class ClusterService : IHostedService, IDisposable
                     deviceMaxConcurrency = EffectiveDeviceCapacity(node, dev);
             }
 
+            var clonedOptions = await CloneOptionsForWorkerAsync(options, workItem.Path, workItem.Id, jobCts.Token);
+
+            // Compute the master's view of the final output path so we can offer
+            // it up front when running in shared-storage mode. Mirrors the
+            // selection in HandleRemoteCompletionAsync so master and node land on
+            // the same path — divergence here would mean the master polls a path
+            // the node never wrote to.
+            var nodeSettings  = GetNodeSettings(node.NodeId);
+            var offerShared   = _config.SharedStorageEnabled && nodeSettings?.DisableSharedStorage != true;
+
+            string? sharedInputPath = null;
+            string? sharedOutputDir = null;
+            string? sharedOutputPath = null;
+            if (offerShared)
+            {
+                sharedInputPath = Path.GetFullPath(workItem.Path);
+
+                var ext = clonedOptions.Format == "mp4" ? ".mp4" : ".mkv";
+                var baseName       = Path.GetFileNameWithoutExtension(workItem.FileName);
+                var outputFileName = $"{baseName} [snacks]{ext}";
+                string outputDir = !string.IsNullOrEmpty(clonedOptions.OutputDirectory)
+                    ? clonedOptions.OutputDirectory!
+                    : _fileService.GetDirectory(workItem.Path);
+                sharedOutputDir  = Path.GetFullPath(outputDir);
+                sharedOutputPath = Path.GetFullPath(Path.Combine(sharedOutputDir, outputFileName));
+            }
+
             // Build metadata for autonomous encoding on the worker
             var metadata = new JobMetadata
             {
                 JobId    = workItem.Id,
                 FileName = workItem.FileName,
                 FileSize = workItem.Size,
-                Options  = await CloneOptionsForWorkerAsync(options, workItem.Path, workItem.Id, jobCts.Token),
+                Options  = clonedOptions,
                 Probe    = workItem.Probe,
                 Duration = workItem.Length,
                 Bitrate  = workItem.Bitrate,
                 IsHevc   = workItem.IsHevc,
                 Is4K     = workItem.Is4K,
                 // Empty deviceId for legacy nodes — they auto-pick on the worker side.
-                DeviceId             = string.IsNullOrEmpty(deviceId) ? null : deviceId,
-                DeviceMaxConcurrency = deviceMaxConcurrency,
+                DeviceId                     = string.IsNullOrEmpty(deviceId) ? null : deviceId,
+                DeviceMaxConcurrency         = deviceMaxConcurrency,
+                SharedStorageInputPath       = sharedInputPath,
+                SharedStorageOutputPath      = sharedOutputPath,
+                SharedStorageOutputDirectory = sharedOutputDir,
             };
 
             var client = _discovery.CreateAuthenticatedClient();
-            // Register metadata on worker before uploading
-            await _fileTransfer.RegisterMetadataAsync(client, baseUrl, metadata, jobCts.Token);
-            // Acquire the upload concurrency gate — gates how many uploads
-            // can be in flight cluster-wide and per-node. The slot ledger
-            // already reserved hardware capacity; this is the orthogonal
-            // network-side concurrency limit. Held until upload completes
-            // or DispatchToNodeAsync exits via dispose.
-            IAsyncDisposable? throttleHandle = _transferThrottle != null
-                ? await _transferThrottle.AcquireUploadAsync(node.NodeId, jobCts.Token)
-                : null;
-            try
+            // Register metadata on worker before uploading. Reply tells us whether
+            // the node accepted shared mode or wants the regular upload path.
+            var ack = await _fileTransfer.RegisterMetadataAsync(client, baseUrl, metadata, jobCts.Token);
+            var sharedMode = ack.Mode == "shared";
+
+            if (sharedMode && sharedOutputPath != null)
             {
-                // Upload file as pure binary chunks
-                await _fileTransfer.UploadFileToNodeAsync(client, baseUrl, workItem, jobCts.Token);
+                _sharedJobOutputPaths[workItem.Id] = sharedOutputPath;
+                workItem.TransferProgress = 100;
+                Console.WriteLine($"Cluster: Shared-storage dispatch for {workItem.FileName} — node will read source directly and place output at {sharedOutputPath}");
             }
-            finally
+            else if (offerShared)
             {
-                if (throttleHandle != null) await throttleHandle.DisposeAsync();
+                Console.WriteLine($"Cluster: Shared-storage dispatch fell back to upload for {workItem.FileName}" +
+                    (ack.Reason != null ? $" — {ack.Reason}" : ""));
             }
 
-            // Verify upload
-            var receivedBytes = await _fileTransfer.GetNodeReceivedBytesAsync(client, baseUrl, workItem.Id);
-            if (receivedBytes != workItem.Size)
+            if (!sharedMode)
             {
-                Console.WriteLine($"Cluster: Upload verification failed for {workItem.FileName} — expected {workItem.Size}, node has {receivedBytes}");
-                _ = DeleteWorkerResourceWithRetryAsync(baseUrl, workItem.Id);
-                throw new Exception("Upload verification failed");
+                // Acquire the upload concurrency gate — gates how many uploads
+                // can be in flight cluster-wide and per-node. The slot ledger
+                // already reserved hardware capacity; this is the orthogonal
+                // network-side concurrency limit. Held until upload completes
+                // or DispatchToNodeAsync exits via dispose.
+                IAsyncDisposable? throttleHandle = _transferThrottle != null
+                    ? await _transferThrottle.AcquireUploadAsync(node.NodeId, jobCts.Token)
+                    : null;
+                try
+                {
+                    // Upload file as pure binary chunks
+                    await _fileTransfer.UploadFileToNodeAsync(client, baseUrl, workItem, jobCts.Token);
+                }
+                finally
+                {
+                    if (throttleHandle != null) await throttleHandle.DisposeAsync();
+                }
+
+                // Verify upload
+                var receivedBytes = await _fileTransfer.GetNodeReceivedBytesAsync(client, baseUrl, workItem.Id);
+                if (receivedBytes != workItem.Size)
+                {
+                    Console.WriteLine($"Cluster: Upload verification failed for {workItem.FileName} — expected {workItem.Size}, node has {receivedBytes}");
+                    _ = DeleteWorkerResourceWithRetryAsync(baseUrl, workItem.Id);
+                    throw new Exception("Upload verification failed");
+                }
             }
 
             // WAL: Uploading → Encoding
@@ -1768,6 +1837,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                 workItem.RemoteJobPhase   = null;
                 workItem.TransferProgress = 0;
                 _remoteJobs.TryRemove(workItem.Id, out _);
+                _sharedJobOutputPaths.TryRemove(workItem.Id, out _);
                 if (_jobCts.TryRemove(workItem.Id, out var timeoutCts))
                     timeoutCts.Dispose();
                 await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Queued);
@@ -1783,6 +1853,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                 await CompleteActiveTransitionAsync(workItem.Id);
                 _ = DeleteWorkerResourceWithRetryAsync(baseUrl, workItem.Id);
                 _remoteJobs.TryRemove(workItem.Id, out _);
+                _sharedJobOutputPaths.TryRemove(workItem.Id, out _);
                 ReleaseActiveSlot(node, workItem.Id, Snacks.Services.Slots.ReleaseReason.Cancelled);
                 UpdateNodeStatus(node.NodeId, node.ActiveJobs.Count > 0 ? NodeStatus.Busy : NodeStatus.Online);
             }
@@ -1801,6 +1872,7 @@ public sealed class ClusterService : IHostedService, IDisposable
             workItem.RemoteJobPhase   = null;
             workItem.TransferProgress = 0;
             _remoteJobs.TryRemove(workItem.Id, out _);
+            _sharedJobOutputPaths.TryRemove(workItem.Id, out _);
             if (_jobCts.TryRemove(workItem.Id, out var failedCts))
                 failedCts.Dispose();
             await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Queued);
@@ -1910,6 +1982,7 @@ public sealed class ClusterService : IHostedService, IDisposable
             {
                 _remoteJobs.TryRemove(jobId, out _);
                 _dispatchedOptions.TryRemove(jobId, out _);
+                _sharedJobOutputPaths.TryRemove(jobId, out _);
                 _activeUploads.TryRemove(jobId, out _);
                 _downloadRetryCounts.TryRemove(jobId, out _);
                 _downloadRetryCounts.TryRemove($"_idle_grace_{jobId}", out _);
@@ -1953,23 +2026,50 @@ public sealed class ClusterService : IHostedService, IDisposable
                     return;
                 }
 
-                // Phase 1: Download
-                var downloadSucceeded = await DownloadOutputAsync(jobId, nodeBaseUrl, workItem);
-                if (!downloadSucceeded) return; // Will retry via pending completions
+                // Phase 1: Download (skipped when the node already wrote the
+                // output directly to a shared mount — the master and node both
+                // agreed on the path at dispatch time, so we just verify the
+                // file landed and proceed straight to validation).
+                var sharedOutputPath = GetSharedOutputPathForJob(jobId);
+                bool sharedMode      = sharedOutputPath != null;
+                if (sharedMode)
+                {
+                    if (!File.Exists(sharedOutputPath!))
+                    {
+                        Console.WriteLine($"Cluster: Shared-mode completion for {workItem.FileName} but output not yet at {sharedOutputPath} — node atomic-rename may still be settling, will retry");
+                        await RetryDownloadAsync(jobId, nodeBaseUrl, workItem);
+                        return;
+                    }
+                    Console.WriteLine($"Cluster: Shared-mode completion — using node-written output at {sharedOutputPath}");
+                    workItem.TransferProgress = 100;
+                }
+                else
+                {
+                    var downloadSucceeded = await DownloadOutputAsync(jobId, nodeBaseUrl, workItem);
+                    if (!downloadSucceeded) return; // Will retry via pending completions
+                }
 
                 // Phase 2: Validate
                 var options = ResolveJobOptions(jobId);
-                var ext     = options.Format == "mp4" ? ".mp4" : ".mkv";
-                var baseName = Path.GetFileNameWithoutExtension(workItem.FileName);
-                var outputFileName = $"{baseName} [snacks]{ext}";
-                string outputDir;
-                if (!string.IsNullOrEmpty(options.EncodeDirectory))
-                    outputDir = options.EncodeDirectory;
-                else if (!string.IsNullOrEmpty(options.OutputDirectory))
-                    outputDir = options.OutputDirectory;
+                string outputPath;
+                if (sharedMode)
+                {
+                    outputPath = sharedOutputPath!;
+                }
                 else
-                    outputDir = _fileService.GetDirectory(workItem.Path);
-                var outputPath = Path.Combine(outputDir, outputFileName);
+                {
+                    var ext            = options.Format == "mp4" ? ".mp4" : ".mkv";
+                    var baseName       = Path.GetFileNameWithoutExtension(workItem.FileName);
+                    var outputFileName = $"{baseName} [snacks]{ext}";
+                    string outputDir;
+                    if (!string.IsNullOrEmpty(options.EncodeDirectory))
+                        outputDir = options.EncodeDirectory;
+                    else if (!string.IsNullOrEmpty(options.OutputDirectory))
+                        outputDir = options.OutputDirectory;
+                    else
+                        outputDir = _fileService.GetDirectory(workItem.Path);
+                    outputPath = Path.Combine(outputDir, outputFileName);
+                }
 
                 var validation = await ValidateOutputAsync(jobId, workItem, outputPath);
 
@@ -2361,6 +2461,7 @@ public sealed class ClusterService : IHostedService, IDisposable
         // encoding succeeded.
         _remoteJobs.TryRemove(jobId, out _);
         _dispatchedOptions.TryRemove(jobId, out _);
+        _sharedJobOutputPaths.TryRemove(jobId, out _);
         _activeUploads.TryRemove(jobId, out _);
         _downloadRetryCounts.TryRemove(jobId, out _);
         _downloadRetryCounts.TryRemove($"_idle_grace_{jobId}", out _);
@@ -2540,6 +2641,7 @@ public sealed class ClusterService : IHostedService, IDisposable
         _activeUploads.TryRemove(jobId, out _);
         _activeDownloads.TryRemove(jobId, out _);
         _dispatchedOptions.TryRemove(jobId, out _);
+        _sharedJobOutputPaths.TryRemove(jobId, out _);
         _downloadRetryCounts.TryRemove(jobId, out _);
         _downloadRetryCounts.TryRemove($"_idle_grace_{jobId}", out _);
         _downloadRetryCounts.TryRemove($"_validation_{jobId}", out _);
@@ -2620,6 +2722,7 @@ public sealed class ClusterService : IHostedService, IDisposable
             workItem.AssignedNodeName = null;
             workItem.RemoteJobPhase   = null;
             _dispatchedOptions.TryRemove(jobId, out _);
+            _sharedJobOutputPaths.TryRemove(jobId, out _);
             await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Failed);
             await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
             await _transcodingService.MarkWorkItemFailed(workItem.Id, workItem.ErrorMessage);
@@ -2630,7 +2733,9 @@ public sealed class ClusterService : IHostedService, IDisposable
             workItem.AssignedNodeName = null;
             workItem.RemoteJobPhase   = null;
             // Don't clear _dispatchedOptions on requeue — same id will get a fresh entry
-            // written on the next dispatch.
+            // written on the next dispatch. Clear _sharedJobOutputPaths though, since the
+            // re-dispatch may not be in shared mode (or the path may differ).
+            _sharedJobOutputPaths.TryRemove(jobId, out _);
             await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Queued);
             _transcodingService.RequeueWorkItem(workItem);
         }

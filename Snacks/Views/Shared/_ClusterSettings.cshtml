@@ -144,6 +144,62 @@
     </div>
 </div>
 
+<!-- Shared Storage settings (visible for master + node since the flag is symmetric) -->
+<div class="row g-4 mt-1" id="sharedStorageSettings" style="display: none;">
+    <div class="col-12">
+        <div class="encoder-panel rounded">
+            <h6 class="fw-bold mb-3 d-flex align-items-center">
+                <i class="fas fa-hdd me-2 text-info"></i>
+                Shared Storage
+            </h6>
+
+            <div class="form-check form-switch mb-3">
+                <input class="form-check-input" type="checkbox" id="clusterSharedStorageEnabled">
+                <label class="form-check-label" for="clusterSharedStorageEnabled">
+                    Enable shared storage mode
+                </label>
+                <div class="form-text ms-4">
+                    When master and node both mount the same NAS/SMB share, skip uploading the source and downloading the output. Both sides must enable this.
+                </div>
+            </div>
+
+            <div class="alert alert-warning py-2 mb-3" id="sharedStorageAllowlistWarning" style="display: none;">
+                <i class="fas fa-exclamation-triangle me-1"></i>
+                Shared storage is enabled but no allowed directories are set. Every dispatch will fall back to the regular upload/download flow until you add at least one path below.
+            </div>
+
+            <div class="row g-3" id="sharedStoragePaths">
+                <div class="col-md-6">
+                    <label for="clusterSharedInputPaths" class="form-label">
+                        <i class="fas fa-folder-open me-1"></i> Allowed input directories
+                    </label>
+                    <textarea class="form-control" id="clusterSharedInputPaths" rows="3" placeholder="/app/work/uploads"></textarea>
+                    <div class="form-text">One path per line. The master may only ask this node to read source files from inside one of these directories. Leave empty to disable shared input.</div>
+                </div>
+
+                <div class="col-md-6">
+                    <label for="clusterSharedOutputPaths" class="form-label">
+                        <i class="fas fa-folder me-1"></i> Allowed output directories
+                    </label>
+                    <textarea class="form-control" id="clusterSharedOutputPaths" rows="3" placeholder="/app/work/uploads"></textarea>
+                    <div class="form-text">One path per line. The master may only ask this node to write encoded output into one of these directories. Leave empty to fall back to downloading the encoded output.</div>
+                </div>
+
+                <div class="col-md-12">
+                    <details>
+                        <summary class="form-label fw-semibold">Path rewrite (advanced)</summary>
+                        <div class="mt-2">
+                            <input type="text" class="form-control mb-2" id="clusterSharedRewriteFrom" placeholder="From (master path prefix, e.g. /app/work/uploads)">
+                            <input type="text" class="form-control" id="clusterSharedRewriteTo" placeholder="To (this node's prefix, e.g. /mnt/nas/movies)">
+                            <div class="form-text mt-1">If the master sees the share at a different path than this node, translate it before validating. Set the per-node scratch location with the existing <em>Temporary Encode Directory</em> field above.</div>
+                        </div>
+                    </details>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
 <div class="row g-4 mt-3">
     <div class="col-12 d-flex align-items-center gap-2 flex-wrap">
         <button class="btn btn-primary" id="saveClusterConfig">

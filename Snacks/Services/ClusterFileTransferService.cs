@@ -72,13 +72,37 @@ public sealed class ClusterFileTransferService
     ///     Registers job metadata on the worker node before uploading begins.
     ///     Called once before the first chunk so the worker knows what encoding
     ///     options to apply once the upload completes.
+    ///     <para>The node responds with a <see cref="MetadataAck"/> indicating whether
+    ///     it accepted shared-storage mode (<c>"shared"</c>) or wants the regular
+    ///     upload (<c>"upload"</c>). Older nodes reply with a plain <c>{ registered: true }</c>
+    ///     body which is treated as <c>"upload"</c> for back-compat.</para>
     /// </summary>
-    public async Task RegisterMetadataAsync(HttpClient client, string baseUrl, JobMetadata metadata, CancellationToken ct = default)
+    public async Task<MetadataAck> RegisterMetadataAsync(HttpClient client, string baseUrl, JobMetadata metadata, CancellationToken ct = default)
     {
         var content = new StringContent(JsonSerializer.Serialize(metadata, _jsonOptions), Encoding.UTF8, "application/json");
         var response = await client.PostAsync($"{baseUrl}/api/cluster/files/{metadata.JobId}/metadata", content, ct);
         response.EnsureSuccessStatusCode();
-        Console.WriteLine($"Cluster: Registered metadata for job {metadata.JobId}");
+
+        var body = await response.Content.ReadAsStringAsync(ct);
+        var ack = TryParseAck(body);
+        Console.WriteLine($"Cluster: Registered metadata for job {metadata.JobId} — node mode={ack.Mode}" +
+            (ack.Reason != null ? $" ({ack.Reason})" : ""));
+        return ack;
+    }
+
+    private MetadataAck TryParseAck(string body)
+    {
+        if (string.IsNullOrWhiteSpace(body)) return new MetadataAck { Mode = "upload" };
+        try
+        {
+            var ack = JsonSerializer.Deserialize<MetadataAck>(body, _jsonOptions);
+            if (ack == null || string.IsNullOrEmpty(ack.Mode)) return new MetadataAck { Mode = "upload" };
+            return ack;
+        }
+        catch
+        {
+            return new MetadataAck { Mode = "upload" };
+        }
     }
 
     /// <summary>

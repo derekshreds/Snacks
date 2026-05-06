@@ -4,6 +4,7 @@ using Snacks.Data;
 using Snacks.Hubs;
 using Snacks.Models;
 using Snacks.Services;
+using Snacks.Services.Cluster;
 using System.Text.Json;
 
 namespace Snacks.Controllers;
@@ -278,7 +279,7 @@ public sealed class ClusterController : ControllerBase
     /// <param name="jobId"> The job ID being registered. </param>
     /// <param name="metadata"> Job metadata for autonomous encoding. </param>
     [HttpPost("files/{jobId}/metadata")]
-    public IActionResult RegisterMetadata(string jobId, [FromBody] JobMetadata metadata)
+    public async Task<IActionResult> RegisterMetadata(string jobId, [FromBody] JobMetadata metadata)
     {
         if (string.IsNullOrEmpty(metadata.JobId) || metadata.JobId != jobId)
             return BadRequest(new { error = "Job ID mismatch" });
@@ -288,13 +289,59 @@ public sealed class ClusterController : ControllerBase
         var metadataPath = Path.Combine(tempDir, "_metadata.json");
         try
         {
-            System.IO.File.WriteAllText(metadataPath, JsonSerializer.Serialize(metadata, _jsonOptions));
+            await System.IO.File.WriteAllTextAsync(metadataPath, JsonSerializer.Serialize(metadata, _jsonOptions));
             // Record the assigned device so the worker self-card's per-device
             // chip counts this slot as occupied during the upload phase, not
             // only once encoding actually starts.
             _clusterService.RegisterReceivingDevice(jobId, metadata.DeviceId);
-            Console.WriteLine($"Cluster: Registered metadata for job {jobId}");
-            return Ok(new { registered = true });
+
+            // Decide shared-storage mode. If the master offered a shared input path
+            // and this node accepts it, persist a sentinel for the encode loop to
+            // pick up and trigger encoding now (no upload will arrive to fire it).
+            // Any failure path falls back to the regular upload — no error
+            // propagates to the master.
+            var ack = SharedStoragePathValidator.Validate(metadata, _clusterService.GetConfig());
+            if (ack.Mode == "shared")
+            {
+                var sentinel = new
+                {
+                    inputPath       = ack.ResolvedInputPath,
+                    outputPath      = ack.ResolvedOutputPath,
+                    outputDirectory = ack.ResolvedOutputDirectory,
+                };
+                var sentinelPath = Path.Combine(tempDir, "_shared.json");
+                await System.IO.File.WriteAllTextAsync(sentinelPath, JsonSerializer.Serialize(sentinel, _jsonOptions));
+                Console.WriteLine($"Cluster: Accepted shared-storage mode for job {jobId} — input={ack.ResolvedInputPath}, output={ack.ResolvedOutputPath ?? "(via download)"}");
+
+                // Fire the encode immediately — the master will skip upload, so
+                // ReceiveFile's "last chunk" path that normally triggers this
+                // never runs. StartAutonomousEncodingAsync hands off to a
+                // background task internally, so the controller still returns
+                // promptly.
+                var (started, rejectReason) = await _clusterService.StartAutonomousEncodingAsync(jobId, metadata, ack.ResolvedInputPath!);
+                if (!started)
+                {
+                    Console.WriteLine($"Cluster: Shared-mode encode rejected for {jobId}: {rejectReason}");
+                    return Ok(new MetadataAck
+                    {
+                        Mode   = "upload",
+                        Reason = $"Shared-mode encode rejected: {rejectReason}",
+                    });
+                }
+            }
+            else
+            {
+                Console.WriteLine($"Cluster: Registered metadata for job {jobId} — falling back to upload" +
+                    (ack.Reason != null ? $" ({ack.Reason})" : ""));
+            }
+
+            return Ok(new MetadataAck
+            {
+                Mode               = ack.Mode,
+                Reason             = ack.Reason,
+                ResolvedInputPath  = ack.ResolvedInputPath,
+                ResolvedOutputPath = ack.ResolvedOutputPath,
+            });
         }
         catch (Exception ex)
         {

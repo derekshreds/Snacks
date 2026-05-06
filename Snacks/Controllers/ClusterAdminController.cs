@@ -63,7 +63,12 @@ public sealed class ClusterAdminController : ControllerBase
             config.ManualNodes,
             config.HeartbeatIntervalSeconds,
             config.NodeTimeoutSeconds,
-            config.NodeId
+            config.NodeId,
+            config.SharedStorageEnabled,
+            config.SharedStorageInputPaths,
+            config.SharedStorageOutputPaths,
+            config.SharedStoragePathRewriteFrom,
+            config.SharedStoragePathRewriteTo,
         });
     }
 

@@ -17,6 +17,7 @@ RUN apt-get update && apt-get install -y curl gnupg && \
 # libleptonica.so.6, so libtesseract5 + libleptonica must be present.
 RUN apt-get update && apt-get install -y \
     coreutils \
+    gosu \
     jellyfin-ffmpeg7=7.1.3-5* \
     intel-media-va-driver-non-free \
     i965-va-driver \
@@ -28,6 +29,14 @@ RUN apt-get update && apt-get install -y \
     libfreetype6 \
     libtesseract5 \
     && rm -rf /var/lib/apt/lists/*
+
+# Pre-create the snacks user so PUID/PGID can re-target it at startup. We
+# don't switch USER here — the entrypoint decides at runtime based on PUID:
+# when set, it drops privileges with gosu; when unset, it stays root to
+# preserve back-compat with deployments that need direct /dev/dri access.
+RUN useradd -m -u 1000 -s /bin/bash snacks && \
+    (usermod -aG video snacks  || true) && \
+    (usermod -aG render snacks || true)
 
 # TesseractOCR's LibraryLoader hardcodes Windows-DLL filenames and just appends
 # .so on Linux, so it dlopens "libleptonica-1.83.1.dll.so" / "libtesseract53.dll.so"
@@ -69,6 +78,8 @@ RUN dotnet publish "./Snacks.csproj" -c $BUILD_CONFIGURATION -o /app/publish /p:
 FROM base AS final
 WORKDIR /app
 COPY --from=publish /app/publish .
+COPY Snacks/entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
 
 # Set environment variables — use jellyfin-ffmpeg paths
 ENV ASPNETCORE_URLS=http://+:6767
@@ -78,11 +89,12 @@ ENV FFPROBE_PATH=/usr/lib/jellyfin-ffmpeg/ffprobe
 # VAAPI driver — auto-detection will try both iHD and i965 at runtime
 # Set via deploy-compose.yml or leave unset for auto-detection
 
-# Run as root to ensure /dev/dri access on NAS devices (QNAP, Synology)
+# Default to root for /dev/dri access on NAS devices (QNAP, Synology). Set
+# PUID/PGID at runtime to drop privileges and own /app/work as that uid/gid.
 RUN mkdir -p /app/work/uploads /app/work/output /app/work/logs
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
     CMD curl -f http://localhost:6767/api/health || exit 1
 
-ENTRYPOINT ["dotnet", "Snacks.dll"]
+ENTRYPOINT ["/app/entrypoint.sh"]

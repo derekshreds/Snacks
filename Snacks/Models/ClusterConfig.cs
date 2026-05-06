@@ -94,6 +94,47 @@ public sealed class ClusterConfig
     ///     over HTTP and a security warning is logged on startup.
     /// </summary>
     public bool UseHttps { get; set; } = false;
+
+    /// <summary>
+    ///     When true, master and node skip uploading/downloading the source and output
+    ///     and instead read/write directly from a path both sides can see (e.g. an NFS
+    ///     or SMB share). Symmetric flag — both sides must enable it. The master only
+    ///     offers shared mode when its own flag is on; the node only honors a shared
+    ///     dispatch when its own flag is on. If either side is off (or the node rejects
+    ///     the path) the regular upload/download flow runs, so this is safe to flip on
+    ///     without coordination.
+    /// </summary>
+    public bool SharedStorageEnabled { get; set; } = false;
+
+    /// <summary>
+    ///     Node-side allowlist of base directories the master may ask this node to read
+    ///     source files from in shared mode. Empty list rejects all shared-mode dispatches
+    ///     (fail closed). The check uses canonicalized prefix matching after symlink
+    ///     resolution to defend against traversal and symlink-escape.
+    ///     <para>Master ignores this field — it only applies on the receiving side.</para>
+    /// </summary>
+    public List<string> SharedStorageInputPaths { get; set; } = new();
+
+    /// <summary>
+    ///     Node-side allowlist of base directories the master may ask this node to write
+    ///     final output into in shared mode. Separated from
+    ///     <see cref="SharedStorageInputPaths"/> so a read-only NAS export can serve as
+    ///     the source while output goes to a different writable location. Empty list
+    ///     rejects all shared-mode dispatches.
+    /// </summary>
+    public List<string> SharedStorageOutputPaths { get; set; } = new();
+
+    /// <summary>
+    ///     Optional path translation applied on the node before
+    ///     <see cref="SharedStorageInputPaths"/> / <see cref="SharedStorageOutputPaths"/>
+    ///     allowlist checks. Lets the master see the share at one mount point while this
+    ///     node sees it at another (e.g. master mounts <c>/shared/movies</c>, node mounts
+    ///     <c>/mnt/nas/movies</c>). Single from/to pair — set both or neither.
+    /// </summary>
+    public string? SharedStoragePathRewriteFrom { get; set; }
+
+    /// <summary> Companion to <see cref="SharedStoragePathRewriteFrom"/>. </summary>
+    public string? SharedStoragePathRewriteTo { get; set; }
 }
 
 /// <summary>

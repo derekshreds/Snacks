@@ -353,8 +353,12 @@ public sealed class ClusterNodeJobService
 
             // Output already on disk (master crash + recovery) — short-circuit
             // to the completed-jobs set so the master's download path picks it up.
+            // Skipped in shared-storage mode: the master expects the file at the
+            // pre-agreed shared path, not in our scratch dir, so a recovered
+            // scratch-only file would never be visible to the master. Re-encoding
+            // is wasteful but correct in that race.
             var existingOutput = GetOutputFileForJob(jobId);
-            if (existingOutput != null)
+            if (existingOutput != null && !File.Exists(Path.Combine(GetNodeTempDirectory(jobId), "_shared.json")))
             {
                 Console.WriteLine($"Cluster: Output already exists for {metadata.FileName} — skipping encode, ready for download");
                 _completedJobIds[jobId] = 0;
@@ -517,6 +521,7 @@ public sealed class ClusterNodeJobService
         options.HardwareAcceleration = active.DeviceId == "cpu" ? "none" : active.DeviceId;
 
         var encodingSucceeded = false;
+        var shared            = TryReadSharedSentinel(workItem.Id);
         try
         {
             var tempDir = GetNodeTempDirectory(workItem.Id);
@@ -623,6 +628,50 @@ public sealed class ClusterNodeJobService
         var noSavings = encodingSucceeded && GetOutputFileForJob(workItem.Id) == null;
         if (noSavings)
             Console.WriteLine($"Cluster: Encoding succeeded for {workItem.FileName} but no savings — will notify master to skip download");
+
+        // Shared-storage mode: move the encoded output from the scratch directory
+        // to the master's pre-agreed shared location so the master can read it
+        // without a download. Tmp-suffix + atomic rename so the master never sees
+        // a partial file. A failure here downgrades the job to a failure since
+        // the master will be polling an empty path.
+        if (encodingSucceeded && !noSavings && shared?.OutputPath is { } sharedTarget)
+        {
+            try
+            {
+                var src = GetOutputFileForJob(workItem.Id);
+                if (src == null)
+                    throw new InvalidOperationException("Encoded output file not found in scratch directory");
+
+                var targetDir = Path.GetDirectoryName(sharedTarget);
+                if (!string.IsNullOrEmpty(targetDir)) Directory.CreateDirectory(targetDir);
+
+                var tmp = sharedTarget + ".snacks-tmp";
+                if (File.Exists(tmp)) File.Delete(tmp);
+                File.Move(src, tmp);
+                if (File.Exists(sharedTarget)) File.Delete(sharedTarget);
+                File.Move(tmp, sharedTarget);
+                Console.WriteLine($"Cluster: Placed shared output at {sharedTarget}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Cluster: Failed to place shared output for {workItem.FileName}: {ex.Message}");
+                encodingSucceeded = false;
+                if (masterUrl != null)
+                {
+                    try
+                    {
+                        var client  = CreateAuthenticatedClient();
+                        var failure = new { jobId = workItem.Id, errorMessage = $"Shared output placement failed: {ex.Message}" };
+                        var content = new StringContent(
+                            JsonSerializer.Serialize(failure, _jsonOptions),
+                            Encoding.UTF8, "application/json");
+                        await client.PostAsync($"{masterUrl}/api/cluster/jobs/{workItem.Id}/failed", content);
+                    }
+                    catch { }
+                }
+                ReleaseJobState(workItem.Id, slotPool);
+            }
+        }
 
         try
         {
@@ -957,6 +1006,41 @@ public sealed class ClusterNodeJobService
     /******************************************************************
      *  Temp Directory and File Management
      ******************************************************************/
+
+    /// <summary>
+    ///     Information about a shared-storage dispatch read from <c>_shared.json</c>.
+    ///     <see cref="OutputPath"/> is the master's chosen final filename — the
+    ///     encoder writes to scratch first, then atomically moves to this location.
+    /// </summary>
+    private sealed record SharedJobInfo(string InputPath, string? OutputPath, string? OutputDirectory);
+
+    /// <summary>
+    ///     Reads the <c>_shared.json</c> sentinel for a job, or returns
+    ///     <see langword="null"/> if it is absent or malformed. Written by
+    ///     <c>ClusterController.RegisterMetadata</c> when the node accepts a
+    ///     shared-mode dispatch.
+    /// </summary>
+    private SharedJobInfo? TryReadSharedSentinel(string jobId)
+    {
+        try
+        {
+            var sentinelPath = Path.Combine(GetNodeTempDirectory(jobId), "_shared.json");
+            if (!File.Exists(sentinelPath)) return null;
+            var json = File.ReadAllText(sentinelPath);
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            string? input  = root.TryGetProperty("inputPath", out var ip)  ? ip.GetString() : null;
+            string? output = root.TryGetProperty("outputPath", out var op) ? op.GetString() : null;
+            string? dir    = root.TryGetProperty("outputDirectory", out var od) ? od.GetString() : null;
+            if (string.IsNullOrEmpty(input)) return null;
+            return new SharedJobInfo(input, output, dir);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Cluster: Failed to read shared sentinel for {jobId}: {ex.Message}");
+            return null;
+        }
+    }
 
     /// <summary>
     ///     Returns the temp directory path for a remote job, creating it if it does not
