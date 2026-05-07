@@ -3,6 +3,7 @@ namespace Snacks.Services;
 using Microsoft.AspNetCore.SignalR;
 using Snacks.Hubs;
 using Snacks.Models;
+using Snacks.Services.Routing;
 using System.Collections.Concurrent;
 using System.Text;
 using System.Text.Json;
@@ -27,6 +28,7 @@ public sealed class ClusterNodeJobService
     private readonly ClusterDiscoveryService                   _discoveryService;
     private readonly ConcurrentDictionary<string, ClusterNode> _nodes;
     private readonly IntegrationService                        _integrationService;
+    private readonly JobKindRouters                            _routers;
 
     private readonly JsonSerializerOptions _jsonOptions = new()
     {
@@ -138,7 +140,8 @@ public sealed class ClusterNodeJobService
         IHttpClientFactory                        httpClientFactory,
         ClusterDiscoveryService                   discoveryService,
         ConcurrentDictionary<string, ClusterNode> nodes,
-        IntegrationService                        integrationService)
+        IntegrationService                        integrationService,
+        JobKindRouters                            routers)
     {
         _transcodingService = transcodingService;
         _hubContext         = hubContext;
@@ -146,6 +149,7 @@ public sealed class ClusterNodeJobService
         _discoveryService   = discoveryService;
         _nodes              = nodes;
         _integrationService = integrationService;
+        _routers            = routers;
 
         var workDir = Environment.GetEnvironmentVariable("SNACKS_WORK_DIR")
             ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Snacks", "work");
@@ -435,6 +439,15 @@ public sealed class ClusterNodeJobService
     /// </summary>
     private string? ResolveDeviceId(string? requested)
     {
+        // Synthetic devices owned by an IJobKindRouter (e.g. "music") aren't
+        // part of GetDetectedDevices() — they're advertised as capabilities by
+        // ClusterDiscoveryService.BuildDevicesWithMusic but never come back from
+        // the hardware probe. Short-circuit to the master's request before
+        // probing, otherwise every music dispatch is rejected with "device not
+        // available on this worker".
+        if (!string.IsNullOrEmpty(requested) && _routers.IsSyntheticDevice(requested))
+            return requested;
+
         var devices = _transcodingService.GetDetectedDevices();
         if (devices.Count == 0)
             return "cpu"; // detection hasn't completed; CPU is always safe
@@ -514,19 +527,13 @@ public sealed class ClusterNodeJobService
     {
         var workItem  = active.Item;
         var masterUrl = ResolveMasterUrl();
+        var router    = _routers.For(workItem.Kind);
 
-        // The master assigned this job to a specific device slot — pin the
-        // hardware acceleration to that device family so the encode lands
-        // where the scheduler intended (and not on whichever device "auto"
-        // would have picked locally). CPU jobs map to "none".
-        options.HardwareAcceleration = active.DeviceId == "cpu" ? "none" : active.DeviceId;
-        // Also resolve the local VAAPI render-node path so jobs land on the iGPU
-        // even when it's on /dev/dri/renderD129 (hybrid laptops where the NVIDIA
-        // card claims renderD128). Master-side selection is by family ("intel"),
-        // not by node path; the worker maps that back to its own detected path.
-        options.HardwareDevicePath = active.DeviceId == "cpu"
-            ? null
-            : _transcodingService.GetDevicePathForDeviceId(active.DeviceId);
+        // Per-kind option pinning. Video pins HardwareAcceleration / Path so the
+        // encode lands on the device family the master picked (resolving local
+        // /dev/dri/renderDXXX along the way for VAAPI on hybrid GPUs); music
+        // is CPU-only and ignores both fields — pinning either would crash ffmpeg.
+        router.PinRemoteEncoderOptions(options, active.DeviceId, _transcodingService.GetDevicePathForDeviceId);
 
         var encodingSucceeded = false;
         var shared            = TryReadSharedSentinel(workItem.Id);
@@ -602,7 +609,7 @@ public sealed class ClusterNodeJobService
                 catch { }
             });
 
-            await _transcodingService.ConvertVideoForRemoteAsync(workItem, options, active.Cts.Token);
+            await router.EncodeRemoteAsync(workItem, options, active.Cts.Token);
             encodingSucceeded = true;
         }
         catch (Exception ex)

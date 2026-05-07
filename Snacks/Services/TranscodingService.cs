@@ -3,6 +3,7 @@ using Microsoft.Extensions.Logging;
 using Snacks.Data;
 using Snacks.Hubs;
 using Snacks.Models;
+using Snacks.Services.Slots;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
@@ -66,25 +67,34 @@ public class TranscodingService
     /// <summary>
     ///     Sentinel <see cref="ActiveLocalJob.DeviceId"/> for music encodes. They
     ///     occupy <see cref="_activeLocalJobs"/> so cancel/kill plumbing works
-    ///     uniformly, but <see cref="TryAcquireLocalDeviceSlot"/> only counts
-    ///     entries against <see cref="HardwareDevice.DeviceId"/>s — and "music"
-    ///     is never a hardware device — so music never tilts the GPU caps and
-    ///     vice versa. The real music gate is <see cref="_musicSlots"/>.
+    ///     uniformly, but slot accounting goes through the shared
+    ///     <see cref="_slotLedger"/> on the synthetic <c>"music"</c> device id —
+    ///     identical to the path workers use, so a queue full of music can't
+    ///     starve GPU video and vice versa. Capacity for the master's music
+    ///     slot comes from <c>EncoderOptions.Music.MasterMusicConcurrency</c>
+    ///     via <c>ClusterService.EffectiveDeviceCapacity</c> (where 0 means
+    ///     "never encode music on master"; the ledger refuses every reserve).
     /// </summary>
     private const string MusicDeviceId = "music";
 
     /// <summary>
-    ///     CPU-only concurrency cap for music encodes, sized from
-    ///     <c>EncoderOptions.Music.MasterMusicConcurrency</c>. Resized live by
-    ///     <see cref="UpdateOptions"/> when the user adjusts the slider.
+    ///     Authoritative slot ledger, shared with <see cref="ClusterService"/>.
+    ///     Master-local encodes reserve <c>(_localNodeId, deviceId)</c> entries
+    ///     here exactly the same way worker dispatches do — one ledger, one
+    ///     source of truth, no parallel semaphore that can drift out of sync.
+    ///     Set by <see cref="SetSlotLedger"/> from cluster wiring; null only
+    ///     in unit tests that don't exercise scheduling.
     /// </summary>
-    private SemaphoreSlim _musicSlots = new(2, int.MaxValue);
+    private SlotLedger? _slotLedger;
 
-    /// <summary>Current configured music concurrency. Used to detect setting changes for resize.</summary>
-    private int _musicSlotCapacity = 2;
-
-    /// <summary>Serializes music-slot resize against acquire/release on the scheduler.</summary>
-    private readonly object _musicSlotsLock = new();
+    /// <summary>
+    ///     The master's NodeId, stamped onto every local ledger reservation
+    ///     so heartbeat reconcile and the dispatch loop see master-local jobs
+    ///     under the master's row in <c>_nodes</c>. Defaults to a stable
+    ///     fallback so non-cluster runs (tests, standalone with cluster off)
+    ///     still produce identifiable reservations.
+    /// </summary>
+    private string _localNodeId = "master-local";
 
     /// <summary>Lock protecting per-job <see cref="ActiveLocalJob.Process"/> publication.</summary>
     private readonly object _activeLock = new();
@@ -165,6 +175,17 @@ public class TranscodingService
     ///     <see cref="ClusterService"/>; null in standalone/tests means "always allowed".
     /// </summary>
     private Func<bool>? _localScheduleGate;
+
+    /// <summary>
+    ///     Optional callback fired immediately after a work item is added to
+    ///     the queue. <see cref="ClusterService"/> wires this to its dispatch
+    ///     entry point so the cluster dispatcher races the master-local
+    ///     scheduler per-item via the queue lock — without it the cluster
+    ///     only fires every 2 seconds via its timer, and master-local (which
+    ///     wakes synchronously on enqueue) consumes fast jobs (music) before
+    ///     the cluster ever sees them.
+    /// </summary>
+    private Action? _onWorkItemQueued;
 
     /// <summary>
     ///     Resolves per-device settings for <em>this</em> machine when the
@@ -317,7 +338,22 @@ public class TranscodingService
         _localNodeIdentity = (
             string.IsNullOrEmpty(nodeId) ? "local" : nodeId,
             string.IsNullOrEmpty(hostname) ? Environment.MachineName : hostname);
+        _localNodeId = _localNodeIdentity.NodeId;
     }
+
+    /// <summary>
+    ///     Wires the shared <see cref="SlotLedger"/> so master-local encodes
+    ///     reserve through the same store the cluster dispatcher uses. Without
+    ///     a ledger (unit tests, early startup), local scheduling falls back
+    ///     to the legacy in-process counting via <see cref="_activeLocalJobs"/>.
+    /// </summary>
+    public void SetSlotLedger(SlotLedger ledger) => _slotLedger = ledger;
+
+    /// <summary> Live-read accessor for callers that need to reach the ledger via TranscodingService. </summary>
+    public SlotLedger? GetSlotLedger() => _slotLedger;
+
+    /// <summary> True if local encoding is suspended (master delegating to workers). </summary>
+    public bool IsLocalEncodingPaused => _localEncodingPaused;
 
     public TranscodingService(
         FileService fileService,
@@ -728,6 +764,11 @@ public class TranscodingService
 
             await _hubContext.Clients.All.SendAsync("WorkItemAdded", workItem);
 
+            // Wake the cluster dispatcher in parallel with the local scheduler
+            // so workers compete for fast jobs (music) instead of losing every
+            // item to the event-driven local loop.
+            try { _onWorkItemQueued?.Invoke(); } catch { }
+
             // Always try to start queue processing — the semaphore ensures only one runs at a time
             _ = Task.Run(async () =>
             {
@@ -747,8 +788,10 @@ public class TranscodingService
     ///     Music-aware counterpart to <see cref="AddFileAsync"/>. Probes the file,
     ///     applies the music-specific skip ladder (codec+bitrate match, lossy-to-lossless
     ///     guard), then creates a <see cref="MediaFile"/> row and a <see cref="WorkItem"/>
-    ///     tagged with <see cref="MediaKind.Music"/> and queues it. Music jobs run on the
-    ///     dedicated <see cref="_musicSlots"/> pool so they never compete with GPU video slots.
+    ///     tagged with <see cref="MediaKind.Music"/> and queues it. Music jobs reserve the
+    ///     synthetic <c>"music"</c> device through the shared <see cref="SlotLedger"/>,
+    ///     keeping them off the per-device video pool so a queue of music files can't
+    ///     starve a 4K HEVC encode (and vice versa).
     /// </summary>
     private async Task<string> AddMusicFileAsync(
         string filePath, EncoderOptions options, bool force, CancellationToken cancellationToken)
@@ -917,6 +960,13 @@ public class TranscodingService
             }
 
             await _hubContext.Clients.All.SendAsync("WorkItemAdded", workItem);
+
+            // Wake the cluster dispatcher in parallel with the local scheduler
+            // so workers compete for music items instead of losing every one to
+            // the event-driven local loop. Music encodes finish in seconds, so
+            // master local would otherwise burn through every queued item
+            // between the cluster's 2-second timer ticks.
+            try { _onWorkItemQueued?.Invoke(); } catch { }
 
             _ = Task.Run(async () =>
             {
@@ -1726,7 +1776,8 @@ public class TranscodingService
                         (_shouldSkipLocal == null || !_shouldSkipLocal(w)));
                     anyMusicPending = _workQueue.Any(w =>
                         w.Kind == MediaKind.Music &&
-                        w.Status == WorkItemStatus.Pending);
+                        w.Status == WorkItemStatus.Pending &&
+                        (_shouldSkipLocal == null || !_shouldSkipLocal(w)));
                 }
 
                 bool queueEmpty = !anyVideoPending && !anyMusicPending;
@@ -1745,61 +1796,73 @@ public class TranscodingService
                 bool dispatched = false;
 
                 // ───── MUSIC DISPATCH ─────
-                // Music encodes run on a dedicated CPU-only slot pool that's
-                // independent of the per-device video pool — a queue full of
-                // music files can't starve a 4K HEVC encode and vice versa.
-                if (anyMusicPending)
+                // Music targets the synthetic "music" device, reserved through
+                // the same SlotLedger workers use. EffectiveDeviceCapacity returns
+                // 0 when MasterMusicConcurrency is 0 (or unset and the default-
+                // concurrency fallback is 0) — TryReserve refuses, the master
+                // skips, and the cluster dispatcher routes the item to a worker.
+                if (anyMusicPending && _slotLedger != null)
                 {
-                    SemaphoreSlim slots;
-                    lock (_musicSlotsLock) { slots = _musicSlots; }
-                    if (await slots.WaitAsync(0))
+                    WorkItem? musicItem;
+                    lock (_queueLock)
                     {
-                        WorkItem? musicItem;
+                        musicItem = _workQueue.FirstOrDefault(w =>
+                            w.Kind == MediaKind.Music &&
+                            w.Status == WorkItemStatus.Pending &&
+                            (_shouldSkipLocal == null || !_shouldSkipLocal(w)));
+                        if (musicItem != null) _workQueue.Remove(musicItem);
+                    }
+
+                    if (musicItem == null)
+                    {
+                        // Race: another path consumed it. Nothing to do.
+                    }
+                    else if (musicItem.Status is WorkItemStatus.Cancelled or WorkItemStatus.Stopped)
+                    {
+                        _workItems.TryRemove(musicItem.Id, out _);
+                    }
+                    else if (!_slotLedger.TryReserve(_localNodeId, MusicDeviceId, musicItem.Id, musicItem.FileName))
+                    {
+                        // Master at music capacity (or master music encoding is
+                        // disabled by MasterMusicConcurrency=0). Put the item
+                        // back so the cluster dispatcher can route it to a
+                        // worker, or so a future tick retries once a master
+                        // music slot frees up.
                         lock (_queueLock)
                         {
-                            musicItem = _workQueue.FirstOrDefault(w =>
-                                w.Kind == MediaKind.Music &&
-                                w.Status == WorkItemStatus.Pending);
-                            if (musicItem != null) _workQueue.Remove(musicItem);
+                            _workQueue.Add(musicItem);
+                            _workQueue.Sort((a, b) => b.Bitrate.CompareTo(a.Bitrate));
                         }
+                    }
+                    else
+                    {
+                        _slotLedger.TransitionPhase(musicItem.Id, SlotPhase.Encoding);
 
-                        if (musicItem == null)
-                        {
-                            // Race: another path consumed it. Release the slot.
-                            slots.Release();
-                        }
-                        else if (musicItem.Status is WorkItemStatus.Cancelled or WorkItemStatus.Stopped)
-                        {
-                            slots.Release();
-                            _workItems.TryRemove(musicItem.Id, out _);
-                        }
-                        else
-                        {
-                            var musicFolderOverride = ResolveFolderOverride(musicItem.Path);
-                            var musicPerJobOptions = EncoderOptionsOverride.ApplyOverrides(current, musicFolderOverride, null);
+                        var musicFolderOverride = ResolveFolderOverride(musicItem.Path);
+                        var musicPerJobOptions = EncoderOptionsOverride.ApplyOverrides(current, musicFolderOverride, null);
 
-                            var musicActive = new ActiveLocalJob
+                        var musicActive = new ActiveLocalJob
+                        {
+                            Item     = musicItem,
+                            Cts      = new CancellationTokenSource(),
+                            DeviceId = MusicDeviceId,
+                        };
+                        _activeLocalJobs[musicItem.Id] = musicActive;
+                        musicItem.DispatchedDeviceId = MusicDeviceId;
+
+                        var capturedItem = musicItem;
+                        var capturedLedger = _slotLedger;
+                        var musicTask = Task.Run(async () =>
+                        {
+                            try { await ProcessMusicWorkItemAsync(capturedItem, musicPerJobOptions, musicActive); }
+                            finally
                             {
-                                Item     = musicItem,
-                                Cts      = new CancellationTokenSource(),
-                                DeviceId = MusicDeviceId,
-                            };
-                            _activeLocalJobs[musicItem.Id] = musicActive;
-                            musicItem.DispatchedDeviceId = MusicDeviceId;
-
-                            var releaseSlots = slots; // capture the semaphore this job acquired against
-                            var musicTask = Task.Run(async () =>
-                            {
-                                try { await ProcessMusicWorkItemAsync(musicItem, musicPerJobOptions, musicActive); }
-                                finally
-                                {
-                                    try { releaseSlots.Release(); } catch { /* disposed during shutdown */ }
-                                    WakeScheduler();
-                                }
-                            });
-                            inflight.Add(musicTask);
-                            dispatched = true;
-                        }
+                                capturedLedger.Release(capturedItem.Id, ReleaseReason.Completed);
+                                WakeScheduler();
+                            }
+                        });
+                        inflight.Add(musicTask);
+                        dispatched = true;
                     }
                 }
 
@@ -1811,44 +1874,46 @@ public class TranscodingService
                     continue;
                 }
 
-                // Pick a device that has free capacity right now. The check
-                // reads the current count of in-flight encodes per device
-                // and the user's current cap from the settings provider, so
-                // a cap change applied while we're looping takes effect on
-                // the very next iteration with no semaphore rebuilding.
-                var deviceId = TryAcquireLocalDeviceSlot(current);
-                if (deviceId == null)
-                {
-                    // No slot free yet — wait for an inflight to finish OR a
-                    // settings-change wake. Without the wake, raising the cap
-                    // mid-run would only take effect after the running encode
-                    // finished, defeating the user's "let two run at once"
-                    // intent.
-                    if (!dispatched)
-                        await WaitForSchedulerProgressAsync(inflight);
-                    continue;
-                }
-
-                // Pick the next pending video item this device can encode.
+                // Pick the next pending video item, then try to reserve a
+                // device slot for it via the ledger. Picking-then-reserving
+                // (vs. the prior reserve-then-pick) matches the cluster
+                // dispatcher's order so the two schedulers see the same
+                // head-of-queue when they race, and avoids the "reserved a
+                // slot then no item fit it — release" round-trip.
                 WorkItem? workItem;
                 lock (_queueLock)
                 {
                     workItem = _workQueue.FirstOrDefault(w =>
                         w.Kind == MediaKind.Video &&
                         w.Status == WorkItemStatus.Pending &&
-                        (_shouldSkipLocal == null || !_shouldSkipLocal(w)) &&
-                        DeviceCanEncode(deviceId, w, current));
+                        (_shouldSkipLocal == null || !_shouldSkipLocal(w)));
                     if (workItem != null) _workQueue.Remove(workItem);
                 }
 
                 if (workItem == null)
                 {
-                    // No item fits this device right now. Wait for inflight
-                    // progress or settings-wake before reconsidering.
                     if (!dispatched)
                         await WaitForSchedulerProgressAsync(inflight);
                     continue;
                 }
+
+                var deviceId = TryReserveLocalDeviceSlot(workItem, current);
+                if (deviceId == null)
+                {
+                    // No master slot fits this item (capacity full, codec
+                    // mismatch, or every device disabled). Re-queue so the
+                    // cluster dispatcher can route to a worker, or a future
+                    // master tick retries once a slot frees up.
+                    lock (_queueLock)
+                    {
+                        _workQueue.Add(workItem);
+                        _workQueue.Sort((a, b) => b.Bitrate.CompareTo(a.Bitrate));
+                    }
+                    if (!dispatched)
+                        await WaitForSchedulerProgressAsync(inflight);
+                    continue;
+                }
+                _slotLedger?.TransitionPhase(workItem.Id, SlotPhase.Encoding);
 
                 // Resolve any per-folder override and merge it into the per-job options.
                 // Cluster dispatch already does this via ClusterService.ResolveOptionsForJob;
@@ -1874,8 +1939,9 @@ public class TranscodingService
                 if (!await FinaliseForDispatchAsync(workItem, perJobOptions, CancellationToken.None))
                 {
                     await MarkDispatchSkippedAsync(workItem, "pre-dispatch check — file already meets target under current options");
-                    // No slot to release — TryAcquireLocalDeviceSlot reads occupancy live from
-                    // _activeLocalJobs, and we never added this item to that map.
+                    // Release the ledger reservation we made above for this item —
+                    // the encode is being skipped, so the slot must go back to the pool.
+                    _slotLedger?.Release(workItem.Id, ReleaseReason.NoSavings);
                     continue;
                 }
 
@@ -1887,13 +1953,15 @@ public class TranscodingService
                 {
                     Console.WriteLine($"Dropping {workItem.FileName}: cancelled/stopped during dispatch finalisation");
                     _workItems.TryRemove(workItem.Id, out _);
+                    _slotLedger?.Release(workItem.Id, ReleaseReason.Cancelled);
                     try { await _hubContext.Clients.All.SendAsync("WorkItemRemoved", workItem.Id); } catch { /* SignalR errors are non-fatal */ }
                     continue;
                 }
 
                 // Pre-register the active job synchronously before spawning so
-                // the scheduler's next iteration counts it against the device's
-                // cap without a race window.
+                // cancellation can find the running ffmpeg process (slot accounting
+                // itself is now in the ledger; _activeLocalJobs is purely for
+                // process-kill plumbing).
                 var active = new ActiveLocalJob
                 {
                     Item     = workItem,
@@ -1903,7 +1971,21 @@ public class TranscodingService
                 _activeLocalJobs[workItem.Id] = active;
                 workItem.DispatchedDeviceId = deviceId;
 
-                var jobTask = ProcessWorkItemAsync(workItem, perJobOptions, active);
+                // Wrap the local encode so the ledger is released exactly once
+                // when it finishes, regardless of success / failure / cancel.
+                // ProcessWorkItemAsync owns _activeLocalJobs cleanup in its
+                // own finally — the ledger release is layered above.
+                var capturedVideoItem   = workItem;
+                var capturedVideoLedger = _slotLedger;
+                var jobTask = Task.Run(async () =>
+                {
+                    try { await ProcessWorkItemAsync(capturedVideoItem, perJobOptions, active); }
+                    finally
+                    {
+                        capturedVideoLedger?.Release(capturedVideoItem.Id, ReleaseReason.Completed);
+                        WakeScheduler();
+                    }
+                });
                 inflight.Add(jobTask);
             }
 
@@ -1920,23 +2002,30 @@ public class TranscodingService
     }
 
     /// <summary>
-    ///     Returns the first device with free capacity for an in-flight encode,
-    ///     or <see langword="null"/> if every device is disabled, codec-mismatched,
-    ///     or already at its user-configured concurrency cap. Capacity is computed
-    ///     from <see cref="_activeLocalJobs"/> live — no cached semaphores — so a
-    ///     cap raised mid-run unlocks the next slot on the very next call.
+    ///     Picks the first hwaccel-eligible device for <paramref name="workItem"/>
+    ///     and atomically reserves a slot on it via the shared
+    ///     <see cref="SlotLedger"/>. Returns the chosen device id on success,
+    ///     <see langword="null"/> when every eligible device is disabled, full,
+    ///     or codec-mismatched — in which case the caller is expected to
+    ///     re-queue and let either the cluster dispatcher (workers) or a
+    ///     future tick (master slot freed) try again.
+    ///
+    ///     <para>Capacity is owned by the ledger's resolver, which honours
+    ///     the user's per-device <c>MaxConcurrency</c> overrides and falls
+    ///     back to <see cref="HardwareDevice.DefaultConcurrency"/>; CPU is
+    ///     hard-capped at 1 inside <c>EffectiveDeviceCapacity</c>.</para>
     ///
     ///     <para>CPU rules:
     ///     <list type="bullet">
     ///         <item><c>none</c> (Software): CPU is the only acceptable slot.</item>
     ///         <item><c>auto</c> on a machine with no hardware encoders: CPU is the auto-fallback.</item>
     ///         <item>Anything else: CPU is excluded so jobs queue rather than spilling onto a slow software encode.</item>
-    ///     </list>
-    ///     The CPU slot is hidden from the override dialog and pinned to a
-    ///     single concurrent encode regardless of any stale per-node setting.</para>
+    ///     </list></para>
     /// </summary>
-    private string? TryAcquireLocalDeviceSlot(EncoderOptions options)
+    private string? TryReserveLocalDeviceSlot(WorkItem workItem, EncoderOptions options)
     {
+        if (_slotLedger == null) return null;
+
         var devices = GetDetectedDevices();
         if (devices.Count == 0) return null;
 
@@ -1956,29 +2045,15 @@ public class TranscodingService
             if (hwPref != "auto" && hwPref != "none"
                 && !string.Equals(hwPref, device.DeviceId, StringComparison.OrdinalIgnoreCase)) continue;
 
-            int cap;
-            if (isCpu)
-            {
-                // CPU slot is hidden from the user and capped at 1.
-                cap = 1;
-            }
-            else
-            {
-                var (enabled, maxOverride) = _localDeviceSettingsProvider?.Invoke(device.DeviceId)
-                    ?? (true, (int?)null);
-                if (!enabled) continue;
-                cap = Math.Max(0, maxOverride ?? device.DefaultConcurrency);
-                if (cap == 0) continue;
-            }
+            // Skip devices that can't encode this item's target codec —
+            // the ledger only cares about capacity, not codec compatibility.
+            if (!DeviceCanEncode(device.DeviceId, workItem, options)) continue;
 
-            // Live count from the active-jobs map. This is the source of
-            // truth for slot occupancy, so changing the user's cap takes
-            // effect on the next iteration with zero state churn.
-            var inUse = 0;
-            foreach (var kv in _activeLocalJobs)
-                if (kv.Value.DeviceId == device.DeviceId) inUse++;
-
-            if (inUse < cap) return device.DeviceId;
+            // Atomic capacity check + reserve. Returns false when the device
+            // is at capacity (MaxConcurrency / DefaultConcurrency / cpu=1)
+            // or disabled (resolver returns 0).
+            if (_slotLedger.TryReserve(_localNodeId, device.DeviceId, workItem.Id, workItem.FileName))
+                return device.DeviceId;
         }
         return null;
     }
@@ -3193,6 +3268,13 @@ public class TranscodingService
         return new MediaFile
         {
             FilePath        = workItem.Path,
+            // Kind must propagate from the work item — without it the synthetic
+            // row defaults to MediaKind.Video and the music early-return at the
+            // top of WouldSkipUnderOptions never fires, causing a music dispatch
+            // through the synthetic-fallback path (e.g. force-add or path-mismatch
+            // DB lookup) to be evaluated against the video skip ladder and
+            // silently marked Skipped.
+            Kind            = workItem.Kind,
             Bitrate         = workItem.Bitrate,
             Codec           = videoStream?.CodecName ?? (workItem.IsHevc ? "hevc" : "unknown"),
             Width           = videoStream?.Width  ?? 0,
@@ -3322,6 +3404,17 @@ public class TranscodingService
     /// </summary>
     public static bool WouldSkipUnderOptions(MediaFile mf, EncoderOptions options)
     {
+        // Music has its own skip ladder at enqueue time (AddMusicFileAsync) keyed
+        // off the audio codec / bitrate against MusicEncoderOptions. Running it
+        // through the video skip gate is meaningless — and dangerous: a non-HEVC
+        // video encoder (libx264, h264_*) makes the codec-match branch evaluate
+        // !mf.IsHevc as "already at target", and a typical music bitrate
+        // (192 kbps) sits well under any video TargetBitrate, which then trips
+        // the bitrate ceiling and silently marks the dispatch as "already meets
+        // target." Music that's reached the dispatch path is by definition past
+        // its own skip checks and should always proceed.
+        if (mf.Kind == MediaKind.Music) return false;
+
         options = WithOriginalLanguageMerged(options, mf.OriginalLanguage);
 
         // Skip4K overrides everything else.
@@ -5184,33 +5277,17 @@ public class TranscodingService
 
     /// <summary>
     ///     Updates the cached encoder options so that queued items pick up
-    ///     settings changes without needing a new scan. Also re-sizes the
-    ///     music-slot semaphore live, mirroring the per-device cap behavior
-    ///     for video — without this, raising <c>MasterMusicConcurrency</c>
-    ///     mid-run would only take effect after the queue drained.
+    ///     settings changes without needing a new scan, and wakes the
+    ///     scheduler so a raised <c>MasterMusicConcurrency</c> takes effect on
+    ///     the very next iteration. Capacity for music (and every other
+    ///     master-local device) lives in the SlotLedger's resolver, which
+    ///     reads <c>MasterMusicConcurrency</c> live from the options on every
+    ///     reservation — no semaphore to resize.
     /// </summary>
     public void UpdateOptions(EncoderOptions options)
     {
         _lastOptions = options;
-        ResizeMusicSlots(options.Music.MasterMusicConcurrency);
         WakeScheduler();
-    }
-
-    /// <summary>
-    ///     Replaces <see cref="_musicSlots"/> with a fresh semaphore at the
-    ///     requested capacity. Live in-flight music encodes still hold their
-    ///     "old" semaphore and release into it when they finish — that's fine,
-    ///     because the new semaphore is what new acquisitions use.
-    /// </summary>
-    private void ResizeMusicSlots(int target)
-    {
-        target = Math.Max(1, Math.Min(target, 32));
-        lock (_musicSlotsLock)
-        {
-            if (target == _musicSlotCapacity) return;
-            _musicSlotCapacity = target;
-            _musicSlots = new SemaphoreSlim(target, int.MaxValue);
-        }
     }
 
     /// <summary>
@@ -5484,6 +5561,15 @@ public class TranscodingService
     public void SetLocalScheduleGate(Func<bool>? gate) => _localScheduleGate = gate;
 
     /// <summary>
+    ///     Registers a callback to fire whenever a work item is added to the
+    ///     queue. Used by <see cref="ClusterService"/> to wake its dispatcher
+    ///     immediately on enqueue so it competes with the master-local
+    ///     scheduler for new items instead of waiting up to 2 seconds for the
+    ///     next timer tick.
+    /// </summary>
+    public void SetWorkItemQueuedCallback(Action? callback) => _onWorkItemQueued = callback;
+
+    /// <summary>
     ///     Restarts <see cref="ProcessQueueAsync"/> if it had previously
     ///     exited because the schedule gate was closed. Idempotent — bails
     ///     early when the queue is paused or already running.
@@ -5606,6 +5692,11 @@ public class TranscodingService
         }
 
         await _hubContext.Clients.All.SendAsync("WorkItemAdded", workItem);
+
+        // Wake the cluster dispatcher so restored items can be sent to workers
+        // immediately on startup instead of waiting for the 2-second timer tick.
+        try { _onWorkItemQueued?.Invoke(); } catch { }
+
         return workItem.Id;
     }
 
@@ -5871,6 +5962,36 @@ public class TranscodingService
         try
         {
             await ConvertVideoAsync(workItem, options, skipPlacement: true, cancellationToken: cancellationToken);
+        }
+        finally
+        {
+            // Don't remove from _workItems — the output file needs to remain accessible
+        }
+    }
+
+    /// <summary>
+    ///     Music counterpart to <see cref="ConvertVideoForRemoteAsync"/>. Steers
+    ///     the encoder's output into the worker's scratch dir
+    ///     (<see cref="EncoderOptions.EncodeDirectory"/>) so the master's
+    ///     <c>GetOutputFileForJob</c> glob (<c>*[snacks]*</c>) finds it, and
+    ///     forces <c>DeleteOriginalFile=false</c> so the worker never touches
+    ///     the master-uploaded source — placement and source lifecycle are the
+    ///     master's job.
+    /// </summary>
+    /// <param name="workItem">The music work item to encode.</param>
+    /// <param name="options">Encoding options from the master's job assignment. Mutated: Music.OutputDirectory and Music.DeleteOriginalFile are overridden.</param>
+    /// <param name="cancellationToken">Token to abort encoding if the job is cancelled.</param>
+    public async Task ConvertMusicForRemoteAsync(WorkItem workItem, EncoderOptions options, CancellationToken cancellationToken = default)
+    {
+        _workItems[workItem.Id] = workItem;
+
+        if (!string.IsNullOrEmpty(options.EncodeDirectory))
+            options.Music.OutputDirectory = options.EncodeDirectory;
+        options.Music.DeleteOriginalFile = false;
+
+        try
+        {
+            await ConvertMusicAsync(workItem, options, cancellationToken);
         }
         finally
         {

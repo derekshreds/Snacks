@@ -128,6 +128,14 @@ public class MediaFileRepository
                 existing.IsHevc = file.IsHevc;
                 existing.IsHdr = file.IsHdr;
                 existing.Is4K = file.Is4K;
+                // Kind must follow the caller's classification. BulkInsertSeenFilesAsync
+                // inserts every scanned path with the default Kind=Video; AddMusicFileAsync
+                // later re-upserts music files with Kind=Music. Without this assignment,
+                // the row stays Video forever, RestoreToQueueAsync rebuilds music WorkItems
+                // with Kind=Video on master restart, and the cluster dispatcher routes them
+                // through the video filter / video device path — they never reach a worker's
+                // music slot.
+                existing.Kind = file.Kind;
                 existing.Status = file.Status;
                 existing.LastScannedAt = file.LastScannedAt;
                 existing.FileMtime = file.FileMtime;
