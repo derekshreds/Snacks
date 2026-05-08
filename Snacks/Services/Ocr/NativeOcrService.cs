@@ -62,7 +62,15 @@ public sealed class NativeOcrService
         if (_ocrSlot.CurrentCount == 0)
             await log($"OCR: waiting for node OCR slot — currently busy with '{_ocrSlotHolder ?? "another job"}'");
 
-        await _ocrSlot.WaitAsync(ct);
+        // Poll with a timeout so we can emit periodic keepalive log lines. The
+        // per-job watchdog kills items whose LastUpdatedAt is stale for 15 min;
+        // a bare WaitAsync(ct) would let queued jobs (high concurrency × many
+        // OCR streams per video) sit silent past that threshold and get reaped
+        // while the slot-holder is still legitimately working.
+        var keepalive = TimeSpan.FromMinutes(5);
+        while (!await _ocrSlot.WaitAsync(keepalive, ct))
+            await log($"OCR: still waiting for node OCR slot — held by '{_ocrSlotHolder ?? "another job"}'");
+
         _ocrSlotHolder = holderLabel;
         return new OcrSlotReleaser(this);
     }
