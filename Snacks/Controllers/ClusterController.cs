@@ -4,6 +4,7 @@ using Snacks.Data;
 using Snacks.Hubs;
 using Snacks.Models;
 using Snacks.Services;
+using Snacks.Services.Cluster;
 using System.Text.Json;
 
 namespace Snacks.Controllers;
@@ -278,7 +279,7 @@ public sealed class ClusterController : ControllerBase
     /// <param name="jobId"> The job ID being registered. </param>
     /// <param name="metadata"> Job metadata for autonomous encoding. </param>
     [HttpPost("files/{jobId}/metadata")]
-    public IActionResult RegisterMetadata(string jobId, [FromBody] JobMetadata metadata)
+    public async Task<IActionResult> RegisterMetadata(string jobId, [FromBody] JobMetadata metadata)
     {
         if (string.IsNullOrEmpty(metadata.JobId) || metadata.JobId != jobId)
             return BadRequest(new { error = "Job ID mismatch" });
@@ -288,13 +289,59 @@ public sealed class ClusterController : ControllerBase
         var metadataPath = Path.Combine(tempDir, "_metadata.json");
         try
         {
-            System.IO.File.WriteAllText(metadataPath, JsonSerializer.Serialize(metadata, _jsonOptions));
+            await System.IO.File.WriteAllTextAsync(metadataPath, JsonSerializer.Serialize(metadata, _jsonOptions));
             // Record the assigned device so the worker self-card's per-device
             // chip counts this slot as occupied during the upload phase, not
             // only once encoding actually starts.
             _clusterService.RegisterReceivingDevice(jobId, metadata.DeviceId);
-            Console.WriteLine($"Cluster: Registered metadata for job {jobId}");
-            return Ok(new { registered = true });
+
+            // Decide shared-storage mode. If the master offered a shared input path
+            // and this node accepts it, persist a sentinel for the encode loop to
+            // pick up and trigger encoding now (no upload will arrive to fire it).
+            // Any failure path falls back to the regular upload — no error
+            // propagates to the master.
+            var ack = SharedStoragePathValidator.Validate(metadata, _clusterService.GetConfig());
+            if (ack.Mode == "shared")
+            {
+                var sentinel = new
+                {
+                    inputPath       = ack.ResolvedInputPath,
+                    outputPath      = ack.ResolvedOutputPath,
+                    outputDirectory = ack.ResolvedOutputDirectory,
+                };
+                var sentinelPath = Path.Combine(tempDir, "_shared.json");
+                await System.IO.File.WriteAllTextAsync(sentinelPath, JsonSerializer.Serialize(sentinel, _jsonOptions));
+                Console.WriteLine($"Cluster: Accepted shared-storage mode for job {jobId} — input={ack.ResolvedInputPath}, output={ack.ResolvedOutputPath ?? "(via download)"}");
+
+                // Fire the encode immediately — the master will skip upload, so
+                // ReceiveFile's "last chunk" path that normally triggers this
+                // never runs. StartAutonomousEncodingAsync hands off to a
+                // background task internally, so the controller still returns
+                // promptly.
+                var (started, rejectReason) = await _clusterService.StartAutonomousEncodingAsync(jobId, metadata, ack.ResolvedInputPath!);
+                if (!started)
+                {
+                    Console.WriteLine($"Cluster: Shared-mode encode rejected for {jobId}: {rejectReason}");
+                    return Ok(new MetadataAck
+                    {
+                        Mode   = "upload",
+                        Reason = $"Shared-mode encode rejected: {rejectReason}",
+                    });
+                }
+            }
+            else
+            {
+                Console.WriteLine($"Cluster: Registered metadata for job {jobId} — falling back to upload" +
+                    (ack.Reason != null ? $" ({ack.Reason})" : ""));
+            }
+
+            return Ok(new MetadataAck
+            {
+                Mode               = ack.Mode,
+                Reason             = ack.Reason,
+                ResolvedInputPath  = ack.ResolvedInputPath,
+                ResolvedOutputPath = ack.ResolvedOutputPath,
+            });
         }
         catch (Exception ex)
         {
@@ -1073,55 +1120,70 @@ public sealed class ClusterController : ControllerBase
      *  Endpoint shapes mirror <see cref="DashboardController"/> exactly.
      ******************************************************************/
 
+    /// <summary>
+    ///     Parses the optional <c>kind</c> query parameter for media-type filtering.
+    ///     Mirrors <c>DashboardController.ParseKind</c> exactly.
+    /// </summary>
+    private static MediaKind? ParseDashboardKind(string? kind)
+    {
+        if (string.IsNullOrWhiteSpace(kind)) return null;
+        return kind.Trim().ToLowerInvariant() switch
+        {
+            "video" => MediaKind.Video,
+            "music" => MediaKind.Music,
+            _       => null,
+        };
+    }
+
     /// <summary> Lifetime totals for the hero strip. </summary>
     [HttpGet("dashboard/summary")]
-    public async Task<IActionResult> DashboardSummary()
-        => Ok(await _historyRepo.GetSummaryAsync());
+    public async Task<IActionResult> DashboardSummary([FromQuery] string? kind = null)
+        => Ok(await _historyRepo.GetSummaryAsync(ParseDashboardKind(kind)));
 
     /// <summary> Daily savings rollup for the time-series chart. </summary>
     [HttpGet("dashboard/savings-over-time")]
-    public async Task<IActionResult> DashboardSavingsOverTime([FromQuery] int days = 30)
+    public async Task<IActionResult> DashboardSavingsOverTime([FromQuery] int days = 30, [FromQuery] string? kind = null)
     {
         days = Math.Clamp(days, 1, 365);
-        return Ok(await _historyRepo.GetSavingsOverTimeAsync(days));
+        return Ok(await _historyRepo.GetSavingsOverTimeAsync(days, ParseDashboardKind(kind)));
     }
 
     /// <summary> Per-device totals for the device utilization stripe. </summary>
     [HttpGet("dashboard/device-utilization")]
-    public async Task<IActionResult> DashboardDeviceUtilization([FromQuery] int days = 30)
+    public async Task<IActionResult> DashboardDeviceUtilization([FromQuery] int days = 30, [FromQuery] string? kind = null)
     {
         days = Math.Clamp(days, 1, 365);
-        return Ok(await _historyRepo.GetDeviceUtilizationAsync(days));
+        return Ok(await _historyRepo.GetDeviceUtilizationAsync(days, ParseDashboardKind(kind)));
     }
 
     /// <summary> Output codec mix donut data. </summary>
     [HttpGet("dashboard/codec-mix")]
-    public async Task<IActionResult> DashboardCodecMix([FromQuery] int days = 30)
+    public async Task<IActionResult> DashboardCodecMix([FromQuery] int days = 30, [FromQuery] string? kind = null)
     {
         days = Math.Clamp(days, 1, 365);
-        return Ok(await _historyRepo.GetCodecMixAsync(days));
+        return Ok(await _historyRepo.GetCodecMixAsync(days, ParseDashboardKind(kind)));
     }
 
     /// <summary> Per-node throughput leaderboard. </summary>
     [HttpGet("dashboard/node-throughput")]
-    public async Task<IActionResult> DashboardNodeThroughput([FromQuery] int days = 30)
+    public async Task<IActionResult> DashboardNodeThroughput([FromQuery] int days = 30, [FromQuery] string? kind = null)
     {
         days = Math.Clamp(days, 1, 365);
-        return Ok(await _historyRepo.GetNodeThroughputAsync(days));
+        return Ok(await _historyRepo.GetNodeThroughputAsync(days, ParseDashboardKind(kind)));
     }
 
     /// <summary> Most recent N completed encodes. </summary>
     [HttpGet("dashboard/recent")]
-    public async Task<IActionResult> DashboardRecent([FromQuery] int limit = 25)
-        => Ok(await _historyRepo.GetRecentAsync(limit));
+    public async Task<IActionResult> DashboardRecent([FromQuery] int limit = 25, [FromQuery] string? kind = null)
+        => Ok(await _historyRepo.GetRecentAsync(limit, ParseDashboardKind(kind)));
 
     /// <summary> Top compression wins. </summary>
     [HttpGet("dashboard/top-savings")]
-    public async Task<IActionResult> DashboardTopSavings([FromQuery] int limit = 10, [FromQuery] int days = 365)
+    public async Task<IActionResult> DashboardTopSavings([FromQuery] int limit = 10, [FromQuery] int days = 365, [FromQuery] string? kind = null)
     {
         limit = Math.Clamp(limit, 1, 100);
         days  = Math.Clamp(days, 1, 365);
-        return Ok(await _historyRepo.GetTopSavingsAsync(limit, days));
+        return Ok(await _historyRepo.GetTopSavingsAsync(limit, days, ParseDashboardKind(kind)));
     }
 
     /// <summary>

@@ -3,14 +3,14 @@
 </p>
 
 <h1 align="center">Snacks</h1>
-<p align="center"><strong>Automated Video Library Encoder</strong></p>
+<p align="center"><strong>Automated Media Library Transcoder</strong></p>
 <p align="center">
-  Batch transcode your entire video library with hardware acceleration.<br>
+  Batch transcode your entire video <em>and</em> music library with hardware acceleration.<br>
   Runs on your NAS via Docker or locally on Windows as a desktop app.
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-2.10.0-8b5cf6?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-2.11.0-8b5cf6?style=flat-square" alt="Version">
   <img src="https://img.shields.io/badge/.NET-10.0-512bd4?style=flat-square" alt=".NET 10">
   <img src="https://img.shields.io/badge/Electron-41-47848f?style=flat-square" alt="Electron">
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License">
@@ -335,6 +335,20 @@ Files are automatically skipped if they already meet requirements:
 - The container uses [jellyfin-ffmpeg](https://github.com/jellyfin/jellyfin-ffmpeg) which includes full VAAPI/QSV support.
 - `privileged: true` is required on QNAP for `/dev/dri` access.
 - Hardware detection runs automatically on first encode and caches the result.
+- **Hybrid GPU laptops (NVIDIA + iGPU)**: Snacks walks every `/dev/dri/renderD*` node so the iGPU is found even when the NVIDIA card claims `renderD128`. No extra config needed — pass `/dev/dri` through and both render nodes are enumerated.
+
+### NVIDIA in Docker (Linux)
+
+VAAPI/QSV passthrough only covers Intel and AMD. For NVENC inside a Linux container you also need the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) installed on the host (`nvidia-ctk`) and the nvidia runtime requested in compose. Append to your Snacks service in `docker-compose.gpu.yml`:
+
+```yaml
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
+```
+
+Adding `privileged: true` or `--cap-add` is **not** a substitute — without the nvidia runtime the container has no path to libcuda.so. Unraid users get the same outcome via the Nvidia-Driver plugin and `--runtime=nvidia` extra parameter (see [`unraid/snacks.xml`](unraid/snacks.xml) and [`unraid/README.md`](unraid/README.md)).
 
 ### Desktop Notes
 

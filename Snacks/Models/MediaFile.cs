@@ -80,6 +80,14 @@ public sealed class MediaFile
     /// <summary> Whether the video resolution exceeds 1920px width (4K/UHD detection). </summary>
     public bool Is4K { get; set; }
 
+    /// <summary>
+    ///     Distinguishes video files from music (audio-only) files. Set at scan time
+    ///     from the file extension by <c>FileService.GetMediaKind</c>. Drives the
+    ///     scheduler branch between <c>ConvertVideoAsync</c> and <c>ConvertMusicAsync</c>,
+    ///     and powers the dashboard's media-type filter.
+    /// </summary>
+    public MediaKind Kind { get; set; } = MediaKind.Video;
+
     /// <summary> Current processing status of this file. </summary>
     public MediaFileStatus Status { get; set; } = MediaFileStatus.Unseen;
 

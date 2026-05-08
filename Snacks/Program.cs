@@ -191,6 +191,11 @@ builder.Services.AddSingleton<SubtitleExtractionService>();
 builder.Services.AddSingleton<AuthService>();
 builder.Services.AddSingleton<TranscodingService>();
 builder.Services.AddSingleton<StateTransitionService>();
+// Per-kind dispatch routers. Adding a new MediaKind = a new IJobKindRouter
+// registration here; no other site needs touching.
+builder.Services.AddSingleton<Snacks.Services.Routing.IJobKindRouter, Snacks.Services.Routing.VideoJobRouter>();
+builder.Services.AddSingleton<Snacks.Services.Routing.IJobKindRouter, Snacks.Services.Routing.MusicJobRouter>();
+builder.Services.AddSingleton<Snacks.Services.Routing.JobKindRouters>();
 builder.Services.AddSingleton<ClusterService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<ClusterService>());
 // SlotLedger is owned by ClusterService; expose the same instance via DI so

@@ -48,6 +48,14 @@ public sealed class NodeSettings
     ///     master's local clock; in-flight jobs run to completion regardless.
     /// </summary>
     public List<ScheduleWindow>? Schedule { get; set; }
+
+    /// <summary>
+    ///     Per-node opt-out for shared-storage dispatch. <see langword="true"/> forces
+    ///     the master to fall back to upload/download for this node even when the
+    ///     cluster-wide <c>SharedStorageEnabled</c> is on — useful for off-LAN nodes
+    ///     that don't have the shared mount. Null = inherit cluster default.
+    /// </summary>
+    public bool? DisableSharedStorage { get; set; }
 }
 
 /// <summary>

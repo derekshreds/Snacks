@@ -52,6 +52,15 @@ public sealed class WorkItem
     public bool Is4K { get; set; } = false;
 
     /// <summary>
+    ///     Distinguishes video work from music (audio-only) work. Copied from the
+    ///     scanned <see cref="MediaFile.Kind"/> at queue-time. The scheduler reads
+    ///     this to route the job into <c>ConvertVideoAsync</c> or <c>ConvertMusicAsync</c>
+    ///     and to acquire the appropriate slot pool (per-device for video, the
+    ///     dedicated music semaphore for music).
+    /// </summary>
+    public MediaKind Kind { get; set; } = MediaKind.Video;
+
+    /// <summary>
     ///     Full ffprobe analysis of the source file, including stream details.
     ///     Used to build FFmpeg command lines and validate output.
     /// </summary>

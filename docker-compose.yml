@@ -18,6 +18,12 @@ services:
       - SNACKS_WORK_DIR=/app/work
       - FFMPEG_PATH=/usr/lib/jellyfin-ffmpeg/ffmpeg
       - FFPROBE_PATH=/usr/lib/jellyfin-ffmpeg/ffprobe
+      # Uncomment to run as a non-root user matching your NAS owner. The
+      # container will chown /app/work to match and drop privileges via gosu.
+      # If /dev/dri is mounted in, the entrypoint also adds the snacks user
+      # to that device's actual group so hardware acceleration keeps working.
+      # - PUID=1000
+      # - PGID=1000
     # GPU passthrough is configured in docker-compose.gpu.yml (Linux NAS only)
     privileged: false
     restart: unless-stopped

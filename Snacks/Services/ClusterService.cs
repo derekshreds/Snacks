@@ -90,6 +90,18 @@ public sealed class ClusterService : IHostedService, IDisposable
     ///     output-path decisions for jobs already encoding.
     /// </summary>
     private readonly ConcurrentDictionary<string, EncoderOptions> _dispatchedOptions = new();
+
+    /// <summary>
+    ///     Tracks jobs accepted under shared-storage mode keyed by jobId. Holds
+    ///     the master's expected output path so <c>HandleRemoteCompletionAsync</c>
+    ///     can skip the download phase and finalize from the shared file directly.
+    ///     Cleared as part of normal job teardown (completion, cancel, or dispatch
+    ///     failure) — never persisted, since a master crash invalidates the in-flight
+    ///     job and recovery re-dispatches under whichever mode is currently
+    ///     negotiated.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, string> _sharedJobOutputPaths = new();
+
     /// <summary>
     ///     Tracks in-flight dispatch tasks keyed by work-item ID so the loop
     ///     can reap completed ones for hygiene. Multiple dispatches to the
@@ -158,6 +170,9 @@ public sealed class ClusterService : IHostedService, IDisposable
     /// </summary>
     private readonly EncodeHistoryRepository _encodeHistoryRepo;
 
+    private readonly Snacks.Services.Routing.JobKindRouters _routers;
+    private readonly Snacks.Services.Routing.ScoreContext _scoreContext;
+
     private readonly ILogger<ClusterService>? _log;
 
     public ClusterService(
@@ -171,6 +186,7 @@ public sealed class ClusterService : IHostedService, IDisposable
         IntegrationService integrationService,
         NotificationService notificationService,
         EncodeHistoryRepository encodeHistoryRepo,
+        Snacks.Services.Routing.JobKindRouters routers,
         Snacks.Services.Cluster.TransferThrottle? transferThrottle = null,
         ILogger<ClusterService>? logger = null)
     {
@@ -185,6 +201,7 @@ public sealed class ClusterService : IHostedService, IDisposable
         _notificationService = notificationService;
         _encodeHistoryRepo   = encodeHistoryRepo;
         _integrationService  = integrationService;
+        _routers             = routers;
         _log                 = logger;
 
         transcodingService.SetExternalDispatchGate(() => ShouldDispatchExternal);
@@ -202,7 +219,17 @@ public sealed class ClusterService : IHostedService, IDisposable
         _fileTransfer = new ClusterFileTransferService(hubContext, httpClientFactory, _transferThrottle);
 
         _nodeJobs = new ClusterNodeJobService(
-            transcodingService, hubContext, httpClientFactory, _discovery, _nodes, integrationService);
+            transcodingService, hubContext, httpClientFactory, _discovery, _nodes, integrationService, routers);
+
+        // Score-context handed to every router; reads are live (delegates close
+        // over the latest _nodes / settings state on every invocation).
+        _scoreContext = new Snacks.Services.Routing.ScoreContext
+        {
+            IsDeviceEnabled         = IsDeviceEnabled,
+            UsedDeviceSlots         = UsedDeviceSlots,
+            EffectiveDeviceCapacity = EffectiveDeviceCapacity,
+            GetNodeSettings         = GetNodeSettings,
+        };
 
         // Capacity resolver translates ledger's (nodeId, deviceId) into the
         // master's effective per-device cap. Returns 0 for unknown / disabled
@@ -242,6 +269,16 @@ public sealed class ClusterService : IHostedService, IDisposable
         // dashboard can attribute "what got encoded here" even after a host
         // rename / NodeId reset.
         _transcodingService.SetLocalNodeIdentity(_config.NodeId, _config.NodeName);
+        // Wire the shared ledger so master-local encodes reserve via the same
+        // store the cluster dispatcher uses — one source of truth for slot
+        // capacity across master and workers.
+        _transcodingService.SetSlotLedger(_slotLedger);
+        // Register the local node in _nodes so the SlotLedger's capacity
+        // resolver can find this machine's hardware devices when the local
+        // scheduler issues a TryReserve. Done unconditionally for any role
+        // that runs local encodes (master + standalone) — workers populate
+        // _nodes through the master via handshake.
+        UpdateLocalSelfNode();
         Console.WriteLine($"Cluster: Config loaded — enabled={_config.Enabled}, role={_config.Role}, nodeId={_config.NodeId}");
 
         if (_config.Enabled && _config.Role != "standalone")
@@ -400,6 +437,15 @@ public sealed class ClusterService : IHostedService, IDisposable
 
     /// <summary> Returns the current cluster configuration. </summary>
     public ClusterConfig GetConfig() => _config;
+
+    /// <summary>
+    ///     Returns the master's expected shared-storage output path for a job, or
+    ///     <see langword="null"/> if the job is not running in shared-storage mode.
+    ///     Set by <c>DispatchToNodeAsync</c> after the node accepts shared mode and
+    ///     consulted by <c>HandleRemoteCompletionAsync</c> to skip the download phase.
+    /// </summary>
+    public string? GetSharedOutputPathForJob(string jobId) =>
+        _sharedJobOutputPaths.TryGetValue(jobId, out var p) ? p : null;
 
     /// <summary> Toggles local encoding on the master without affecting remote dispatch. </summary>
     public void SetLocalEncodingEnabled(bool enabled)
@@ -828,6 +874,20 @@ public sealed class ClusterService : IHostedService, IDisposable
             _transcodingService.SetRemoteJobCanceller(CancelRemoteJobOnNodeAsync);
             _transcodingService.SetRemoteJobChecker(IsRemoteJobAsync);
             _transcodingService.SetLocalScheduleGate(() => IsNodeWithinScheduleById(_config.NodeId));
+            // Race the master-local scheduler per-item via the queue lock.
+            // Without this, the cluster dispatcher only fires every 2s — fast
+            // jobs (music finishes in seconds) get burned through by the local
+            // loop before the next cluster tick and workers stay idle. The
+            // _dispatchLock inside RunDispatchAsync is non-blocking, so a
+            // burst of enqueues during a running dispatch coalesces safely.
+            _transcodingService.SetWorkItemQueuedCallback(() =>
+            {
+                _ = Task.Run(async () =>
+                {
+                    try { await RunDispatchAsync(); }
+                    catch (Exception ex) { Console.WriteLine($"Cluster: enqueue-wake dispatch error: {ex.Message}"); }
+                });
+            });
             UpdateLocalSkipPredicate();
 
             _dispatchTimer = new Timer(async _ =>
@@ -904,6 +964,13 @@ public sealed class ClusterService : IHostedService, IDisposable
         var  now         = DateTime.UtcNow;
         var  timeout     = TimeSpan.FromSeconds(_config.NodeTimeoutSeconds);
         var  removeAfter = TimeSpan.FromMinutes(5);
+
+        // Refresh the local self entry every heartbeat so changes to local
+        // hardware probing (devices coming online late) and capabilities
+        // (music toggle, etc.) propagate to the SlotLedger's capacity resolver.
+        // Workers (Role=node) don't run a heartbeat at all on this codepath,
+        // so this is master/standalone only.
+        UpdateLocalSelfNode();
 
         foreach (var kvp in _nodes)
         {
@@ -1207,10 +1274,11 @@ public sealed class ClusterService : IHostedService, IDisposable
                 // encoding silently could double-process the same job.
                 _ = DeleteWorkerResourceWithRetryAsync(baseUrl, job.Id, "jobs");
 
+                // HandleNodeFailureAsync owns the full release: it calls
+                // ReleaseActiveSlot internally which clears node.ActiveJobs,
+                // node.ActiveWorkItemId, and the ledger reservation in one
+                // step. Don't repeat any of those here.
                 await HandleNodeFailureAsync(job.Id);
-                node.ActiveJobs.RemoveAll(j => j.JobId == job.Id);
-                if (node.ActiveWorkItemId == job.Id) node.ActiveWorkItemId = null;
-                _slotLedger.Release(job.Id, Snacks.Services.Slots.ReleaseReason.NodeFailed);
             }
             else
             {
@@ -1235,6 +1303,7 @@ public sealed class ClusterService : IHostedService, IDisposable
             _ = DeleteWorkerResourceWithRetryAsync(baseUrl, reported.JobId, "jobs");
             _ = DeleteWorkerResourceWithRetryAsync(baseUrl, reported.JobId, "files");
         }
+
     }
 
     /******************************************************************
@@ -1302,6 +1371,14 @@ public sealed class ClusterService : IHostedService, IDisposable
 
             var globalOptions = LoadEncoderOptions();
 
+            // Items that failed FindBestSlot or whose chosen slot raced this
+            // tick. Excluded from subsequent dequeues so the loop doesn't
+            // re-pick the same blocked item every iteration — and, more
+            // importantly, doesn't have to break the moment a video item
+            // can't find a video slot, which would strand a music item
+            // sitting behind it.
+            var skipThisTick = new HashSet<string>(StringComparer.Ordinal);
+
             while (true)
             {
                 // Recompute available workers each iteration (slots fill as we dispatch)
@@ -1339,19 +1416,53 @@ public sealed class ClusterService : IHostedService, IDisposable
                         inFlightPaths.Add(Path.GetFullPath(uploadItem.Path));
                 }
 
+                bool clusterMusicEnabled = globalOptions.Music?.DispatchToCluster ?? true;
+
+                // Slot availability by kind. The synthetic "music" device only
+                // takes music jobs and GPU/CPU devices only take video jobs
+                // (see ScoreSlot), so a node can have a free music slot while
+                // every video slot is busy — or vice versa. Computed once per
+                // iteration so the filter below skips an entire kind early
+                // when no slot of that kind is free, instead of letting the
+                // dequeue thrash on items it can't place.
+                bool hasMusicSlotFree = false;
+                bool hasVideoSlotFree = false;
+                foreach (var n in availableNow)
+                {
+                    var devs = n.Capabilities?.Devices;
+                    if (devs == null) continue;
+                    foreach (var d in devs)
+                    {
+                        if (!IsDeviceEnabled(n, d.DeviceId)) continue;
+                        int cap = EffectiveDeviceCapacity(n, d);
+                        if (cap <= 0) continue;
+                        if (UsedDeviceSlots(n, d.DeviceId) >= cap) continue;
+                        if (d.DeviceId == "music") hasMusicSlotFree = true;
+                        else                       hasVideoSlotFree = true;
+                    }
+                    if (hasMusicSlotFree && hasVideoSlotFree) break;
+                }
+
                 var workItem = _transcodingService.DequeueForRemoteProcessing(item =>
                 {
-                    // Master's 4K preference only hogs an item type when no worker
-                    // shares that preference — otherwise a worker configured the same
-                    // way as the master would sit idle forever while master monopolised
-                    // the queue. When a worker can take the type, load-share instead.
+                    if (skipThisTick.Contains(item.Id)) return false;
+
+                    // Music items take a different routing path — the 4K worker checks
+                    // are video-only. Eligible only when (a) cluster dispatch is enabled
+                    // for music, and (b) some worker has a free music slot right now.
+                    if (item.Kind == MediaKind.Music)
+                    {
+                        if (!clusterMusicEnabled || !hasMusicSlotFree) return false;
+                        if (inFlightPaths.Contains(Path.GetFullPath(item.Path))) return false;
+                        return true;
+                    }
+
+                    // Video items need a free non-music slot.
+                    if (!hasVideoSlotFree) return false;
+
                     if (masterExcludes4K && !item.Is4K && !anyNon4KWorker) return false;
                     if (masterOnly4K     &&  item.Is4K && !any4KWorker)    return false;
 
-                    // Skip items whose source path is already being processed
-                    // by another in-flight job — same-path double dispatch is
-                    // what produces "Source file was removed during encoding"
-                    // when the first job replaces the source under the second.
                     if (inFlightPaths.Contains(Path.GetFullPath(item.Path))) return false;
 
                     return item.Is4K ? any4KWorker : anyNon4KWorker;
@@ -1362,19 +1473,27 @@ public sealed class ClusterService : IHostedService, IDisposable
                 var folderOverride = FolderOverrideResolver?.Invoke(workItem.Path);
                 var folderOptions  = EncoderOptionsOverride.ApplyOverrides(globalOptions, folderOverride, null);
 
+                // FindBestSlot picks the best (node, device) pair across the
+                // whole cluster — original behavior, preserves load-spread and
+                // codec-aware selection. If null, this item can't be placed
+                // by any current candidate; mark it skippable for the rest of
+                // this tick and continue (instead of breaking the loop, which
+                // would strand other-kind items behind it).
                 var slot = FindBestSlot(workItem, folderOptions);
                 if (slot == null)
                 {
                     _transcodingService.RequeueWorkItem(workItem, silent: true);
-                    break;
+                    skipThisTick.Add(workItem.Id);
+                    continue;
                 }
 
                 var bestNode = slot.Value.Node;
                 var deviceId = slot.Value.DeviceId;
 
-                // Final options: global → folder → node overrides
-                var nodeOverride  = GetNodeSettings(bestNode.NodeId)?.EncodingOverrides;
-                var finalOptions  = EncoderOptionsOverride.ApplyOverrides(globalOptions, folderOverride, nodeOverride);
+                // Final options: global → folder → node overrides. Reuses the
+                // folderOverride resolved a few lines up for the slot-pick filter.
+                var nodeOverride = GetNodeSettings(bestNode.NodeId)?.EncodingOverrides;
+                var finalOptions = EncoderOptionsOverride.ApplyOverrides(globalOptions, folderOverride, nodeOverride);
 
                 // Pre-dispatch skip gate (mirror of the local FinaliseForDispatchAsync).
                 // Resolves any missing OriginalLanguage live, persists it, merges it into
@@ -1679,51 +1798,105 @@ public sealed class ClusterService : IHostedService, IDisposable
                     deviceMaxConcurrency = EffectiveDeviceCapacity(node, dev);
             }
 
+            var clonedOptions = await CloneOptionsForWorkerAsync(options, workItem.Path, workItem.Id, jobCts.Token);
+
+            // Compute the master's view of the final output path so we can offer
+            // it up front when running in shared-storage mode. Mirrors the
+            // selection in HandleRemoteCompletionAsync so master and node land on
+            // the same path — divergence here would mean the master polls a path
+            // the node never wrote to.
+            var nodeSettings  = GetNodeSettings(node.NodeId);
+            var offerShared   = _config.SharedStorageEnabled && nodeSettings?.DisableSharedStorage != true;
+
+            string? sharedInputPath = null;
+            string? sharedOutputDir = null;
+            string? sharedOutputPath = null;
+            if (offerShared)
+            {
+                sharedInputPath = Path.GetFullPath(workItem.Path);
+
+                // Per-kind output extension. The previous master assumed video
+                // (.mkv/.mp4) for every job, so a music encode whose worker
+                // produced "track [snacks].m4a" landed at the master as
+                // "track [snacks].mkv" — playable as audio but cosmetically
+                // wrong. The router knows the kind's true extension.
+                var ext = _routers.For(workItem.Kind).ExpectedOutputExtension(clonedOptions);
+                var baseName       = Path.GetFileNameWithoutExtension(workItem.FileName);
+                var outputFileName = $"{baseName} [snacks]{ext}";
+                string outputDir = !string.IsNullOrEmpty(clonedOptions.OutputDirectory)
+                    ? clonedOptions.OutputDirectory!
+                    : _fileService.GetDirectory(workItem.Path);
+                sharedOutputDir  = Path.GetFullPath(outputDir);
+                sharedOutputPath = Path.GetFullPath(Path.Combine(sharedOutputDir, outputFileName));
+            }
+
             // Build metadata for autonomous encoding on the worker
             var metadata = new JobMetadata
             {
                 JobId    = workItem.Id,
                 FileName = workItem.FileName,
                 FileSize = workItem.Size,
-                Options  = await CloneOptionsForWorkerAsync(options, workItem.Path, workItem.Id, jobCts.Token),
+                Options  = clonedOptions,
                 Probe    = workItem.Probe,
                 Duration = workItem.Length,
                 Bitrate  = workItem.Bitrate,
                 IsHevc   = workItem.IsHevc,
                 Is4K     = workItem.Is4K,
+                Kind     = workItem.Kind,
                 // Empty deviceId for legacy nodes — they auto-pick on the worker side.
-                DeviceId             = string.IsNullOrEmpty(deviceId) ? null : deviceId,
-                DeviceMaxConcurrency = deviceMaxConcurrency,
+                DeviceId                     = string.IsNullOrEmpty(deviceId) ? null : deviceId,
+                DeviceMaxConcurrency         = deviceMaxConcurrency,
+                SharedStorageInputPath       = sharedInputPath,
+                SharedStorageOutputPath      = sharedOutputPath,
+                SharedStorageOutputDirectory = sharedOutputDir,
             };
 
             var client = _discovery.CreateAuthenticatedClient();
-            // Register metadata on worker before uploading
-            await _fileTransfer.RegisterMetadataAsync(client, baseUrl, metadata, jobCts.Token);
-            // Acquire the upload concurrency gate — gates how many uploads
-            // can be in flight cluster-wide and per-node. The slot ledger
-            // already reserved hardware capacity; this is the orthogonal
-            // network-side concurrency limit. Held until upload completes
-            // or DispatchToNodeAsync exits via dispose.
-            IAsyncDisposable? throttleHandle = _transferThrottle != null
-                ? await _transferThrottle.AcquireUploadAsync(node.NodeId, jobCts.Token)
-                : null;
-            try
+            // Register metadata on worker before uploading. Reply tells us whether
+            // the node accepted shared mode or wants the regular upload path.
+            var ack = await _fileTransfer.RegisterMetadataAsync(client, baseUrl, metadata, jobCts.Token);
+            var sharedMode = ack.Mode == "shared";
+
+            if (sharedMode && sharedOutputPath != null)
             {
-                // Upload file as pure binary chunks
-                await _fileTransfer.UploadFileToNodeAsync(client, baseUrl, workItem, jobCts.Token);
+                _sharedJobOutputPaths[workItem.Id] = sharedOutputPath;
+                workItem.TransferProgress = 100;
+                Console.WriteLine($"Cluster: Shared-storage dispatch for {workItem.FileName} — node will read source directly and place output at {sharedOutputPath}");
             }
-            finally
+            else if (offerShared)
             {
-                if (throttleHandle != null) await throttleHandle.DisposeAsync();
+                Console.WriteLine($"Cluster: Shared-storage dispatch fell back to upload for {workItem.FileName}" +
+                    (ack.Reason != null ? $" — {ack.Reason}" : ""));
             }
 
-            // Verify upload
-            var receivedBytes = await _fileTransfer.GetNodeReceivedBytesAsync(client, baseUrl, workItem.Id);
-            if (receivedBytes != workItem.Size)
+            if (!sharedMode)
             {
-                Console.WriteLine($"Cluster: Upload verification failed for {workItem.FileName} — expected {workItem.Size}, node has {receivedBytes}");
-                _ = DeleteWorkerResourceWithRetryAsync(baseUrl, workItem.Id);
-                throw new Exception("Upload verification failed");
+                // Acquire the upload concurrency gate — gates how many uploads
+                // can be in flight cluster-wide and per-node. The slot ledger
+                // already reserved hardware capacity; this is the orthogonal
+                // network-side concurrency limit. Held until upload completes
+                // or DispatchToNodeAsync exits via dispose.
+                IAsyncDisposable? throttleHandle = _transferThrottle != null
+                    ? await _transferThrottle.AcquireUploadAsync(node.NodeId, jobCts.Token)
+                    : null;
+                try
+                {
+                    // Upload file as pure binary chunks
+                    await _fileTransfer.UploadFileToNodeAsync(client, baseUrl, workItem, jobCts.Token);
+                }
+                finally
+                {
+                    if (throttleHandle != null) await throttleHandle.DisposeAsync();
+                }
+
+                // Verify upload
+                var receivedBytes = await _fileTransfer.GetNodeReceivedBytesAsync(client, baseUrl, workItem.Id);
+                if (receivedBytes != workItem.Size)
+                {
+                    Console.WriteLine($"Cluster: Upload verification failed for {workItem.FileName} — expected {workItem.Size}, node has {receivedBytes}");
+                    _ = DeleteWorkerResourceWithRetryAsync(baseUrl, workItem.Id);
+                    throw new Exception("Upload verification failed");
+                }
             }
 
             // WAL: Uploading → Encoding
@@ -1768,6 +1941,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                 workItem.RemoteJobPhase   = null;
                 workItem.TransferProgress = 0;
                 _remoteJobs.TryRemove(workItem.Id, out _);
+                _sharedJobOutputPaths.TryRemove(workItem.Id, out _);
                 if (_jobCts.TryRemove(workItem.Id, out var timeoutCts))
                     timeoutCts.Dispose();
                 await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Queued);
@@ -1783,6 +1957,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                 await CompleteActiveTransitionAsync(workItem.Id);
                 _ = DeleteWorkerResourceWithRetryAsync(baseUrl, workItem.Id);
                 _remoteJobs.TryRemove(workItem.Id, out _);
+                _sharedJobOutputPaths.TryRemove(workItem.Id, out _);
                 ReleaseActiveSlot(node, workItem.Id, Snacks.Services.Slots.ReleaseReason.Cancelled);
                 UpdateNodeStatus(node.NodeId, node.ActiveJobs.Count > 0 ? NodeStatus.Busy : NodeStatus.Online);
             }
@@ -1801,6 +1976,7 @@ public sealed class ClusterService : IHostedService, IDisposable
             workItem.RemoteJobPhase   = null;
             workItem.TransferProgress = 0;
             _remoteJobs.TryRemove(workItem.Id, out _);
+            _sharedJobOutputPaths.TryRemove(workItem.Id, out _);
             if (_jobCts.TryRemove(workItem.Id, out var failedCts))
                 failedCts.Dispose();
             await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Queued);
@@ -1910,6 +2086,7 @@ public sealed class ClusterService : IHostedService, IDisposable
             {
                 _remoteJobs.TryRemove(jobId, out _);
                 _dispatchedOptions.TryRemove(jobId, out _);
+                _sharedJobOutputPaths.TryRemove(jobId, out _);
                 _activeUploads.TryRemove(jobId, out _);
                 _downloadRetryCounts.TryRemove(jobId, out _);
                 _downloadRetryCounts.TryRemove($"_idle_grace_{jobId}", out _);
@@ -1945,6 +2122,12 @@ public sealed class ClusterService : IHostedService, IDisposable
                     workItem.Status       = WorkItemStatus.Failed;
                     workItem.ErrorMessage = "Source file was removed during encoding";
                     workItem.CompletedAt  = DateTime.UtcNow;
+                    // Release the slot before clearing _remoteJobs — heartbeat
+                    // reconcile only walks _remoteJobs, so a leaked reservation
+                    // here would silently mark the worker's device fully booked
+                    // forever without anything actually running on it.
+                    if (workItem.AssignedNodeId != null && _nodes.TryGetValue(workItem.AssignedNodeId, out var srcMissingNode))
+                        ReleaseActiveSlot(srcMissingNode, jobId, Snacks.Services.Slots.ReleaseReason.ValidationFailed);
                     _remoteJobs.TryRemove(jobId, out _);
                     _dispatchedOptions.TryRemove(jobId, out _);
                     await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Failed);
@@ -1953,23 +2136,53 @@ public sealed class ClusterService : IHostedService, IDisposable
                     return;
                 }
 
-                // Phase 1: Download
-                var downloadSucceeded = await DownloadOutputAsync(jobId, nodeBaseUrl, workItem);
-                if (!downloadSucceeded) return; // Will retry via pending completions
+                // Phase 1: Download (skipped when the node already wrote the
+                // output directly to a shared mount — the master and node both
+                // agreed on the path at dispatch time, so we just verify the
+                // file landed and proceed straight to validation).
+                var sharedOutputPath = GetSharedOutputPathForJob(jobId);
+                bool sharedMode      = sharedOutputPath != null;
+                if (sharedMode)
+                {
+                    if (!File.Exists(sharedOutputPath!))
+                    {
+                        Console.WriteLine($"Cluster: Shared-mode completion for {workItem.FileName} but output not yet at {sharedOutputPath} — node atomic-rename may still be settling, will retry");
+                        await RetryDownloadAsync(jobId, nodeBaseUrl, workItem);
+                        return;
+                    }
+                    Console.WriteLine($"Cluster: Shared-mode completion — using node-written output at {sharedOutputPath}");
+                    workItem.TransferProgress = 100;
+                }
+                else
+                {
+                    var downloadSucceeded = await DownloadOutputAsync(jobId, nodeBaseUrl, workItem);
+                    if (!downloadSucceeded) return; // Will retry via pending completions
+                }
 
                 // Phase 2: Validate
                 var options = ResolveJobOptions(jobId);
-                var ext     = options.Format == "mp4" ? ".mp4" : ".mkv";
-                var baseName = Path.GetFileNameWithoutExtension(workItem.FileName);
-                var outputFileName = $"{baseName} [snacks]{ext}";
-                string outputDir;
-                if (!string.IsNullOrEmpty(options.EncodeDirectory))
-                    outputDir = options.EncodeDirectory;
-                else if (!string.IsNullOrEmpty(options.OutputDirectory))
-                    outputDir = options.OutputDirectory;
+                string outputPath;
+                if (sharedMode)
+                {
+                    outputPath = sharedOutputPath!;
+                }
                 else
-                    outputDir = _fileService.GetDirectory(workItem.Path);
-                var outputPath = Path.Combine(outputDir, outputFileName);
+                {
+                    // Per-kind extension — see ExpectedOutputExtension. Music
+                    // encodes produce a music container (e.g. .m4a); the
+                    // historical .mkv-or-.mp4 assumption was a video-only hole.
+                    var ext            = _routers.For(workItem.Kind).ExpectedOutputExtension(options);
+                    var baseName       = Path.GetFileNameWithoutExtension(workItem.FileName);
+                    var outputFileName = $"{baseName} [snacks]{ext}";
+                    string outputDir;
+                    if (!string.IsNullOrEmpty(options.EncodeDirectory))
+                        outputDir = options.EncodeDirectory;
+                    else if (!string.IsNullOrEmpty(options.OutputDirectory))
+                        outputDir = options.OutputDirectory;
+                    else
+                        outputDir = _fileService.GetDirectory(workItem.Path);
+                    outputPath = Path.Combine(outputDir, outputFileName);
+                }
 
                 var validation = await ValidateOutputAsync(jobId, workItem, outputPath);
 
@@ -2153,7 +2366,11 @@ public sealed class ClusterService : IHostedService, IDisposable
             }
 
             var options  = ResolveJobOptions(jobId);
-            var ext      = options.Format == "mp4" ? ".mp4" : ".mkv";
+            // Per-kind extension — music encodes produce a music container
+            // (e.g. .m4a). The previous video-only fallback wrote .m4a bytes
+            // into a .mkv path on download, leaving "track [snacks].mkv"
+            // sitting next to the source.
+            var ext      = _routers.For(workItem.Kind).ExpectedOutputExtension(options);
             var baseName = Path.GetFileNameWithoutExtension(workItem.FileName);
             var outputFileName = $"{baseName} [snacks]{ext}";
 
@@ -2327,10 +2544,18 @@ public sealed class ClusterService : IHostedService, IDisposable
             return OutputValidation.DownloadCorrupt;
 
         var outputProbe = await _ffprobeService.ProbeAsync(outputPath);
-        bool hasVideo    = outputProbe.Streams.Any(s => s.CodecType == "video");
+        // Required-stream check is per-kind: video jobs must have a video
+        // stream (catches "audio-only file made it through" corruption);
+        // music jobs only need audio (cover art is optional, so a
+        // require-video gate would false-positive on every music encode
+        // without embedded artwork).
+        bool isMusic     = workItem.Kind == MediaKind.Music;
+        bool hasRequired = isMusic
+            ? outputProbe.Streams.Any(s => s.CodecType == "audio")
+            : outputProbe.Streams.Any(s => s.CodecType == "video");
         bool hasDuration = _ffprobeService.GetVideoDuration(outputProbe) > 0;
 
-        if (!hasVideo || !hasDuration)
+        if (!hasRequired || !hasDuration)
         {
             var failCount = _downloadRetryCounts.AddOrUpdate($"_validation_{jobId}", 1, (_, c) => c + 1);
             try { File.Delete(outputPath); } catch { }
@@ -2341,7 +2566,8 @@ public sealed class ClusterService : IHostedService, IDisposable
                 return OutputValidation.EncodeCorrupt;
             }
 
-            Console.WriteLine($"Cluster: Sanity probe failed ({failCount}) for {workItem.FileName} — file missing video or duration, retrying download");
+            var missing = !hasRequired ? (isMusic ? "audio" : "video") : "duration";
+            Console.WriteLine($"Cluster: Sanity probe failed ({failCount}) for {workItem.FileName} — file missing {missing}, retrying download");
             return OutputValidation.DownloadCorrupt;
         }
 
@@ -2361,6 +2587,7 @@ public sealed class ClusterService : IHostedService, IDisposable
         // encoding succeeded.
         _remoteJobs.TryRemove(jobId, out _);
         _dispatchedOptions.TryRemove(jobId, out _);
+        _sharedJobOutputPaths.TryRemove(jobId, out _);
         _activeUploads.TryRemove(jobId, out _);
         _downloadRetryCounts.TryRemove(jobId, out _);
         _downloadRetryCounts.TryRemove($"_idle_grace_{jobId}", out _);
@@ -2527,6 +2754,13 @@ public sealed class ClusterService : IHostedService, IDisposable
     /// </summary>
     public async Task CancelRemoteJobOnNodeAsync(string jobId, string nodeId)
     {
+        // Release the slot ledger reservation BEFORE _remoteJobs.TryRemove —
+        // heartbeat reconcile only walks _remoteJobs, so a leaked reservation
+        // here silently keeps the worker's device fully booked. Done up front
+        // so the resolution window doesn't depend on which removal landed first.
+        if (_nodes.TryGetValue(nodeId, out var cancelNode))
+            ReleaseActiveSlot(cancelNode, jobId, Snacks.Services.Slots.ReleaseReason.Cancelled);
+
         _remoteJobs.TryRemove(jobId, out _);
         await CompleteActiveTransitionAsync(jobId);
 
@@ -2540,6 +2774,7 @@ public sealed class ClusterService : IHostedService, IDisposable
         _activeUploads.TryRemove(jobId, out _);
         _activeDownloads.TryRemove(jobId, out _);
         _dispatchedOptions.TryRemove(jobId, out _);
+        _sharedJobOutputPaths.TryRemove(jobId, out _);
         _downloadRetryCounts.TryRemove(jobId, out _);
         _downloadRetryCounts.TryRemove($"_idle_grace_{jobId}", out _);
         _downloadRetryCounts.TryRemove($"_validation_{jobId}", out _);
@@ -2620,6 +2855,7 @@ public sealed class ClusterService : IHostedService, IDisposable
             workItem.AssignedNodeName = null;
             workItem.RemoteJobPhase   = null;
             _dispatchedOptions.TryRemove(jobId, out _);
+            _sharedJobOutputPaths.TryRemove(jobId, out _);
             await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Failed);
             await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
             await _transcodingService.MarkWorkItemFailed(workItem.Id, workItem.ErrorMessage);
@@ -2630,7 +2866,9 @@ public sealed class ClusterService : IHostedService, IDisposable
             workItem.AssignedNodeName = null;
             workItem.RemoteJobPhase   = null;
             // Don't clear _dispatchedOptions on requeue — same id will get a fresh entry
-            // written on the next dispatch.
+            // written on the next dispatch. Clear _sharedJobOutputPaths though, since the
+            // re-dispatch may not be in shared mode (or the path may differ).
+            _sharedJobOutputPaths.TryRemove(jobId, out _);
             await _mediaFileRepo.ClearRemoteAssignmentAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Queued);
             _transcodingService.RequeueWorkItem(workItem);
         }
@@ -2751,9 +2989,35 @@ public sealed class ClusterService : IHostedService, IDisposable
     {
         if (device.DeviceId == "cpu") return 1;
 
-        var ns = GetNodeSettings(node.NodeId);
-        if (ns?.DeviceSettings != null
-            && ns.DeviceSettings.TryGetValue(device.DeviceId, out var s)
+        // Synthetic music device. Per-node override wins; otherwise:
+        //   - For the master itself, use MasterMusicConcurrency (the user's
+        //     master-local cap), falling back to the device default.
+        //   - For workers, use the worker's reported DefaultConcurrency.
+        //
+        // Routing the master's MasterMusicConcurrency through to workers is
+        // wrong: a user setting it to 0 to disable music encoding on the
+        // master also zeros every worker's music capacity, causing
+        // SlotLedger.TryReserve to refuse every music dispatch and the
+        // hasMusicSlotFree gate in the dispatch loop to stay false. Video
+        // devices already use only the worker's own DefaultConcurrency, so
+        // music dispatch was the lone path that conflated the two settings.
+        if (device.DeviceId == "music")
+        {
+            var ns = GetNodeSettings(node.NodeId);
+            if (ns?.DeviceSettings != null
+                && ns.DeviceSettings.TryGetValue("music", out var ms)
+                && ms.MaxConcurrency.HasValue)
+            {
+                return Math.Max(0, ms.MaxConcurrency.Value);
+            }
+            if (node.NodeId == _config.NodeId)
+                return Math.Max(0, LoadEncoderOptions().Music?.MasterMusicConcurrency ?? device.DefaultConcurrency);
+            return Math.Max(0, device.DefaultConcurrency);
+        }
+
+        var nsDev = GetNodeSettings(node.NodeId);
+        if (nsDev?.DeviceSettings != null
+            && nsDev.DeviceSettings.TryGetValue(device.DeviceId, out var s)
             && s.MaxConcurrency.HasValue)
         {
             return Math.Max(0, s.MaxConcurrency.Value);
@@ -2943,85 +3207,14 @@ public sealed class ClusterService : IHostedService, IDisposable
     }
 
     /// <summary>
-    ///     Scores a (node, device) slot for a candidate work item against
-    ///     the user's hardware-acceleration preference and the codec-to-device
-    ///     mapping. CPU is reserved for explicit "Software" jobs and for
-    ///     "auto" jobs on nodes with no hardware encoder; everywhere else it
-    ///     returns -50.
+    ///     Scores a (node, device) slot for a candidate work item by dispatching
+    ///     to the per-kind <see cref="Routing.IJobKindRouter"/>. Returns ≤ 0
+    ///     when the slot can't host the item; positive when it can (higher =
+    ///     better fit). All kind-specific scoring (codec match, hwaccel
+    ///     gating, music synthetic-device routing) lives inside the routers.
     /// </summary>
     private int ScoreSlot(ClusterNode node, HardwareDevice device, WorkItem workItem, EncoderOptions options)
-    {
-        var ns = GetNodeSettings(node.NodeId);
-        if (ns != null)
-        {
-            if (ns.Only4K  == true && !workItem.Is4K)  return -100;
-            if (ns.Exclude4K == true && workItem.Is4K) return -100;
-        }
-
-        var caps = node.Capabilities;
-        if (caps == null) return 1;
-
-        if (caps.AvailableDiskSpaceBytes < workItem.Size * 2.5)
-            return -100;
-
-        // Codec-to-device match: every device must be able to encode the codec
-        // the job is asking for. CPU supports all three; hardware devices may
-        // not (e.g. AV1 requires recent silicon).
-        var requestedCodec = (options.Codec ?? "").ToLowerInvariant();
-        var codecKey = requestedCodec switch
-        {
-            "h265" or "hevc" => "h265",
-            "h264" or "avc"  => "h264",
-            "av1"            => "av1",
-            _                => requestedCodec,
-        };
-        if (!device.SupportedCodecs.Any(c => c.Equals(codecKey, StringComparison.OrdinalIgnoreCase)))
-            return -50;
-
-        // CPU is reserved for explicit "Software" jobs and for "auto" jobs
-        // on nodes that have no usable hardware encoder for the requested
-        // codec. Under "auto" with hardware that can do the codec, or any
-        // specific-vendor preference, CPU is excluded outright — we'd rather
-        // queue a job than silently spend it on a slow software encode while
-        // a GPU sits idle. "Usable" means present, enabled, and capable of
-        // the requested codec — an Intel iGPU without AV1 encode shouldn't
-        // lock out the CPU on an AV1 job, otherwise the node deadlocks.
-        var hw = options.HardwareAcceleration?.ToLower() ?? "auto";
-        bool isCpu = device.DeviceId == "cpu";
-        bool nodeHasUsableHardware = node.Capabilities?.Devices?.Any(d =>
-            d.DeviceId != "cpu"
-            && IsDeviceEnabled(node, d.DeviceId)
-            && d.SupportedCodecs.Any(c => c.Equals(codecKey, StringComparison.OrdinalIgnoreCase))) == true;
-
-        if (hw == "none" && !isCpu) return -50;                             // software-only ⇒ CPU only
-        if (hw != "none" && hw != "auto" && isCpu) return -50;              // specific vendor ⇒ never CPU
-        if (hw == "auto" && isCpu && nodeHasUsableHardware) return -50;     // auto + usable HW ⇒ never CPU
-        if (hw != "none" && !isCpu && !string.Equals(device.DeviceId, hw, StringComparison.OrdinalIgnoreCase)
-            && hw != "auto") return -50;                                    // specific vendor ⇒ wrong family
-
-        int score = 1;
-        if (hw == "none")
-        {
-            score += 6;        // CPU is the only valid pick here
-        }
-        else if (hw == "auto")
-        {
-            score += isCpu ? 5 : 8;   // CPU is the auto-fallback when no HW exists
-        }
-        else if (string.Equals(device.DeviceId, hw, StringComparison.OrdinalIgnoreCase))
-        {
-            score += 12;       // exact match on a specific vendor pref
-        }
-
-        // Spread load: lightly prefer slots on devices with more headroom so
-        // a node with two free NVENC slots takes the next two jobs before
-        // we start filling its single QSV slot.
-        int cap  = EffectiveDeviceCapacity(node, device);
-        int used = UsedDeviceSlots(node, device.DeviceId);
-        score += Math.Max(0, cap - used);
-
-        return score;
-    }
+        => _routers.For(workItem.Kind).ScoreSlot(node, device, workItem, options, _scoreContext);
 
     /******************************************************************
      *  Dispatch Cooldown & Node Reset
@@ -3078,8 +3271,14 @@ public sealed class ClusterService : IHostedService, IDisposable
                 try { cts.Cancel(); cts.Dispose(); } catch { }
             }
 
-            // Clear tracking
+            // Clear tracking. Release the ledger reservation before removing
+            // from _remoteJobs — heartbeat reconcile only walks _remoteJobs,
+            // so a leaked reservation here would persist forever, falsely
+            // showing the worker's device fully booked. The 30s cooldown
+            // applied below stops dispatch from racing the just-released
+            // slot, but we still need an actual release.
             await CompleteActiveTransitionAsync(jobId);
+            ReleaseActiveSlot(node, jobId, Snacks.Services.Slots.ReleaseReason.NodeFailed);
             _remoteJobs.TryRemove(jobId, out _);
             _activeUploads.TryRemove(jobId, out _);
             _activeDownloads.TryRemove(jobId, out _);
@@ -3147,6 +3346,53 @@ public sealed class ClusterService : IHostedService, IDisposable
      ******************************************************************/
 
     /// <summary>
+    ///     Reserves a slot during master-restart recovery and transitions it to
+    ///     <paramref name="phase"/>. Returns false when the reservation is refused
+    ///     by the ledger — typically because the recovered node has not yet
+    ///     reported capabilities (its <see cref="ClusterNode.Capabilities"/>
+    ///     starts empty and is populated by the first heartbeat). Logs an error
+    ///     so the failure is observable: the caller is expected to abandon the
+    ///     in-flight attach and re-queue the work item from <c>Pending</c>, which
+    ///     also makes the worker drop its straggler copy on next reconcile.
+    /// </summary>
+    private bool TryReserveRecoveredSlot(MediaFile mediaFile, WorkItem workItem, Snacks.Services.Slots.SlotPhase phase)
+    {
+        if (string.IsNullOrEmpty(mediaFile.DispatchedDeviceId) || string.IsNullOrEmpty(mediaFile.AssignedNodeId))
+        {
+            Console.Error.WriteLine($"Cluster: Recovery: missing DispatchedDeviceId / AssignedNodeId for {mediaFile.FileName} — cannot reserve slot, will re-queue from Pending");
+            return false;
+        }
+
+        if (!_slotLedger.TryReserve(mediaFile.AssignedNodeId, mediaFile.DispatchedDeviceId, workItem.Id, mediaFile.FileName))
+        {
+            Console.Error.WriteLine($"Cluster: Recovery: SlotLedger refused reservation for {mediaFile.FileName} on {mediaFile.AssignedNodeId}/{mediaFile.DispatchedDeviceId} — node hasn't reported capabilities yet, will re-queue from Pending");
+            return false;
+        }
+
+        _slotLedger.TransitionPhase(workItem.Id, phase);
+        return true;
+    }
+
+    /// <summary>
+    ///     Recovery fallback when a slot reservation can't be re-established at
+    ///     master startup: clear the in-flight assignment and put the file back
+    ///     on the queue from <c>Pending</c> so the next dispatch tick can pick
+    ///     it up cleanly. The worker's straggler copy of the job is left for
+    ///     heartbeat reconcile to cancel via the orphan-job DELETE path.
+    /// </summary>
+    private async Task RequeueRecoveredJobAsync(MediaFile mediaFile, WorkItem workItem)
+    {
+        try { await _mediaFileRepo.ClearRemoteAssignmentAsync(mediaFile.FilePath, MediaFileStatus.Queued); }
+        catch (Exception ex) { Console.WriteLine($"Cluster: Recovery: ClearRemoteAssignment failed for {mediaFile.FileName}: {ex.Message}"); }
+        workItem.AssignedNodeId   = null;
+        workItem.AssignedNodeName = null;
+        workItem.RemoteJobPhase   = null;
+        workItem.TransferProgress = 0;
+        workItem.Status           = WorkItemStatus.Pending;
+        _transcodingService.RequeueWorkItem(workItem, silent: true);
+    }
+
+    /// <summary>
     ///     Processes incomplete WAL entries left by the previous session. Each entry
     ///     represents a phase transition that was started but never completed, meaning
     ///     the master crashed mid-operation. Corrects the DB phase so that the
@@ -3210,7 +3456,11 @@ public sealed class ClusterService : IHostedService, IDisposable
                     if (mediaFile.AssignedNodeId != null)
                     {
                         var options = ResolveOptionsForJob(mediaFile.FilePath, mediaFile.AssignedNodeId);
-                        var ext = options.Format == "mp4" ? ".mp4" : ".mkv";
+                        // Per-kind extension (music = .m4a/.flac/etc., video = .mkv/.mp4)
+                        // — the recovery probe must look for the right filename or it
+                        // will report "output missing" and trigger a redundant
+                        // re-download/re-encode for any music job.
+                        var ext = _routers.For(mediaFile.Kind).ExpectedOutputExtension(options);
                         var baseName = Path.GetFileNameWithoutExtension(mediaFile.FileName);
                         var outputFileName = $"{baseName} [snacks]{ext}";
 
@@ -3381,6 +3631,14 @@ public sealed class ClusterService : IHostedService, IDisposable
                     if (isCompleted)
                     {
                         Console.WriteLine($"Cluster: Node has completed encoding {mediaFile.FileName} — downloading");
+                        // Reserve the slot first so we can bail cleanly before any
+                        // _remoteJobs / _jobCts side-effects if the ledger refuses
+                        // (e.g. recovered node hasn't reported capabilities yet).
+                        if (!TryReserveRecoveredSlot(mediaFile, workItem, Snacks.Services.Slots.SlotPhase.Downloading))
+                        {
+                            await RequeueRecoveredJobAsync(mediaFile, workItem);
+                            continue;
+                        }
                         var recDlCts1 = new CancellationTokenSource();
                         _jobCts[workItem.Id]        = recDlCts1;
                         workItem.Status             = WorkItemStatus.Downloading;
@@ -3391,15 +3649,6 @@ public sealed class ClusterService : IHostedService, IDisposable
                         workItem.ErrorMessage       = null;
                         workItem.DispatchedDeviceId = mediaFile.DispatchedDeviceId;
                         _remoteJobs[workItem.Id]    = workItem;
-                        // Rebuild the ledger row so the recovered job correctly
-                        // counts against per-device capacity until the download
-                        // completes. DeviceId comes from the persisted column;
-                        // skip the reservation if absent (legacy row pre-upgrade).
-                        if (!string.IsNullOrEmpty(mediaFile.DispatchedDeviceId) && !string.IsNullOrEmpty(mediaFile.AssignedNodeId))
-                        {
-                            _slotLedger.TryReserve(mediaFile.AssignedNodeId, mediaFile.DispatchedDeviceId, workItem.Id, mediaFile.FileName);
-                            _slotLedger.TransitionPhase(workItem.Id, Snacks.Services.Slots.SlotPhase.Downloading);
-                        }
                         // Snapshot reconstructed options so the completion path uses the same
                         // folder/node-overridden options as the original dispatch (best
                         // approximation post-crash; ResolveOptionsForJob rebuilds from current
@@ -3422,6 +3671,12 @@ public sealed class ClusterService : IHostedService, IDisposable
                     if (!isReceiving && isActive)
                     {
                         Console.WriteLine($"Cluster: Node is actively encoding {mediaFile.FileName} at {recoveredProgress}% — tracking");
+                        if (!TryReserveRecoveredSlot(mediaFile, workItem, Snacks.Services.Slots.SlotPhase.Encoding))
+                        {
+                            await RequeueRecoveredJobAsync(mediaFile, workItem);
+                            continue;
+                        }
+                        _slotLedger.UpdateProgress(workItem.Id, recoveredProgress, "Encoding");
                         var recEncCts = new CancellationTokenSource();
                         _jobCts[workItem.Id]      = recEncCts;
                         workItem.Status           = WorkItemStatus.Processing;
@@ -3431,12 +3686,6 @@ public sealed class ClusterService : IHostedService, IDisposable
                         workItem.RemoteJobPhase   = "Encoding";
                         workItem.ErrorMessage     = null;
                         workItem.DispatchedDeviceId = mediaFile.DispatchedDeviceId;
-                        if (!string.IsNullOrEmpty(mediaFile.DispatchedDeviceId) && !string.IsNullOrEmpty(mediaFile.AssignedNodeId))
-                        {
-                            _slotLedger.TryReserve(mediaFile.AssignedNodeId, mediaFile.DispatchedDeviceId, workItem.Id, mediaFile.FileName);
-                            _slotLedger.TransitionPhase(workItem.Id, Snacks.Services.Slots.SlotPhase.Encoding);
-                            _slotLedger.UpdateProgress(workItem.Id, recoveredProgress, "Encoding");
-                        }
                         // Original encode start is unrecoverable here — the worker
                         // is already mid-encode but its kickoff time wasn't
                         // persisted. Stamp "now" so EncodeSeconds is at worst a
@@ -3458,6 +3707,11 @@ public sealed class ClusterService : IHostedService, IDisposable
                     if (outputResponse.IsSuccessStatusCode)
                     {
                         Console.WriteLine($"Cluster: Node has output for {mediaFile.FileName} — downloading");
+                        if (!TryReserveRecoveredSlot(mediaFile, workItem, Snacks.Services.Slots.SlotPhase.Downloading))
+                        {
+                            await RequeueRecoveredJobAsync(mediaFile, workItem);
+                            continue;
+                        }
                         var recDlCts2 = new CancellationTokenSource();
                         _jobCts[workItem.Id]        = recDlCts2;
                         workItem.Status             = WorkItemStatus.Downloading;
@@ -3468,11 +3722,6 @@ public sealed class ClusterService : IHostedService, IDisposable
                         workItem.ErrorMessage       = null;
                         workItem.DispatchedDeviceId = mediaFile.DispatchedDeviceId;
                         _remoteJobs[workItem.Id]    = workItem;
-                        if (!string.IsNullOrEmpty(mediaFile.DispatchedDeviceId) && !string.IsNullOrEmpty(mediaFile.AssignedNodeId))
-                        {
-                            _slotLedger.TryReserve(mediaFile.AssignedNodeId, mediaFile.DispatchedDeviceId, workItem.Id, mediaFile.FileName);
-                            _slotLedger.TransitionPhase(workItem.Id, Snacks.Services.Slots.SlotPhase.Downloading);
-                        }
                         _dispatchedOptions[workItem.Id] = ResolveOptionsForJob(mediaFile.FilePath, mediaFile.AssignedNodeId);
                         if (mediaFile.RemoteFailureCount > 0)
                             _downloadRetryCounts[workItem.Id] = mediaFile.RemoteFailureCount * 3;
@@ -3497,16 +3746,16 @@ public sealed class ClusterService : IHostedService, IDisposable
                     if (receivedBytes > 0)
                     {
                         Console.WriteLine($"Cluster: Node has {receivedBytes / 1048576}MB of {mediaFile.FileName} — resuming upload");
+                        if (!TryReserveRecoveredSlot(mediaFile, workItem, Snacks.Services.Slots.SlotPhase.Uploading))
+                        {
+                            await RequeueRecoveredJobAsync(mediaFile, workItem);
+                            continue;
+                        }
                         workItem.AssignedNodeId   = mediaFile.AssignedNodeId;
                         workItem.AssignedNodeName = mediaFile.AssignedNodeName ?? "recovered";
                         workItem.RemoteJobPhase   = "Uploading";
                         workItem.DispatchedDeviceId = mediaFile.DispatchedDeviceId;
                         _remoteJobs[workItem.Id]  = workItem;
-                        if (!string.IsNullOrEmpty(mediaFile.DispatchedDeviceId) && !string.IsNullOrEmpty(mediaFile.AssignedNodeId))
-                        {
-                            _slotLedger.TryReserve(mediaFile.AssignedNodeId, mediaFile.DispatchedDeviceId, workItem.Id, mediaFile.FileName);
-                            _slotLedger.TransitionPhase(workItem.Id, Snacks.Services.Slots.SlotPhase.Uploading);
-                        }
                         await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
 
                         var options = ResolveOptionsForJob(mediaFile.FilePath, mediaFile.AssignedNodeId);
@@ -3550,7 +3799,8 @@ public sealed class ClusterService : IHostedService, IDisposable
                                     Duration = workItem.Length,
                                     Bitrate  = workItem.Bitrate,
                                     IsHevc   = workItem.IsHevc,
-                                    Is4K     = workItem.Is4K
+                                    Is4K     = workItem.Is4K,
+                                    Kind     = workItem.Kind,
                                 };
 
                                 var uploadClient = _discovery.CreateAuthenticatedClient();
@@ -3562,6 +3812,13 @@ public sealed class ClusterService : IHostedService, IDisposable
                                 {
                                     Console.WriteLine($"Cluster: Resumed upload verification failed");
                                     _remoteJobs.TryRemove(workItem.Id, out _);
+                                    // Release the ledger reservation we made at line 3722.
+                                    // Without this the slot stays held for a job that is no
+                                    // longer in _remoteJobs, so heartbeat reconcile (which
+                                    // only walks _remoteJobs) can never reclaim it — the
+                                    // worker's device shows as fully booked while nothing
+                                    // is actually running on it.
+                                    ReleaseActiveSlot(nodeForDispatch, workItem.Id, Snacks.Services.Slots.ReleaseReason.ValidationFailed);
                                     await _mediaFileRepo.ClearRemoteAssignmentAsync(mediaFile.FilePath, MediaFileStatus.Queued);
                                     _transcodingService.RequeueWorkItem(workItem);
                                     UpdateNodeStatus(nodeForDispatch.NodeId, NodeStatus.Online);
@@ -3589,6 +3846,11 @@ public sealed class ClusterService : IHostedService, IDisposable
                                 Console.WriteLine($"Cluster: Recovery upload failed for {workItem.FileName}: {ex.Message}");
                                 await CompleteActiveTransitionAsync(workItem.Id);
                                 _remoteJobs.TryRemove(workItem.Id, out _);
+                                // Release the ledger reservation we made at line 3722.
+                                // Without this the slot stays held for a job that is no
+                                // longer in _remoteJobs, so heartbeat reconcile (which
+                                // only walks _remoteJobs) can never reclaim it.
+                                ReleaseActiveSlot(nodeForDispatch, workItem.Id, Snacks.Services.Slots.ReleaseReason.DispatchThrew);
                                 try { await _mediaFileRepo.ClearRemoteAssignmentAsync(mediaFile.FilePath, MediaFileStatus.Queued); } catch { }
                                 _transcodingService.RequeueWorkItem(workItem);
                                 UpdateNodeStatus(nodeForDispatch.NodeId, NodeStatus.Online);
@@ -3800,6 +4062,37 @@ public sealed class ClusterService : IHostedService, IDisposable
                 return (true, (int?)null);
             return (s.Enabled, s.MaxConcurrency);
         });
+    }
+
+    /// <summary>
+    ///     Refreshes the local node's own entry in <c>_nodes</c> so the
+    ///     SlotLedger's capacity resolver can find this machine's hardware
+    ///     devices when the master-local scheduler issues a TryReserve.
+    ///     Called for both <c>master</c> and <c>standalone</c> roles —
+    ///     standalone has no cluster but still needs ledger-backed slot
+    ///     accounting on the local node. Workers (Role=node) never reach
+    ///     this path; their entries are populated by the master via
+    ///     handshake/heartbeat from the worker's POV.
+    ///     Idempotent — overwrites the existing entry every call so live
+    ///     hardware probing (devices coming online late) propagates.
+    /// </summary>
+    private void UpdateLocalSelfNode()
+    {
+        if (_config.Role == "node") return;
+        try
+        {
+            var self = _discovery.BuildSelfNode();
+            // BuildSelfNode stamps the configured Role ("master" or
+            // "standalone"). The dispatch loop's "n.Role == 'node'" filter
+            // naturally excludes the local entry from worker dispatch
+            // candidates, while the SlotLedger's resolver indexes by NodeId
+            // alone and so still finds this entry for master-local encodes.
+            _nodes[self.NodeId] = self;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Cluster: UpdateLocalSelfNode failed: {ex.Message}");
+        }
     }
 
     /// <summary>

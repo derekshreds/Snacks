@@ -122,6 +122,15 @@ public sealed class WorkerCapabilities
     ///     <see cref="NodeSettings.DeviceSettings"/>.
     /// </summary>
     public List<HardwareDevice> Devices { get; set; } = new();
+
+    /// <summary>
+    ///     Whether this node implements the music transcoding pipeline. Defaults
+    ///     to <see langword="true"/> for any node running this version or later.
+    ///     Pre-pivot worker builds deserialize this from a missing JSON field as
+    ///     <see langword="false"/>, so the master automatically routes music jobs
+    ///     only to nodes that can actually run them.
+    /// </summary>
+    public bool SupportsMusic { get; set; } = true;
 }
 
 /// <summary> Operational status of a cluster node. </summary>

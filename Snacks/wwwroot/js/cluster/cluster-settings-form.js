@@ -43,6 +43,30 @@ export class ClusterSettingsForm {
         document.getElementById('toggleSecretVisibility')?.addEventListener('click', () => this._toggleSecretVisibility());
         document.getElementById('addManualNode')        ?.addEventListener('click', () => this._addManualNode());
         document.getElementById('switchToStandalone')   ?.addEventListener('click', () => this._switchToStandalone());
+
+        // Live-update the empty-allowlist warning so the user sees it appear
+        // the moment they toggle the feature on without having configured paths.
+        const sharedToggle = document.getElementById('clusterSharedStorageEnabled');
+        const inputPaths   = document.getElementById('clusterSharedInputPaths');
+        const outputPaths  = document.getElementById('clusterSharedOutputPaths');
+        sharedToggle?.addEventListener('change', () => this._updateSharedStorageWarning());
+        inputPaths  ?.addEventListener('input',  () => this._updateSharedStorageWarning());
+        outputPaths ?.addEventListener('input',  () => this._updateSharedStorageWarning());
+    }
+
+    /**
+     * Toggles the "shared mode is on but no paths are allowed" alert. The
+     * validator fails closed when the allowlist is empty, so without this hint
+     * a user could enable the feature, save, and never realize jobs are silently
+     * still using the upload path.
+     */
+    _updateSharedStorageWarning() {
+        const enabled    = !!document.getElementById('clusterSharedStorageEnabled')?.checked;
+        const hasInput   = (document.getElementById('clusterSharedInputPaths')?.value  || '').split('\n').some(s => s.trim());
+        const hasOutput  = (document.getElementById('clusterSharedOutputPaths')?.value || '').split('\n').some(s => s.trim());
+        const warning    = document.getElementById('sharedStorageAllowlistWarning');
+        if (!warning) return;
+        warning.style.display = (enabled && !hasInput && !hasOutput) ? '' : 'none';
     }
 
 
@@ -73,7 +97,14 @@ export class ClusterSettingsForm {
             if (el('clusterMasterUrl'))     el('clusterMasterUrl').value       = config.masterUrl            || '';
             if (el('clusterNodeTempDir'))   el('clusterNodeTempDir').value     = config.nodeTempDirectory    || '';
 
+            if (el('clusterSharedStorageEnabled')) el('clusterSharedStorageEnabled').checked = !!config.sharedStorageEnabled;
+            if (el('clusterSharedInputPaths'))     el('clusterSharedInputPaths').value       = (config.sharedStorageInputPaths  || []).join('\n');
+            if (el('clusterSharedOutputPaths'))    el('clusterSharedOutputPaths').value      = (config.sharedStorageOutputPaths || []).join('\n');
+            if (el('clusterSharedRewriteFrom'))    el('clusterSharedRewriteFrom').value      = config.sharedStoragePathRewriteFrom || '';
+            if (el('clusterSharedRewriteTo'))      el('clusterSharedRewriteTo').value        = config.sharedStoragePathRewriteTo   || '';
+
             this._updateRoleUI(config.role);
+            this._updateSharedStorageWarning();
             this._renderManualNodes(config.manualNodes || []);
         } catch (err) {
             console.error('Failed to load cluster config:', err);
@@ -114,6 +145,12 @@ export class ClusterSettingsForm {
         config.masterUrl            = el('clusterMasterUrl')?.value       || '';
         config.nodeTempDirectory    = el('clusterNodeTempDir')?.value     || '';
         config.manualNodes          = this._manualNodes;
+
+        config.sharedStorageEnabled         = !!el('clusterSharedStorageEnabled')?.checked;
+        config.sharedStorageInputPaths      = (el('clusterSharedInputPaths')?.value  || '').split('\n').map(s => s.trim()).filter(Boolean);
+        config.sharedStorageOutputPaths     = (el('clusterSharedOutputPaths')?.value || '').split('\n').map(s => s.trim()).filter(Boolean);
+        config.sharedStoragePathRewriteFrom = el('clusterSharedRewriteFrom')?.value  || '';
+        config.sharedStoragePathRewriteTo   = el('clusterSharedRewriteTo')?.value    || '';
 
         // Enabling cluster mode requires a shared secret; reject up-front.
         if (config.enabled
@@ -184,10 +221,15 @@ export class ClusterSettingsForm {
     _updateRoleUI(role) {
         const master = document.getElementById('masterSettings');
         const node   = document.getElementById('nodeSettings');
+        const shared = document.getElementById('sharedStorageSettings');
         const desc   = document.getElementById('roleDescription');
 
         if (master) master.style.display = role === 'master' ? '' : 'none';
         if (node)   node.style.display   = role === 'node'   ? '' : 'none';
+        // Shared-storage panel is symmetric — visible whenever this instance
+        // participates in a cluster, since master and node both need it
+        // configured in the same way.
+        if (shared) shared.style.display = (role === 'master' || role === 'node') ? '' : 'none';
 
         if (!desc) return;
         desc.textContent =

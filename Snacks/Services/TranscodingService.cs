@@ -3,8 +3,10 @@ using Microsoft.Extensions.Logging;
 using Snacks.Data;
 using Snacks.Hubs;
 using Snacks.Models;
+using Snacks.Services.Slots;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 
@@ -61,6 +63,38 @@ public class TranscodingService
     ///     slot.
     /// </summary>
     private readonly ConcurrentDictionary<string, ActiveLocalJob> _activeLocalJobs = new();
+
+    /// <summary>
+    ///     Sentinel <see cref="ActiveLocalJob.DeviceId"/> for music encodes. They
+    ///     occupy <see cref="_activeLocalJobs"/> so cancel/kill plumbing works
+    ///     uniformly, but slot accounting goes through the shared
+    ///     <see cref="_slotLedger"/> on the synthetic <c>"music"</c> device id —
+    ///     identical to the path workers use, so a queue full of music can't
+    ///     starve GPU video and vice versa. Capacity for the master's music
+    ///     slot comes from <c>EncoderOptions.Music.MasterMusicConcurrency</c>
+    ///     via <c>ClusterService.EffectiveDeviceCapacity</c> (where 0 means
+    ///     "never encode music on master"; the ledger refuses every reserve).
+    /// </summary>
+    private const string MusicDeviceId = "music";
+
+    /// <summary>
+    ///     Authoritative slot ledger, shared with <see cref="ClusterService"/>.
+    ///     Master-local encodes reserve <c>(_localNodeId, deviceId)</c> entries
+    ///     here exactly the same way worker dispatches do — one ledger, one
+    ///     source of truth, no parallel semaphore that can drift out of sync.
+    ///     Set by <see cref="SetSlotLedger"/> from cluster wiring; null only
+    ///     in unit tests that don't exercise scheduling.
+    /// </summary>
+    private SlotLedger? _slotLedger;
+
+    /// <summary>
+    ///     The master's NodeId, stamped onto every local ledger reservation
+    ///     so heartbeat reconcile and the dispatch loop see master-local jobs
+    ///     under the master's row in <c>_nodes</c>. Defaults to a stable
+    ///     fallback so non-cluster runs (tests, standalone with cluster off)
+    ///     still produce identifiable reservations.
+    /// </summary>
+    private string _localNodeId = "master-local";
 
     /// <summary>Lock protecting per-job <see cref="ActiveLocalJob.Process"/> publication.</summary>
     private readonly object _activeLock = new();
@@ -141,6 +175,17 @@ public class TranscodingService
     ///     <see cref="ClusterService"/>; null in standalone/tests means "always allowed".
     /// </summary>
     private Func<bool>? _localScheduleGate;
+
+    /// <summary>
+    ///     Optional callback fired immediately after a work item is added to
+    ///     the queue. <see cref="ClusterService"/> wires this to its dispatch
+    ///     entry point so the cluster dispatcher races the master-local
+    ///     scheduler per-item via the queue lock — without it the cluster
+    ///     only fires every 2 seconds via its timer, and master-local (which
+    ///     wakes synchronously on enqueue) consumes fast jobs (music) before
+    ///     the cluster ever sees them.
+    /// </summary>
+    private Action? _onWorkItemQueued;
 
     /// <summary>
     ///     Resolves per-device settings for <em>this</em> machine when the
@@ -293,7 +338,22 @@ public class TranscodingService
         _localNodeIdentity = (
             string.IsNullOrEmpty(nodeId) ? "local" : nodeId,
             string.IsNullOrEmpty(hostname) ? Environment.MachineName : hostname);
+        _localNodeId = _localNodeIdentity.NodeId;
     }
+
+    /// <summary>
+    ///     Wires the shared <see cref="SlotLedger"/> so master-local encodes
+    ///     reserve through the same store the cluster dispatcher uses. Without
+    ///     a ledger (unit tests, early startup), local scheduling falls back
+    ///     to the legacy in-process counting via <see cref="_activeLocalJobs"/>.
+    /// </summary>
+    public void SetSlotLedger(SlotLedger ledger) => _slotLedger = ledger;
+
+    /// <summary> Live-read accessor for callers that need to reach the ledger via TranscodingService. </summary>
+    public SlotLedger? GetSlotLedger() => _slotLedger;
+
+    /// <summary> True if local encoding is suspended (master delegating to workers). </summary>
+    public bool IsLocalEncodingPaused => _localEncodingPaused;
 
     public TranscodingService(
         FileService fileService,
@@ -424,6 +484,12 @@ public class TranscodingService
     /// <returns>The work item ID (may be a previously existing ID if the file was already tracked).</returns>
     public async Task<string> AddFileAsync(string filePath, EncoderOptions options, bool force = false, CancellationToken cancellationToken = default)
     {
+        // Music files take a much leaner code path — no HDR/4K/HW-accel logic, no
+        // per-track audio profiles, no subtitle handling. Dispatch on extension here
+        // so the video path below stays unchanged.
+        if (_fileService.GetMediaKind(filePath) == MediaKind.Music)
+            return await AddMusicFileAsync(filePath, options, force, cancellationToken);
+
         try
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -476,7 +542,8 @@ public class TranscodingService
                 Bitrate = bitrate,
                 Length = length,
                 IsHevc = isHevc,
-                Probe = probe
+                Probe = probe,
+                Kind = MediaKind.Video,
             };
 
             // Don't add items that already meet the requirements.
@@ -697,6 +764,11 @@ public class TranscodingService
 
             await _hubContext.Clients.All.SendAsync("WorkItemAdded", workItem);
 
+            // Wake the cluster dispatcher in parallel with the local scheduler
+            // so workers compete for fast jobs (music) instead of losing every
+            // item to the event-driven local loop.
+            try { _onWorkItemQueued?.Invoke(); } catch { }
+
             // Always try to start queue processing — the semaphore ensures only one runs at a time
             _ = Task.Run(async () =>
             {
@@ -713,11 +785,209 @@ public class TranscodingService
     }
 
     /// <summary>
-    ///     Adds all video files in a directory to the encoding queue.
+    ///     Music-aware counterpart to <see cref="AddFileAsync"/>. Probes the file,
+    ///     applies the music-specific skip ladder (codec+bitrate match, lossy-to-lossless
+    ///     guard), then creates a <see cref="MediaFile"/> row and a <see cref="WorkItem"/>
+    ///     tagged with <see cref="MediaKind.Music"/> and queues it. Music jobs reserve the
+    ///     synthetic <c>"music"</c> device through the shared <see cref="SlotLedger"/>,
+    ///     keeping them off the per-device video pool so a queue of music files can't
+    ///     starve a 4K HEVC encode (and vice versa).
+    /// </summary>
+    private async Task<string> AddMusicFileAsync(
+        string filePath, EncoderOptions options, bool force, CancellationToken cancellationToken)
+    {
+        try
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var fileInfo = new FileInfo(filePath);
+            var probe    = await _ffprobeService.ProbeAsync(filePath, cancellationToken);
+
+            double length = 0;
+            if (double.TryParse(probe.Format?.Duration, NumberStyles.Float, CultureInfo.InvariantCulture, out var d)) length = d;
+
+            var sourceCodec  = MusicEncoderArgs.GetSourceCodec(probe);
+            var sourceKbps   = MusicEncoderArgs.GetSourceBitrateKbps(probe);
+            var sourceChans  = MusicEncoderArgs.GetSourceChannels(probe);
+
+            var workItem = new WorkItem
+            {
+                FileName = _fileService.GetFileName(filePath),
+                Path     = filePath,
+                Size     = fileInfo.Length,
+                Bitrate  = sourceKbps,
+                Length   = length,
+                Probe    = probe,
+                Kind     = MediaKind.Music,
+            };
+
+            var music = options.Music;
+            var targetEncoder = MusicEncoderArgs.ResolveEncoder(music.Codec);
+            bool targetLossless = MusicEncoderArgs.IsLossless(targetEncoder);
+            bool sourceLossy    = MusicEncoderArgs.IsLossy(sourceCodec);
+            var normalizedPath  = Path.GetFullPath(filePath);
+
+            async Task MarkSkippedInDb(string reason)
+            {
+                Console.WriteLine($"Skipping {workItem.FileName}: {reason}");
+                await _mediaFileRepo.UpsertAsync(new MediaFile
+                {
+                    FilePath      = normalizedPath,
+                    Directory     = Path.GetDirectoryName(normalizedPath) ?? "",
+                    FileName      = Path.GetFileName(normalizedPath),
+                    BaseName      = Path.GetFileNameWithoutExtension(normalizedPath),
+                    FileSize      = fileInfo.Length,
+                    Bitrate       = sourceKbps,
+                    Codec         = sourceCodec,
+                    Duration      = length,
+                    Kind          = MediaKind.Music,
+                    Status        = MediaFileStatus.Skipped,
+                    LastScannedAt = DateTime.UtcNow,
+                    FileMtime     = fileInfo.LastWriteTimeUtc.Ticks,
+                });
+            }
+
+            // Lossy → lossless: re-encoding can't recover quality, so it just bloats files.
+            // Always skip with a clear reason; user can force via per-folder override.
+            if (sourceLossy && targetLossless && !force)
+            {
+                await MarkSkippedInDb("lossy-to-lossless avoided (no quality recovery possible)");
+                return workItem.Id;
+            }
+
+            // Codec + bitrate match — re-encoding lossy → lossy at near-target loses quality
+            // without saving meaningful space. Lossless source + lossless target is also a noop.
+            if (music.SkipIfAlreadyTargetCodec && !force)
+            {
+                bool codecMatch = string.Equals(sourceCodec, targetEncoder, StringComparison.OrdinalIgnoreCase)
+                    || (sourceCodec.Equals("aac", StringComparison.OrdinalIgnoreCase) && targetEncoder.Equals("aac", StringComparison.OrdinalIgnoreCase))
+                    || (sourceCodec.Equals("flac", StringComparison.OrdinalIgnoreCase) && targetEncoder.Equals("flac", StringComparison.OrdinalIgnoreCase));
+
+                if (codecMatch && sourceKbps > 0 && !targetLossless)
+                {
+                    int tolerance = Math.Max(0, music.BitrateMatchTolerancePct);
+                    long lower = music.BitrateKbps * (100L - tolerance) / 100;
+                    long upper = music.BitrateKbps * (100L + tolerance) / 100;
+                    if (sourceKbps >= lower && sourceKbps <= upper)
+                    {
+                        await MarkSkippedInDb($"already {sourceCodec} at {sourceKbps}kbps (target {music.BitrateKbps}kbps ±{tolerance}%)");
+                        return workItem.Id;
+                    }
+                }
+                else if (codecMatch && targetLossless && string.Equals(sourceCodec, "flac", StringComparison.OrdinalIgnoreCase))
+                {
+                    await MarkSkippedInDb("already flac (lossless target matches source)");
+                    return workItem.Id;
+                }
+            }
+
+            var dbFile = await _mediaFileRepo.GetByPathAsync(normalizedPath);
+
+            if (_workItems.Values.Any(w =>
+                Path.GetFullPath(w.Path).Equals(normalizedPath, StringComparison.OrdinalIgnoreCase) &&
+                w.Status is WorkItemStatus.Pending or WorkItemStatus.Processing
+                    or WorkItemStatus.Uploading or WorkItemStatus.Downloading))
+            {
+                return workItem.Id;
+            }
+
+            if (dbFile != null)
+            {
+                // Change detection mirrors the video path — a >10% size change or
+                // >30s duration change means the file was replaced, so reset and
+                // start fresh. Without this a corrected re-rip would be skipped
+                // because the prior row still says Completed/Failed.
+                double sizeDelta     = dbFile.FileSize > 0 ? Math.Abs(1.0 - (double)fileInfo.Length / dbFile.FileSize) : 0;
+                double durationDelta = dbFile.Duration > 0 && length > 0 ? Math.Abs(dbFile.Duration - length) : 0;
+                bool fileChanged     = sizeDelta > 0.10 || durationDelta > 30;
+
+                if (fileChanged)
+                {
+                    Console.WriteLine($"Music file changed on disk: {workItem.FileName} (size: {dbFile.FileSize}→{fileInfo.Length}) — resetting");
+                    await _mediaFileRepo.ResetFileAsync(normalizedPath);
+                }
+                else if (!force && dbFile.Status is MediaFileStatus.Cancelled)
+                {
+                    Console.WriteLine($"Skipping {workItem.FileName}: previously cancelled by user");
+                    return workItem.Id;
+                }
+                else if (!force && dbFile.Status is MediaFileStatus.Failed && dbFile.FailureCount >= 3)
+                {
+                    // Music encodes are fast and the pipeline is new — give a few retry
+                    // attempts before giving up so a transient bug or one-off ffmpeg
+                    // hiccup doesn't permanently bench a track. After 3 strikes the user
+                    // has to fix something or explicitly force-retry.
+                    Console.WriteLine($"Skipping {workItem.FileName}: failed {dbFile.FailureCount} times — permanent fail");
+                    return workItem.Id;
+                }
+                else if (!force && dbFile.Status is MediaFileStatus.Completed)
+                {
+                    Console.WriteLine($"Skipping {workItem.FileName}: already completed");
+                    return workItem.Id;
+                }
+            }
+
+            if (force)
+            {
+                var existing = _workItems.Values.FirstOrDefault(w =>
+                    Path.GetFullPath(w.Path).Equals(normalizedPath, StringComparison.OrdinalIgnoreCase));
+                if (existing != null)
+                    _workItems.TryRemove(existing.Id, out _);
+            }
+
+            await _mediaFileRepo.UpsertAsync(new MediaFile
+            {
+                FilePath      = normalizedPath,
+                Directory     = Path.GetDirectoryName(normalizedPath) ?? "",
+                FileName      = Path.GetFileName(normalizedPath),
+                BaseName      = Path.GetFileNameWithoutExtension(normalizedPath),
+                FileSize      = fileInfo.Length,
+                Bitrate       = sourceKbps,
+                Codec         = sourceCodec,
+                Duration      = length,
+                Kind          = MediaKind.Music,
+                Status        = MediaFileStatus.Queued,
+                LastScannedAt = DateTime.UtcNow,
+                FileMtime     = fileInfo.LastWriteTimeUtc.Ticks,
+            });
+
+            Console.WriteLine($"Queuing music {workItem.FileName}: {sourceCodec} {sourceKbps}kbps {sourceChans}ch → {music.Codec} {music.BitrateKbps}kbps");
+
+            _workItems[workItem.Id] = workItem;
+            lock (_queueLock)
+            {
+                _workQueue.Add(workItem);
+                _workQueue.Sort((a, b) => b.Bitrate.CompareTo(a.Bitrate));
+            }
+
+            await _hubContext.Clients.All.SendAsync("WorkItemAdded", workItem);
+
+            // Wake the cluster dispatcher in parallel with the local scheduler
+            // so workers compete for music items instead of losing every one to
+            // the event-driven local loop. Music encodes finish in seconds, so
+            // master local would otherwise burn through every queued item
+            // between the cluster's 2-second timer ticks.
+            try { _onWorkItemQueued?.Invoke(); } catch { }
+
+            _ = Task.Run(async () =>
+            {
+                try { await ProcessQueueAsync(options); }
+                catch (Exception ex) { Console.WriteLine($"Error in ProcessQueueAsync: {ex.Message}"); }
+            });
+
+            return workItem.Id;
+        }
+        catch (Exception ex)
+        {
+            throw new Exception($"Failed to add music file: {ex.Message}", ex);
+        }
+    }
+
+    /// <summary>
+    ///     Adds all media files (video + music) in a directory to the encoding queue.
     ///     Files are probed sequentially to avoid overwhelming NAS storage.
     ///     Encoding starts as soon as the first file is scanned — no waiting for the full batch.
     /// </summary>
-    /// <param name="directoryPath">The directory to scan for video files.</param>
+    /// <param name="directoryPath">The directory to scan for media files.</param>
     /// <param name="options">Encoder options to apply to all files.</param>
     /// <param name="recursive">When <c>true</c>, subdirectories are also scanned.</param>
     /// <returns>A summary message with the count of files added.</returns>
@@ -732,13 +1002,13 @@ public class TranscodingService
         {
             directories = new List<string> { directoryPath };
         }
-        var videoFiles = _fileService.GetAllVideoFiles(directories);
+        var mediaFiles = _fileService.GetAllMediaFiles(directories);
 
         // Probe files sequentially to avoid overwhelming NAS storage.
         // Each file triggers queue processing via AddFileAsync, so encoding
         // starts as soon as the first file is scanned — no waiting for the full scan.
         int addedCount = 0;
-        foreach (var file in videoFiles)
+        foreach (var (file, _) in mediaFiles)
         {
             try
             {
@@ -769,15 +1039,92 @@ public class TranscodingService
         var directories = recursive
             ? _fileService.RecursivelyFindDirectories(directoryPath)
             : new List<string> { directoryPath };
-        var videoFiles = _fileService.GetAllVideoFiles(directories);
+        var mediaFiles = _fileService.GetAllMediaFiles(directories);
 
-        var results = new List<FileAnalysisResult>(videoFiles.Count);
-        foreach (var file in videoFiles)
+        var results = new List<FileAnalysisResult>(mediaFiles.Count);
+        foreach (var (file, kind) in mediaFiles)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            results.Add(await AnalyzeFileAsync(file, options, cancellationToken));
+            results.Add(kind == MediaKind.Music
+                ? await AnalyzeMusicFileAsync(file, options, cancellationToken)
+                : await AnalyzeFileAsync(file, options, cancellationToken));
         }
         return results;
+    }
+
+    /// <summary>
+    ///     Music dry-run prediction. Mirrors the skip ladder in
+    ///     <c>AddMusicFileAsync</c> so the analyze modal sees the same outcome the
+    ///     real run would produce. Lossy → lossless and codec+bitrate matches are
+    ///     surfaced as <c>Skip</c>; everything else is <c>Queue</c>.
+    /// </summary>
+    private async Task<FileAnalysisResult> AnalyzeMusicFileAsync(string filePath, EncoderOptions options, CancellationToken cancellationToken)
+    {
+        var result = new FileAnalysisResult
+        {
+            FilePath = filePath,
+            FileName = _fileService.GetFileName(filePath),
+        };
+
+        try
+        {
+            var fileInfo = new FileInfo(filePath);
+            result.SizeBytes = fileInfo.Length;
+
+            var probe = await _ffprobeService.ProbeAsync(filePath, cancellationToken);
+            double length = 0;
+            if (double.TryParse(probe.Format?.Duration, NumberStyles.Float, CultureInfo.InvariantCulture, out var d)) length = d;
+
+            result.Duration    = length;
+            result.Codec       = MusicEncoderArgs.GetSourceCodec(probe);
+            result.BitrateKbps = MusicEncoderArgs.GetSourceBitrateKbps(probe);
+
+            var music         = options.Music;
+            var targetEncoder = MusicEncoderArgs.ResolveEncoder(music.Codec);
+            bool targetLossless = MusicEncoderArgs.IsLossless(targetEncoder);
+            bool sourceLossy    = MusicEncoderArgs.IsLossy(result.Codec);
+
+            if (sourceLossy && targetLossless)
+            {
+                result.Decision = "Skip";
+                result.Reason   = "lossy → lossless avoided (no quality recovery)";
+                return result;
+            }
+
+            bool codecMatch = string.Equals(result.Codec, targetEncoder, StringComparison.OrdinalIgnoreCase);
+            if (music.SkipIfAlreadyTargetCodec && codecMatch)
+            {
+                if (targetLossless)
+                {
+                    result.Decision = "Skip";
+                    result.Reason   = "already in target lossless codec";
+                    return result;
+                }
+                if (result.BitrateKbps > 0)
+                {
+                    int tolerance = Math.Max(0, music.BitrateMatchTolerancePct);
+                    long lower = music.BitrateKbps * (100L - tolerance) / 100;
+                    long upper = music.BitrateKbps * (100L + tolerance) / 100;
+                    if (result.BitrateKbps >= lower && result.BitrateKbps <= upper)
+                    {
+                        result.Decision = "Skip";
+                        result.Reason   = $"already {result.Codec} at {result.BitrateKbps}kbps (target {music.BitrateKbps}±{tolerance}%)";
+                        return result;
+                    }
+                }
+            }
+
+            result.Decision         = "Queue";
+            result.Reason           = $"transcode → {music.Codec} {music.BitrateKbps}kbps";
+            result.EncodeTargetKbps = music.BitrateKbps;
+            return result;
+        }
+        catch (Exception ex)
+        {
+            result.Decision = "Error";
+            result.Reason   = ex.Message;
+            return result;
+        }
     }
 
     /// <summary>
@@ -1221,7 +1568,11 @@ public class TranscodingService
             var encodedSize = workItem.OutputSize ?? 0;
             var noSavings   = encodedSize == 0 || encodedSize >= workItem.Size;
             var encodeStart = workItem.StartedAt ?? workItem.CreatedAt;
-            var srcCodec    = workItem.Probe?.Streams?.FirstOrDefault(s => s.CodecType == "video")?.CodecName ?? "";
+            bool isMusic    = workItem.Kind == MediaKind.Music;
+            var srcStream   = workItem.Probe?.Streams?.FirstOrDefault(s =>
+                s.CodecType == (isMusic ? "audio" : "video"));
+            var srcCodec    = srcStream?.CodecName ?? "";
+            var encodedCodec = isMusic ? options.Music.Codec : options.Codec;
 
             var record = new EncodeHistory
             {
@@ -1232,7 +1583,7 @@ public class TranscodingService
                 EncodedSizeBytes    = noSavings ? 0 : encodedSize,
                 BytesSaved          = noSavings ? 0 : Math.Max(0, workItem.Size - encodedSize),
                 OriginalCodec       = srcCodec,
-                EncodedCodec        = options.Codec,
+                EncodedCodec        = encodedCodec,
                 OriginalBitrateKbps = workItem.Bitrate,
                 EncodedBitrateKbps  = workItem.Length > 0 && encodedSize > 0
                     ? (long)(encodedSize * 8.0 / 1024.0 / workItem.Length)
@@ -1244,6 +1595,7 @@ public class TranscodingService
                 NodeHostname        = _localNodeIdentity.Hostname,
                 WasRemote           = false,
                 Is4K                = workItem.Is4K,
+                Kind                = workItem.Kind,
                 StartedAt           = encodeStart,
                 CompletedAt         = DateTime.UtcNow,
                 Outcome             = noSavings ? "NoSavings" : "Completed",
@@ -1412,14 +1764,23 @@ public class TranscodingService
                 // Reap completed inflight tasks before checking for queue-empty exit.
                 inflight.RemoveAll(t => t.IsCompleted);
 
-                bool queueEmpty;
+                var current = _lastOptions ?? options;
+
+                bool anyVideoPending, anyMusicPending;
                 lock (_queueLock)
                 {
                     _workQueue.RemoveAll(w => w.Status is WorkItemStatus.Cancelled or WorkItemStatus.Stopped);
-                    queueEmpty = !_workQueue.Any(w =>
+                    anyVideoPending = _workQueue.Any(w =>
+                        w.Kind == MediaKind.Video &&
+                        w.Status == WorkItemStatus.Pending &&
+                        (_shouldSkipLocal == null || !_shouldSkipLocal(w)));
+                    anyMusicPending = _workQueue.Any(w =>
+                        w.Kind == MediaKind.Music &&
                         w.Status == WorkItemStatus.Pending &&
                         (_shouldSkipLocal == null || !_shouldSkipLocal(w)));
                 }
+
+                bool queueEmpty = !anyVideoPending && !anyMusicPending;
 
                 if (queueEmpty && inflight.Count == 0) break;
 
@@ -1432,42 +1793,127 @@ public class TranscodingService
                     continue;
                 }
 
-                // Pick a device that has free capacity right now. The check
-                // reads the current count of in-flight encodes per device
-                // and the user's current cap from the settings provider, so
-                // a cap change applied while we're looping takes effect on
-                // the very next iteration with no semaphore rebuilding.
-                var current = _lastOptions ?? options;
-                var deviceId = TryAcquireLocalDeviceSlot(current);
-                if (deviceId == null)
+                bool dispatched = false;
+
+                // ───── MUSIC DISPATCH ─────
+                // Music targets the synthetic "music" device, reserved through
+                // the same SlotLedger workers use. EffectiveDeviceCapacity returns
+                // 0 when MasterMusicConcurrency is 0 (or unset and the default-
+                // concurrency fallback is 0) — TryReserve refuses, the master
+                // skips, and the cluster dispatcher routes the item to a worker.
+                if (anyMusicPending && _slotLedger != null)
                 {
-                    // No slot free yet — wait for an inflight to finish OR a
-                    // settings-change wake. Without the wake, raising the cap
-                    // mid-run would only take effect after the running encode
-                    // finished, defeating the user's "let two run at once"
-                    // intent.
-                    await WaitForSchedulerProgressAsync(inflight);
+                    WorkItem? musicItem;
+                    lock (_queueLock)
+                    {
+                        musicItem = _workQueue.FirstOrDefault(w =>
+                            w.Kind == MediaKind.Music &&
+                            w.Status == WorkItemStatus.Pending &&
+                            (_shouldSkipLocal == null || !_shouldSkipLocal(w)));
+                        if (musicItem != null) _workQueue.Remove(musicItem);
+                    }
+
+                    if (musicItem == null)
+                    {
+                        // Race: another path consumed it. Nothing to do.
+                    }
+                    else if (musicItem.Status is WorkItemStatus.Cancelled or WorkItemStatus.Stopped)
+                    {
+                        _workItems.TryRemove(musicItem.Id, out _);
+                    }
+                    else if (!_slotLedger.TryReserve(_localNodeId, MusicDeviceId, musicItem.Id, musicItem.FileName))
+                    {
+                        // Master at music capacity (or master music encoding is
+                        // disabled by MasterMusicConcurrency=0). Put the item
+                        // back so the cluster dispatcher can route it to a
+                        // worker, or so a future tick retries once a master
+                        // music slot frees up.
+                        lock (_queueLock)
+                        {
+                            _workQueue.Add(musicItem);
+                            _workQueue.Sort((a, b) => b.Bitrate.CompareTo(a.Bitrate));
+                        }
+                    }
+                    else
+                    {
+                        _slotLedger.TransitionPhase(musicItem.Id, SlotPhase.Encoding);
+
+                        var musicFolderOverride = ResolveFolderOverride(musicItem.Path);
+                        var musicPerJobOptions = EncoderOptionsOverride.ApplyOverrides(current, musicFolderOverride, null);
+
+                        var musicActive = new ActiveLocalJob
+                        {
+                            Item     = musicItem,
+                            Cts      = new CancellationTokenSource(),
+                            DeviceId = MusicDeviceId,
+                        };
+                        _activeLocalJobs[musicItem.Id] = musicActive;
+                        musicItem.DispatchedDeviceId = MusicDeviceId;
+
+                        var capturedItem = musicItem;
+                        var capturedLedger = _slotLedger;
+                        var musicTask = Task.Run(async () =>
+                        {
+                            try { await ProcessMusicWorkItemAsync(capturedItem, musicPerJobOptions, musicActive); }
+                            finally
+                            {
+                                capturedLedger.Release(capturedItem.Id, ReleaseReason.Completed);
+                                WakeScheduler();
+                            }
+                        });
+                        inflight.Add(musicTask);
+                        dispatched = true;
+                    }
+                }
+
+                // ───── VIDEO DISPATCH ─────
+                if (!anyVideoPending)
+                {
+                    if (!dispatched)
+                        await WaitForSchedulerProgressAsync(inflight);
                     continue;
                 }
 
-                // Pick the next pending item this device can encode.
+                // Pick the next pending video item, then try to reserve a
+                // device slot for it via the ledger. Picking-then-reserving
+                // (vs. the prior reserve-then-pick) matches the cluster
+                // dispatcher's order so the two schedulers see the same
+                // head-of-queue when they race, and avoids the "reserved a
+                // slot then no item fit it — release" round-trip.
                 WorkItem? workItem;
                 lock (_queueLock)
                 {
                     workItem = _workQueue.FirstOrDefault(w =>
+                        w.Kind == MediaKind.Video &&
                         w.Status == WorkItemStatus.Pending &&
-                        (_shouldSkipLocal == null || !_shouldSkipLocal(w)) &&
-                        DeviceCanEncode(deviceId, w, current));
+                        (_shouldSkipLocal == null || !_shouldSkipLocal(w)));
                     if (workItem != null) _workQueue.Remove(workItem);
                 }
 
                 if (workItem == null)
                 {
-                    // No item fits this device right now. Wait for inflight
-                    // progress or settings-wake before reconsidering.
-                    await WaitForSchedulerProgressAsync(inflight);
+                    if (!dispatched)
+                        await WaitForSchedulerProgressAsync(inflight);
                     continue;
                 }
+
+                var deviceId = TryReserveLocalDeviceSlot(workItem, current);
+                if (deviceId == null)
+                {
+                    // No master slot fits this item (capacity full, codec
+                    // mismatch, or every device disabled). Re-queue so the
+                    // cluster dispatcher can route to a worker, or a future
+                    // master tick retries once a slot frees up.
+                    lock (_queueLock)
+                    {
+                        _workQueue.Add(workItem);
+                        _workQueue.Sort((a, b) => b.Bitrate.CompareTo(a.Bitrate));
+                    }
+                    if (!dispatched)
+                        await WaitForSchedulerProgressAsync(inflight);
+                    continue;
+                }
+                _slotLedger?.TransitionPhase(workItem.Id, SlotPhase.Encoding);
 
                 // Resolve any per-folder override and merge it into the per-job options.
                 // Cluster dispatch already does this via ClusterService.ResolveOptionsForJob;
@@ -1479,6 +1925,7 @@ public class TranscodingService
                 var folderOverride = ResolveFolderOverride(workItem.Path);
                 var perJobOptions = EncoderOptionsOverride.ApplyOverrides(current, folderOverride, null);
                 perJobOptions.HardwareAcceleration = deviceId == "cpu" ? "none" : deviceId;
+                perJobOptions.HardwareDevicePath   = deviceId == "cpu" ? null : GetDevicePathForDeviceId(deviceId);
 
                 // Pre-dispatch finalisation: resolve any missing OriginalLanguage live,
                 // merge it into the per-job keep lists, and re-run the skip ladder under
@@ -1492,8 +1939,9 @@ public class TranscodingService
                 if (!await FinaliseForDispatchAsync(workItem, perJobOptions, CancellationToken.None))
                 {
                     await MarkDispatchSkippedAsync(workItem, "pre-dispatch check — file already meets target under current options");
-                    // No slot to release — TryAcquireLocalDeviceSlot reads occupancy live from
-                    // _activeLocalJobs, and we never added this item to that map.
+                    // Release the ledger reservation we made above for this item —
+                    // the encode is being skipped, so the slot must go back to the pool.
+                    _slotLedger?.Release(workItem.Id, ReleaseReason.NoSavings);
                     continue;
                 }
 
@@ -1505,13 +1953,15 @@ public class TranscodingService
                 {
                     Console.WriteLine($"Dropping {workItem.FileName}: cancelled/stopped during dispatch finalisation");
                     _workItems.TryRemove(workItem.Id, out _);
+                    _slotLedger?.Release(workItem.Id, ReleaseReason.Cancelled);
                     try { await _hubContext.Clients.All.SendAsync("WorkItemRemoved", workItem.Id); } catch { /* SignalR errors are non-fatal */ }
                     continue;
                 }
 
                 // Pre-register the active job synchronously before spawning so
-                // the scheduler's next iteration counts it against the device's
-                // cap without a race window.
+                // cancellation can find the running ffmpeg process (slot accounting
+                // itself is now in the ledger; _activeLocalJobs is purely for
+                // process-kill plumbing).
                 var active = new ActiveLocalJob
                 {
                     Item     = workItem,
@@ -1521,7 +1971,21 @@ public class TranscodingService
                 _activeLocalJobs[workItem.Id] = active;
                 workItem.DispatchedDeviceId = deviceId;
 
-                var jobTask = ProcessWorkItemAsync(workItem, perJobOptions, active);
+                // Wrap the local encode so the ledger is released exactly once
+                // when it finishes, regardless of success / failure / cancel.
+                // ProcessWorkItemAsync owns _activeLocalJobs cleanup in its
+                // own finally — the ledger release is layered above.
+                var capturedVideoItem   = workItem;
+                var capturedVideoLedger = _slotLedger;
+                var jobTask = Task.Run(async () =>
+                {
+                    try { await ProcessWorkItemAsync(capturedVideoItem, perJobOptions, active); }
+                    finally
+                    {
+                        capturedVideoLedger?.Release(capturedVideoItem.Id, ReleaseReason.Completed);
+                        WakeScheduler();
+                    }
+                });
                 inflight.Add(jobTask);
             }
 
@@ -1538,23 +2002,30 @@ public class TranscodingService
     }
 
     /// <summary>
-    ///     Returns the first device with free capacity for an in-flight encode,
-    ///     or <see langword="null"/> if every device is disabled, codec-mismatched,
-    ///     or already at its user-configured concurrency cap. Capacity is computed
-    ///     from <see cref="_activeLocalJobs"/> live — no cached semaphores — so a
-    ///     cap raised mid-run unlocks the next slot on the very next call.
+    ///     Picks the first hwaccel-eligible device for <paramref name="workItem"/>
+    ///     and atomically reserves a slot on it via the shared
+    ///     <see cref="SlotLedger"/>. Returns the chosen device id on success,
+    ///     <see langword="null"/> when every eligible device is disabled, full,
+    ///     or codec-mismatched — in which case the caller is expected to
+    ///     re-queue and let either the cluster dispatcher (workers) or a
+    ///     future tick (master slot freed) try again.
+    ///
+    ///     <para>Capacity is owned by the ledger's resolver, which honours
+    ///     the user's per-device <c>MaxConcurrency</c> overrides and falls
+    ///     back to <see cref="HardwareDevice.DefaultConcurrency"/>; CPU is
+    ///     hard-capped at 1 inside <c>EffectiveDeviceCapacity</c>.</para>
     ///
     ///     <para>CPU rules:
     ///     <list type="bullet">
     ///         <item><c>none</c> (Software): CPU is the only acceptable slot.</item>
     ///         <item><c>auto</c> on a machine with no hardware encoders: CPU is the auto-fallback.</item>
     ///         <item>Anything else: CPU is excluded so jobs queue rather than spilling onto a slow software encode.</item>
-    ///     </list>
-    ///     The CPU slot is hidden from the override dialog and pinned to a
-    ///     single concurrent encode regardless of any stale per-node setting.</para>
+    ///     </list></para>
     /// </summary>
-    private string? TryAcquireLocalDeviceSlot(EncoderOptions options)
+    private string? TryReserveLocalDeviceSlot(WorkItem workItem, EncoderOptions options)
     {
+        if (_slotLedger == null) return null;
+
         var devices = GetDetectedDevices();
         if (devices.Count == 0) return null;
 
@@ -1574,29 +2045,15 @@ public class TranscodingService
             if (hwPref != "auto" && hwPref != "none"
                 && !string.Equals(hwPref, device.DeviceId, StringComparison.OrdinalIgnoreCase)) continue;
 
-            int cap;
-            if (isCpu)
-            {
-                // CPU slot is hidden from the user and capped at 1.
-                cap = 1;
-            }
-            else
-            {
-                var (enabled, maxOverride) = _localDeviceSettingsProvider?.Invoke(device.DeviceId)
-                    ?? (true, (int?)null);
-                if (!enabled) continue;
-                cap = Math.Max(0, maxOverride ?? device.DefaultConcurrency);
-                if (cap == 0) continue;
-            }
+            // Skip devices that can't encode this item's target codec —
+            // the ledger only cares about capacity, not codec compatibility.
+            if (!DeviceCanEncode(device.DeviceId, workItem, options)) continue;
 
-            // Live count from the active-jobs map. This is the source of
-            // truth for slot occupancy, so changing the user's cap takes
-            // effect on the next iteration with zero state churn.
-            var inUse = 0;
-            foreach (var kv in _activeLocalJobs)
-                if (kv.Value.DeviceId == device.DeviceId) inUse++;
-
-            if (inUse < cap) return device.DeviceId;
+            // Atomic capacity check + reserve. Returns false when the device
+            // is at capacity (MaxConcurrency / DefaultConcurrency / cpu=1)
+            // or disabled (resolver returns 0).
+            if (_slotLedger.TryReserve(_localNodeId, device.DeviceId, workItem.Id, workItem.FileName))
+                return device.DeviceId;
         }
         return null;
     }
@@ -1751,6 +2208,217 @@ public class TranscodingService
     }
 
     /// <summary>
+    ///     Music-only counterpart to <see cref="ProcessWorkItemAsync"/>. Drives the
+    ///     status/hub/watchdog plumbing around <see cref="ConvertMusicAsync"/> and
+    ///     records analytics on completion. The dedicated music slot semaphore is
+    ///     released by the dispatcher's wrapping continuation, not this method.
+    /// </summary>
+    private async Task ProcessMusicWorkItemAsync(WorkItem workItem, EncoderOptions options, ActiveLocalJob active)
+    {
+        try
+        {
+            workItem.Status    = WorkItemStatus.Processing;
+            workItem.StartedAt = DateTime.UtcNow;
+            workItem.Progress  = 0;
+            await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
+            await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Processing);
+
+            if (_notificationService != null && ShouldDispatchExternal)
+                _ = _notificationService.NotifyEncodeStartedAsync(Path.GetFileName(workItem.Path));
+
+            if (workItem.Probe == null)
+            {
+                workItem.Probe = await _ffprobeService.ProbeAsync(workItem.Path);
+                if (workItem.Length <= 0 && workItem.Probe?.Format?.Duration != null)
+                    workItem.Length = _ffprobeService.DurationStringToSeconds(workItem.Probe.Format.Duration);
+            }
+
+            using var watchdogCts = new CancellationTokenSource();
+            var watchdogTask = Task.Run(async () =>
+            {
+                try
+                {
+                    while (!watchdogCts.IsCancellationRequested)
+                    {
+                        await Task.Delay(TimeSpan.FromSeconds(30), watchdogCts.Token);
+                        if ((DateTime.UtcNow - workItem.LastUpdatedAt) > TimeSpan.FromMinutes(15))
+                        {
+                            await LogAsync(workItem.Id, "Watchdog: no music progress for 15 min — aborting job");
+                            active.Cts.Cancel();
+                            return;
+                        }
+                    }
+                }
+                catch (OperationCanceledException) { }
+            });
+
+            try
+            {
+                await ConvertMusicAsync(workItem, options, active.Cts.Token);
+            }
+            finally
+            {
+                watchdogCts.Cancel();
+                try { await watchdogTask; } catch { }
+            }
+
+            if (workItem.Status != WorkItemStatus.Failed)
+            {
+                bool noSavings = workItem.LastEncodeProducedNoSavings;
+                workItem.Status = noSavings ? WorkItemStatus.NoSavings : WorkItemStatus.Completed;
+                workItem.CompletedAt = DateTime.UtcNow;
+                workItem.Progress = 100;
+                Interlocked.Increment(ref _localCompletedJobs);
+                await _mediaFileRepo.SetStatusAndLastEncodedAtAsync(
+                    Path.GetFullPath(workItem.Path),
+                    noSavings ? MediaFileStatus.NoSavings : MediaFileStatus.Completed,
+                    DateTime.UtcNow);
+
+                if (!noSavings && _notificationService != null && ShouldDispatchExternal)
+                    _ = _notificationService.NotifyEncodeCompletedAsync(Path.GetFileName(workItem.Path), workItem.Size);
+
+                _ = RecordLocalEncodeHistoryAsync(workItem, options, active.DeviceId);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Cancelled — clean up partial output if it exists.
+            try
+            {
+                var outputPath = GetMusicOutputPath(workItem, options);
+                await _fileService.FileDeleteAsync(outputPath);
+            }
+            catch { }
+        }
+        catch (Exception ex)
+        {
+            Interlocked.Increment(ref _localFailedJobs);
+            workItem.Status = WorkItemStatus.Failed;
+            workItem.ErrorMessage = ex.Message;
+            workItem.CompletedAt = DateTime.UtcNow;
+            await _mediaFileRepo.IncrementFailureCountAsync(Path.GetFullPath(workItem.Path), ex.Message);
+
+            if (_notificationService != null && ShouldDispatchExternal)
+                _ = _notificationService.NotifyEncodeFailedAsync(Path.GetFileName(workItem.Path), ex.Message);
+        }
+        finally
+        {
+            _activeLocalJobs.TryRemove(workItem.Id, out _);
+            try { active.Cts.Dispose(); } catch { }
+        }
+
+        await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
+    }
+
+    /// <summary>
+    ///     Resolves the destination path for a music encode. Mirrors
+    ///     <see cref="GetOutputPath"/> for video but uses the music-specific
+    ///     extension and <see cref="MusicEncoderOptions.OutputDirectory"/>.
+    /// </summary>
+    private string GetMusicOutputPath(WorkItem workItem, EncoderOptions options)
+    {
+        var music = options.Music;
+        var fileName = _fileService.RemoveExtension(workItem.FileName);
+        var extension = "." + MusicEncoderArgs.ExtensionForFormat(music.Format);
+        var snacksName = $"{fileName} [snacks]{extension}";
+
+        if (!string.IsNullOrEmpty(music.OutputDirectory))
+            return Path.Combine(music.OutputDirectory, snacksName);
+
+        var originalDir = _fileService.GetDirectory(workItem.Path);
+        return Path.Combine(originalDir, snacksName);
+    }
+
+    /// <summary>
+    ///     Encodes a music file via ffmpeg. Significantly leaner than
+    ///     <c>ConvertVideoAsync</c>: no HDR detection, no hardware acceleration,
+    ///     no per-track audio profiles, no subtitle handling, no retry chain.
+    ///     On output ≥ source the encode is classified as no-savings and the
+    ///     output is discarded — same semantics as the video path.
+    /// </summary>
+    private async Task ConvertMusicAsync(WorkItem workItem, EncoderOptions options, CancellationToken cancellationToken)
+    {
+        if (workItem.Probe == null)
+            workItem.Probe = await _ffprobeService.ProbeAsync(workItem.Path, cancellationToken);
+
+        var outputPath = GetMusicOutputPath(workItem, options);
+        var outputDir  = Path.GetDirectoryName(outputPath);
+        if (!string.IsNullOrEmpty(outputDir) && !Directory.Exists(outputDir))
+            Directory.CreateDirectory(outputDir);
+
+        // Pre-clean any stale [snacks] output from a prior run; ffmpeg's -y also
+        // overwrites, but an explicit delete avoids ambiguity if the prior file
+        // was corrupt and ffmpeg's overwrite-in-place behavior on the user's NAS
+        // is finicky.
+        try { await _fileService.FileDeleteAsync(outputPath); } catch { }
+
+        var command = MusicEncoderArgs.Build(workItem.Path, outputPath, options.Music, workItem.Probe);
+        await LogAsync(workItem.Id, $"Music encode: ffmpeg {command}");
+        await RunFfmpegAsync(command, workItem, cancellationToken);
+
+        if (!File.Exists(outputPath))
+            throw new Exception("Music encode failed: output file not produced");
+
+        var outFileInfo = new FileInfo(outputPath);
+        if (outFileInfo.Length == 0)
+        {
+            try { await _fileService.FileDeleteAsync(outputPath); } catch { }
+            throw new Exception("Music encode failed: output file is empty");
+        }
+
+        // Validate output duration vs source (within 1s tolerance) — catches
+        // partial encodes where ffmpeg returned 0 but the file is truncated.
+        try
+        {
+            var outProbe = await _ffprobeService.ProbeAsync(outputPath, cancellationToken);
+            if (double.TryParse(outProbe.Format?.Duration, NumberStyles.Float, CultureInfo.InvariantCulture, out var outDur)
+                && workItem.Length > 0
+                && Math.Abs(outDur - workItem.Length) > 1.0)
+            {
+                try { await _fileService.FileDeleteAsync(outputPath); } catch { }
+                throw new Exception($"Music encode failed: output duration {outDur:F1}s differs from source {workItem.Length:F1}s");
+            }
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception)
+        {
+            // Probe failure on output — treat as encode failure.
+            try { await _fileService.FileDeleteAsync(outputPath); } catch { }
+            throw;
+        }
+
+        workItem.OutputSize = outFileInfo.Length;
+
+        // No-savings classification: discard output if encoded >= source unless
+        // the user is doing a lossy → lossless intentional re-encode. A lossless
+        // FLAC output of an MP3 will always be larger; that's by design and
+        // shouldn't count as no-savings — but the AddMusicFileAsync skip ladder
+        // already prevents that case from running, so here we treat "encoded
+        // >= source" as discardable across the board.
+        if (outFileInfo.Length >= workItem.Size)
+        {
+            workItem.LastEncodeProducedNoSavings = true;
+            try { await _fileService.FileDeleteAsync(outputPath); } catch { }
+            await LogAsync(workItem.Id, $"Music encode produced no savings: {outFileInfo.Length} ≥ {workItem.Size} bytes — discarded");
+            return;
+        }
+
+        // Optional: delete original after successful encode.
+        if (options.Music.DeleteOriginalFile)
+        {
+            try
+            {
+                await _fileService.FileDeleteAsync(workItem.Path);
+                await LogAsync(workItem.Id, $"Deleted original: {workItem.FileName}");
+            }
+            catch (Exception ex)
+            {
+                await LogAsync(workItem.Id, $"Failed to delete original: {ex.Message}");
+            }
+        }
+    }
+
+    /// <summary>
     ///     Builds and executes an FFmpeg command for the given work item.
     ///     Handles hardware acceleration setup, VAAPI quality calibration, bitrate calculation,
     ///     stream mapping, and post-conversion validation and file placement.
@@ -1810,7 +2478,7 @@ public class TranscodingService
         string hwAccel = options.HardwareAcceleration;
         if (!videoCopy && !encoder.StartsWith("lib") && encoder != "copy")
         {
-            string testHwFlags = GetInitFlags(hwAccel);
+            string testHwFlags = GetInitFlags(hwAccel, options.HardwareDevicePath);
             if (!await TestEncoderAsync(testHwFlags, encoder))
             {
                 string swEncoder = GetSoftwareFallbackEncoder(options);
@@ -1914,7 +2582,7 @@ public class TranscodingService
             encoder = GetEncoder(options);
             if (!encoder.StartsWith("lib") && encoder != "copy")
             {
-                string testHwFlags = GetInitFlags(hwAccel);
+                string testHwFlags = GetInitFlags(hwAccel, options.HardwareDevicePath);
                 if (!await TestEncoderAsync(testHwFlags, encoder))
                 {
                     string swEncoder = GetSoftwareFallbackEncoder(options);
@@ -1940,7 +2608,9 @@ public class TranscodingService
                 "Using software decode + VAAPI encode (hwaccel decode disabled)");
         }
 
-        string initFlags = useVaapi ? GetInitFlags(hwAccel, canHwDecode) : GetInitFlags(hwAccel);
+        string initFlags = useVaapi
+            ? GetInitFlags(hwAccel, options.HardwareDevicePath, canHwDecode)
+            : GetInitFlags(hwAccel, options.HardwareDevicePath);
 
         // Explicitly select the NVDEC (cuvid) decoder on the nvidia path. `-hwaccel cuda` alone
         // is just a hint — on some driver/setup combinations (datacenter Windows drivers, vGPU
@@ -2598,6 +3268,13 @@ public class TranscodingService
         return new MediaFile
         {
             FilePath        = workItem.Path,
+            // Kind must propagate from the work item — without it the synthetic
+            // row defaults to MediaKind.Video and the music early-return at the
+            // top of WouldSkipUnderOptions never fires, causing a music dispatch
+            // through the synthetic-fallback path (e.g. force-add or path-mismatch
+            // DB lookup) to be evaluated against the video skip ladder and
+            // silently marked Skipped.
+            Kind            = workItem.Kind,
             Bitrate         = workItem.Bitrate,
             Codec           = videoStream?.CodecName ?? (workItem.IsHevc ? "hevc" : "unknown"),
             Width           = videoStream?.Width  ?? 0,
@@ -2727,6 +3404,17 @@ public class TranscodingService
     /// </summary>
     public static bool WouldSkipUnderOptions(MediaFile mf, EncoderOptions options)
     {
+        // Music has its own skip ladder at enqueue time (AddMusicFileAsync) keyed
+        // off the audio codec / bitrate against MusicEncoderOptions. Running it
+        // through the video skip gate is meaningless — and dangerous: a non-HEVC
+        // video encoder (libx264, h264_*) makes the codec-match branch evaluate
+        // !mf.IsHevc as "already at target", and a typical music bitrate
+        // (192 kbps) sits well under any video TargetBitrate, which then trips
+        // the bitrate ceiling and silently marks the dispatch as "already meets
+        // target." Music that's reached the dispatch path is by definition past
+        // its own skip checks and should always proceed.
+        if (mf.Kind == MediaKind.Music) return false;
+
         options = WithOriginalLanguageMerged(options, mf.OriginalLanguage);
 
         // Skip4K overrides everything else.
@@ -3162,35 +3850,62 @@ public class TranscodingService
             // Linux
             await LogVaapiInfoAsync();
 
-            // VAAPI (Intel iGPU and AMD GPUs on Linux) — probe both drivers.
-            if (File.Exists("/dev/dri/renderD128"))
+            // VAAPI (Intel iGPU and AMD GPUs on Linux) — walk every render node, not
+            // just renderD128. On hybrid laptops (e.g. Pop!_OS with system76-power in
+            // hybrid/nvidia/compute mode) the NVIDIA card can claim renderD128 while
+            // the iGPU lands on renderD129. The legacy single-node probe failed against
+            // the NVIDIA node (no iHD/i965 VAAPI support there) and silently skipped
+            // VAAPI entirely, even though a perfectly good iGPU was sitting on the
+            // next render node over.
+            var renderNodes = EnumerateRenderNodes();
+            var originalLibvaDriver = Environment.GetEnvironmentVariable("LIBVA_DRIVER_NAME");
+            try
             {
-                var driversToTry = new[] { "iHD", "i965" };
-                foreach (var driver in driversToTry)
+                foreach (var nodePath in renderNodes)
                 {
-                    Console.WriteLine($"Auto-detect: Trying VAAPI with {driver} driver...");
-                    Environment.SetEnvironmentVariable("LIBVA_DRIVER_NAME", driver);
-
-                    var hwInit = "-init_hw_device vaapi=hw:/dev/dri/renderD128 -filter_hw_device hw";
-                    bool hevcOk = await TestEncoderAsync(hwInit, "hevc_vaapi");
-                    bool h264Ok = await TestEncoderAsync(hwInit, "h264_vaapi");
-                    bool av1Ok  = await TestEncoderAsync(hwInit, "av1_vaapi");
-
-                    if (hevcOk || h264Ok || av1Ok)
+                    var driversToTry = new[] { "iHD", "i965" };
+                    bool nodeMatched = false;
+                    foreach (var driver in driversToTry)
                     {
-                        Console.WriteLine($"Auto-detect: VAAPI available with {driver} driver (hevc={hevcOk}, h264={h264Ok}, av1={av1Ok})");
-                        devices.Add(new HardwareDevice
+                        Console.WriteLine($"Auto-detect: Trying VAAPI on {nodePath} with {driver} driver...");
+                        Environment.SetEnvironmentVariable("LIBVA_DRIVER_NAME", driver);
+
+                        var hwInit = $"-init_hw_device vaapi=hw:{nodePath} -filter_hw_device hw";
+                        bool hevcOk = await TestEncoderAsync(hwInit, "hevc_vaapi");
+                        bool h264Ok = await TestEncoderAsync(hwInit, "h264_vaapi");
+                        bool av1Ok  = await TestEncoderAsync(hwInit, "av1_vaapi");
+
+                        if (hevcOk || h264Ok || av1Ok)
                         {
-                            DeviceId           = "intel",
-                            DisplayName        = "Intel VAAPI",
-                            SupportedCodecs    = BuildSupportedCodecs(hevcOk, h264Ok, av1Ok),
-                            Encoders           = BuildIntelEncoders(hevcOk, h264Ok, av1Ok, qsv: false),
-                            DefaultConcurrency = DefaultConcurrencyFor("intel"),
-                            IsHardware         = true,
-                        });
-                        break;
+                            Console.WriteLine($"Auto-detect: VAAPI available on {nodePath} with {driver} driver (hevc={hevcOk}, h264={h264Ok}, av1={av1Ok})");
+                            devices.Add(new HardwareDevice
+                            {
+                                DeviceId           = "intel",
+                                DisplayName        = "Intel VAAPI",
+                                SupportedCodecs    = BuildSupportedCodecs(hevcOk, h264Ok, av1Ok),
+                                Encoders           = BuildIntelEncoders(hevcOk, h264Ok, av1Ok, qsv: false),
+                                DefaultConcurrency = DefaultConcurrencyFor("intel"),
+                                IsHardware         = true,
+                                DevicePath         = nodePath,
+                            });
+                            nodeMatched = true;
+                            break;
+                        }
                     }
+                    // First working render node wins — stop probing the rest. We only
+                    // expose one VAAPI device family right now (DeviceId="intel"), so
+                    // there's no way to surface a second VAAPI GPU through the existing
+                    // slot-pool model. If/when the model grows per-card devices, drop
+                    // this break and let every node register its own HardwareDevice.
+                    if (nodeMatched) break;
                 }
+            }
+            finally
+            {
+                // Restore whatever LIBVA_DRIVER_NAME the host set (or unset, if it
+                // wasn't set at all) so we don't leak driver state into later ffmpeg
+                // invocations that don't go through GetInitFlags.
+                Environment.SetEnvironmentVariable("LIBVA_DRIVER_NAME", originalLibvaDriver);
             }
 
             if (await TestEncoderAsync("-hwaccel cuda", "hevc_nvenc"))
@@ -3275,7 +3990,28 @@ public class TranscodingService
     }
 
     /// <summary>
-    ///     Logs VAAPI diagnostic info (vainfo output) for troubleshooting.
+    ///     Returns every <c>/dev/dri/renderD*</c> node sorted by the trailing index so
+    ///     iteration is deterministic — important for both reproducible probe order on
+    ///     hybrid systems and stable test expectations. Returns an empty array when the
+    ///     <c>/dev/dri</c> directory is missing (Windows, macOS, container without GPU
+    ///     passthrough).
+    /// </summary>
+    internal static string[] EnumerateRenderNodes()
+    {
+        if (!Directory.Exists("/dev/dri")) return Array.Empty<string>();
+        return Directory.GetFiles("/dev/dri", "renderD*")
+            .OrderBy(p =>
+            {
+                var name = Path.GetFileName(p);
+                return int.TryParse(name.AsSpan("renderD".Length), out var n) ? n : int.MaxValue;
+            })
+            .ToArray();
+    }
+
+    /// <summary>
+    ///     Logs VAAPI diagnostic info (vainfo output) for troubleshooting. On hybrid
+    ///     systems with multiple render nodes, vainfo runs against the first node — the
+    ///     detection probe loop covers the rest.
     /// </summary>
     private async Task LogVaapiInfoAsync()
     {
@@ -3286,11 +4022,10 @@ public class TranscodingService
 
         try
         {
-            if (File.Exists("/dev/dri/renderD128"))
-                Console.WriteLine("Auto-detect: /dev/dri/renderD128 exists");
-            else
+            var renderNodes = EnumerateRenderNodes();
+            if (renderNodes.Length == 0)
             {
-                Console.WriteLine("Auto-detect: /dev/dri/renderD128 NOT FOUND");
+                Console.WriteLine("Auto-detect: no /dev/dri/renderD* nodes found");
                 if (Directory.Exists("/dev/dri"))
                 {
                     var entries = Directory.GetFileSystemEntries("/dev/dri");
@@ -3301,9 +4036,12 @@ public class TranscodingService
                 return;
             }
 
+            Console.WriteLine($"Auto-detect: render nodes found: {string.Join(", ", renderNodes)}");
+            var firstNode = renderNodes[0];
+
             var psi = new ProcessStartInfo("vainfo")
             {
-                Arguments = "--display drm --device /dev/dri/renderD128",
+                Arguments = $"--display drm --device {firstNode}",
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
@@ -3318,7 +4056,7 @@ public class TranscodingService
             process.WaitForExit(5000);
 
             var output = !string.IsNullOrEmpty(stdout) ? stdout : stderr;
-            Console.WriteLine($"Auto-detect vainfo output:\n{output.Substring(0, Math.Min(output.Length, 1000))}");
+            Console.WriteLine($"Auto-detect vainfo ({firstNode}) output:\n{output.Substring(0, Math.Min(output.Length, 1000))}");
         }
         catch (Exception ex)
         {
@@ -3387,12 +4125,26 @@ public class TranscodingService
     /// <summary>
     ///     Resolves "auto" to a concrete hardware acceleration type.
     ///     For explicit selections, returns as-is.
+    ///
+    ///     <para>Once a concrete device family is in hand, also fills in
+    ///     <see cref="EncoderOptions.HardwareDevicePath"/> from the locally detected
+    ///     <see cref="HardwareDevice.DevicePath"/> so VAAPI jobs target the render
+    ///     node detection picked instead of falling back to the legacy renderD128
+    ///     default. Skips the path lookup when the caller pre-set a path (e.g. a
+    ///     test fixture exercising a specific node) or when the family doesn't
+    ///     map to a node path (NVIDIA, Windows QSV/AMF, Apple, CPU).</para>
     /// </summary>
     private async Task ResolveHardwareAccelerationAsync(EncoderOptions options)
     {
         if (options.HardwareAcceleration.Equals("auto", StringComparison.OrdinalIgnoreCase))
         {
             options.HardwareAcceleration = await DetectHardwareAccelerationAsync();
+        }
+
+        if (options.HardwareDevicePath == null
+            && !string.Equals(options.HardwareAcceleration, "none", StringComparison.OrdinalIgnoreCase))
+        {
+            options.HardwareDevicePath = GetDevicePathForDeviceId(options.HardwareAcceleration);
         }
     }
 
@@ -3427,23 +4179,42 @@ public class TranscodingService
     ///     forcing hardware decode (software decode + VAAPI encode mode).
     /// </summary>
     internal static string GetInitFlags(string hardwareAcceleration, bool hwDecode = true)
-        => GetInitFlags(hardwareAcceleration, RuntimeInformation.IsOSPlatform(OSPlatform.Windows), hwDecode);
+        => GetInitFlags(hardwareAcceleration, devicePath: null, RuntimeInformation.IsOSPlatform(OSPlatform.Windows), hwDecode);
+
+    /// <summary>
+    ///     Path-aware overload. <paramref name="devicePath"/> selects the VAAPI render
+    ///     node (e.g. <c>/dev/dri/renderD129</c>); <see langword="null"/> falls back to
+    ///     <c>/dev/dri/renderD128</c> for compatibility with the legacy single-node
+    ///     assumption. Use this overload from the dispatch path so jobs land on the
+    ///     same node detection picked.
+    /// </summary>
+    internal static string GetInitFlags(string hardwareAcceleration, string? devicePath, bool hwDecode = true)
+        => GetInitFlags(hardwareAcceleration, devicePath, RuntimeInformation.IsOSPlatform(OSPlatform.Windows), hwDecode);
 
     /// <summary>
     ///     Pure overload that takes <paramref name="isWindows"/> explicitly so unit tests can
     ///     exercise the VAAPI / QSV / AMF branches independently of the test host OS.
     /// </summary>
     internal static string GetInitFlags(string hardwareAcceleration, bool isWindows, bool hwDecode)
+        => GetInitFlags(hardwareAcceleration, devicePath: null, isWindows, hwDecode);
+
+    /// <summary>
+    ///     Pure overload with explicit OS gate AND device-path injection. The four VAAPI
+    ///     branches use <paramref name="devicePath"/> when set, falling back to renderD128
+    ///     so single-GPU machines get the same flag string they always have.
+    /// </summary>
+    internal static string GetInitFlags(string hardwareAcceleration, string? devicePath, bool isWindows, bool hwDecode)
     {
+        var node = string.IsNullOrEmpty(devicePath) ? "/dev/dri/renderD128" : devicePath;
         return hardwareAcceleration.ToLower() switch
         {
             "intel" when isWindows => "-y -hwaccel qsv -hwaccel_output_format qsv -qsv_device auto",
             "amd" when isWindows => "-y -hwaccel auto",
             // Software decode + VAAPI encode: init the device but don't force hwaccel decode
-            "intel" when !hwDecode => "-y -init_hw_device vaapi=hw:/dev/dri/renderD128 -filter_hw_device hw",
-            "amd" when !hwDecode => "-y -init_hw_device vaapi=hw:/dev/dri/renderD128 -filter_hw_device hw",
-            "intel" => "-y -init_hw_device vaapi=hw:/dev/dri/renderD128 -hwaccel vaapi -hwaccel_output_format vaapi -filter_hw_device hw",
-            "amd" => "-y -init_hw_device vaapi=hw:/dev/dri/renderD128 -hwaccel vaapi -hwaccel_output_format vaapi -filter_hw_device hw",
+            "intel" when !hwDecode => $"-y -init_hw_device vaapi=hw:{node} -filter_hw_device hw",
+            "amd" when !hwDecode => $"-y -init_hw_device vaapi=hw:{node} -filter_hw_device hw",
+            "intel" => $"-y -init_hw_device vaapi=hw:{node} -hwaccel vaapi -hwaccel_output_format vaapi -filter_hw_device hw",
+            "amd" => $"-y -init_hw_device vaapi=hw:{node} -hwaccel vaapi -hwaccel_output_format vaapi -filter_hw_device hw",
             "nvidia" => "-y -hwaccel cuda",
             "apple" => "-y -hwaccel videotoolbox",
             _ => "-y"
@@ -3625,7 +4396,7 @@ public class TranscodingService
         }
 
         bool canHwDecode = CanVaapiDecode(workItem.Probe);
-        string initFlags = GetInitFlags(options.HardwareAcceleration, canHwDecode);
+        string initFlags = GetInitFlags(options.HardwareAcceleration, options.HardwareDevicePath, canHwDecode);
         string encoder = GetEncoder(options);
         // Use p010 for 10-bit content, nv12 for 8-bit
         bool is10Bit = workItem.Probe?.Streams?.Any(s =>
@@ -3876,7 +4647,7 @@ public class TranscodingService
                 double measuredSeconds = int.Parse(timeMatch.Groups[1].Value) * 3600
                                         + int.Parse(timeMatch.Groups[2].Value) * 60
                                         + int.Parse(timeMatch.Groups[3].Value)
-                                        + double.Parse("0." + timeMatch.Groups[4].Value);
+                                        + double.Parse("0." + timeMatch.Groups[4].Value, NumberStyles.Float, CultureInfo.InvariantCulture);
                 if (measuredSeconds < 1) return 0;
                 return (long)(videoKb * 8 / measuredSeconds);
             }
@@ -3919,7 +4690,7 @@ public class TranscodingService
             samples.Add((FormatSeekTime(seekSec), dur));
         }
 
-        string initFlags = GetInitFlags(options.HardwareAcceleration);
+        string initFlags = GetInitFlags(options.HardwareAcceleration, options.HardwareDevicePath);
         long currentBv = targetKbps;
 
         for (int iter = 1; iter <= maxIterations; iter++)
@@ -4083,7 +4854,7 @@ public class TranscodingService
         string startTime = lengthInMinutes > 20 ? "00:10:00" : "00:00:00";
         string duration = lengthInMinutes > 20 ? "00:10:00" : $"00:{Math.Min(lengthInMinutes, 10):D2}:00";
         
-        string command = $"{GetInitFlags(options.HardwareAcceleration)} -ss {startTime} -i \"{inputPath}\" " +
+        string command = $"{GetInitFlags(options.HardwareAcceleration, options.HardwareDevicePath)} -ss {startTime} -i \"{inputPath}\" " +
                         $"-t {duration} -vf cropdetect=24:2:8 -f null -";
 
         var cropValues = new ConcurrentDictionary<string, int>();
@@ -4506,9 +5277,18 @@ public class TranscodingService
 
     /// <summary>
     ///     Updates the cached encoder options so that queued items pick up
-    ///     settings changes without needing a new scan.
+    ///     settings changes without needing a new scan, and wakes the
+    ///     scheduler so a raised <c>MasterMusicConcurrency</c> takes effect on
+    ///     the very next iteration. Capacity for music (and every other
+    ///     master-local device) lives in the SlotLedger's resolver, which
+    ///     reads <c>MasterMusicConcurrency</c> live from the options on every
+    ///     reservation — no semaphore to resize.
     /// </summary>
-    public void UpdateOptions(EncoderOptions options) => _lastOptions = options;
+    public void UpdateOptions(EncoderOptions options)
+    {
+        _lastOptions = options;
+        WakeScheduler();
+    }
 
     /// <summary>
     ///     Resolves and persists <see cref="MediaFile.OriginalLanguage"/> for every row in
@@ -4698,7 +5478,23 @@ public class TranscodingService
         Encoders           = new List<string>(src.Encoders),
         DefaultConcurrency = src.DefaultConcurrency,
         IsHardware         = src.IsHardware,
+        DevicePath         = src.DevicePath,
     };
+
+    /// <summary>
+    ///     Returns the locally detected <see cref="HardwareDevice.DevicePath"/> for the
+    ///     given device id, or <see langword="null"/> if the device has no node path
+    ///     (NVIDIA, Windows QSV/AMF, Apple, CPU) or hasn't been detected yet. Dispatch
+    ///     sites stamp the result onto <see cref="EncoderOptions.HardwareDevicePath"/>
+    ///     so per-job ffmpeg invocations target the same render node detection picked.
+    /// </summary>
+    public string? GetDevicePathForDeviceId(string deviceId)
+    {
+        if (_detectedDevices == null) return null;
+        var match = _detectedDevices.FirstOrDefault(d =>
+            string.Equals(d.DeviceId, deviceId, StringComparison.OrdinalIgnoreCase));
+        return match?.DevicePath;
+    }
 
     /// <summary>
     ///     Registers a per-job progress callback for forwarding progress to the master.
@@ -4763,6 +5559,15 @@ public class TranscodingService
     ///     always allowed.
     /// </summary>
     public void SetLocalScheduleGate(Func<bool>? gate) => _localScheduleGate = gate;
+
+    /// <summary>
+    ///     Registers a callback to fire whenever a work item is added to the
+    ///     queue. Used by <see cref="ClusterService"/> to wake its dispatcher
+    ///     immediately on enqueue so it competes with the master-local
+    ///     scheduler for new items instead of waiting up to 2 seconds for the
+    ///     next timer tick.
+    /// </summary>
+    public void SetWorkItemQueuedCallback(Action? callback) => _onWorkItemQueued = callback;
 
     /// <summary>
     ///     Restarts <see cref="ProcessQueueAsync"/> if it had previously
@@ -4875,6 +5680,7 @@ public class TranscodingService
             Length   = dbFile.Duration,
             IsHevc   = dbFile.IsHevc,
             Is4K     = dbFile.Is4K,
+            Kind     = dbFile.Kind,
             Probe    = null // Lazily probed when processing starts
         };
 
@@ -4886,6 +5692,11 @@ public class TranscodingService
         }
 
         await _hubContext.Clients.All.SendAsync("WorkItemAdded", workItem);
+
+        // Wake the cluster dispatcher so restored items can be sent to workers
+        // immediately on startup instead of waiting for the 2-second timer tick.
+        try { _onWorkItemQueued?.Invoke(); } catch { }
+
         return workItem.Id;
     }
 
@@ -5112,6 +5923,7 @@ public class TranscodingService
                 Length = length,
                 IsHevc = isHevc,
                 Is4K = probe.Streams.Any(s => s.CodecType == "video" && s.Width > 1920),
+                Kind = _fileService.GetMediaKind(filePath) ?? MediaKind.Video,
                 Probe = probe,
                 Status = WorkItemStatus.Processing,
                 StartedAt = DateTime.UtcNow
@@ -5150,6 +5962,36 @@ public class TranscodingService
         try
         {
             await ConvertVideoAsync(workItem, options, skipPlacement: true, cancellationToken: cancellationToken);
+        }
+        finally
+        {
+            // Don't remove from _workItems — the output file needs to remain accessible
+        }
+    }
+
+    /// <summary>
+    ///     Music counterpart to <see cref="ConvertVideoForRemoteAsync"/>. Steers
+    ///     the encoder's output into the worker's scratch dir
+    ///     (<see cref="EncoderOptions.EncodeDirectory"/>) so the master's
+    ///     <c>GetOutputFileForJob</c> glob (<c>*[snacks]*</c>) finds it, and
+    ///     forces <c>DeleteOriginalFile=false</c> so the worker never touches
+    ///     the master-uploaded source — placement and source lifecycle are the
+    ///     master's job.
+    /// </summary>
+    /// <param name="workItem">The music work item to encode.</param>
+    /// <param name="options">Encoding options from the master's job assignment. Mutated: Music.OutputDirectory and Music.DeleteOriginalFile are overridden.</param>
+    /// <param name="cancellationToken">Token to abort encoding if the job is cancelled.</param>
+    public async Task ConvertMusicForRemoteAsync(WorkItem workItem, EncoderOptions options, CancellationToken cancellationToken = default)
+    {
+        _workItems[workItem.Id] = workItem;
+
+        if (!string.IsNullOrEmpty(options.EncodeDirectory))
+            options.Music.OutputDirectory = options.EncodeDirectory;
+        options.Music.DeleteOriginalFile = false;
+
+        try
+        {
+            await ConvertMusicAsync(workItem, options, cancellationToken);
         }
         finally
         {

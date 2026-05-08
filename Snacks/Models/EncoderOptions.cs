@@ -191,6 +191,30 @@ public sealed class EncoderOptions
     /// <summary> Hardware acceleration mode (e.g. "auto", "nvenc", "vaapi", "none"). </summary>
     public string HardwareAcceleration { get; set; } = "auto";
 
+    /// <summary>
+    ///     Linux VAAPI device node path for the GPU that should service this job
+    ///     (e.g. <c>/dev/dri/renderD128</c>, <c>/dev/dri/renderD129</c>). Resolved at
+    ///     dispatch from the chosen <see cref="HardwareDevice.DevicePath"/>. <see langword="null"/>
+    ///     on Windows/macOS, for NVIDIA encodes, and for the CPU/software path —
+    ///     ffmpeg's init flags fall back to the legacy <c>renderD128</c> default in
+    ///     those cases. Not user-configurable; not persisted to settings.json — this
+    ///     is per-dispatch ephemeral state.
+    /// </summary>
+    public string? HardwareDevicePath { get; set; }
+
+    /******************************************************************
+     *  Music (audio-only files)
+     ******************************************************************/
+
+    /// <summary>
+    ///     Settings for music (audio-only) file transcoding. Music encoding shares the
+    ///     queue, scheduler, cluster dispatcher, and analytics with video, but has its
+    ///     own encoder pipeline (<c>ConvertMusicAsync</c>) and an independent slot pool
+    ///     so it never competes with GPU video slots. Pre-pivot <c>settings.json</c>
+    ///     files load with this initialized to defaults.
+    /// </summary>
+    public MusicEncoderOptions Music { get; set; } = new();
+
     /******************************************************************
      *  Cloning
      ******************************************************************/
@@ -234,6 +258,8 @@ public sealed class EncoderOptions
         OutputDirectory            = OutputDirectory,
         EncodeDirectory            = EncodeDirectory,
         HardwareAcceleration       = HardwareAcceleration,
+        HardwareDevicePath         = HardwareDevicePath,
+        Music                      = Music.Clone(),
     };
 
     /******************************************************************

@@ -180,6 +180,46 @@ public sealed class HardwareEncoderTests
 
 
     /// <summary>
+    ///     Path-aware overload: when a render-node path is supplied, the four VAAPI
+    ///     branches must use it instead of the legacy renderD128 default. Covers the
+    ///     hybrid-laptop scenario where the iGPU lands on /dev/dri/renderD129 because
+    ///     the NVIDIA card claimed renderD128.
+    /// </summary>
+    [Theory]
+    [InlineData("intel", true)]
+    [InlineData("intel", false)]
+    [InlineData("amd",   true)]
+    [InlineData("amd",   false)]
+    public void GetInitFlags_uses_supplied_device_path(string hwAccel, bool hwDecode)
+    {
+        // isWindows: false — VAAPI branches only fire on Linux. Force the OS gate so
+        // this test runs identically on every CI host.
+        var flags = TranscodingService.GetInitFlags(hwAccel, "/dev/dri/renderD129", isWindows: false, hwDecode);
+        flags.Should().Contain("vaapi=hw:/dev/dri/renderD129");
+        flags.Should().NotContain("vaapi=hw:/dev/dri/renderD128");
+    }
+
+
+    /// <summary>
+    ///     Path-aware overload with a null path must produce the same flag string the
+    ///     legacy single-arg overload always has. Regression guard for single-GPU
+    ///     hosts — they should be byte-identical to the pre-fix output.
+    /// </summary>
+    [Theory]
+    [InlineData("intel", true)]
+    [InlineData("intel", false)]
+    [InlineData("amd",   true)]
+    [InlineData("amd",   false)]
+    public void GetInitFlags_null_path_falls_back_to_renderD128(string hwAccel, bool hwDecode)
+    {
+        var withNull   = TranscodingService.GetInitFlags(hwAccel, devicePath: null, isWindows: false, hwDecode);
+        var legacyFlag = TranscodingService.GetInitFlags(hwAccel, isWindows: false, hwDecode);
+        withNull.Should().Be(legacyFlag);
+        withNull.Should().Contain("vaapi=hw:/dev/dri/renderD128");
+    }
+
+
+    /// <summary>
     ///     Rows: (UI preset, expected SVT-AV1 numeric preset). The actual table is
     ///     a five-step ladder: veryslow=2, slow=4, medium=6, fast=8, veryfast=10. Anything
     ///     unrecognised lands on 6 (the former hardcode).

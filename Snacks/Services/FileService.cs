@@ -13,6 +13,18 @@ public sealed class FileService
         "mkv", "mp4", "ts", "wmv", "avi", "m4v", "mpeg", "mov", "3gp", "webm", "flv"
     };
 
+    /// <summary>
+    ///     Music (audio-only) file extensions recognized by the application (case-insensitive).
+    ///     Excludes <c>mid</c>/<c>midi</c> (not stream-encodable in the same sense),
+    ///     playlist formats (<c>m3u</c>/<c>pls</c>), <c>cue</c>, and <c>iso</c> (could
+    ///     mask DVD video ISOs).
+    /// </summary>
+    private readonly HashSet<string> _musicExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "mp3", "m4a", "flac", "aac", "ogg", "opus", "wav",
+        "wma", "alac", "ape", "aiff", "dsf", "dff", "mka", "mp2",
+    };
+
     /// <summary> Maximum number of retry attempts for file operations. </summary>
     private const int MaxRetries = 10;
 
@@ -162,6 +174,95 @@ public sealed class FileService
             return false;
 
         return true;
+    }
+
+    /// <summary>
+    ///     Returns <see langword="true"/> if the file has a recognized music extension and is not
+    ///     an already-encoded <c>[snacks]</c> output file.
+    /// </summary>
+    /// <param name="input"> The file path to check. </param>
+    public bool IsMusicFile(string input)
+    {
+        string ext = GetExtension(input);
+        if (!_musicExtensions.Contains(ext))
+            return false;
+
+        string fileName = Path.GetFileNameWithoutExtension(input);
+        if (fileName.Contains("[snacks]"))
+            return false;
+
+        return true;
+    }
+
+    /// <summary>
+    ///     Returns the <see cref="MediaKind"/> for a path based on its extension,
+    ///     or <see langword="null"/> if the file is neither video nor music. Skips
+    ///     <c>[snacks]</c>-suffixed outputs the same way <see cref="IsVideoFile"/>
+    ///     and <see cref="IsMusicFile"/> do.
+    /// </summary>
+    /// <param name="input"> The file path to classify. </param>
+    public MediaKind? GetMediaKind(string input)
+    {
+        if (IsVideoFile(input)) return MediaKind.Video;
+        if (IsMusicFile(input)) return MediaKind.Music;
+        return null;
+    }
+
+    /// <summary> Returns all music files found in the specified directories (non-recursive, one level per directory). </summary>
+    /// <param name="directories"> The list of directory paths to search. </param>
+    public List<string> GetAllMusicFiles(List<string> directories)
+    {
+        var musicFiles = new List<string>();
+
+        foreach (var directory in directories)
+        {
+            try
+            {
+                if (!Directory.Exists(directory))
+                    continue;
+
+                var files = Directory.GetFiles(directory);
+                musicFiles.AddRange(files.Where(IsMusicFile));
+            }
+            catch
+            {
+                // Permission-denied and access errors are non-fatal; skip inaccessible paths.
+            }
+        }
+
+        return musicFiles;
+    }
+
+    /// <summary>
+    ///     Returns all media files (both video and music) found in the specified directories
+    ///     (non-recursive, one level per directory), each tagged with its <see cref="MediaKind"/>.
+    /// </summary>
+    /// <param name="directories"> The list of directory paths to search. </param>
+    public List<(string Path, MediaKind Kind)> GetAllMediaFiles(List<string> directories)
+    {
+        var mediaFiles = new List<(string, MediaKind)>();
+
+        foreach (var directory in directories)
+        {
+            try
+            {
+                if (!Directory.Exists(directory))
+                    continue;
+
+                foreach (var file in Directory.GetFiles(directory))
+                {
+                    var kind = GetMediaKind(file);
+                    if (kind.HasValue)
+                        mediaFiles.Add((file, kind.Value));
+                }
+            }
+            catch
+            {
+                // Permission-denied and access errors are non-fatal; skip inaccessible paths.
+            }
+        }
+
+        return mediaFiles;
     }
 
     /******************************************************************

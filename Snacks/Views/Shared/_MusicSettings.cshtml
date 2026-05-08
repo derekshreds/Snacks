@@ -1,0 +1,91 @@
+@{
+    string formPrefix = ViewData["FormPrefix"]?.ToString() ?? "";
+}
+
+<div class="row g-4">
+    <div class="col-md-6">
+        <div class="encoder-panel rounded">
+            <h6 class="fw-bold mb-3"><i class="fas fa-music me-2 text-primary"></i>Output Format</h6>
+
+            <div class="mb-3">
+                <label for="@(formPrefix)MusicFormat" class="form-label">Container / Codec</label>
+                <select class="form-select" id="@(formPrefix)MusicFormat" name="Music.Format" data-music-format>
+                    <option value="m4a">m4a (AAC) — recommended</option>
+                    <option value="mp3">mp3 (libmp3lame) — universal compatibility</option>
+                    <option value="opus">opus (libopus) — most efficient lossy</option>
+                    <option value="ogg">ogg (libvorbis)</option>
+                    <option value="flac">flac (lossless)</option>
+                </select>
+                <div class="form-text">Codec is fixed by container. Bitrate is ignored for FLAC.</div>
+            </div>
+
+            <div class="mb-3" data-music-bitrate-row>
+                <label for="@(formPrefix)MusicBitrate" class="form-label">Target bitrate (kbps)</label>
+                <input type="number" class="form-control" id="@(formPrefix)MusicBitrate" name="Music.BitrateKbps"
+                       min="32" max="512" step="16" value="192">
+                <div class="form-text">Common: 128 (lower quality), 192 (default), 256, 320 (max for mp3).</div>
+            </div>
+
+            <div class="mb-3">
+                <label for="@(formPrefix)MusicSampleRate" class="form-label">Sample rate</label>
+                <select class="form-select" id="@(formPrefix)MusicSampleRate" name="Music.SampleRatePolicy">
+                    <option value="Source">Source (preserve)</option>
+                    <option value="44100">44.1 kHz (CD)</option>
+                    <option value="48000">48 kHz</option>
+                </select>
+            </div>
+
+            <div class="mb-3">
+                <label for="@(formPrefix)MusicChannels" class="form-label">Channel layout</label>
+                <select class="form-select" id="@(formPrefix)MusicChannels" name="Music.ChannelPolicy">
+                    <option value="Source">Source (preserve)</option>
+                    <option value="Mono">Mono</option>
+                    <option value="Stereo">Stereo</option>
+                </select>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-md-6">
+        <div class="encoder-panel rounded">
+            <h6 class="fw-bold mb-3"><i class="fas fa-filter me-2 text-info"></i>Skip Ladder &amp; Output</h6>
+
+            <div class="form-check mb-3">
+                <input class="form-check-input" type="checkbox" id="@(formPrefix)MusicSkipIfTarget" name="Music.SkipIfAlreadyTargetCodec" checked>
+                <label class="form-check-label" for="@(formPrefix)MusicSkipIfTarget">Skip files already in target codec</label>
+                <div class="form-text ms-4">Lossy → lossless is always skipped (no quality recovery).</div>
+            </div>
+
+            <div class="mb-3">
+                <label for="@(formPrefix)MusicTolerance" class="form-label">Bitrate match tolerance (%)</label>
+                <input type="number" class="form-control" id="@(formPrefix)MusicTolerance" name="Music.BitrateMatchTolerancePct"
+                       min="0" max="50" step="1" value="15">
+                <div class="form-text">Source within ±N% of target bitrate is treated as a match and skipped.</div>
+            </div>
+
+            <div class="form-check mb-3">
+                <input class="form-check-input" type="checkbox" id="@(formPrefix)MusicCopyMetadata" name="Music.CopyMetadataAndArt" checked>
+                <label class="form-check-label" for="@(formPrefix)MusicCopyMetadata">Copy metadata &amp; cover art</label>
+                <div class="form-text ms-4">Preserves artist, title, album, year, embedded album art.</div>
+            </div>
+
+            <div class="form-check mb-3">
+                <input class="form-check-input" type="checkbox" id="@(formPrefix)MusicDeleteOriginal" name="Music.DeleteOriginalFile">
+                <label class="form-check-label" for="@(formPrefix)MusicDeleteOriginal">Delete original file after success</label>
+            </div>
+
+            <div class="mb-3">
+                <label for="@(formPrefix)MusicConcurrency" class="form-label">Concurrent music encodes</label>
+                <input type="number" class="form-control" id="@(formPrefix)MusicConcurrency" name="Music.MasterMusicConcurrency"
+                       min="1" max="32" step="1" value="2">
+                <div class="form-text">Independent of GPU video slots — music never starves a 4K encode and vice versa.</div>
+            </div>
+
+            <div class="form-check mb-3" data-role-visible="master standalone">
+                <input class="form-check-input" type="checkbox" id="@(formPrefix)MusicCluster" name="Music.DispatchToCluster" checked>
+                <label class="form-check-label" for="@(formPrefix)MusicCluster">Dispatch music jobs to cluster workers</label>
+                <div class="form-text ms-4">Off-loads to workers that report music support; falls back to master when none available.</div>
+            </div>
+        </div>
+    </div>
+</div>

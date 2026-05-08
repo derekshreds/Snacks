@@ -1,7 +1,7 @@
 {
   "name": "snacks",
-  "version": "2.10.0",
-  "description": "Snacks - Automated video transcoding",
+  "version": "2.11.0",
+  "description": "Snacks - Automated media transcoding",
   "main": "main.js",
   "scripts": {
     "start": "electron .",

@@ -48,6 +48,14 @@ public sealed class JobMetadata
     public bool Is4K { get; set; }
 
     /// <summary>
+    ///     Distinguishes a video job from a music (audio-only) job. Pre-pivot
+    ///     master builds don't send this field — workers default-deserialize
+    ///     it to <see cref="MediaKind.Video"/>, preserving existing behaviour
+    ///     for compatibility.
+    /// </summary>
+    public MediaKind Kind { get; set; } = MediaKind.Video;
+
+    /// <summary>
     ///     SHA256 hash of the source file for end-to-end integrity verification.
     ///     The node computes this after upload and rejects the job if it doesn't match,
     ///     protecting against network corruption that could produce invalid output.
@@ -77,4 +85,29 @@ public sealed class JobMetadata
     ///     <c>DefaultConcurrency</c> for sizing.</para>
     /// </summary>
     public int? DeviceMaxConcurrency { get; set; }
+
+    /// <summary>
+    ///     Master's absolute path to the source file when offering shared-storage mode.
+    ///     The node validates the path against its <c>SharedStorageInputPaths</c>
+    ///     allowlist (after optional rewrite) and, on success, reads the source
+    ///     directly instead of accepting a chunked upload. Null on dispatches that
+    ///     don't offer shared mode — the upload path runs unchanged.
+    /// </summary>
+    public string? SharedStorageInputPath { get; set; }
+
+    /// <summary>
+    ///     Master's absolute path where the node should place the final encoded output
+    ///     when running in shared-storage mode. The node validates this against its
+    ///     <c>SharedStorageOutputPaths</c> allowlist, encodes to its scratch directory,
+    ///     then atomically moves the result here. The master polls for the file at
+    ///     this path instead of downloading. Null when shared mode is not in use for
+    ///     output.
+    /// </summary>
+    public string? SharedStorageOutputPath { get; set; }
+
+    /// <summary>
+    ///     Directory portion of <see cref="SharedStorageOutputPath"/>, sent so the
+    ///     node can validate the writable location independently of the filename.
+    /// </summary>
+    public string? SharedStorageOutputDirectory { get; set; }
 }

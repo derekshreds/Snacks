@@ -134,6 +134,18 @@ public sealed class EncoderOptionsOverride
     public string? EncodeDirectory { get; set; }
 
     /******************************************************************
+     *  Music
+     ******************************************************************/
+
+    /// <summary>
+    ///     Per-folder/per-node music overrides. When non-<see langword="null"/>,
+    ///     non-null fields layer onto <see cref="EncoderOptions.Music"/>. Lets a
+    ///     "Lossless" folder target flac while an "Audiobooks" folder targets opus
+    ///     64 kbps without disturbing the global music settings.
+    /// </summary>
+    public MusicEncoderOptionsOverride? MusicOverride { get; set; }
+
+    /******************************************************************
      *  Override Application
      ******************************************************************/
 
@@ -210,5 +222,6 @@ public sealed class EncoderOptionsOverride
         if (over.DownscaleTarget != null)             target.DownscaleTarget            = over.DownscaleTarget;
         if (over.TonemapHdrToSdr.HasValue)            target.TonemapHdrToSdr            = over.TonemapHdrToSdr.Value;
         if (over.FfmpegQualityPreset != null)         target.FfmpegQualityPreset        = over.FfmpegQualityPreset;
+        over.MusicOverride?.ApplyTo(target.Music);
     }
 }
