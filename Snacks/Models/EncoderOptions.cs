@@ -153,6 +153,22 @@ public sealed class EncoderOptions
     /// </summary>
     public bool PassThroughImageSubtitlesMkv { get; set; } = false;
 
+    /// <summary>
+    ///     When <see langword="true"/>, drops subtitle tracks tagged as hearing-impaired —
+    ///     either via ffprobe's <c>disposition.hearing_impaired</c> flag or a title containing
+    ///     "SDH", "CC", "Hearing Impaired", "HI", or "HoH" (case-insensitive, word-boundary
+    ///     aware). Applies to muxed subtitles and sidecar extraction.
+    /// </summary>
+    public bool ExcludeSdhSubtitles { get; set; } = false;
+
+    /// <summary>
+    ///     When <see langword="true"/>, the first kept audio and subtitle output stream is
+    ///     flagged as the default track and the others within each type have their default
+    ///     flag cleared. Combined with the per-language priority order, this makes the
+    ///     top-preference language auto-play in players that honor disposition.
+    /// </summary>
+    public bool AutoSetDefaultTrack { get; set; } = false;
+
     /******************************************************************
      *  Video Pipeline
      ******************************************************************/
@@ -248,6 +264,8 @@ public sealed class EncoderOptions
         SidecarSubtitleFormat      = SidecarSubtitleFormat,
         ConvertImageSubtitlesToSrt = ConvertImageSubtitlesToSrt,
         PassThroughImageSubtitlesMkv = PassThroughImageSubtitlesMkv,
+        ExcludeSdhSubtitles        = ExcludeSdhSubtitles,
+        AutoSetDefaultTrack        = AutoSetDefaultTrack,
         DownscalePolicy            = DownscalePolicy,
         DownscaleTarget            = DownscaleTarget,
         TonemapHdrToSdr            = TonemapHdrToSdr,

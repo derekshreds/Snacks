@@ -210,6 +210,29 @@ public sealed class Stream
     /// <summary> Stream metadata tags (language, title, etc.). </summary>
     [JsonProperty("tags")]
     public Tags? Tags { get; set; }
+
+    /// <summary> ffprobe disposition flags (default, forced, hearing_impaired, ...). </summary>
+    [JsonProperty("disposition")]
+    public Disposition? Disposition { get; set; }
+}
+
+/// <summary>
+///     ffprobe <c>disposition</c> flags. Each field is <c>1</c> when set, <c>0</c> otherwise.
+///     Only a small subset is consulted today (<see cref="HearingImpaired"/> for SDH filtering,
+///     <see cref="Default"/> as a tiebreaker), but the rest are captured so future features
+///     can use them without a probe-schema change.
+/// </summary>
+public sealed class Disposition
+{
+    [JsonProperty("default")]          public int Default          { get; set; }
+    [JsonProperty("dub")]              public int Dub              { get; set; }
+    [JsonProperty("original")]         public int Original         { get; set; }
+    [JsonProperty("comment")]          public int Comment          { get; set; }
+    [JsonProperty("lyrics")]           public int Lyrics           { get; set; }
+    [JsonProperty("karaoke")]          public int Karaoke          { get; set; }
+    [JsonProperty("forced")]           public int Forced           { get; set; }
+    [JsonProperty("hearing_impaired")] public int HearingImpaired  { get; set; }
+    [JsonProperty("visual_impaired")]  public int VisualImpaired   { get; set; }
 }
 
 /// <summary>

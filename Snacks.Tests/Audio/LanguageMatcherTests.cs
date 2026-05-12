@@ -249,4 +249,27 @@ public sealed class LanguageMatcherTests
         LanguageMatcher.Matches("eng", null, new[] { "eng" }).Should().BeFalse();
         LanguageMatcher.Matches("eng", null, new[] { "English" }).Should().BeFalse();
     }
+
+
+    // =====================================================================
+    //  IsSdhTitle — title-based fallback when ffprobe's disposition is silent.
+    // =====================================================================
+
+    [Theory]
+    [InlineData("English SDH",                true)]
+    [InlineData("English [SDH]",              true)]
+    [InlineData("English (CC)",               true)]
+    [InlineData("Hearing Impaired",           true)]
+    [InlineData("English - Hearing-Impaired", true)]
+    [InlineData("English HoH",                true)]
+    [InlineData("English HI",                 true)]
+    [InlineData("English",                    false)]
+    [InlineData("Director's Commentary",      false)]
+    [InlineData("Chichewa",                   false)] // contains "hi" as a substring but not a word
+    [InlineData("",                           false)]
+    [InlineData(null,                         false)]
+    public void IsSdhTitle_matches_common_markers(string? title, bool expected)
+    {
+        LanguageMatcher.IsSdhTitle(title).Should().Be(expected);
+    }
 }

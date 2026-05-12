@@ -2662,7 +2662,8 @@ public class TranscodingService
             doAudioWork ? options.PreserveOriginalAudio : true,
             doAudioWork ? options.AudioOutputs : null,
             options.Format == "mkv",
-            out var audioWarnings) + " ";
+            out var audioWarnings,
+            autoSetDefault: doAudioWork && options.AutoSetDefaultTrack) + " ";
 
         foreach (var w in audioWarnings)
             await LogAsync(workItem.Id, w);
@@ -2717,6 +2718,7 @@ public class TranscodingService
                 options.SubtitleLanguagesToKeep,
                 options.SidecarSubtitleFormat,
                 options.ConvertImageSubtitlesToSrt,
+                options.ExcludeSdhSubtitles,
                 msg => LogAsync(workItem.Id, msg),
                 cancellationToken);
             stripSubtitles = true;
@@ -2735,6 +2737,7 @@ public class TranscodingService
                 var results = await _subtitleExtractionService.OcrBitmapsForMuxAsync(
                     workItem, inputPath, ocrMuxTmpDir,
                     options.SubtitleLanguagesToKeep,
+                    options.ExcludeSdhSubtitles,
                     msg => LogAsync(workItem.Id, msg),
                     cancellationToken);
                 ocrMuxSrts.AddRange(results);
@@ -2768,8 +2771,26 @@ public class TranscodingService
                             && !dropImageSubtitlesOnly;
 
             var sourceSubs = _ffprobeService
-                .SelectSidecarStreams(workItem.Probe!, options.SubtitleLanguagesToKeep, includeBitmaps: passBitmaps)
+                .SelectSidecarStreams(
+                    workItem.Probe!,
+                    options.SubtitleLanguagesToKeep,
+                    includeBitmaps: passBitmaps,
+                    excludeSdh:     options.ExcludeSdhSubtitles)
                 .ToList();
+
+            // Reorder source subs by user preference so the default flag below lands on
+            // the top-priority language. OCR'd SRTs follow in their original order — they
+            // already came back from OcrBitmapsForMuxAsync in source-stream order, and the
+            // user-facing priority comes from the source subs first.
+            if (options.SubtitleLanguagesToKeep is { Count: > 0 } subPref)
+            {
+                sourceSubs = sourceSubs
+                    .Select((s, srcIdx) => new { s, srcIdx, prefIdx = SidecarPreferenceIndex(s.Lang, subPref) })
+                    .OrderBy(x => x.prefIdx)
+                    .ThenBy(x => x.srcIdx)
+                    .Select(x => x.s)
+                    .ToList();
+            }
 
             string maps   = "";
             string codecs = "";
@@ -2816,7 +2837,17 @@ public class TranscodingService
                 outSubIndex++;
             }
 
-            subtitleFlags = maps + codecs + meta;
+            // Default-flag the first kept sub when the user opts in. -disposition resets
+            // all flags on the targeted stream, so this also clears any stale default=1
+            // carried through from the source via -c:s copy.
+            string disposition = "";
+            if (doSubtitleWork && options.AutoSetDefaultTrack && outSubIndex > 0)
+            {
+                disposition = "-disposition:s:0 default ";
+                for (int i = 1; i < outSubIndex; i++) disposition += $"-disposition:s:{i} 0 ";
+            }
+
+            subtitleFlags = maps + codecs + meta + disposition;
         }
         else
         {
@@ -2826,7 +2857,13 @@ public class TranscodingService
             bool passBitmaps = options.Format == "mkv"
                             && options.PassThroughImageSubtitlesMkv
                             && !dropImageSubtitlesOnly;
-            subtitleFlags = _ffprobeService.MapSub(workItem.Probe!, subLangs, options.Format == "mkv", passBitmaps) + " ";
+            subtitleFlags = _ffprobeService.MapSub(
+                workItem.Probe!,
+                subLangs,
+                options.Format == "mkv",
+                passBitmaps,
+                excludeSdh:     doSubtitleWork && options.ExcludeSdhSubtitles,
+                autoSetDefault: doSubtitleWork && options.AutoSetDefaultTrack) + " ";
         }
 
         // -analyzeduration and -probesize handle files with many streams (e.g. 30+ PGS subtitle tracks)
@@ -2998,6 +3035,11 @@ public class TranscodingService
                 .ToList();
             if (filtered.Count < audioStreams.Count) return true;
             kept = filtered;
+
+            // Preference order changed? Re-mux so the top-priority language ends up
+            // on track 0. Without this, a MuxOnly user toggling the order would see
+            // nothing happen on already-fine files.
+            if (WouldReorder(audLangs, kept.Select(s => s.Language))) return true;
         }
 
         // Commentary tracks are unconditionally dropped by the planner (see
@@ -3068,6 +3110,9 @@ public class TranscodingService
     {
         if (subStreams.Count == 0) return false;
 
+        // SDH drop would remove at least one track?
+        if (options.ExcludeSdhSubtitles && subStreams.Any(s => s.Sdh)) return true;
+
         // Language filter would drop at least one track?
         if (options.SubtitleLanguagesToKeep is { Count: > 0 } subLangs)
         {
@@ -3076,6 +3121,10 @@ public class TranscodingService
                 .ToList();
             if (kept.Count < subStreams.Count) return true;
             subStreams = kept;
+
+            // Reordering would change the output stream order — that's work even when
+            // no streams are added or removed.
+            if (WouldReorder(subLangs, subStreams.Select(s => s.Language))) return true;
         }
 
         // Sidecar extraction with any text (or OCR-able bitmap) track present?
@@ -3131,8 +3180,70 @@ public class TranscodingService
                 Language  = s.Tags?.Language,
                 CodecName = s.CodecName,
                 Title     = s.Tags?.Title,
+                Sdh       = FfprobeService.IsHearingImpaired(s),
             })
             .ToList();
+
+    /// <summary>
+    ///     Returns <see langword="true"/> when the kept-language order in
+    ///     <paramref name="streamLangs"/> would change after sorting by
+    ///     <paramref name="keepList"/>. Used by <see cref="HasAudioWork"/> /
+    ///     <see cref="HasSubtitleWork"/> so changing the priority order in settings
+    ///     triggers a re-mux on files that already contain all the kept languages.
+    ///     A null/empty keep-list means "no preference" — never re-orders.
+    /// </summary>
+    internal static bool WouldReorder(IReadOnlyList<string>? keepList, IEnumerable<string?> streamLangs)
+    {
+        if (keepList == null || keepList.Count == 0) return false;
+
+        // Canonicalize the user's keep-list once.
+        var preference = keepList
+            .Select(l => LanguageMatcher.ToTwoLetter(l) ?? l?.Trim().ToLowerInvariant() ?? "")
+            .Where(l => !string.IsNullOrEmpty(l))
+            .ToList();
+
+        // Build the source-order sequence of kept languages, deduped (only the first
+        // occurrence per language matters for ordering — equal-language tracks stay
+        // grouped because their preference index is identical).
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var sourceOrder = new List<string>();
+        foreach (var raw in streamLangs)
+        {
+            var two = LanguageMatcher.ToTwoLetter(raw) ?? raw?.Trim().ToLowerInvariant();
+            if (string.IsNullOrEmpty(two)) continue;
+            if (!preference.Contains(two, StringComparer.OrdinalIgnoreCase)) continue;
+            if (seen.Add(two)) sourceOrder.Add(two);
+        }
+
+        if (sourceOrder.Count <= 1) return false;
+
+        // Target order: preference list filtered down to languages actually present.
+        var targetOrder = preference
+            .Where(p => sourceOrder.Contains(p, StringComparer.OrdinalIgnoreCase))
+            .ToList();
+
+        if (sourceOrder.Count != targetOrder.Count) return false;
+        for (int i = 0; i < sourceOrder.Count; i++)
+            if (!string.Equals(sourceOrder[i], targetOrder[i], StringComparison.OrdinalIgnoreCase))
+                return true;
+        return false;
+    }
+
+    /// <summary>
+    ///     Index of <paramref name="lang"/> within <paramref name="preferences"/>, or
+    ///     <see cref="int.MaxValue"/> when it doesn't match any preference. Used to sort
+    ///     <see cref="FfprobeService.SidecarSpec"/> lists in the OCR-mux path.
+    /// </summary>
+    private static int SidecarPreferenceIndex(string lang, IReadOnlyList<string> preferences)
+    {
+        var two = LanguageMatcher.ToTwoLetter(lang) ?? lang;
+        for (int i = 0; i < preferences.Count; i++)
+        {
+            var wantedTwo = LanguageMatcher.ToTwoLetter(preferences[i]) ?? preferences[i];
+            if (string.Equals(wantedTwo, two, StringComparison.OrdinalIgnoreCase)) return i;
+        }
+        return int.MaxValue;
+    }
 
     /// <summary>
     ///     Returns <see langword="true"/> when <see cref="EncoderOptions.MuxStreams"/> selects a

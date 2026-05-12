@@ -45,24 +45,115 @@ function escapeHtml(s) {
  * remove-button click handler. The chip's data-value preserves the
  * original (unescaped) user input.
  *
+ * When the parent `.chip-input` has `data-reorderable="true"`, the chip is
+ * rendered with a drag grip and made keyboard-reorderable via Alt+ArrowLeft /
+ * Alt+ArrowRight on the focused chip.
+ *
  * @param {HTMLElement} list   The `.chip-list` container to append into.
  * @param {string}      value  The value to display on the chip.
  * @param {string|null} [tooltip]  Optional tooltip text for the chip.
  */
 function addChip(list, value, tooltip = null) {
+    const root        = list.closest('.chip-input');
+    const reorderable = root?.dataset.reorderable === 'true';
+
     const chip = document.createElement('span');
     chip.className = 'chip';
     chip.dataset.value = value;
     if (tooltip) chip.title = tooltip;
-    chip.innerHTML = `${escapeHtml(value)} <button type="button" class="chip-remove" aria-label="Remove">&times;</button>`;
+
+    const grip = reorderable
+        ? '<span class="chip-grip" aria-hidden="true"><i class="fas fa-grip-vertical"></i></span>'
+        : '';
+    chip.innerHTML = `${grip}<span class="chip-label">${escapeHtml(value)}</span>` +
+                     ` <button type="button" class="chip-remove" aria-label="Remove">&times;</button>`;
+
+    if (reorderable) {
+        chip.setAttribute('draggable', 'true');
+        chip.tabIndex = 0;
+        wireChipReorder(chip, list, root);
+    }
 
     chip.querySelector('.chip-remove').addEventListener('click', () => {
-        const root = list.closest('.chip-input');
         chip.remove();
         root.dispatchEvent(new Event('change', { bubbles: true }));
     });
 
     list.appendChild(chip);
+}
+
+/**
+ * Wires HTML5 drag-and-drop + keyboard reorder on a single chip. The drop
+ * target is computed from the cursor's X position relative to the candidate
+ * chip's midpoint so the chip slots cleanly to either side. Fires a `change`
+ * event on the root once the DOM has been reordered.
+ *
+ * @param {HTMLElement} chip
+ * @param {HTMLElement} list
+ * @param {HTMLElement} root
+ */
+function wireChipReorder(chip, list, root) {
+    chip.addEventListener('dragstart', (e) => {
+        chip.classList.add('chip-dragging');
+        // Some browsers refuse to start a drag without setData(); the payload
+        // itself is irrelevant — we look up the dragging chip via the .chip-dragging
+        // marker class.
+        try { e.dataTransfer?.setData('text/plain', chip.dataset.value || ''); } catch { /* noop */ }
+        if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move';
+    });
+
+    chip.addEventListener('dragend', () => {
+        chip.classList.remove('chip-dragging');
+        list.querySelectorAll('.chip-drop-before, .chip-drop-after')
+            .forEach(n => n.classList.remove('chip-drop-before', 'chip-drop-after'));
+    });
+
+    chip.addEventListener('dragover', (e) => {
+        const dragging = list.querySelector('.chip-dragging');
+        if (!dragging || dragging === chip) return;
+        e.preventDefault();
+        if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+        const rect = chip.getBoundingClientRect();
+        const before = e.clientX < rect.left + rect.width / 2;
+        chip.classList.toggle('chip-drop-before', before);
+        chip.classList.toggle('chip-drop-after',  !before);
+    });
+
+    chip.addEventListener('dragleave', () => {
+        chip.classList.remove('chip-drop-before', 'chip-drop-after');
+    });
+
+    chip.addEventListener('drop', (e) => {
+        const dragging = list.querySelector('.chip-dragging');
+        if (!dragging || dragging === chip) return;
+        e.preventDefault();
+        const rect = chip.getBoundingClientRect();
+        const before = e.clientX < rect.left + rect.width / 2;
+        chip.classList.remove('chip-drop-before', 'chip-drop-after');
+        list.insertBefore(dragging, before ? chip : chip.nextSibling);
+        root.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+
+    chip.addEventListener('keydown', (e) => {
+        if (!e.altKey) return;
+        if (e.key === 'ArrowLeft') {
+            e.preventDefault();
+            const prev = chip.previousElementSibling;
+            if (prev && prev.classList.contains('chip')) {
+                list.insertBefore(chip, prev);
+                chip.focus();
+                root.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+        } else if (e.key === 'ArrowRight') {
+            e.preventDefault();
+            const next = chip.nextElementSibling;
+            if (next && next.classList.contains('chip')) {
+                list.insertBefore(next, chip);
+                chip.focus();
+                root.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+        }
+    });
 }
 
 /**

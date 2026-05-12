@@ -23,6 +23,14 @@ public sealed class SubtitleStreamSummary
     [JsonPropertyName("l")] public string? Language  { get; set; }
     [JsonPropertyName("c")] public string? CodecName { get; set; }
     [JsonPropertyName("t")] public string? Title     { get; set; }
+
+    /// <summary>
+    ///     <c>true</c> when the source track is tagged as hearing-impaired
+    ///     (via ffprobe <c>disposition.hearing_impaired</c> or an SDH-style title).
+    ///     Persisted so <c>HasSubtitleWork</c> can decide mux-pass eligibility
+    ///     without re-running ffprobe.
+    /// </summary>
+    [JsonPropertyName("s")] public bool    Sdh       { get; set; }
 }
 
 /// <summary>
