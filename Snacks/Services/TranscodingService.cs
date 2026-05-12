@@ -6243,6 +6243,11 @@ public class TranscodingService
     /// </summary>
     private async Task HandleOutputPlacement(string outputPath, WorkItem workItem, EncoderOptions options)
     {
+        // Route FileService retry messages into the work-item log so a multi-minute
+        // backoff against an external lock (AV, indexer) is visible to the user instead
+        // of looking like a silent hang followed by a generic failure.
+        Func<string, Task> log = msg => LogAsync(workItem.Id, msg);
+
         try
         {
             if (!string.IsNullOrEmpty(options.OutputDirectory))
@@ -6252,8 +6257,8 @@ public class TranscodingService
                 if (!string.IsNullOrEmpty(options.EncodeDirectory))
                 {
                     string finalSnacksPath = Path.Combine(options.OutputDirectory, Path.GetFileName(outputPath));
-                    await LogAsync(workItem.Id, $"Moving to output directory: {finalSnacksPath}");
-                    await _fileService.FileMoveAsync(outputPath, finalSnacksPath);
+                    await LogAsync(workItem.Id, $"Moving to output directory: {outputPath} -> {finalSnacksPath}");
+                    await _fileService.FileMoveAsync(outputPath, finalSnacksPath, log);
                     await MoveSidecarsAlongsideAsync(outputPath, finalSnacksPath, workItem);
                     outputPath = finalSnacksPath;
                 }
@@ -6262,13 +6267,15 @@ public class TranscodingService
                 {
                     // Replace original: delete it, then move encoded file back to original location
                     await LogAsync(workItem.Id, "Replacing original file");
-                    await _fileService.FileDeleteAsync(workItem.Path);
+                    await LogAsync(workItem.Id, $"Deleting original: {workItem.Path}");
+                    await _fileService.FileDeleteAsync(workItem.Path, log);
 
                     // Move back to the original's directory with a clean name (no [snacks] tag)
                     string originalDir = _fileService.GetDirectory(workItem.Path);
                     string cleanName = Path.GetFileNameWithoutExtension(outputPath).Replace(" [snacks]", "") + Path.GetExtension(outputPath);
                     string finalPath = Path.Combine(originalDir, cleanName);
-                    await _fileService.FileMoveAsync(outputPath, finalPath);
+                    await LogAsync(workItem.Id, $"Moving encoded output: {outputPath} -> {finalPath}");
+                    await _fileService.FileMoveAsync(outputPath, finalPath, log);
                     await MoveSidecarsAlongsideAsync(outputPath, finalPath, workItem);
                     await LogAsync(workItem.Id, $"Final output: {finalPath}");
                 }
@@ -6287,10 +6294,12 @@ public class TranscodingService
                 {
                     // Replace original: delete it and rename transcoded file to take its place
                     await LogAsync(workItem.Id, "Replacing original with transcoded version");
-                    await _fileService.FileDeleteAsync(workItem.Path);
+                    await LogAsync(workItem.Id, $"Deleting original: {workItem.Path}");
+                    await _fileService.FileDeleteAsync(workItem.Path, log);
 
                     string cleanPath = GetCleanOutputName(outputPath);
-                    await _fileService.FileMoveAsync(outputPath, cleanPath);
+                    await LogAsync(workItem.Id, $"Moving encoded output: {outputPath} -> {cleanPath}");
+                    await _fileService.FileMoveAsync(outputPath, cleanPath, log);
                     await MoveSidecarsAlongsideAsync(outputPath, cleanPath, workItem);
                     await LogAsync(workItem.Id, $"Final output: {cleanPath}");
                 }
@@ -6306,7 +6315,12 @@ public class TranscodingService
         }
         catch (Exception ex)
         {
-            await LogAsync(workItem.Id, $"Error handling output placement: {ex.Message}");
+            // Include the exception type and inner exception (if any) so future failure reports
+            // distinguish e.g. IOException sharing-violation from access-denied or disk-full,
+            // and the preceding "Deleting original: ..." / "Moving encoded output: ..." log line
+            // identifies which file operation was in flight.
+            string suffix = ex.InnerException != null ? $" -> {ex.InnerException.Message}" : "";
+            await LogAsync(workItem.Id, $"Error handling output placement [{ex.GetType().Name}]: {ex.Message}{suffix}");
             throw;
         }
     }
