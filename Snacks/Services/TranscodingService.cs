@@ -1670,6 +1670,8 @@ public class TranscodingService
     /// <summary>
     ///     Resets a previously failed or cancelled file in both the database and the in-memory
     ///     tracking dictionary so it will be accepted by <see cref="AddFileAsync"/> on the next attempt.
+    ///     Emits <c>WorkItemRemoved</c> so the UI drops the failed card immediately — the file
+    ///     will reappear in the queue on the next AutoScan pass (or via an immediate "Scan Now").
     /// </summary>
     /// <param name="filePath"> Absolute path to the file to reset. </param>
     public async Task RetryFileAsync(string filePath)
@@ -1680,7 +1682,11 @@ public class TranscodingService
         var existing = _workItems.Values.FirstOrDefault(w =>
             Path.GetFullPath(w.Path).Equals(normalizedPath, StringComparison.OrdinalIgnoreCase));
         if (existing != null)
+        {
             _workItems.TryRemove(existing.Id, out _);
+            try { await _hubContext.Clients.All.SendAsync("WorkItemRemoved", existing.Id); }
+            catch { /* SignalR errors are non-fatal */ }
+        }
     }
 
     /// <summary>

@@ -273,6 +273,7 @@ document.addEventListener('DOMContentLoaded', () => {
         // in sync as encodes start, progress, and finish.
         clusterDashboard.onWorkItemUpdated?.(wi);
     });
+    signalR.on('WorkItemRemoved',   (id)      => queueManager.removeItem(id));
     signalR.on('TranscodingLog',    (id, msg) => logViewer.appendLine(id, msg));
 
     signalR.on('AutoScanCompleted', (newFiles) => {

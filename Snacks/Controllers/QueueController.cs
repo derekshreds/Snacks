@@ -151,13 +151,28 @@ public sealed class QueueController : ControllerBase
         }
     }
 
-    /// <summary> Re-queues a previously failed file for encoding. </summary>
+    /// <summary>
+    ///     Re-queues a previously failed file for encoding. Clears the failure state on the
+    ///     persisted row, then immediately re-adds the file under the current encoder options
+    ///     so the user sees it back in the queue without waiting for the next AutoScan.
+    /// </summary>
     /// <param name="request"> Contains the file path to retry. </param>
     [HttpPost("retry")]
     public async Task<IActionResult> Retry([FromBody] RetryRequest request)
     {
         if (request == null || string.IsNullOrEmpty(request.FilePath)) return BadRequest("File path is required");
         await _transcodingService.RetryFileAsync(request.FilePath);
+        try
+        {
+            await _autoScanService.AddSingleFileAsync(request.FilePath);
+        }
+        catch (Exception ex)
+        {
+            // Re-add failed (file no longer on disk, probe failed, exclusion rules now drop it,
+            // etc.). DB row is already reset, so the next scan will see the file as Unseen and
+            // try again — surface the message so the UI can toast it without rolling back.
+            return BadRequest($"Retry queued but re-add failed: {ex.Message}");
+        }
         return new JsonResult(new { success = true });
     }
 

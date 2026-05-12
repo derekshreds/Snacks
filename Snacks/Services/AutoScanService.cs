@@ -280,6 +280,22 @@ public sealed class AutoScanService : IHostedService, IDisposable
     }
 
     /// <summary>
+    ///     Re-queues a single file using the current global encoder options merged with any
+    ///     folder-level overrides — the same options recipe the periodic scan uses. Bypasses
+    ///     the "may still be transferring" mtime guard, since this is an explicit user action.
+    ///     Used by the retry button so a failed item goes back into the queue immediately
+    ///     instead of waiting for the next scheduled scan.
+    /// </summary>
+    /// <param name="filePath"> Absolute path to the file to add. </param>
+    public async Task AddSingleFileAsync(string filePath)
+    {
+        var globalOptions  = LoadEncoderOptions();
+        var folderOverride = FindFolderOverride(filePath);
+        var fileOptions    = EncoderOptionsOverride.ApplyOverrides(globalOptions, folderOverride, null);
+        await _transcodingService.AddFileAsync(filePath, fileOptions);
+    }
+
+    /// <summary>
     ///     Resets all file statuses in the database and clears the last-scan timestamp.
     ///     The next scan will treat all files as new.
     /// </summary>
