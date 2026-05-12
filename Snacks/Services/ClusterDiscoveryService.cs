@@ -662,7 +662,12 @@ public sealed class ClusterDiscoveryService
         }
         else if (hw == "intel")
         {
-            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            // On Linux, Snacks probes QSV before VAAPI during hardware detection and sets
+            // LinuxIntelUsesQsv when the QSV probe succeeds on the chosen render node.
+            // Advertise QSV encoders in that case so the master scheduler dispatches
+            // QSV-aware jobs; otherwise fall back to VAAPI encoders for compatibility.
+            bool useQsv = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) || TranscodingService.LinuxIntelUsesQsv;
+            if (useQsv)
                 encoders.AddRange(new[] { "hevc_qsv", "h264_qsv" });
             else
                 encoders.AddRange(new[] { "hevc_vaapi", "h264_vaapi" });

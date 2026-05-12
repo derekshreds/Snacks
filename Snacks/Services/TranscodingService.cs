@@ -3746,6 +3746,16 @@ public class TranscodingService
     private List<HardwareDevice>? _detectedDevices = null;
 
     /// <summary>
+    ///     Set to <c>true</c> during Linux detection when the QSV probe on an Intel
+    ///     render node succeeds. The static helpers <see cref="GetEncoder"/> and
+    ///     <see cref="GetInitFlags"/> read this to pick QSV variants over the VAAPI
+    ///     defaults on Linux without plumbing a new field through <c>EncoderOptions</c>.
+    ///     Static because detection is a one-shot at startup and the static helpers
+    ///     don't have an instance handle.
+    /// </summary>
+    internal static bool LinuxIntelUsesQsv { get; set; }
+
+    /// <summary>
     ///     All devices default to a single concurrent encode. Users opt in to
     ///     parallelism per-device via the dashboard's hardware-concurrency
     ///     editor — the safe default avoids surprising a fresh install with a
@@ -3863,19 +3873,54 @@ public class TranscodingService
             // Linux
             await LogVaapiInfoAsync();
 
-            // VAAPI (Intel iGPU and AMD GPUs on Linux) — walk every render node, not
-            // just renderD128. On hybrid laptops (e.g. Pop!_OS with system76-power in
+            // Intel iGPU and AMD GPUs on Linux — walk every render node, not just
+            // renderD128. On hybrid laptops (e.g. Pop!_OS with system76-power in
             // hybrid/nvidia/compute mode) the NVIDIA card can claim renderD128 while
             // the iGPU lands on renderD129. The legacy single-node probe failed against
             // the NVIDIA node (no iHD/i965 VAAPI support there) and silently skipped
             // VAAPI entirely, even though a perfectly good iGPU was sitting on the
             // next render node over.
+            //
+            // Per-node order is QSV first, then VAAPI. On modern Intel parts with
+            // Jellyfin-FFmpeg's oneVPL runtime (shipped in the Docker image), QSV is
+            // the Intel-native encode path and outperforms VAAPI on HEVC; VAAPI stays
+            // as the fallback for builds without QSV support or older drivers.
             var renderNodes = EnumerateRenderNodes();
             var originalLibvaDriver = Environment.GetEnvironmentVariable("LIBVA_DRIVER_NAME");
             try
             {
                 foreach (var nodePath in renderNodes)
                 {
+                    // QSV first. oneVPL on Linux needs the iHD driver — i965 doesn't
+                    // expose QSV — so pin it before probing instead of leaving it to
+                    // the host's default.
+                    Console.WriteLine($"Auto-detect: Trying Intel QSV (Linux) on {nodePath}...");
+                    Environment.SetEnvironmentVariable("LIBVA_DRIVER_NAME", "iHD");
+
+                    var qsvInit = $"-hwaccel qsv -qsv_device {nodePath}";
+                    bool qsvHevc = await TestEncoderAsync(qsvInit, "hevc_qsv");
+                    bool qsvH264 = await TestEncoderAsync(qsvInit, "h264_qsv");
+                    bool qsvAv1  = await TestEncoderAsync(qsvInit, "av1_qsv");
+
+                    if (qsvHevc || qsvH264 || qsvAv1)
+                    {
+                        Console.WriteLine($"Auto-detect: Intel QSV (Linux) available on {nodePath} (hevc={qsvHevc}, h264={qsvH264}, av1={qsvAv1})");
+                        devices.Add(new HardwareDevice
+                        {
+                            DeviceId           = "intel",
+                            DisplayName        = "Intel QSV",
+                            SupportedCodecs    = BuildSupportedCodecs(qsvHevc, qsvH264, qsvAv1),
+                            Encoders           = BuildIntelEncoders(qsvHevc, qsvH264, qsvAv1, qsv: true),
+                            DefaultConcurrency = DefaultConcurrencyFor("intel"),
+                            IsHardware         = true,
+                            DevicePath         = nodePath,
+                        });
+                        LinuxIntelUsesQsv = true;
+                        break;
+                    }
+
+                    // QSV unavailable on this node — fall back to VAAPI with the
+                    // existing two-driver probe (iHD, then legacy i965).
                     var driversToTry = new[] { "iHD", "i965" };
                     bool nodeMatched = false;
                     foreach (var driver in driversToTry)
@@ -4192,7 +4237,7 @@ public class TranscodingService
     ///     forcing hardware decode (software decode + VAAPI encode mode).
     /// </summary>
     internal static string GetInitFlags(string hardwareAcceleration, bool hwDecode = true)
-        => GetInitFlags(hardwareAcceleration, devicePath: null, RuntimeInformation.IsOSPlatform(OSPlatform.Windows), hwDecode);
+        => GetInitFlags(hardwareAcceleration, devicePath: null, RuntimeInformation.IsOSPlatform(OSPlatform.Windows), LinuxIntelUsesQsv, hwDecode);
 
     /// <summary>
     ///     Path-aware overload. <paramref name="devicePath"/> selects the VAAPI render
@@ -4202,14 +4247,14 @@ public class TranscodingService
     ///     same node detection picked.
     /// </summary>
     internal static string GetInitFlags(string hardwareAcceleration, string? devicePath, bool hwDecode = true)
-        => GetInitFlags(hardwareAcceleration, devicePath, RuntimeInformation.IsOSPlatform(OSPlatform.Windows), hwDecode);
+        => GetInitFlags(hardwareAcceleration, devicePath, RuntimeInformation.IsOSPlatform(OSPlatform.Windows), LinuxIntelUsesQsv, hwDecode);
 
     /// <summary>
     ///     Pure overload that takes <paramref name="isWindows"/> explicitly so unit tests can
     ///     exercise the VAAPI / QSV / AMF branches independently of the test host OS.
     /// </summary>
     internal static string GetInitFlags(string hardwareAcceleration, bool isWindows, bool hwDecode)
-        => GetInitFlags(hardwareAcceleration, devicePath: null, isWindows, hwDecode);
+        => GetInitFlags(hardwareAcceleration, devicePath: null, isWindows, linuxIntelQsv: false, hwDecode);
 
     /// <summary>
     ///     Pure overload with explicit OS gate AND device-path injection. The four VAAPI
@@ -4217,12 +4262,27 @@ public class TranscodingService
     ///     so single-GPU machines get the same flag string they always have.
     /// </summary>
     internal static string GetInitFlags(string hardwareAcceleration, string? devicePath, bool isWindows, bool hwDecode)
+        => GetInitFlags(hardwareAcceleration, devicePath, isWindows, linuxIntelQsv: false, hwDecode);
+
+    /// <summary>
+    ///     Pure overload with explicit OS gate, device path, and Linux-QSV preference. When
+    ///     <paramref name="linuxIntelQsv"/> is <c>true</c> and we're on Linux, Intel jobs
+    ///     use the QSV pipeline (<c>-hwaccel qsv -qsv_device {path}</c>) instead of VAAPI.
+    ///     <paramref name="linuxIntelQsv"/> is ignored on Windows, where QSV is always the
+    ///     Intel path, and for non-Intel hwaccel values.
+    /// </summary>
+    internal static string GetInitFlags(string hardwareAcceleration, string? devicePath, bool isWindows, bool linuxIntelQsv, bool hwDecode)
     {
         var node = string.IsNullOrEmpty(devicePath) ? "/dev/dri/renderD128" : devicePath;
         return hardwareAcceleration.ToLower() switch
         {
             "intel" when isWindows => "-y -hwaccel qsv -hwaccel_output_format qsv -qsv_device auto",
             "amd" when isWindows => "-y -hwaccel auto",
+            // Linux Intel QSV: derive a QSV device from VAAPI on the same render node
+            // when input is software-decoded, so the encoder can still find a QSV
+            // context. Full pipeline when input is hw-decodable.
+            "intel" when linuxIntelQsv && !hwDecode => $"-y -init_hw_device vaapi=va:{node} -init_hw_device qsv=hw@va -filter_hw_device hw",
+            "intel" when linuxIntelQsv => $"-y -hwaccel qsv -hwaccel_output_format qsv -qsv_device {node}",
             // Software decode + VAAPI encode: init the device but don't force hwaccel decode
             "intel" when !hwDecode => $"-y -init_hw_device vaapi=hw:{node} -filter_hw_device hw",
             "amd" when !hwDecode => $"-y -init_hw_device vaapi=hw:{node} -filter_hw_device hw",
@@ -4260,8 +4320,16 @@ public class TranscodingService
     ///     concrete FFmpeg encoder name (e.g., <c>"hevc_vaapi"</c>, <c>"hevc_nvenc"</c>, <c>"libx265"</c>).
     /// </summary>
     internal static string GetEncoder(EncoderOptions options)
+        => GetEncoder(options, RuntimeInformation.IsOSPlatform(OSPlatform.Windows), LinuxIntelUsesQsv);
+
+    /// <summary>
+    ///     Pure overload that takes the OS gate and Linux-QSV preference explicitly so unit
+    ///     tests can exercise every branch (QSV / VAAPI / AMF / NVENC / VideoToolbox)
+    ///     independently of the test host. <paramref name="linuxIntelQsv"/> only matters
+    ///     when <paramref name="isWindows"/> is <c>false</c> and the hwaccel is "intel".
+    /// </summary>
+    internal static string GetEncoder(EncoderOptions options, bool isWindows, bool linuxIntelQsv)
     {
-        bool isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
         // Case-insensitive: Encoder can come from settings.json or per-folder overrides
         // where casing isn't enforced; the UI's ENCODER_MAP is lowercase but external
         // entry points aren't, and a non-matching codec string silently falls through
@@ -4271,23 +4339,24 @@ public class TranscodingService
                    || encoder.Contains("svt", StringComparison.OrdinalIgnoreCase);
         bool isH265 = !isAv1 && encoder.Contains("265", StringComparison.OrdinalIgnoreCase);
         bool isH264 = !isAv1 && encoder.Contains("264", StringComparison.OrdinalIgnoreCase);
+        bool intelUsesQsv = isWindows || linuxIntelQsv;
 
         return options.HardwareAcceleration.ToLower() switch
         {
             // AV1 encoders
-            "intel" when isWindows && isAv1 => "av1_qsv",
+            "intel" when intelUsesQsv && isAv1 => "av1_qsv",
             "amd" when isWindows && isAv1 => "av1_amf",
             "intel" when isAv1 => "av1_vaapi",
             "amd" when isAv1 => "av1_vaapi",
             "nvidia" when isAv1 => "av1_nvenc",
             // H.264 encoders
-            "intel" when isWindows && isH264 => "h264_qsv",
+            "intel" when intelUsesQsv && isH264 => "h264_qsv",
             "amd" when isWindows && isH264 => "h264_amf",
             "intel" when isH264 => "h264_vaapi",
             "amd" when isH264 => "h264_vaapi",
             "nvidia" when isH264 => "h264_nvenc",
             // H.265 encoders
-            "intel" when isWindows && isH265 => "hevc_qsv",
+            "intel" when intelUsesQsv && isH265 => "hevc_qsv",
             "amd" when isWindows && isH265 => "hevc_amf",
             "intel" when isH265 => "hevc_vaapi",
             "amd" when isH265 => "hevc_vaapi",

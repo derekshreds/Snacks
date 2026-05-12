@@ -57,6 +57,53 @@ public sealed class HardwareEncoderTests
     }
 
 
+    /// <summary>
+    ///     Linux Intel with the QSV preference set picks QSV encoders instead of VAAPI.
+    ///     Uses the pure overload so this runs on any host — VAAPI vs QSV here depends
+    ///     on detection, not the test process's OS.
+    /// </summary>
+    [Theory]
+    [InlineData("libx265",   "hevc_qsv")]
+    [InlineData("libx264",   "h264_qsv")]
+    [InlineData("libsvtav1", "av1_qsv")]
+    public void GetEncoder_intel_on_linux_with_qsv_picks_qsv_variant(string requested, string expected)
+    {
+        var opts = new EncoderOptions { HardwareAcceleration = "intel", Encoder = requested };
+        TranscodingService.GetEncoder(opts, isWindows: false, linuxIntelQsv: true).Should().Be(expected);
+    }
+
+
+    /// <summary>
+    ///     Linux Intel without QSV (probe failed → backend stayed VAAPI) keeps the VAAPI
+    ///     encoders. Regression guard for the existing VAAPI fallback path.
+    /// </summary>
+    [Theory]
+    [InlineData("libx265",   "hevc_vaapi")]
+    [InlineData("libx264",   "h264_vaapi")]
+    [InlineData("libsvtav1", "av1_vaapi")]
+    public void GetEncoder_intel_on_linux_without_qsv_picks_vaapi_variant(string requested, string expected)
+    {
+        var opts = new EncoderOptions { HardwareAcceleration = "intel", Encoder = requested };
+        TranscodingService.GetEncoder(opts, isWindows: false, linuxIntelQsv: false).Should().Be(expected);
+    }
+
+
+    /// <summary>
+    ///     Linux QSV preference must not bleed into AMD or NVIDIA paths — only Intel
+    ///     swaps backend. Catches a regression where the QSV gate accidentally widens.
+    /// </summary>
+    [Theory]
+    [InlineData("amd",    "libx265",   "hevc_vaapi")]
+    [InlineData("amd",    "libx264",   "h264_vaapi")]
+    [InlineData("amd",    "libsvtav1", "av1_vaapi")]
+    [InlineData("nvidia", "libx265",   "hevc_nvenc")]
+    public void GetEncoder_linux_qsv_does_not_affect_non_intel(string hwAccel, string requested, string expected)
+    {
+        var opts = new EncoderOptions { HardwareAcceleration = hwAccel, Encoder = requested };
+        TranscodingService.GetEncoder(opts, isWindows: false, linuxIntelQsv: true).Should().Be(expected);
+    }
+
+
     /// <summary>Rows: (encoder, expected fallback).</summary>
     public static IEnumerable<object[]> SoftwareFallbackRows() => new[]
     {
@@ -216,6 +263,55 @@ public sealed class HardwareEncoderTests
         var legacyFlag = TranscodingService.GetInitFlags(hwAccel, isWindows: false, hwDecode);
         withNull.Should().Be(legacyFlag);
         withNull.Should().Contain("vaapi=hw:/dev/dri/renderD128");
+    }
+
+
+    /// <summary>
+    ///     Linux Intel QSV with hw-decode capable input uses the full QSV pipeline on the
+    ///     detected render node — not the legacy renderD128 default — and never falls
+    ///     through to the VAAPI branch.
+    /// </summary>
+    [Fact]
+    public void GetInitFlags_intel_on_linux_with_qsv_uses_qsv_pipeline()
+    {
+        var flags = TranscodingService.GetInitFlags("intel", "/dev/dri/renderD129", isWindows: false, linuxIntelQsv: true, hwDecode: true);
+        flags.Should().Contain("-hwaccel qsv");
+        flags.Should().Contain("-hwaccel_output_format qsv");
+        flags.Should().Contain("-qsv_device /dev/dri/renderD129");
+        flags.Should().NotContain("vaapi");
+    }
+
+
+    /// <summary>
+    ///     Linux Intel QSV with software-decoded input still needs a QSV device for the
+    ///     encoder. The canonical FFmpeg form derives QSV from a VAAPI base on the same
+    ///     render node, so the encoder finds a QSV context even though decode runs in
+    ///     software.
+    /// </summary>
+    [Fact]
+    public void GetInitFlags_intel_on_linux_with_qsv_and_sw_decode_derives_qsv_from_vaapi()
+    {
+        var flags = TranscodingService.GetInitFlags("intel", "/dev/dri/renderD129", isWindows: false, linuxIntelQsv: true, hwDecode: false);
+        flags.Should().Contain("vaapi=va:/dev/dri/renderD129");
+        flags.Should().Contain("qsv=hw@va");
+        flags.Should().Contain("-filter_hw_device hw");
+        flags.Should().NotContain("-hwaccel qsv");
+    }
+
+
+    /// <summary>
+    ///     Linux QSV preference is Intel-only. AMD jobs on Linux must still pick the
+    ///     VAAPI pipeline regardless of the QSV flag, since the flag describes Intel's
+    ///     backend choice — not a global Linux preference.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void GetInitFlags_linux_qsv_does_not_affect_amd(bool hwDecode)
+    {
+        var flags = TranscodingService.GetInitFlags("amd", "/dev/dri/renderD128", isWindows: false, linuxIntelQsv: true, hwDecode);
+        flags.Should().Contain("vaapi=hw:/dev/dri/renderD128");
+        flags.Should().NotContain("-hwaccel qsv");
     }
 
 
