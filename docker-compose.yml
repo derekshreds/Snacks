@@ -19,11 +19,17 @@ services:
       - FFMPEG_PATH=/usr/lib/jellyfin-ffmpeg/ffmpeg
       - FFPROBE_PATH=/usr/lib/jellyfin-ffmpeg/ffprobe
       # Uncomment to run as a non-root user matching your NAS owner. The
-      # container will chown /app/work to match and drop privileges via gosu.
-      # If /dev/dri is mounted in, the entrypoint also adds the snacks user
-      # to that device's actual group so hardware acceleration keeps working.
+      # entrypoint chowns the Snacks-managed paths under /app/work (config,
+      # logs, the work-dir lock file) and drops privileges via gosu. The
+      # /app/work/uploads and /app/work/output mounts are left alone — the
+      # NAS share already enforces its own ownership and recursing into a
+      # large NFS/SMB library would hang startup. If /dev/dri is mounted in,
+      # the entrypoint also adds the snacks user to that device's actual
+      # group so hardware acceleration keeps working.
       # - PUID=1000
       # - PGID=1000
+      # Set to skip the startup chown entirely (e.g. host manages all perms).
+      # - SNACKS_DISABLE_CHOWN=true
     # GPU passthrough is configured in docker-compose.gpu.yml (Linux NAS only)
     privileged: false
     restart: unless-stopped
