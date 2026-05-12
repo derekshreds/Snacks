@@ -279,6 +279,16 @@ public sealed class ClusterService : IHostedService, IDisposable
         // that runs local encodes (master + standalone) — workers populate
         // _nodes through the master via handshake.
         UpdateLocalSelfNode();
+        // Hardware detection runs async from the TranscodingService
+        // constructor and typically finishes after StartAsync returns. In
+        // master mode the heartbeat timer eventually re-snapshots the local
+        // node so the resolver catches up; in standalone the heartbeat
+        // never fires, so the initial Capabilities.Devices=[music] snapshot
+        // taken above is the only one the resolver ever sees, and every
+        // TryReserve for a real GPU/CPU device fails — encoding silently
+        // never starts. Wire a one-shot refresh so detection completion
+        // updates _nodes regardless of role.
+        _transcodingService.SetHardwareDetectedCallback(UpdateLocalSelfNode);
         Console.WriteLine($"Cluster: Config loaded — enabled={_config.Enabled}, role={_config.Role}, nodeId={_config.NodeId}");
 
         if (_config.Enabled && _config.Role != "standalone")

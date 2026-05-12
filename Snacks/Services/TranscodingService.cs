@@ -382,6 +382,13 @@ public class TranscodingService
             try
             {
                 await DetectHardwareAccelerationAsync();
+                // Notify the cluster service so the local node's cached
+                // Capabilities.Devices in _nodes catches up with the just-
+                // populated _detectedDevices. The capacity resolver reads
+                // from _nodes, and without this refresh standalone mode's
+                // first encode permanently fails to reserve a slot.
+                try { _hardwareDetectedCallback?.Invoke(); }
+                catch (Exception ex) { Console.WriteLine($"HardwareDetected callback error: {ex.Message}"); }
                 await _hubContext.Clients.All.SendAsync("HardwareDetected", _detectedHardware);
             }
             catch
@@ -5570,6 +5577,36 @@ public class TranscodingService
     public void SetWorkItemQueuedCallback(Action? callback) => _onWorkItemQueued = callback;
 
     /// <summary>
+    ///     Fires once after <see cref="DetectHardwareAccelerationAsync"/>
+    ///     populates <see cref="_detectedDevices"/>. <see cref="ClusterService"/>
+    ///     wires this to refresh the local node's <c>Capabilities.Devices</c>
+    ///     snapshot in its <c>_nodes</c> registry — without that refresh, the
+    ///     SlotLedger's capacity resolver only sees the pre-detection snapshot
+    ///     (music device only) and refuses every TryReserve for the real GPU/CPU
+    ///     devices, which silently prevents standalone-mode encoding from
+    ///     starting on macOS and Windows. In master mode the heartbeat timer
+    ///     hides the race by re-snapshotting every few seconds; standalone has
+    ///     no such timer.
+    /// </summary>
+    private Action? _hardwareDetectedCallback;
+
+    /// <summary>
+    ///     Registers the one-shot post-detection callback. If detection has
+    ///     already completed by the time the callback is registered (the cluster
+    ///     service may bind after the async probe finishes on fast machines),
+    ///     fire it immediately so we don't leak the missed-edge race.
+    /// </summary>
+    public void SetHardwareDetectedCallback(Action callback)
+    {
+        _hardwareDetectedCallback = callback;
+        if (_detectedDevices != null)
+        {
+            try { callback(); }
+            catch (Exception ex) { Console.WriteLine($"HardwareDetected callback error: {ex.Message}"); }
+        }
+    }
+
+    /// <summary>
     ///     Restarts <see cref="ProcessQueueAsync"/> if it had previously
     ///     exited because the schedule gate was closed. Idempotent — bails
     ///     early when the queue is paused or already running.
@@ -5696,6 +5733,20 @@ public class TranscodingService
         // Wake the cluster dispatcher so restored items can be sent to workers
         // immediately on startup instead of waiting for the 2-second timer tick.
         try { _onWorkItemQueued?.Invoke(); } catch { }
+
+        // Also kick the local scheduler. Without this, standalone-mode
+        // restores leave items stuck in Pending forever: _onWorkItemQueued
+        // is unset (the cluster dispatcher only exists in master/node modes)
+        // and no other path wakes ProcessQueueAsync until the user manually
+        // re-saves a setting or toggles something. AddFileAsync (fresh
+        // queue from the UI) already does this — restore was the lone path
+        // that didn't, which is why fresh adds work but a restart leaves
+        // the queue frozen.
+        _ = Task.Run(async () =>
+        {
+            try { await ProcessQueueAsync(options); }
+            catch (Exception ex) { Console.WriteLine($"Error in ProcessQueueAsync after restore: {ex.Message}"); }
+        });
 
         return workItem.Id;
     }

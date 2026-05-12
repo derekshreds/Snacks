@@ -42,7 +42,7 @@ public sealed class HomeController : Controller
     {
         status    = "healthy",
         timestamp = DateTime.UtcNow,
-        version   = "2.11.0",
+        version   = "2.11.1",
     });
 
     /// <summary>
