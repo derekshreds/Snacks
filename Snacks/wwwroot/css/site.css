@@ -1494,6 +1494,34 @@ footer a.text-muted:hover {
 }
 .chip-suggestion-name { color: var(--text-muted, #6c757d); }
 
+/* Drag-to-reorder chips (data-reorderable="true" on the .chip-input root) */
+.chip-input[data-reorderable="true"] .chip {
+    cursor: grab;
+    user-select: none;
+}
+.chip-input[data-reorderable="true"] .chip:focus-visible {
+    outline: 2px solid var(--primary, #0d6efd);
+    outline-offset: 1px;
+}
+.chip-input .chip-grip {
+    display: inline-flex;
+    align-items: center;
+    color: currentColor;
+    opacity: 0.55;
+    font-size: 0.7rem;
+    cursor: grab;
+}
+.chip-input .chip.chip-dragging {
+    opacity: 0.5;
+    cursor: grabbing;
+}
+.chip-input .chip.chip-drop-before {
+    box-shadow: -3px 0 0 0 var(--primary, #0d6efd);
+}
+.chip-input .chip.chip-drop-after {
+    box-shadow:  3px 0 0 0 var(--primary, #0d6efd);
+}
+
 /* ===========================
    Folder picker rows
    =========================== */

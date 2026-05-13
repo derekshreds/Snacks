@@ -111,18 +111,20 @@ export function getActionButtons(workItem) {
                 </div>`;
 
         case 'Completed':
-        case 'Failed':
         case 'Cancelled':
         case 'Stopped':
             return '<button class="btn btn-sm btn-outline-info log-btn" data-action="log" title="View Log"><i class="fas fa-terminal"></i></button>';
 
+        case 'Failed':
         case 'NoSavings':
-            // Encoded but didn't shrink. Log button + "Try again" lets the user request
-            // a single-row retry under the same settings (the bulk "Retry no-savings"
-            // toggle on the Re-evaluate button covers the entire library at once).
+            // Failed: file errored out (often a transient lock — e.g. another process
+            // had the file open). Retry resets the DB row so the next AutoScan
+            // re-queues the file under the current settings.
+            // NoSavings: encode finished but didn't shrink — retry runs it again under
+            // current settings (the bulk "Retry no-savings" toggle covers the library at once).
             return `
                 <div class="btn-group" role="group">
-                    <button class="btn btn-sm btn-outline-warning retry-btn" data-action="retry" title="Try encoding again under current settings"><i class="fas fa-redo"></i></button>
+                    <button class="btn btn-sm btn-outline-warning retry-btn" data-action="retry" title="Retry under current settings"><i class="fas fa-redo"></i></button>
                     <button class="btn btn-sm btn-outline-info log-btn" data-action="log" title="View Log"><i class="fas fa-terminal"></i></button>
                 </div>`;
 

@@ -896,4 +896,52 @@ public sealed class AudioPlannerTests
         streams[0].Codec.Should().Be("aac");
         warnings.Should().Contain(w => w.Contains("wma") && w.Contains("AAC"));
     }
+
+
+    // ---------------------------------------------------------------------
+    //  AutoSetDefault: emits -disposition:a:0 default and clears the rest.
+    // ---------------------------------------------------------------------
+
+    [Fact]
+    public void AutoSetDefault_flags_first_audio_output()
+    {
+        var probe = new ProbeBuilder()
+            .Video()
+            .Audio(codec: "aac", channels: 2, lang: "eng")
+            .Audio(codec: "ac3", channels: 6, lang: "fre")
+            .Build();
+
+        var flags = _svc.MapAudio(
+            probe,
+            new[] { "fr", "en" },
+            preserveOriginalAudio: true,
+            audioOutputs: null,
+            isMatroska: true,
+            warnings: out _,
+            autoSetDefault: true);
+
+        flags.Should().Contain("-disposition:a:0 default");
+        flags.Should().Contain("-disposition:a:1 0");
+    }
+
+
+    [Fact]
+    public void AutoSetDefault_off_emits_no_disposition_flags()
+    {
+        var probe = new ProbeBuilder()
+            .Video()
+            .Audio(codec: "aac", channels: 2, lang: "eng")
+            .Build();
+
+        var flags = _svc.MapAudio(
+            probe,
+            new[] { "en" },
+            preserveOriginalAudio: true,
+            audioOutputs: null,
+            isMatroska: true,
+            warnings: out _,
+            autoSetDefault: false);
+
+        flags.Should().NotContain("-disposition:a");
+    }
 }

@@ -12,14 +12,15 @@ namespace Snacks.Tests.Subtitles;
 /// </summary>
 public sealed class HasSubtitleWorkTests
 {
-    private static SubtitleStreamSummary Sum(string codec, string lang = "eng", string? title = null) =>
-        new() { CodecName = codec, Language = lang, Title = title };
+    private static SubtitleStreamSummary Sum(string codec, string lang = "eng", string? title = null, bool sdh = false) =>
+        new() { CodecName = codec, Language = lang, Title = title, Sdh = sdh };
 
     private static EncoderOptions Opts(
         IEnumerable<string>? keep = null,
         bool sidecar       = false,
         bool ocr           = false,
         bool passBitmaps   = true,
+        bool excludeSdh    = false,
         string format      = "mkv") => new()
     {
         Format                       = format,
@@ -27,6 +28,7 @@ public sealed class HasSubtitleWorkTests
         ExtractSubtitlesToSidecar    = sidecar,
         ConvertImageSubtitlesToSrt   = ocr,
         PassThroughImageSubtitlesMkv = passBitmaps,
+        ExcludeSdhSubtitles          = excludeSdh,
     };
 
 
@@ -215,6 +217,59 @@ public sealed class HasSubtitleWorkTests
         TranscodingService.HasSubtitleWork(
             Opts(keep: new[] { "en" }, passBitmaps: false, format: "mkv"),
             new[] { Sum("subrip", "eng"), Sum("hdmv_pgs_subtitle", "eng") })
+        .Should().BeTrue();
+    }
+
+
+    // ---------------------------------------------------------------------
+    //  SDH drop. Toggling ExcludeSdhSubtitles must trigger work whenever
+    //  the source contains a hearing-impaired track that would be dropped.
+    // ---------------------------------------------------------------------
+
+    [Fact]
+    public void Sdh_present_with_exclude_on_is_work()
+    {
+        TranscodingService.HasSubtitleWork(
+            Opts(keep: new[] { "en" }, excludeSdh: true),
+            new[] { Sum("subrip", "eng"), Sum("subrip", "eng", sdh: true) })
+        .Should().BeTrue();
+    }
+
+
+    [Fact]
+    public void Sdh_present_with_exclude_off_is_not_work()
+    {
+        TranscodingService.HasSubtitleWork(
+            Opts(keep: new[] { "en" }, excludeSdh: false),
+            new[] { Sum("subrip", "eng"), Sum("subrip", "eng", sdh: true) })
+        .Should().BeFalse();
+    }
+
+
+    // ---------------------------------------------------------------------
+    //  Reorder. Source order differing from keep-list priority is work even
+    //  when every language is already present (the visible payoff is the
+    //  output stream order changing).
+    // ---------------------------------------------------------------------
+
+    [Fact]
+    public void Source_order_matching_preference_is_not_work()
+    {
+        var subs = new[] { Sum("subrip", "fre"), Sum("subrip", "eng") };
+        TranscodingService.HasSubtitleWork(
+            Opts(keep: new[] { "fr", "en" }),
+            subs)
+        .Should().BeFalse();
+    }
+
+
+    [Fact]
+    public void Source_order_inverted_from_preference_is_work()
+    {
+        var subs = new[] { Sum("subrip", "eng"), Sum("subrip", "fre") };
+        TranscodingService.HasSubtitleWork(
+            Opts(keep: new[] { "fr", "en" }),
+            subs)
         .Should().BeTrue();
     }
 }

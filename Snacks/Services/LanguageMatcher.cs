@@ -1,3 +1,5 @@
+using System.Text.RegularExpressions;
+
 namespace Snacks.Services;
 
 /// <summary>
@@ -159,6 +161,35 @@ public static class LanguageMatcher
     /// </summary>
     public static bool Matches(string? trackLang, IReadOnlyList<string>? wantedTwoLetter)
         => Matches(trackLang, trackTitle: null, wantedTwoLetter);
+
+    // Word-boundary match for the common hearing-impaired markers. The narrow tokens
+    // (cc, hi, hoh) only match when surrounded by non-letter delimiters so we don't
+    // false-positive on "Chichewa" or words containing "hi". "Sdh" and the
+    // multi-word forms are unambiguous enough to allow case-insensitive matches.
+    private static readonly Regex _sdhTitleRegex = new(
+        @"(?ix)
+            \b sdh \b                              |
+            \b cc \b                               |
+            \b hi \b                               |
+            \b hoh \b                              |
+            \b hearing [\s\-_]* impaired \b        |
+            \b for [\s\-_]* the [\s\-_]* hearing [\s\-_]* impaired \b
+        ",
+        RegexOptions.Compiled);
+
+    /// <summary>
+    ///     Returns <see langword="true"/> when <paramref name="title"/> looks like a
+    ///     hearing-impaired / closed-captions / SDH subtitle track. Matches common
+    ///     descriptive markers — "SDH", "CC", "HI", "HoH", "Hearing Impaired" — using
+    ///     word boundaries so unrelated tokens (e.g. a language name that happens to
+    ///     contain "hi") aren't flagged. Used as a fallback when the source doesn't
+    ///     set <c>disposition.hearing_impaired</c>, common on Blu-ray rips.
+    /// </summary>
+    public static bool IsSdhTitle(string? title)
+    {
+        if (string.IsNullOrWhiteSpace(title)) return false;
+        return _sdhTitleRegex.IsMatch(title);
+    }
 
     /// <summary>
     ///     Returns <see langword="true"/> when a track should be kept given

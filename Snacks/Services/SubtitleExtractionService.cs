@@ -40,6 +40,7 @@ public sealed class SubtitleExtractionService
     /// <param name="languagesToKeep">  Two-letter language keep-list; null/empty keeps all. </param>
     /// <param name="format">           <c>"srt"</c> or <c>"ass"</c>. OCR output is always <c>"srt"</c> regardless. </param>
     /// <param name="convertBitmaps">   When <c>true</c>, bitmap streams are OCR'd via Subtitle Edit. </param>
+    /// <param name="excludeSdh">       When <c>true</c>, drops tracks tagged hearing-impaired. </param>
     /// <param name="log">              Async logger callback (usually wired to <c>LogAsync</c>). </param>
     /// <param name="ct">               Cancellation token. </param>
     public async Task<IReadOnlyList<string>> ExtractAsync(
@@ -49,12 +50,13 @@ public sealed class SubtitleExtractionService
         IReadOnlyList<string>?  languagesToKeep,
         string                  format,
         bool                    convertBitmaps,
+        bool                    excludeSdh,
         Func<string, Task>      log,
         CancellationToken       ct)
     {
         if (workItem.Probe == null) return Array.Empty<string>();
 
-        var specs = _ffprobeService.SelectSidecarStreams(workItem.Probe, languagesToKeep, convertBitmaps);
+        var specs = _ffprobeService.SelectSidecarStreams(workItem.Probe, languagesToKeep, convertBitmaps, excludeSdh);
         if (specs.Count == 0)
         {
             await log("Sidecar extraction: no matching subtitle streams — skipping.");
@@ -142,13 +144,14 @@ public sealed class SubtitleExtractionService
         string                 inputPath,
         string                 tmpDir,
         IReadOnlyList<string>? languagesToKeep,
+        bool                   excludeSdh,
         Func<string, Task>     log,
         CancellationToken      ct)
     {
         if (workItem.Probe == null) return Array.Empty<OcrMuxResult>();
 
         var bitmapSpecs = _ffprobeService
-            .SelectSidecarStreams(workItem.Probe, languagesToKeep, includeBitmaps: true)
+            .SelectSidecarStreams(workItem.Probe, languagesToKeep, includeBitmaps: true, excludeSdh: excludeSdh)
             .Where(s => s.IsBitmap)
             .ToList();
 

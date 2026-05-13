@@ -336,7 +336,12 @@ public sealed class FileService
     /// </summary>
     /// <param name="input"> Source file path. </param>
     /// <param name="output"> Destination file path. </param>
-    public async Task FileMoveAsync(string input, string output)
+    /// <param name="onRetry">
+    ///     Optional async callback invoked once per retry attempt with the formatted retry message.
+    ///     When supplied, retry messages are routed here instead of <see cref="Console.WriteLine(string)"/>
+    ///     so callers (e.g. the placement step in TranscodingService) can surface them in the work-item log.
+    /// </param>
+    public async Task FileMoveAsync(string input, string output, Func<string, Task>? onRetry = null)
     {
         if (input.Equals(output, StringComparison.OrdinalIgnoreCase))
             return;
@@ -352,7 +357,7 @@ public sealed class FileService
 
             File.Move(input, output);
             return Task.CompletedTask;
-        }, $"Move {Path.GetFileName(input)} -> {Path.GetFileName(output)}");
+        }, $"Move {Path.GetFileName(input)} -> {Path.GetFileName(output)}", onRetry);
     }
 
     /// <summary>
@@ -360,7 +365,12 @@ public sealed class FileService
     ///     No-op if the file does not exist.
     /// </summary>
     /// <param name="path"> The path of the file to delete. </param>
-    public async Task FileDeleteAsync(string path)
+    /// <param name="onRetry">
+    ///     Optional async callback invoked once per retry attempt with the formatted retry message.
+    ///     When supplied, retry messages are routed here instead of <see cref="Console.WriteLine(string)"/>
+    ///     so callers (e.g. the placement step in TranscodingService) can surface them in the work-item log.
+    /// </param>
+    public async Task FileDeleteAsync(string path, Func<string, Task>? onRetry = null)
     {
         if (!File.Exists(path))
             return;
@@ -369,7 +379,7 @@ public sealed class FileService
         {
             File.Delete(path);
             return Task.CompletedTask;
-        }, $"Delete {Path.GetFileName(path)}");
+        }, $"Delete {Path.GetFileName(path)}", onRetry);
     }
 
     /// <summary>
@@ -379,7 +389,11 @@ public sealed class FileService
     /// </summary>
     /// <param name="operation">The file operation to execute.</param>
     /// <param name="description">Human-readable description for logging retry attempts.</param>
-    private async Task RetryAsync(Func<Task> operation, string description)
+    /// <param name="onRetry">
+    ///     Optional async callback invoked once per retry attempt with the formatted retry message.
+    ///     When supplied, retry messages are routed here instead of <see cref="Console.WriteLine(string)"/>.
+    /// </param>
+    private async Task RetryAsync(Func<Task> operation, string description, Func<string, Task>? onRetry = null)
     {
         for (int attempt = 1; attempt <= MaxRetries; attempt++)
         {
@@ -388,16 +402,44 @@ public sealed class FileService
                 await operation();
                 return;
             }
-            catch (IOException) when (attempt < MaxRetries)
+            catch (IOException ex) when (attempt < MaxRetries)
             {
-                Console.WriteLine($"File operation retry {attempt}/{MaxRetries}: {description}");
+                await EmitRetryAsync($"File operation retry {attempt}/{MaxRetries} [{FormatExceptionTag(ex)}]: {description}", onRetry);
                 await Task.Delay(RetryDelayMs * attempt);
             }
-            catch (UnauthorizedAccessException) when (attempt < MaxRetries)
+            catch (UnauthorizedAccessException ex) when (attempt < MaxRetries)
             {
-                Console.WriteLine($"File operation retry {attempt}/{MaxRetries} (access denied): {description}");
+                await EmitRetryAsync($"File operation retry {attempt}/{MaxRetries} [{FormatExceptionTag(ex)}]: {description}", onRetry);
                 await Task.Delay(RetryDelayMs * attempt);
             }
         }
+    }
+
+    private static async Task EmitRetryAsync(string message, Func<string, Task>? onRetry)
+    {
+        if (onRetry != null)
+        {
+            try { await onRetry(message); }
+            catch { Console.WriteLine(message); }
+        }
+        else
+        {
+            Console.WriteLine(message);
+        }
+    }
+
+    private static string FormatExceptionTag(Exception ex)
+    {
+        // HResult on Windows IOExceptions is 0x8007XXXX where XXXX is the Win32 error code.
+        // The sharing-violation case (ERROR_SHARING_VIOLATION, 0x20) is what we most want to identify;
+        // ERROR_LOCK_VIOLATION (0x21) and ERROR_ACCESS_DENIED (0x05) are the other common ones.
+        string label = (ex.HResult & 0xFFFF) switch
+        {
+            0x0020 => " sharing-violation",
+            0x0021 => " lock-violation",
+            0x0005 => " access-denied",
+            _      => "",
+        };
+        return $"{ex.GetType().Name} 0x{ex.HResult:X8}{label}";
     }
 }

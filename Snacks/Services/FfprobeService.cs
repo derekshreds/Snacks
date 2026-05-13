@@ -196,6 +196,12 @@ public class FfprobeService
     ///     and source tracks the container can't carry are re-encoded rather than copied.
     /// </param>
     /// <param name="warnings">Receives one entry per fallback/clamp/skipped-profile event so callers can surface them in the per-job log.</param>
+    /// <param name="autoSetDefault">
+    ///     When <c>true</c>, flags the first kept audio output as the default track and
+    ///     clears the default flag on the others. The reorder is implicit — buckets are
+    ///     already iterated in keep-list order, so the first output belongs to the
+    ///     top-priority language.
+    /// </param>
     /// <returns>FFmpeg map + per-output-stream codec arguments. Empty string when the source has no audio streams.</returns>
     public string MapAudio(
         ProbeResult                       probe,
@@ -203,7 +209,8 @@ public class FfprobeService
         bool                              preserveOriginalAudio,
         IReadOnlyList<AudioOutputProfile>? audioOutputs,
         bool                              isMatroska,
-        out List<string>                  warnings)
+        out List<string>                  warnings,
+        bool                              autoSetDefault = false)
     {
         ArgumentNullException.ThrowIfNull(probe);
         warnings = new List<string>();
@@ -354,7 +361,19 @@ public class FfprobeService
         }
 
         if (outIndex == 0) return "";
-        return (maps.ToString() + codecArgs.ToString() + meta.ToString()).TrimEnd();
+
+        // Auto-default: flag the first kept output (top-priority language) as the
+        // default audio track, clear default on the rest. Emitted after the meta block
+        // because -disposition resets all disposition flags for that stream — we want
+        // it to win against any "default=1" carried in via -c:a copy.
+        var disposition = new StringBuilder();
+        if (autoSetDefault)
+        {
+            disposition.Append("-disposition:a:0 default ");
+            for (int i = 1; i < outIndex; i++) disposition.Append($"-disposition:a:{i} 0 ");
+        }
+
+        return (maps.ToString() + codecArgs.ToString() + meta.ToString() + disposition.ToString()).TrimEnd();
     }
 
     /// <summary>
@@ -527,8 +546,23 @@ public class FfprobeService
     ///     When <c>true</c> AND the container is Matroska, bitmap subs (PGS/VOBSUB/DVB) are passed through
     ///     instead of dropped. <c>-c:s copy</c> handles them without re-decoding.
     /// </param>
+    /// <param name="excludeSdh">
+    ///     When <c>true</c>, drops tracks tagged hearing-impaired via
+    ///     <c>disposition.hearing_impaired</c> or an SDH-style title.
+    /// </param>
+    /// <param name="autoSetDefault">
+    ///     When <c>true</c>, flags the first output subtitle as the default track and clears
+    ///     default on the others. Combined with the preference-order reorder this makes the
+    ///     top-priority language auto-select in players that honor disposition.
+    /// </param>
     /// <returns>FFmpeg subtitle mapping arguments, or <c>-sn</c> to strip all subtitles.</returns>
-    public string MapSub(ProbeResult probe, IReadOnlyList<string>? languagesToKeep, bool isMatroska, bool includeBitmaps = false)
+    public string MapSub(
+        ProbeResult            probe,
+        IReadOnlyList<string>? languagesToKeep,
+        bool                   isMatroska,
+        bool                   includeBitmaps = false,
+        bool                   excludeSdh     = false,
+        bool                   autoSetDefault = false)
     {
         ArgumentNullException.ThrowIfNull(probe);
 
@@ -544,20 +578,72 @@ public class FfprobeService
             ? subtitleStreams
             : subtitleStreams.Where(s => !_bitmapSubCodecs.Contains(s.CodecName ?? "")).ToList();
 
-        if (languagesToKeep != null && languagesToKeep.Count > 0)
+        if (excludeSdh)
+            keepSubs = keepSubs.Where(s => !IsHearingImpaired(s)).ToList();
+
+        bool haveKeepList = languagesToKeep != null && languagesToKeep.Count > 0;
+        if (haveKeepList)
         {
             keepSubs = keepSubs
-                .Where(s => LanguageMatcher.Matches(s.Tags?.Language, s.Tags?.Title, languagesToKeep))
+                .Where(s => LanguageMatcher.Matches(s.Tags?.Language, s.Tags?.Title, languagesToKeep!))
+                .ToList();
+
+            // Reorder by user preference: tracks whose language sits earlier in the keep-list
+            // come first. Within a single language bucket we preserve source order so multiple
+            // sub variants for the same language stay together. Unresolvable languages
+            // (shouldn't happen after the filter, but defensive) sort last.
+            keepSubs = keepSubs
+                .Select((s, srcIdx) => new { s, srcIdx, prefIdx = PreferenceIndex(s, languagesToKeep!) })
+                .OrderBy(x => x.prefIdx)
+                .ThenBy(x => x.srcIdx)
+                .Select(x => x.s)
                 .ToList();
         }
 
-        if (keepSubs.Any())
+        if (keepSubs.Count == 0) return "-sn";
+
+        var sb = new StringBuilder();
+        foreach (var s in keepSubs) sb.Append("-map 0:").Append(s.Index).Append(' ');
+        sb.Append("-c:s copy");
+
+        if (autoSetDefault)
         {
-            var maps = string.Join(" ", keepSubs.Select(s => $"-map 0:{s.Index}"));
-            return $"{maps} -c:s copy";
+            sb.Append(" -disposition:s:0 default");
+            for (int i = 1; i < keepSubs.Count; i++)
+                sb.Append(" -disposition:s:").Append(i).Append(" 0");
         }
 
-        return "-sn";
+        return sb.ToString();
+    }
+
+    /// <summary>
+    ///     <c>true</c> when a subtitle stream is tagged hearing-impaired, either by
+    ///     ffprobe's <c>disposition.hearing_impaired</c> flag or by a descriptive title
+    ///     matching the SDH/CC patterns in <see cref="LanguageMatcher.IsSdhTitle"/>.
+    ///     The title fallback catches Blu-ray bitmap rips where the disposition flag
+    ///     is rarely set but the track name says "English [SDH]".
+    /// </summary>
+    internal static bool IsHearingImpaired(Stream s) =>
+        (s.Disposition?.HearingImpaired ?? 0) == 1
+        || LanguageMatcher.IsSdhTitle(s.Tags?.Title);
+
+    /// <summary>
+    ///     Index of a stream's language within <paramref name="languagesToKeep"/>, or
+    ///     <see cref="int.MaxValue"/> when it can't be resolved. Used as the primary sort key
+    ///     in <see cref="MapSub"/> so the user's preference order becomes the output order.
+    /// </summary>
+    private static int PreferenceIndex(Stream s, IReadOnlyList<string> languagesToKeep)
+    {
+        var two = LanguageMatcher.ToTwoLetter(s.Tags?.Language)
+               ?? LanguageMatcher.InferFromTitle(s.Tags?.Title);
+        if (two == null) return int.MaxValue;
+
+        for (int i = 0; i < languagesToKeep.Count; i++)
+        {
+            var wantedTwo = LanguageMatcher.ToTwoLetter(languagesToKeep[i]) ?? languagesToKeep[i];
+            if (string.Equals(wantedTwo, two, StringComparison.OrdinalIgnoreCase)) return i;
+        }
+        return int.MaxValue;
     }
 
     /// <summary>
@@ -577,14 +663,17 @@ public class FfprobeService
     /// <param name="probe">            Probe of the source file. </param>
     /// <param name="languagesToKeep">  2-letter ISO codes to retain; null/empty keeps all. </param>
     /// <param name="includeBitmaps">   When <c>true</c>, bitmap subs (PGS/VobSub/DVB) are returned for OCR. </param>
+    /// <param name="excludeSdh">       When <c>true</c>, drops tracks tagged hearing-impaired. </param>
     public IReadOnlyList<SidecarSpec> SelectSidecarStreams(
         ProbeResult            probe,
         IReadOnlyList<string>? languagesToKeep,
-        bool                   includeBitmaps)
+        bool                   includeBitmaps,
+        bool                   excludeSdh = false)
     {
         ArgumentNullException.ThrowIfNull(probe);
 
         var subs = probe.Streams.Where(s => s.CodecType == "subtitle").ToList();
+        if (excludeSdh) subs = subs.Where(s => !IsHearingImpaired(s)).ToList();
         var keepByLang = languagesToKeep == null || languagesToKeep.Count == 0
             ? subs
             : subs.Where(s => LanguageMatcher.Matches(s.Tags?.Language, s.Tags?.Title, languagesToKeep)).ToList();

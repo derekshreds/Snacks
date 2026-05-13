@@ -44,7 +44,22 @@ if [[ -n "${PUID}" ]]; then
         done
     fi
 
-    chown -R snacks:snacks /app/work || true
+    # Limit the chown to Snacks-managed paths under /app/work. The "uploads"
+    # and "output" subdirs are documented bind-mount targets for user media
+    # libraries (often NFS/SMB); recursing into a large external share hangs
+    # startup or trips the OOM killer, and the NAS export already enforces
+    # its own ownership. Set SNACKS_DISABLE_CHOWN=true to skip entirely.
+    if [[ "${SNACKS_DISABLE_CHOWN,,}" != "true" && "${SNACKS_DISABLE_CHOWN}" != "1" ]]; then
+        chown snacks:snacks /app/work 2>/dev/null || true
+        shopt -s nullglob dotglob
+        for entry in /app/work/*; do
+            case "$(basename "${entry}")" in
+                uploads|output) continue ;;
+            esac
+            chown -R snacks:snacks "${entry}" 2>/dev/null || true
+        done
+        shopt -u nullglob dotglob
+    fi
     exec gosu snacks dotnet Snacks.dll
 fi
 

@@ -1670,6 +1670,8 @@ public class TranscodingService
     /// <summary>
     ///     Resets a previously failed or cancelled file in both the database and the in-memory
     ///     tracking dictionary so it will be accepted by <see cref="AddFileAsync"/> on the next attempt.
+    ///     Emits <c>WorkItemRemoved</c> so the UI drops the failed card immediately — the file
+    ///     will reappear in the queue on the next AutoScan pass (or via an immediate "Scan Now").
     /// </summary>
     /// <param name="filePath"> Absolute path to the file to reset. </param>
     public async Task RetryFileAsync(string filePath)
@@ -1680,7 +1682,11 @@ public class TranscodingService
         var existing = _workItems.Values.FirstOrDefault(w =>
             Path.GetFullPath(w.Path).Equals(normalizedPath, StringComparison.OrdinalIgnoreCase));
         if (existing != null)
+        {
             _workItems.TryRemove(existing.Id, out _);
+            try { await _hubContext.Clients.All.SendAsync("WorkItemRemoved", existing.Id); }
+            catch { /* SignalR errors are non-fatal */ }
+        }
     }
 
     /// <summary>
@@ -2656,7 +2662,8 @@ public class TranscodingService
             doAudioWork ? options.PreserveOriginalAudio : true,
             doAudioWork ? options.AudioOutputs : null,
             options.Format == "mkv",
-            out var audioWarnings) + " ";
+            out var audioWarnings,
+            autoSetDefault: doAudioWork && options.AutoSetDefaultTrack) + " ";
 
         foreach (var w in audioWarnings)
             await LogAsync(workItem.Id, w);
@@ -2711,6 +2718,7 @@ public class TranscodingService
                 options.SubtitleLanguagesToKeep,
                 options.SidecarSubtitleFormat,
                 options.ConvertImageSubtitlesToSrt,
+                options.ExcludeSdhSubtitles,
                 msg => LogAsync(workItem.Id, msg),
                 cancellationToken);
             stripSubtitles = true;
@@ -2729,6 +2737,7 @@ public class TranscodingService
                 var results = await _subtitleExtractionService.OcrBitmapsForMuxAsync(
                     workItem, inputPath, ocrMuxTmpDir,
                     options.SubtitleLanguagesToKeep,
+                    options.ExcludeSdhSubtitles,
                     msg => LogAsync(workItem.Id, msg),
                     cancellationToken);
                 ocrMuxSrts.AddRange(results);
@@ -2762,8 +2771,26 @@ public class TranscodingService
                             && !dropImageSubtitlesOnly;
 
             var sourceSubs = _ffprobeService
-                .SelectSidecarStreams(workItem.Probe!, options.SubtitleLanguagesToKeep, includeBitmaps: passBitmaps)
+                .SelectSidecarStreams(
+                    workItem.Probe!,
+                    options.SubtitleLanguagesToKeep,
+                    includeBitmaps: passBitmaps,
+                    excludeSdh:     options.ExcludeSdhSubtitles)
                 .ToList();
+
+            // Reorder source subs by user preference so the default flag below lands on
+            // the top-priority language. OCR'd SRTs follow in their original order — they
+            // already came back from OcrBitmapsForMuxAsync in source-stream order, and the
+            // user-facing priority comes from the source subs first.
+            if (options.SubtitleLanguagesToKeep is { Count: > 0 } subPref)
+            {
+                sourceSubs = sourceSubs
+                    .Select((s, srcIdx) => new { s, srcIdx, prefIdx = SidecarPreferenceIndex(s.Lang, subPref) })
+                    .OrderBy(x => x.prefIdx)
+                    .ThenBy(x => x.srcIdx)
+                    .Select(x => x.s)
+                    .ToList();
+            }
 
             string maps   = "";
             string codecs = "";
@@ -2810,7 +2837,17 @@ public class TranscodingService
                 outSubIndex++;
             }
 
-            subtitleFlags = maps + codecs + meta;
+            // Default-flag the first kept sub when the user opts in. -disposition resets
+            // all flags on the targeted stream, so this also clears any stale default=1
+            // carried through from the source via -c:s copy.
+            string disposition = "";
+            if (doSubtitleWork && options.AutoSetDefaultTrack && outSubIndex > 0)
+            {
+                disposition = "-disposition:s:0 default ";
+                for (int i = 1; i < outSubIndex; i++) disposition += $"-disposition:s:{i} 0 ";
+            }
+
+            subtitleFlags = maps + codecs + meta + disposition;
         }
         else
         {
@@ -2820,7 +2857,13 @@ public class TranscodingService
             bool passBitmaps = options.Format == "mkv"
                             && options.PassThroughImageSubtitlesMkv
                             && !dropImageSubtitlesOnly;
-            subtitleFlags = _ffprobeService.MapSub(workItem.Probe!, subLangs, options.Format == "mkv", passBitmaps) + " ";
+            subtitleFlags = _ffprobeService.MapSub(
+                workItem.Probe!,
+                subLangs,
+                options.Format == "mkv",
+                passBitmaps,
+                excludeSdh:     doSubtitleWork && options.ExcludeSdhSubtitles,
+                autoSetDefault: doSubtitleWork && options.AutoSetDefaultTrack) + " ";
         }
 
         // -analyzeduration and -probesize handle files with many streams (e.g. 30+ PGS subtitle tracks)
@@ -2992,6 +3035,11 @@ public class TranscodingService
                 .ToList();
             if (filtered.Count < audioStreams.Count) return true;
             kept = filtered;
+
+            // Preference order changed? Re-mux so the top-priority language ends up
+            // on track 0. Without this, a MuxOnly user toggling the order would see
+            // nothing happen on already-fine files.
+            if (WouldReorder(audLangs, kept.Select(s => s.Language))) return true;
         }
 
         // Commentary tracks are unconditionally dropped by the planner (see
@@ -3062,6 +3110,9 @@ public class TranscodingService
     {
         if (subStreams.Count == 0) return false;
 
+        // SDH drop would remove at least one track?
+        if (options.ExcludeSdhSubtitles && subStreams.Any(s => s.Sdh)) return true;
+
         // Language filter would drop at least one track?
         if (options.SubtitleLanguagesToKeep is { Count: > 0 } subLangs)
         {
@@ -3070,6 +3121,10 @@ public class TranscodingService
                 .ToList();
             if (kept.Count < subStreams.Count) return true;
             subStreams = kept;
+
+            // Reordering would change the output stream order — that's work even when
+            // no streams are added or removed.
+            if (WouldReorder(subLangs, subStreams.Select(s => s.Language))) return true;
         }
 
         // Sidecar extraction with any text (or OCR-able bitmap) track present?
@@ -3125,8 +3180,70 @@ public class TranscodingService
                 Language  = s.Tags?.Language,
                 CodecName = s.CodecName,
                 Title     = s.Tags?.Title,
+                Sdh       = FfprobeService.IsHearingImpaired(s),
             })
             .ToList();
+
+    /// <summary>
+    ///     Returns <see langword="true"/> when the kept-language order in
+    ///     <paramref name="streamLangs"/> would change after sorting by
+    ///     <paramref name="keepList"/>. Used by <see cref="HasAudioWork"/> /
+    ///     <see cref="HasSubtitleWork"/> so changing the priority order in settings
+    ///     triggers a re-mux on files that already contain all the kept languages.
+    ///     A null/empty keep-list means "no preference" — never re-orders.
+    /// </summary>
+    internal static bool WouldReorder(IReadOnlyList<string>? keepList, IEnumerable<string?> streamLangs)
+    {
+        if (keepList == null || keepList.Count == 0) return false;
+
+        // Canonicalize the user's keep-list once.
+        var preference = keepList
+            .Select(l => LanguageMatcher.ToTwoLetter(l) ?? l?.Trim().ToLowerInvariant() ?? "")
+            .Where(l => !string.IsNullOrEmpty(l))
+            .ToList();
+
+        // Build the source-order sequence of kept languages, deduped (only the first
+        // occurrence per language matters for ordering — equal-language tracks stay
+        // grouped because their preference index is identical).
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var sourceOrder = new List<string>();
+        foreach (var raw in streamLangs)
+        {
+            var two = LanguageMatcher.ToTwoLetter(raw) ?? raw?.Trim().ToLowerInvariant();
+            if (string.IsNullOrEmpty(two)) continue;
+            if (!preference.Contains(two, StringComparer.OrdinalIgnoreCase)) continue;
+            if (seen.Add(two)) sourceOrder.Add(two);
+        }
+
+        if (sourceOrder.Count <= 1) return false;
+
+        // Target order: preference list filtered down to languages actually present.
+        var targetOrder = preference
+            .Where(p => sourceOrder.Contains(p, StringComparer.OrdinalIgnoreCase))
+            .ToList();
+
+        if (sourceOrder.Count != targetOrder.Count) return false;
+        for (int i = 0; i < sourceOrder.Count; i++)
+            if (!string.Equals(sourceOrder[i], targetOrder[i], StringComparison.OrdinalIgnoreCase))
+                return true;
+        return false;
+    }
+
+    /// <summary>
+    ///     Index of <paramref name="lang"/> within <paramref name="preferences"/>, or
+    ///     <see cref="int.MaxValue"/> when it doesn't match any preference. Used to sort
+    ///     <see cref="FfprobeService.SidecarSpec"/> lists in the OCR-mux path.
+    /// </summary>
+    private static int SidecarPreferenceIndex(string lang, IReadOnlyList<string> preferences)
+    {
+        var two = LanguageMatcher.ToTwoLetter(lang) ?? lang;
+        for (int i = 0; i < preferences.Count; i++)
+        {
+            var wantedTwo = LanguageMatcher.ToTwoLetter(preferences[i]) ?? preferences[i];
+            if (string.Equals(wantedTwo, two, StringComparison.OrdinalIgnoreCase)) return i;
+        }
+        return int.MaxValue;
+    }
 
     /// <summary>
     ///     Returns <see langword="true"/> when <see cref="EncoderOptions.MuxStreams"/> selects a
@@ -3740,6 +3857,16 @@ public class TranscodingService
     private List<HardwareDevice>? _detectedDevices = null;
 
     /// <summary>
+    ///     Set to <c>true</c> during Linux detection when the QSV probe on an Intel
+    ///     render node succeeds. The static helpers <see cref="GetEncoder"/> and
+    ///     <see cref="GetInitFlags"/> read this to pick QSV variants over the VAAPI
+    ///     defaults on Linux without plumbing a new field through <c>EncoderOptions</c>.
+    ///     Static because detection is a one-shot at startup and the static helpers
+    ///     don't have an instance handle.
+    /// </summary>
+    internal static bool LinuxIntelUsesQsv { get; set; }
+
+    /// <summary>
     ///     All devices default to a single concurrent encode. Users opt in to
     ///     parallelism per-device via the dashboard's hardware-concurrency
     ///     editor — the safe default avoids surprising a fresh install with a
@@ -3857,19 +3984,54 @@ public class TranscodingService
             // Linux
             await LogVaapiInfoAsync();
 
-            // VAAPI (Intel iGPU and AMD GPUs on Linux) — walk every render node, not
-            // just renderD128. On hybrid laptops (e.g. Pop!_OS with system76-power in
+            // Intel iGPU and AMD GPUs on Linux — walk every render node, not just
+            // renderD128. On hybrid laptops (e.g. Pop!_OS with system76-power in
             // hybrid/nvidia/compute mode) the NVIDIA card can claim renderD128 while
             // the iGPU lands on renderD129. The legacy single-node probe failed against
             // the NVIDIA node (no iHD/i965 VAAPI support there) and silently skipped
             // VAAPI entirely, even though a perfectly good iGPU was sitting on the
             // next render node over.
+            //
+            // Per-node order is QSV first, then VAAPI. On modern Intel parts with
+            // Jellyfin-FFmpeg's oneVPL runtime (shipped in the Docker image), QSV is
+            // the Intel-native encode path and outperforms VAAPI on HEVC; VAAPI stays
+            // as the fallback for builds without QSV support or older drivers.
             var renderNodes = EnumerateRenderNodes();
             var originalLibvaDriver = Environment.GetEnvironmentVariable("LIBVA_DRIVER_NAME");
             try
             {
                 foreach (var nodePath in renderNodes)
                 {
+                    // QSV first. oneVPL on Linux needs the iHD driver — i965 doesn't
+                    // expose QSV — so pin it before probing instead of leaving it to
+                    // the host's default.
+                    Console.WriteLine($"Auto-detect: Trying Intel QSV (Linux) on {nodePath}...");
+                    Environment.SetEnvironmentVariable("LIBVA_DRIVER_NAME", "iHD");
+
+                    var qsvInit = $"-hwaccel qsv -qsv_device {nodePath}";
+                    bool qsvHevc = await TestEncoderAsync(qsvInit, "hevc_qsv");
+                    bool qsvH264 = await TestEncoderAsync(qsvInit, "h264_qsv");
+                    bool qsvAv1  = await TestEncoderAsync(qsvInit, "av1_qsv");
+
+                    if (qsvHevc || qsvH264 || qsvAv1)
+                    {
+                        Console.WriteLine($"Auto-detect: Intel QSV (Linux) available on {nodePath} (hevc={qsvHevc}, h264={qsvH264}, av1={qsvAv1})");
+                        devices.Add(new HardwareDevice
+                        {
+                            DeviceId           = "intel",
+                            DisplayName        = "Intel QSV",
+                            SupportedCodecs    = BuildSupportedCodecs(qsvHevc, qsvH264, qsvAv1),
+                            Encoders           = BuildIntelEncoders(qsvHevc, qsvH264, qsvAv1, qsv: true),
+                            DefaultConcurrency = DefaultConcurrencyFor("intel"),
+                            IsHardware         = true,
+                            DevicePath         = nodePath,
+                        });
+                        LinuxIntelUsesQsv = true;
+                        break;
+                    }
+
+                    // QSV unavailable on this node — fall back to VAAPI with the
+                    // existing two-driver probe (iHD, then legacy i965).
                     var driversToTry = new[] { "iHD", "i965" };
                     bool nodeMatched = false;
                     foreach (var driver in driversToTry)
@@ -4186,7 +4348,7 @@ public class TranscodingService
     ///     forcing hardware decode (software decode + VAAPI encode mode).
     /// </summary>
     internal static string GetInitFlags(string hardwareAcceleration, bool hwDecode = true)
-        => GetInitFlags(hardwareAcceleration, devicePath: null, RuntimeInformation.IsOSPlatform(OSPlatform.Windows), hwDecode);
+        => GetInitFlags(hardwareAcceleration, devicePath: null, RuntimeInformation.IsOSPlatform(OSPlatform.Windows), LinuxIntelUsesQsv, hwDecode);
 
     /// <summary>
     ///     Path-aware overload. <paramref name="devicePath"/> selects the VAAPI render
@@ -4196,14 +4358,14 @@ public class TranscodingService
     ///     same node detection picked.
     /// </summary>
     internal static string GetInitFlags(string hardwareAcceleration, string? devicePath, bool hwDecode = true)
-        => GetInitFlags(hardwareAcceleration, devicePath, RuntimeInformation.IsOSPlatform(OSPlatform.Windows), hwDecode);
+        => GetInitFlags(hardwareAcceleration, devicePath, RuntimeInformation.IsOSPlatform(OSPlatform.Windows), LinuxIntelUsesQsv, hwDecode);
 
     /// <summary>
     ///     Pure overload that takes <paramref name="isWindows"/> explicitly so unit tests can
     ///     exercise the VAAPI / QSV / AMF branches independently of the test host OS.
     /// </summary>
     internal static string GetInitFlags(string hardwareAcceleration, bool isWindows, bool hwDecode)
-        => GetInitFlags(hardwareAcceleration, devicePath: null, isWindows, hwDecode);
+        => GetInitFlags(hardwareAcceleration, devicePath: null, isWindows, linuxIntelQsv: false, hwDecode);
 
     /// <summary>
     ///     Pure overload with explicit OS gate AND device-path injection. The four VAAPI
@@ -4211,12 +4373,27 @@ public class TranscodingService
     ///     so single-GPU machines get the same flag string they always have.
     /// </summary>
     internal static string GetInitFlags(string hardwareAcceleration, string? devicePath, bool isWindows, bool hwDecode)
+        => GetInitFlags(hardwareAcceleration, devicePath, isWindows, linuxIntelQsv: false, hwDecode);
+
+    /// <summary>
+    ///     Pure overload with explicit OS gate, device path, and Linux-QSV preference. When
+    ///     <paramref name="linuxIntelQsv"/> is <c>true</c> and we're on Linux, Intel jobs
+    ///     use the QSV pipeline (<c>-hwaccel qsv -qsv_device {path}</c>) instead of VAAPI.
+    ///     <paramref name="linuxIntelQsv"/> is ignored on Windows, where QSV is always the
+    ///     Intel path, and for non-Intel hwaccel values.
+    /// </summary>
+    internal static string GetInitFlags(string hardwareAcceleration, string? devicePath, bool isWindows, bool linuxIntelQsv, bool hwDecode)
     {
         var node = string.IsNullOrEmpty(devicePath) ? "/dev/dri/renderD128" : devicePath;
         return hardwareAcceleration.ToLower() switch
         {
             "intel" when isWindows => "-y -hwaccel qsv -hwaccel_output_format qsv -qsv_device auto",
             "amd" when isWindows => "-y -hwaccel auto",
+            // Linux Intel QSV: derive a QSV device from VAAPI on the same render node
+            // when input is software-decoded, so the encoder can still find a QSV
+            // context. Full pipeline when input is hw-decodable.
+            "intel" when linuxIntelQsv && !hwDecode => $"-y -init_hw_device vaapi=va:{node} -init_hw_device qsv=hw@va -filter_hw_device hw",
+            "intel" when linuxIntelQsv => $"-y -hwaccel qsv -hwaccel_output_format qsv -qsv_device {node}",
             // Software decode + VAAPI encode: init the device but don't force hwaccel decode
             "intel" when !hwDecode => $"-y -init_hw_device vaapi=hw:{node} -filter_hw_device hw",
             "amd" when !hwDecode => $"-y -init_hw_device vaapi=hw:{node} -filter_hw_device hw",
@@ -4254,8 +4431,16 @@ public class TranscodingService
     ///     concrete FFmpeg encoder name (e.g., <c>"hevc_vaapi"</c>, <c>"hevc_nvenc"</c>, <c>"libx265"</c>).
     /// </summary>
     internal static string GetEncoder(EncoderOptions options)
+        => GetEncoder(options, RuntimeInformation.IsOSPlatform(OSPlatform.Windows), LinuxIntelUsesQsv);
+
+    /// <summary>
+    ///     Pure overload that takes the OS gate and Linux-QSV preference explicitly so unit
+    ///     tests can exercise every branch (QSV / VAAPI / AMF / NVENC / VideoToolbox)
+    ///     independently of the test host. <paramref name="linuxIntelQsv"/> only matters
+    ///     when <paramref name="isWindows"/> is <c>false</c> and the hwaccel is "intel".
+    /// </summary>
+    internal static string GetEncoder(EncoderOptions options, bool isWindows, bool linuxIntelQsv)
     {
-        bool isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
         // Case-insensitive: Encoder can come from settings.json or per-folder overrides
         // where casing isn't enforced; the UI's ENCODER_MAP is lowercase but external
         // entry points aren't, and a non-matching codec string silently falls through
@@ -4265,23 +4450,24 @@ public class TranscodingService
                    || encoder.Contains("svt", StringComparison.OrdinalIgnoreCase);
         bool isH265 = !isAv1 && encoder.Contains("265", StringComparison.OrdinalIgnoreCase);
         bool isH264 = !isAv1 && encoder.Contains("264", StringComparison.OrdinalIgnoreCase);
+        bool intelUsesQsv = isWindows || linuxIntelQsv;
 
         return options.HardwareAcceleration.ToLower() switch
         {
             // AV1 encoders
-            "intel" when isWindows && isAv1 => "av1_qsv",
+            "intel" when intelUsesQsv && isAv1 => "av1_qsv",
             "amd" when isWindows && isAv1 => "av1_amf",
             "intel" when isAv1 => "av1_vaapi",
             "amd" when isAv1 => "av1_vaapi",
             "nvidia" when isAv1 => "av1_nvenc",
             // H.264 encoders
-            "intel" when isWindows && isH264 => "h264_qsv",
+            "intel" when intelUsesQsv && isH264 => "h264_qsv",
             "amd" when isWindows && isH264 => "h264_amf",
             "intel" when isH264 => "h264_vaapi",
             "amd" when isH264 => "h264_vaapi",
             "nvidia" when isH264 => "h264_nvenc",
             // H.265 encoders
-            "intel" when isWindows && isH265 => "hevc_qsv",
+            "intel" when intelUsesQsv && isH265 => "hevc_qsv",
             "amd" when isWindows && isH265 => "hevc_amf",
             "intel" when isH265 => "hevc_vaapi",
             "amd" when isH265 => "hevc_vaapi",
@@ -6057,6 +6243,11 @@ public class TranscodingService
     /// </summary>
     private async Task HandleOutputPlacement(string outputPath, WorkItem workItem, EncoderOptions options)
     {
+        // Route FileService retry messages into the work-item log so a multi-minute
+        // backoff against an external lock (AV, indexer) is visible to the user instead
+        // of looking like a silent hang followed by a generic failure.
+        Func<string, Task> log = msg => LogAsync(workItem.Id, msg);
+
         try
         {
             if (!string.IsNullOrEmpty(options.OutputDirectory))
@@ -6066,8 +6257,8 @@ public class TranscodingService
                 if (!string.IsNullOrEmpty(options.EncodeDirectory))
                 {
                     string finalSnacksPath = Path.Combine(options.OutputDirectory, Path.GetFileName(outputPath));
-                    await LogAsync(workItem.Id, $"Moving to output directory: {finalSnacksPath}");
-                    await _fileService.FileMoveAsync(outputPath, finalSnacksPath);
+                    await LogAsync(workItem.Id, $"Moving to output directory: {outputPath} -> {finalSnacksPath}");
+                    await _fileService.FileMoveAsync(outputPath, finalSnacksPath, log);
                     await MoveSidecarsAlongsideAsync(outputPath, finalSnacksPath, workItem);
                     outputPath = finalSnacksPath;
                 }
@@ -6076,13 +6267,15 @@ public class TranscodingService
                 {
                     // Replace original: delete it, then move encoded file back to original location
                     await LogAsync(workItem.Id, "Replacing original file");
-                    await _fileService.FileDeleteAsync(workItem.Path);
+                    await LogAsync(workItem.Id, $"Deleting original: {workItem.Path}");
+                    await _fileService.FileDeleteAsync(workItem.Path, log);
 
                     // Move back to the original's directory with a clean name (no [snacks] tag)
                     string originalDir = _fileService.GetDirectory(workItem.Path);
                     string cleanName = Path.GetFileNameWithoutExtension(outputPath).Replace(" [snacks]", "") + Path.GetExtension(outputPath);
                     string finalPath = Path.Combine(originalDir, cleanName);
-                    await _fileService.FileMoveAsync(outputPath, finalPath);
+                    await LogAsync(workItem.Id, $"Moving encoded output: {outputPath} -> {finalPath}");
+                    await _fileService.FileMoveAsync(outputPath, finalPath, log);
                     await MoveSidecarsAlongsideAsync(outputPath, finalPath, workItem);
                     await LogAsync(workItem.Id, $"Final output: {finalPath}");
                 }
@@ -6101,10 +6294,12 @@ public class TranscodingService
                 {
                     // Replace original: delete it and rename transcoded file to take its place
                     await LogAsync(workItem.Id, "Replacing original with transcoded version");
-                    await _fileService.FileDeleteAsync(workItem.Path);
+                    await LogAsync(workItem.Id, $"Deleting original: {workItem.Path}");
+                    await _fileService.FileDeleteAsync(workItem.Path, log);
 
                     string cleanPath = GetCleanOutputName(outputPath);
-                    await _fileService.FileMoveAsync(outputPath, cleanPath);
+                    await LogAsync(workItem.Id, $"Moving encoded output: {outputPath} -> {cleanPath}");
+                    await _fileService.FileMoveAsync(outputPath, cleanPath, log);
                     await MoveSidecarsAlongsideAsync(outputPath, cleanPath, workItem);
                     await LogAsync(workItem.Id, $"Final output: {cleanPath}");
                 }
@@ -6120,7 +6315,12 @@ public class TranscodingService
         }
         catch (Exception ex)
         {
-            await LogAsync(workItem.Id, $"Error handling output placement: {ex.Message}");
+            // Include the exception type and inner exception (if any) so future failure reports
+            // distinguish e.g. IOException sharing-violation from access-denied or disk-full,
+            // and the preceding "Deleting original: ..." / "Moving encoded output: ..." log line
+            // identifies which file operation was in flight.
+            string suffix = ex.InnerException != null ? $" -> {ex.InnerException.Message}" : "";
+            await LogAsync(workItem.Id, $"Error handling output placement [{ex.GetType().Name}]: {ex.Message}{suffix}");
             throw;
         }
     }

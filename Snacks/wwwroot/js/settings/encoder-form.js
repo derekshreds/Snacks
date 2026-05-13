@@ -280,6 +280,7 @@ export function getEncoderOptions(prefix = 'settings') {
         OriginalLanguageProvider: str('OriginalLanguageProvider', 'None'),
         PreserveOriginalAudio:    bool('PreserveOriginalAudio', true),
         AudioOutputs:             readAudioOutputs(prefix),
+        AutoSetDefaultTrack:      bool('AutoSetDefaultTrack'),
 
         // Subtitles.
         SubtitleLanguagesToKeep:      chips('SubtitleLanguagesToKeep') ?? ['en'],
@@ -287,6 +288,7 @@ export function getEncoderOptions(prefix = 'settings') {
         SidecarSubtitleFormat:        str('SidecarSubtitleFormat', 'srt'),
         ConvertImageSubtitlesToSrt:   bool('ConvertImageSubtitlesToSrt'),
         PassThroughImageSubtitlesMkv: bool('PassThroughImageSubtitlesMkv'),
+        ExcludeSdhSubtitles:          bool('ExcludeSdhSubtitles'),
 
         // Encoding mode.
         EncodingMode: str('EncodingMode', 'Transcode'),
@@ -403,6 +405,8 @@ export async function restoreEncoderOptions(prefix = 'settings') {
         set('SidecarSubtitleFormat',        pick('SidecarSubtitleFormat') || 'srt');
         set('ConvertImageSubtitlesToSrt',   pick('ConvertImageSubtitlesToSrt'));
         set('PassThroughImageSubtitlesMkv', pick('PassThroughImageSubtitlesMkv'));
+        set('ExcludeSdhSubtitles',          pick('ExcludeSdhSubtitles'));
+        set('AutoSetDefaultTrack',          pick('AutoSetDefaultTrack'));
 
         // Encoding mode.
         set('EncodingMode', pick('EncodingMode') || 'Transcode');

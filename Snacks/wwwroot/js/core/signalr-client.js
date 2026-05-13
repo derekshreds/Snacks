@@ -33,6 +33,7 @@
 const KNOWN_EVENTS = Object.freeze([
     'WorkItemAdded',
     'WorkItemUpdated',
+    'WorkItemRemoved',
     'TranscodingLog',
     'AutoScanCompleted',
     'HistoryCleared',

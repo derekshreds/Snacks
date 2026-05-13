@@ -48,16 +48,27 @@ internal sealed class ProbeBuilder
     }
 
     public ProbeBuilder Subtitle(
-        string codec  = "subrip",
-        string lang   = "eng",
-        string? title = null)
+        string codec           = "subrip",
+        string lang            = "eng",
+        string? title          = null,
+        bool   hearingImpaired = false,
+        bool   defaultFlag     = false,
+        bool   forced          = false)
     {
         _streams.Add(new Stream
         {
-            Index     = _streams.Count,
-            CodecType = "subtitle",
-            CodecName = codec,
-            Tags      = new Tags { Language = lang, Title = title },
+            Index       = _streams.Count,
+            CodecType   = "subtitle",
+            CodecName   = codec,
+            Tags        = new Tags { Language = lang, Title = title },
+            Disposition = (hearingImpaired || defaultFlag || forced)
+                ? new Disposition
+                  {
+                      HearingImpaired = hearingImpaired ? 1 : 0,
+                      Default         = defaultFlag     ? 1 : 0,
+                      Forced          = forced          ? 1 : 0,
+                  }
+                : null,
         });
         return this;
     }

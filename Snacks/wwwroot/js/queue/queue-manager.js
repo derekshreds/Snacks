@@ -89,6 +89,10 @@ export class QueueManager {
                 if (btn.dataset.action === 'log') {
                     this._logViewer.show(itemId, this._workItems.get(itemId)?.fileName);
                 }
+                if (btn.dataset.action === 'retry') {
+                    const path = this._workItems.get(itemId)?.path;
+                    if (path) this.retry(itemId, path);
+                }
             });
         }
 
@@ -524,5 +528,32 @@ export class QueueManager {
         } catch (err) {
             showToast('Error cancelling work item: ' + err.message, 'danger');
         }
+    }
+
+    /**
+     * Re-queues a Failed or NoSavings item by clearing its DB failure state
+     * and re-adding the file under the current encoder options. The card is
+     * removed via SignalR `WorkItemRemoved`, and a fresh `WorkItemAdded`
+     * arrives moments later.
+     */
+    async retry(id, filePath) {
+        try {
+            await queueApi.retry(filePath);
+            // Remove the card optimistically — the SignalR removal arrives moments
+            // later, but the user sees instant feedback from the click.
+            this._workItems.delete(id);
+            document.getElementById(`work-item-${id}`)?.remove();
+            showToast('Item re-queued', 'info');
+            this._scheduleRefresh();
+        } catch (err) {
+            showToast('Error retrying item: ' + err.message, 'danger');
+        }
+    }
+
+    /** Called on SignalR `WorkItemRemoved`. Drops the card from the in-memory map and DOM. */
+    removeItem(id) {
+        this._workItems.delete(id);
+        document.getElementById(`work-item-${id}`)?.remove();
+        this._scheduleRefresh();
     }
 }

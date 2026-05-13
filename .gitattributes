@@ -3,6 +3,13 @@
 ###############################################################################
 * text=auto
 
+# Shell scripts must keep LF endings even when checked out on Windows — CRLF
+# in the shebang line makes Linux look for "/bin/bash\r" and the container
+# fails with the misleading "exec /app/entrypoint.sh: no such file or directory".
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.dockerfile text eol=lf
+
 ###############################################################################
 # Set default behavior for command prompt diff.
 #
