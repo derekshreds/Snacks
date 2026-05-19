@@ -15,6 +15,7 @@ public sealed class AuthMiddleware
         "/transcodingHub",    // SignalR
         "/api/cluster/",      // inter-node RPC (secret-authenticated)
         "/api/health",        // liveness probe
+        "/iframe/",           // embed-friendly HTML tiles — browser can't send X-Api-Key in <iframe>
         "/lib/", "/css/", "/js/", "/img/", "/favicon",
     };
 
@@ -55,6 +56,16 @@ public sealed class AuthMiddleware
 
         var token = ctx.Request.Cookies[AuthService.CookieName];
         if (auth.ValidateToken(token, out _))
+        {
+            await _next(ctx);
+            return;
+        }
+
+        // Public-API path: accept the key via X-Api-Key header or ?apiKey= query string.
+        // Mirrors the Sonarr/Radarr convention; either form is sufficient.
+        var apiKey = ctx.Request.Headers["X-Api-Key"].FirstOrDefault()
+                     ?? ctx.Request.Query["apiKey"].FirstOrDefault();
+        if (auth.ValidateApiKey(apiKey))
         {
             await _next(ctx);
             return;

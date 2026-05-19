@@ -38,4 +38,46 @@
             </ul>
         </div>
     </div>
+
+    <div class="col-12">
+        <div class="encoder-panel rounded">
+            <h6 class="fw-bold mb-3"><i class="fas fa-key me-2 text-info"></i>API Key — Homarr &amp; other external dashboards</h6>
+
+            <p class="small text-muted">
+                Generate an API key to let external dashboards (Homarr, Glance, Dashy, etc.) read Snacks's status via the
+                read-only <code>/api/v1/*</code> endpoints. Present it as either an <code>X-Api-Key</code> header or a
+                <code>?apiKey=</code> query string — Sonarr/Radarr-compatible. The key is only shown once at generation;
+                generate a new one to rotate.
+            </p>
+
+            <div class="mb-3" id="apiKeyDisplayRow" style="display:none;">
+                <label for="apiKeyValue" class="form-label">Your new API key</label>
+                <div class="input-group">
+                    <input type="text" class="form-control font-monospace" id="apiKeyValue" readonly>
+                    <button class="btn btn-outline-secondary" type="button" id="copyApiKeyBtn">
+                        <i class="fas fa-copy me-1"></i>Copy
+                    </button>
+                </div>
+                <div class="form-text text-warning">
+                    <i class="fas fa-exclamation-triangle me-1"></i>
+                    Copy this now — it cannot be displayed again. Generate a new key to rotate.
+                </div>
+            </div>
+
+            <div class="d-flex gap-2 align-items-center">
+                <button class="btn btn-primary" id="generateApiKeyBtn" type="button">
+                    <i class="fas fa-key me-1"></i><span id="generateApiKeyBtnLabel">Generate API key</span>
+                </button>
+                <button class="btn btn-outline-danger" id="revokeApiKeyBtn" type="button" style="display:none;">
+                    <i class="fas fa-trash me-1"></i>Revoke
+                </button>
+                <span class="small text-muted ms-2" id="apiKeyStatus"></span>
+            </div>
+
+            <div class="form-text mt-2">
+                The key only matters while sign-in is enabled above. With sign-in disabled, the public API is open to
+                anyone who can reach this server.
+            </div>
+        </div>
+    </div>
 </div>

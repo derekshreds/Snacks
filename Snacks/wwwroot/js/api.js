@@ -317,6 +317,15 @@ export const authApi = {
 
     /** Signs the current user out; navigation is typically handled by the caller. */
     logout: () => fetch('/Auth/Logout', { method: 'POST' }),
+
+    /** Checks whether an API key is configured. Returns `{ hasKey: boolean }`. */
+    getApiKey:      () => getJson('/api/auth/api-key'),
+
+    /** Generates (or replaces) the API key. Returns `{ hasKey: true, key: '<plaintext>' }` — the only time the value is surfaced. */
+    generateApiKey: () => postJson('/api/auth/api-key'),
+
+    /** Clears the API key, immediately revoking any external clients using it. */
+    revokeApiKey:   () => deleteJson('/api/auth/api-key'),
 };
 
 

@@ -1,0 +1,216 @@
+@model Snacks.Controllers.HomarrIframeModel
+@{
+    Layout = null;
+    var dark = string.Equals(Model.Theme, "dark", StringComparison.OrdinalIgnoreCase);
+    string FormatBytes(long bytes)
+    {
+        string[] units = { "B", "KB", "MB", "GB", "TB", "PB" };
+        double size   = bytes;
+        int    unit   = 0;
+        while (size >= 1024 && unit < units.Length - 1) { size /= 1024; unit++; }
+        return $"{size:0.##} {units[unit]}";
+    }
+}
+<!DOCTYPE html>
+<html lang="en" data-theme="@Model.Theme">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Snacks — Homarr tile</title>
+    <style>
+        :root {
+            --bg:      @(dark ? "#16181d" : "#f7f8fa");
+            --panel:   @(dark ? "#1e2128" : "#ffffff");
+            --border:  @(dark ? "#2a2e38" : "#e3e6ec");
+            --text:    @(dark ? "#e4e6eb" : "#1c1f26");
+            --muted:   @(dark ? "#9aa3b2" : "#5a6470");
+            --accent:  #4c8bf5;
+            --ok:      #4caf50;
+            --warn:    #ffb020;
+            --fail:    #ef5350;
+        }
+        * { box-sizing: border-box; }
+        html, body {
+            margin: 0;
+            padding: 0;
+            background: var(--bg);
+            color: var(--text);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            font-size: 14px;
+            line-height: 1.4;
+        }
+        .wrap { padding: 12px; }
+        header {
+            display: flex; align-items: baseline; justify-content: space-between;
+            padding-bottom: 8px; border-bottom: 1px solid var(--border); margin-bottom: 12px;
+        }
+        header .name   { font-weight: 600; }
+        header .meta   { color: var(--muted); font-size: 12px; }
+        nav { display: flex; gap: 6px; margin-bottom: 12px; }
+        nav a {
+            padding: 4px 10px; border-radius: 6px; text-decoration: none;
+            color: var(--muted); border: 1px solid transparent; font-size: 12px;
+        }
+        nav a.active { color: var(--text); border-color: var(--border); background: var(--panel); }
+
+        .stats-grid {
+            display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px;
+        }
+        .stat {
+            background: var(--panel); border: 1px solid var(--border);
+            border-radius: 8px; padding: 10px 12px;
+        }
+        .stat .label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+        .stat .value { font-size: 18px; font-weight: 600; margin-top: 2px; }
+        .stat.processing .value { color: var(--accent); }
+        .stat.failed     .value { color: var(--fail); }
+
+        table { width: 100%; border-collapse: collapse; font-size: 12px; }
+        th, td { padding: 6px 8px; text-align: left; border-bottom: 1px solid var(--border); }
+        th     { color: var(--muted); font-weight: 500; }
+        td.num { text-align: right; font-variant-numeric: tabular-nums; }
+
+        .progressbar { background: var(--border); border-radius: 4px; height: 6px; overflow: hidden; }
+        .progressbar > span { display: block; height: 100%; background: var(--accent); }
+        .status-Pending    { color: var(--muted); }
+        .status-Processing { color: var(--accent); }
+        .status-Completed  { color: var(--ok); }
+        .status-Failed     { color: var(--fail); }
+
+        .node {
+            background: var(--panel); border: 1px solid var(--border);
+            border-radius: 8px; padding: 10px 12px; margin-bottom: 8px;
+        }
+        .node header { border: 0; padding: 0; margin-bottom: 6px; }
+        .node .badge {
+            font-size: 10px; padding: 2px 6px; border-radius: 4px;
+            background: var(--border); color: var(--muted);
+        }
+        .empty { color: var(--muted); font-style: italic; font-size: 12px; padding: 8px 0; }
+
+        footer { color: var(--muted); font-size: 11px; margin-top: 12px; text-align: right; }
+    </style>
+</head>
+<body>
+    <div class="wrap">
+        <header>
+            <div>
+                <span class="name">@Model.InstanceName</span>
+                <span class="meta">— v@Model.Version</span>
+            </div>
+            <div class="meta">@Model.TotalFiles total encodes</div>
+        </header>
+
+        <nav>
+            <a href="?theme=@Model.Theme&tab=stats&limit=@Model.Limit"   class="@(Model.Tab == "stats"   ? "active" : "")">Stats</a>
+            <a href="?theme=@Model.Theme&tab=queue&limit=@Model.Limit"   class="@(Model.Tab == "queue"   ? "active" : "")">Queue</a>
+            <a href="?theme=@Model.Theme&tab=workers&limit=@Model.Limit" class="@(Model.Tab == "workers" ? "active" : "")">Workers</a>
+        </nav>
+
+        @if (Model.Tab == "stats")
+        {
+            <div class="stats-grid">
+                <div class="stat">
+                    <div class="label">Saved</div>
+                    <div class="value">@FormatBytes(Model.BytesSaved)</div>
+                </div>
+                <div class="stat">
+                    <div class="label">4K encodes</div>
+                    <div class="value">@Model.FourKCount</div>
+                </div>
+                <div class="stat">
+                    <div class="label">Queued</div>
+                    <div class="value">@Model.Pending</div>
+                </div>
+                <div class="stat processing">
+                    <div class="label">Processing</div>
+                    <div class="value">@Model.Processing</div>
+                </div>
+                <div class="stat">
+                    <div class="label">Completed</div>
+                    <div class="value">@Model.TotalFiles</div>
+                </div>
+                <div class="stat failed">
+                    <div class="label">Failed</div>
+                    <div class="value">@Model.Failed</div>
+                </div>
+            </div>
+        }
+        else if (Model.Tab == "queue")
+        {
+            if (Model.Queue.Count == 0)
+            {
+                <div class="empty">Queue is empty.</div>
+            }
+            else
+            {
+                <table>
+                    <thead>
+                        <tr>
+                            <th>File</th>
+                            <th>Status</th>
+                            <th class="num">Size</th>
+                            <th class="num" style="width: 80px;">Progress</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var row in Model.Queue)
+                        {
+                            var statusClass = row.Status switch
+                            {
+                                "Queued"     => "status-Pending",
+                                "Processing" => "status-Processing",
+                                "Completed"  => "status-Completed",
+                                "Failed"     => "status-Failed",
+                                _            => ""
+                            };
+                            <tr>
+                                <td title="@row.FileName" style="max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">@row.FileName</td>
+                                <td class="@statusClass">@row.Status</td>
+                                <td class="num">@FormatBytes(row.SizeBytes)</td>
+                                <td>
+                                    <div class="progressbar"><span style="width: @row.Progress%;"></span></div>
+                                </td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            }
+        }
+        else
+        {
+            @foreach (var node in Model.Workers)
+            {
+                <div class="node">
+                    <header>
+                        <span class="name">@node.NodeName</span>
+                        @if (node.Paused)
+                        {
+                            <span class="badge">Paused</span>
+                        }
+                    </header>
+                    @if (node.Jobs.Count == 0)
+                    {
+                        <div class="empty">Idle.</div>
+                    }
+                    else
+                    {
+                        @foreach (var job in node.Jobs)
+                        {
+                            <div style="margin-top: 6px;">
+                                <div style="display: flex; justify-content: space-between; font-size: 12px;">
+                                    <span title="@job.FileName" style="max-width: 70%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">@job.FileName</span>
+                                    <span style="color: var(--muted);">@job.Device · @job.Phase · @job.Progress%</span>
+                                </div>
+                                <div class="progressbar" style="margin-top: 4px;"><span style="width: @job.Progress%;"></span></div>
+                            </div>
+                        }
+                    }
+                </div>
+            }
+        }
+
+        <footer>via /iframe/homarr</footer>
+    </div>
+</body>
+</html>

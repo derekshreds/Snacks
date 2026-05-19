@@ -61,4 +61,40 @@ public sealed class AuthApiController : ControllerBase
             return new JsonResult(new { success = false, error = ex.Message });
         }
     }
+
+    /******************************************************************
+     *  API Key (public read-only /api/v1/* surface)
+     ******************************************************************/
+
+    /// <summary>
+    ///     Returns whether an API key is currently configured. The key value itself is
+    ///     never returned by this endpoint — it is only surfaced once at the moment of
+    ///     generation via <see cref="GenerateApiKey"/>.
+    /// </summary>
+    [HttpGet("api-key")]
+    public IActionResult GetApiKey()
+    {
+        var cfg = _auth.GetConfig();
+        return new JsonResult(new { hasKey = !string.IsNullOrEmpty(cfg.ApiKey) });
+    }
+
+    /// <summary>
+    ///     Generates a fresh API key, persists it to <c>auth.json</c>, and returns the
+    ///     plaintext value. The caller must surface the key immediately — subsequent
+    ///     <see cref="GetApiKey"/> calls only return <c>hasKey: true</c>.
+    /// </summary>
+    [HttpPost("api-key")]
+    public IActionResult GenerateApiKey()
+    {
+        var key = _auth.GenerateApiKey();
+        return new JsonResult(new { hasKey = true, key });
+    }
+
+    /// <summary> Clears the stored API key, immediately revoking any external clients using it. </summary>
+    [HttpDelete("api-key")]
+    public IActionResult DeleteApiKey()
+    {
+        _auth.ClearApiKey();
+        return new JsonResult(new { hasKey = false });
+    }
 }

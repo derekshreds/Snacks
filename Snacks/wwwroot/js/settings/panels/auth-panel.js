@@ -7,6 +7,7 @@
  */
 
 import { authApi } from '../../api.js';
+import { showConfirmModal } from '../../utils/modal-controller.js';
 
 
 // ---------------------------------------------------------------------------
@@ -28,7 +29,83 @@ async function load() {
         document.getElementById('authEnabledHint').textContent = cfg.hasPassword
             ? 'A password is set. Leave the password field blank to keep it.'
             : 'No password set yet. Enter one below to enable sign-in.';
+
+        renderApiKeyState(!!cfg.hasApiKey);
     } catch { /* auth may already gate this */ }
+}
+
+// ---------------------------------------------------------------------------
+// API key (external dashboards)
+// ---------------------------------------------------------------------------
+
+/** Updates the button labels and status hint to reflect whether a key exists. */
+function renderApiKeyState(hasKey) {
+    document.getElementById('generateApiKeyBtnLabel').textContent =
+        hasKey ? 'Regenerate API key' : 'Generate API key';
+    document.getElementById('revokeApiKeyBtn').style.display = hasKey ? '' : 'none';
+    document.getElementById('apiKeyStatus').textContent =
+        hasKey ? 'A key is configured.' : 'No key configured.';
+    document.getElementById('apiKeyDisplayRow').style.display = 'none';
+    document.getElementById('apiKeyValue').value = '';
+}
+
+async function generateApiKey() {
+    const hadKey = document.getElementById('revokeApiKeyBtn').style.display !== 'none';
+    if (hadKey) {
+        const ok = await showConfirmModal(
+            'Regenerate API key',
+            '<p>Generating a new key will <strong>revoke the existing one immediately</strong>. ' +
+            'Any external dashboards using the current key will stop working until you update them.</p>',
+            'Regenerate',
+        );
+        if (!ok) return;
+    }
+
+    try {
+        const data = await authApi.generateApiKey();
+        document.getElementById('apiKeyValue').value = data.key || '';
+        document.getElementById('apiKeyDisplayRow').style.display = '';
+        renderApiKeyStateAfterGenerate();
+        showToast('API key generated', 'success');
+    } catch (e) {
+        showToast('Generate failed: ' + e.message, 'danger');
+    }
+}
+
+/** Like renderApiKeyState(true) but keeps the just-generated key visible. */
+function renderApiKeyStateAfterGenerate() {
+    document.getElementById('generateApiKeyBtnLabel').textContent = 'Regenerate API key';
+    document.getElementById('revokeApiKeyBtn').style.display = '';
+    document.getElementById('apiKeyStatus').textContent = 'A key is configured.';
+}
+
+async function revokeApiKey() {
+    const ok = await showConfirmModal(
+        'Revoke API key',
+        '<p>External dashboards (Homarr, Glance, …) using this key will <strong>lose access immediately</strong>.</p>',
+        'Revoke',
+    );
+    if (!ok) return;
+
+    try {
+        await authApi.revokeApiKey();
+        renderApiKeyState(false);
+        showToast('API key revoked', 'success');
+    } catch (e) {
+        showToast('Revoke failed: ' + e.message, 'danger');
+    }
+}
+
+async function copyApiKey() {
+    const value = document.getElementById('apiKeyValue').value;
+    if (!value) return;
+    try {
+        await navigator.clipboard.writeText(value);
+        showToast('Copied to clipboard', 'success');
+    } catch {
+        document.getElementById('apiKeyValue').select();
+        showToast('Copy failed — selected the value so you can copy manually', 'warning');
+    }
 }
 
 /**
@@ -91,6 +168,9 @@ async function signOut() {
 export function initAuthPanel() {
     document.getElementById('saveAuthConfig')?.addEventListener('click', save);
     document.getElementById('signOutBtn')    ?.addEventListener('click', signOut);
+    document.getElementById('generateApiKeyBtn')?.addEventListener('click', generateApiKey);
+    document.getElementById('revokeApiKeyBtn')  ?.addEventListener('click', revokeApiKey);
+    document.getElementById('copyApiKeyBtn')    ?.addEventListener('click', copyApiKey);
 }
 
 /** Lazy data load, invoked when the settings modal is first opened. */

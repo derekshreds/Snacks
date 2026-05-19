@@ -45,7 +45,7 @@ public sealed class AuthService
     }
 
     /// <summary>
-    ///     Public view of auth config — never exposes the password hash or session secret.
+    ///     Public view of auth config — never exposes the password hash, session secret, or API key.
     /// </summary>
     public object GetPublicConfig()
     {
@@ -56,6 +56,7 @@ public sealed class AuthService
                 enabled     = _config.Enabled,
                 username    = _config.Username,
                 hasPassword = !string.IsNullOrEmpty(_config.PasswordHash),
+                hasApiKey   = !string.IsNullOrEmpty(_config.ApiKey),
             };
         }
     }
@@ -164,6 +165,77 @@ public sealed class AuthService
     public bool IsAuthRequired()
     {
         lock (_lock) return _config.Enabled && !string.IsNullOrEmpty(_config.PasswordHash);
+    }
+
+    /******************************************************************
+     *  API Key
+     ******************************************************************/
+
+    /// <summary>
+    ///     Generates a fresh 32-byte random key, base64url-encoded (no padding), persists
+    ///     it to <c>auth.json</c>, and returns it once. Caller is expected to surface the
+    ///     value to the user immediately — it is not retrievable after this call.
+    /// </summary>
+    public string GenerateApiKey()
+    {
+        var bytes = RandomNumberGenerator.GetBytes(32);
+        var key   = Convert.ToBase64String(bytes).Replace("+", "-").Replace("/", "_").TrimEnd('=');
+
+        lock (_lock)
+        {
+            _config.ApiKey = key;
+            _configFileService.Save("auth.json", _config);
+        }
+        return key;
+    }
+
+    /// <summary>
+    ///     Clears the stored API key. Subsequent <see cref="ValidateApiKey"/> calls will
+    ///     reject every candidate until <see cref="GenerateApiKey"/> is called again.
+    /// </summary>
+    public void ClearApiKey()
+    {
+        lock (_lock)
+        {
+            _config.ApiKey = null;
+            _configFileService.Save("auth.json", _config);
+        }
+    }
+
+    /// <summary>
+    ///     Constant-time compare of <paramref name="key"/> against the stored API key.
+    ///     Returns <see langword="false"/> when no key is configured server-side, when the
+    ///     candidate is empty, or when the lengths differ — the key path is opt-in and
+    ///     never grants implicit access.
+    /// </summary>
+    /// <param name="key"> The candidate key from the <c>X-Api-Key</c> header or <c>?apiKey=</c> query. </param>
+    public bool ValidateApiKey(string? key)
+    {
+        if (string.IsNullOrEmpty(key)) return false;
+
+        string? stored;
+        lock (_lock) stored = _config.ApiKey;
+        if (string.IsNullOrEmpty(stored)) return false;
+
+        var candidateBytes = Encoding.UTF8.GetBytes(key);
+        var storedBytes    = Encoding.UTF8.GetBytes(stored);
+        if (candidateBytes.Length != storedBytes.Length) return false;
+        return CryptographicOperations.FixedTimeEquals(candidateBytes, storedBytes);
+    }
+
+    /// <summary>
+    ///     CSP <c>frame-ancestors</c> directive value derived from the configured
+    ///     iframe allowlist. Returns <c>"*"</c> when the allowlist is empty (permissive
+    ///     default) or a space-joined list of origins otherwise.
+    /// </summary>
+    public string GetIframeFrameAncestors()
+    {
+        lock (_lock)
+        {
+            var origins = _config.IframeAllowedOrigins;
+            if (origins == null || origins.Count == 0) return "*";
+            return string.Join(' ', origins.Where(o => !string.IsNullOrWhiteSpace(o)));
+        }
     }
 
     /******************************************************************

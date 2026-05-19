@@ -19,4 +19,20 @@ public sealed class AuthConfig
     ///     Per-install random secret used to sign session cookies. Generated on first save.
     /// </summary>
     public string SessionSecret { get; set; } = "";
+
+    /// <summary>
+    ///     Optional API key for the public read-only <c>/api/v1/*</c> surface consumed by
+    ///     external dashboards (Homarr, Glance, etc.). Matches Sonarr/Radarr conventions —
+    ///     the same key can be presented via <c>X-Api-Key</c> header or <c>?apiKey=</c>
+    ///     query string. Generated on demand from the security settings panel; absent
+    ///     until the user opts in.
+    /// </summary>
+    public string? ApiKey { get; set; }
+
+    /// <summary>
+    ///     CSP <c>frame-ancestors</c> allowlist for the <c>/iframe/*</c> embed routes.
+    ///     Empty list ⇒ permissive (any origin may embed). Populate with concrete
+    ///     origins (e.g. <c>"https://homarr.local"</c>) to lock embedding down.
+    /// </summary>
+    public List<string> IframeAllowedOrigins { get; set; } = new();
 }
