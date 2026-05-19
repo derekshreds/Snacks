@@ -6289,7 +6289,12 @@ public class TranscodingService
             }
             else
             {
-                // In-place processing — output is in the same directory as the original with [snacks] tag
+                // No OutputDirectory configured — final destination is the original's directory.
+                // The staged file may be alongside the original, or in EncodeDirectory if scratch
+                // was used; either way, route the move target through workItem.Path's directory so
+                // we don't strand the encode on the scratch volume.
+                string originalDir = _fileService.GetDirectory(workItem.Path);
+
                 if (options.DeleteOriginalFile)
                 {
                     // Replace original: delete it and rename transcoded file to take its place
@@ -6297,15 +6302,27 @@ public class TranscodingService
                     await LogAsync(workItem.Id, $"Deleting original: {workItem.Path}");
                     await _fileService.FileDeleteAsync(workItem.Path, log);
 
-                    string cleanPath = GetCleanOutputName(outputPath);
-                    await LogAsync(workItem.Id, $"Moving encoded output: {outputPath} -> {cleanPath}");
-                    await _fileService.FileMoveAsync(outputPath, cleanPath, log);
-                    await MoveSidecarsAlongsideAsync(outputPath, cleanPath, workItem);
-                    await LogAsync(workItem.Id, $"Final output: {cleanPath}");
+                    string cleanName = Path.GetFileNameWithoutExtension(outputPath).Replace(" [snacks]", "") + Path.GetExtension(outputPath);
+                    string finalPath = Path.Combine(originalDir, cleanName);
+                    await LogAsync(workItem.Id, $"Moving encoded output: {outputPath} -> {finalPath}");
+                    await _fileService.FileMoveAsync(outputPath, finalPath, log);
+                    await MoveSidecarsAlongsideAsync(outputPath, finalPath, workItem);
+                    await LogAsync(workItem.Id, $"Final output: {finalPath}");
                 }
                 else
                 {
-                    // Keep both — original untouched, transcoded file has [snacks] tag
+                    // Keep both — original untouched, transcoded file keeps [snacks] tag.
+                    // If staged in EncodeDirectory, move it next to the original so the user
+                    // isn't surprised to find their encode on the scratch drive.
+                    if (!string.IsNullOrEmpty(options.EncodeDirectory))
+                    {
+                        string finalPath = Path.Combine(originalDir, Path.GetFileName(outputPath));
+                        await LogAsync(workItem.Id, $"Moving encoded output: {outputPath} -> {finalPath}");
+                        await _fileService.FileMoveAsync(outputPath, finalPath, log);
+                        await MoveSidecarsAlongsideAsync(outputPath, finalPath, workItem);
+                        outputPath = finalPath;
+                    }
+
                     await LogAsync(workItem.Id,
                         $"Original kept at: {workItem.Path}");
                     await LogAsync(workItem.Id,
