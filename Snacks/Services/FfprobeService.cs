@@ -126,7 +126,8 @@ public class FfprobeService
         AudioBitrateStyle BitrateStyle,
         int    DefaultBitrateKbps,
         int    MaxChannels,
-        bool   AllowedInMp4);
+        bool   AllowedInMp4,
+        bool   AllowedInWebm);
 
     private enum AudioBitrateStyle { Cbr, OpusVbr, None }
 
@@ -137,10 +138,10 @@ public class FfprobeService
     /// </summary>
     private static readonly Dictionary<string, AudioCodecSpec> _codecSpecs = new(StringComparer.OrdinalIgnoreCase)
     {
-        ["aac"]  = new("aac",      AudioBitrateStyle.Cbr,     192, 8, true),
-        ["ac3"]  = new("ac3",      AudioBitrateStyle.Cbr,     448, 6, true),
-        ["eac3"] = new("eac3",     AudioBitrateStyle.Cbr,     384, 8, true),
-        ["opus"] = new("libopus",  AudioBitrateStyle.OpusVbr, 192, 8, false),
+        ["aac"]  = new("aac",      AudioBitrateStyle.Cbr,     192, 8, AllowedInMp4: true,  AllowedInWebm: false),
+        ["ac3"]  = new("ac3",      AudioBitrateStyle.Cbr,     448, 6, AllowedInMp4: true,  AllowedInWebm: false),
+        ["eac3"] = new("eac3",     AudioBitrateStyle.Cbr,     384, 8, AllowedInMp4: true,  AllowedInWebm: false),
+        ["opus"] = new("libopus",  AudioBitrateStyle.OpusVbr, 192, 8, AllowedInMp4: false, AllowedInWebm: true),
     };
 
     /// <summary>
@@ -191,9 +192,10 @@ public class FfprobeService
     ///     any encoded variants in <paramref name="audioOutputs"/>.
     /// </param>
     /// <param name="audioOutputs">Encoded variants to emit per kept language, or <see langword="null"/>/empty for none.</param>
-    /// <param name="isMatroska">
-    ///     When <see langword="false"/> (MP4 output), codecs that can't be muxed into MP4 fall back to AAC,
-    ///     and source tracks the container can't carry are re-encoded rather than copied.
+    /// <param name="container">
+    ///     Output container token ("mkv", "mp4", or "webm"). MP4 forces non-MP4-safe codecs to AAC and
+    ///     re-encodes copy sources the container can't carry. WebM forces non-WebM-safe codecs to Opus
+    ///     and only stream-copies Opus / Vorbis sources. Matroska is permissive.
     /// </param>
     /// <param name="warnings">Receives one entry per fallback/clamp/skipped-profile event so callers can surface them in the per-job log.</param>
     /// <param name="autoSetDefault">
@@ -208,7 +210,7 @@ public class FfprobeService
         IReadOnlyList<string>?            languagesToKeep,
         bool                              preserveOriginalAudio,
         IReadOnlyList<AudioOutputProfile>? audioOutputs,
-        bool                              isMatroska,
+        string                            container,
         out List<string>                  warnings,
         bool                              autoSetDefault = false)
     {
@@ -306,7 +308,7 @@ public class FfprobeService
                 }
 
                 int encodeCh = targetCh ?? candidate.Channels;
-                var resolved = ResolveAudioCodec(profile.Codec, encodeCh, isMatroska, warnings);
+                var resolved = ResolveAudioCodec(profile.Codec, encodeCh, container, warnings);
                 reencodes.Add((candidate.Index, resolved.codec, resolved.channels, profile.BitrateKbps));
             }
 
@@ -330,11 +332,12 @@ public class FfprobeService
             {
                 var src = sources.First(s => s.Index == srcIndex);
 
-                if (!isMatroska && !ContainerCanCopySource(src.CodecName))
+                if (!ContainerCanCopySource(src.CodecName, container))
                 {
+                    string reencTarget = IsWebm(container) ? "opus" : "aac";
                     warnings.Add(
-                        $"Audio: source track #{src.Index} ({src.CodecName}) cannot be copied to MP4 — re-encoding to AAC.");
-                    var fallback = ResolveAudioCodec("aac", src.Channels, isMatroska, warnings);
+                        $"Audio: source track #{src.Index} ({src.CodecName}) cannot be copied to {container.ToUpperInvariant()} — re-encoding to {reencTarget.ToUpperInvariant()}.");
+                    var fallback = ResolveAudioCodec(reencTarget, src.Channels, container, warnings);
                     maps.Append($"-map 0:{src.Index} ");
                     codecArgs.Append(BuildAudioCodecArgs(fallback.codec, fallback.channels, 0, outIndex)).Append(' ');
                     AppendAudioMeta(meta, outIndex, bucket, fallback.codec, fallback.channels);
@@ -431,23 +434,32 @@ public class FfprobeService
     private static (string codec, int channels) ResolveAudioCodec(
         string                  requested,
         int                     channels,
-        bool                    isMatroska,
+        string                  container,
         List<string>            warnings)
     {
         var codec = (requested ?? "").Trim().ToLowerInvariant();
+        bool webm = IsWebm(container);
+        bool mp4  = IsMp4(container);
 
         if (!_codecSpecs.TryGetValue(codec, out var spec))
         {
-            warnings.Add($"Audio: unknown codec '{requested}' — falling back to AAC.");
-            codec = "aac";
-            spec  = _codecSpecs["aac"];
+            string unknownFallback = webm ? "opus" : "aac";
+            warnings.Add($"Audio: unknown codec '{requested}' — falling back to {unknownFallback.ToUpperInvariant()}.");
+            codec = unknownFallback;
+            spec  = _codecSpecs[codec];
         }
 
-        if (!isMatroska && !spec.AllowedInMp4)
+        if (mp4 && !spec.AllowedInMp4)
         {
             warnings.Add($"Audio: codec '{codec}' is not supported in MP4 — falling back to AAC.");
             codec = "aac";
             spec  = _codecSpecs["aac"];
+        }
+        else if (webm && !spec.AllowedInWebm)
+        {
+            warnings.Add($"Audio: codec '{codec}' is not supported in WebM — falling back to Opus.");
+            codec = "opus";
+            spec  = _codecSpecs["opus"];
         }
 
         if (channels > spec.MaxChannels)
@@ -499,18 +511,40 @@ public class FfprobeService
     internal static bool IsCommentaryTitle(string? title) =>
         title != null && title.ToLowerInvariant().Contains("comm");
 
+    /// <summary> True when <paramref name="container"/> is the WebM container. </summary>
+    internal static bool IsWebm(string? container) =>
+        string.Equals(container, "webm", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary> True when <paramref name="container"/> is the MP4 container. </summary>
+    internal static bool IsMp4(string? container) =>
+        string.Equals(container, "mp4", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary> True when <paramref name="container"/> is the Matroska container. </summary>
+    internal static bool IsMatroska(string? container) =>
+        string.Equals(container, "mkv", StringComparison.OrdinalIgnoreCase);
+
     /// <summary>
-    ///     Whether MP4 can stream-copy a source audio codec. Used during pass-through to
-    ///     decide between <c>-c:a copy</c> and a re-encode fallback. Matroska is permissive
-    ///     enough that we don't gate copies for it.
+    ///     Whether <paramref name="container"/> can stream-copy a source audio codec. Used during
+    ///     pass-through to decide between <c>-c:a copy</c> and a re-encode fallback. Matroska is
+    ///     permissive enough that we don't gate copies for it; MP4 and WebM both have strict
+    ///     allowed-codec lists.
     /// </summary>
-    internal static bool ContainerCanCopySource(string? sourceCodec) =>
-        (sourceCodec ?? "").ToLowerInvariant() switch
+    internal static bool ContainerCanCopySource(string? sourceCodec, string container)
+    {
+        var c = (sourceCodec ?? "").ToLowerInvariant();
+        if (IsWebm(container))
         {
-            "aac" or "ac3" or "eac3" or "mp3" or "alac" => true,
+            // WebM officially allows only Opus and Vorbis audio.
+            return c is "opus" or "vorbis";
+        }
+        if (IsMp4(container))
+        {
+            return c is "aac" or "ac3" or "eac3" or "mp3" or "alac";
             // truehd, dts, dtshd, flac, opus, pcm_*: not safe to copy into MP4
-            _ => false,
-        };
+        }
+        // Matroska (or unknown): permissive — copy anything.
+        return true;
+    }
 
     /// <summary> Bitmap subtitle codecs that can cause FFmpeg to hang — always excluded. </summary>
     internal static readonly HashSet<string> _bitmapSubCodecs = new(StringComparer.OrdinalIgnoreCase)
@@ -541,7 +575,10 @@ public class FfprobeService
     ///     2-letter ISO codes to retain. Empty or null keeps every (non-bitmap) subtitle stream. Matching
     ///     accepts the track's tag in any of its common forms (2-letter, 3-letter, or English name).
     /// </param>
-    /// <param name="isMatroska">When <c>false</c>, subtitles are always stripped (<c>-sn</c>).</param>
+    /// <param name="container">
+    ///     Output container token ("mkv", "mp4", or "webm"). Only Matroska preserves text subtitles;
+    ///     MP4 and WebM both emit <c>-sn</c> to strip all subs.
+    /// </param>
     /// <param name="includeBitmaps">
     ///     When <c>true</c> AND the container is Matroska, bitmap subs (PGS/VOBSUB/DVB) are passed through
     ///     instead of dropped. <c>-c:s copy</c> handles them without re-decoding.
@@ -559,14 +596,15 @@ public class FfprobeService
     public string MapSub(
         ProbeResult            probe,
         IReadOnlyList<string>? languagesToKeep,
-        bool                   isMatroska,
+        string                 container,
         bool                   includeBitmaps = false,
         bool                   excludeSdh     = false,
         bool                   autoSetDefault = false)
     {
         ArgumentNullException.ThrowIfNull(probe);
 
-        if (!isMatroska)
+        // Only Matroska preserves text subtitles. MP4 and WebM both strip everything.
+        if (!IsMatroska(container))
             return "-sn";
 
         var subtitleStreams = probe.Streams.Where(s => s.CodecType == "subtitle").ToList();

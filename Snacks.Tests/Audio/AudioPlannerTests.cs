@@ -31,7 +31,7 @@ public sealed class AudioPlannerTests
         ProbeResult                   probe,
         bool                          preserve,
         IReadOnlyList<AudioOutputProfile>? outputs,
-        bool                          isMatroska   = true,
+        string                        container    = "mkv",
         IReadOnlyList<string>?        languages    = null,
         bool                          languagesSet = false)
     {
@@ -46,7 +46,7 @@ public sealed class AudioPlannerTests
             effective,
             preserve,
             outputs,
-            isMatroska,
+            container,
             out var warnings);
         return (AudioFlagsParser.Parse(flags), warnings);
     }
@@ -232,7 +232,7 @@ public sealed class AudioPlannerTests
 
         var (streams, warnings) = Plan(probe,
             preserve: false,
-            isMatroska: false,
+            container: "mp4",
             outputs: new[]
             {
                 new AudioOutputProfile { Codec = "opus", Layout = "5.1", BitrateKbps = 256 },
@@ -548,7 +548,7 @@ public sealed class AudioPlannerTests
         var (streams, warnings) = Plan(probe,
             preserve: true,
             outputs: null,
-            isMatroska: false);
+            container: "mp4");
 
         streams.Should().ContainSingle();
         streams[0].Codec.Should().Be("aac");
@@ -916,7 +916,7 @@ public sealed class AudioPlannerTests
             new[] { "fr", "en" },
             preserveOriginalAudio: true,
             audioOutputs: null,
-            isMatroska: true,
+            container: "mkv",
             warnings: out _,
             autoSetDefault: true);
 
@@ -938,7 +938,7 @@ public sealed class AudioPlannerTests
             new[] { "en" },
             preserveOriginalAudio: true,
             audioOutputs: null,
-            isMatroska: true,
+            container: "mkv",
             warnings: out _,
             autoSetDefault: false);
 

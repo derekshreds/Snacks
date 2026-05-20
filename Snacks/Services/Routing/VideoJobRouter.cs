@@ -104,5 +104,5 @@ public sealed class VideoJobRouter : IJobKindRouter
         => _transcoder.ConvertVideoForRemoteAsync(item, options, ct);
 
     public string ExpectedOutputExtension(EncoderOptions options) =>
-        string.Equals(options.Format, "mp4", StringComparison.OrdinalIgnoreCase) ? ".mp4" : ".mkv";
+        TranscodingService.FormatExtension(options.Format);
 }

@@ -23,7 +23,7 @@ public sealed class SubtitleMappingTests
             .Subtitle(codec: "subrip", lang: "eng")
             .Build();
 
-        _svc.MapSub(probe, new[] { "en" }, isMatroska: false).Should().Be("-sn");
+        _svc.MapSub(probe, new[] { "en" }, container: "mp4").Should().Be("-sn");
     }
 
 
@@ -35,7 +35,7 @@ public sealed class SubtitleMappingTests
             .Subtitle(codec: "subrip", lang: "eng")
             .Build();
 
-        var flags = _svc.MapSub(probe, new[] { "en" }, isMatroska: true);
+        var flags = _svc.MapSub(probe, new[] { "en" }, container: "mkv");
         flags.Should().Contain("-map 0:1");
         flags.Should().Contain("-c:s copy");
     }
@@ -49,7 +49,7 @@ public sealed class SubtitleMappingTests
             .Subtitle(codec: "hdmv_pgs_subtitle", lang: "eng")
             .Build();
 
-        _svc.MapSub(probe, new[] { "en" }, isMatroska: true).Should().Be("-sn");
+        _svc.MapSub(probe, new[] { "en" }, container: "mkv").Should().Be("-sn");
     }
 
 
@@ -61,7 +61,7 @@ public sealed class SubtitleMappingTests
             .Subtitle(codec: "hdmv_pgs_subtitle", lang: "eng")
             .Build();
 
-        var flags = _svc.MapSub(probe, new[] { "en" }, isMatroska: true, includeBitmaps: true);
+        var flags = _svc.MapSub(probe, new[] { "en" }, container: "mkv", includeBitmaps: true);
         flags.Should().Contain("-map 0:1");
         flags.Should().Contain("-c:s copy");
     }
@@ -76,7 +76,7 @@ public sealed class SubtitleMappingTests
             .Subtitle(codec: "subrip", lang: "fre")
             .Build();
 
-        var flags = _svc.MapSub(probe, languagesToKeep: null, isMatroska: true);
+        var flags = _svc.MapSub(probe, languagesToKeep: null, container: "mkv");
         flags.Should().Contain("-map 0:1");
         flags.Should().Contain("-map 0:2");
     }
@@ -91,7 +91,7 @@ public sealed class SubtitleMappingTests
             .Subtitle(codec: "subrip", lang: "fre")
             .Build();
 
-        var flags = _svc.MapSub(probe, new[] { "en" }, isMatroska: true);
+        var flags = _svc.MapSub(probe, new[] { "en" }, container: "mkv");
         flags.Should().Contain("-map 0:1");
         flags.Should().NotContain("-map 0:2");
     }
@@ -151,7 +151,7 @@ public sealed class SubtitleMappingTests
             .Subtitle(codec: "subrip", lang: "fre")   // index 2
             .Build();
 
-        var flags = _svc.MapSub(probe, new[] { "fr", "en" }, isMatroska: true);
+        var flags = _svc.MapSub(probe, new[] { "fr", "en" }, container: "mkv");
         var fr = flags.IndexOf("-map 0:2", System.StringComparison.Ordinal);
         var en = flags.IndexOf("-map 0:1", System.StringComparison.Ordinal);
 
@@ -170,7 +170,7 @@ public sealed class SubtitleMappingTests
             .Subtitle(codec: "subrip", lang: "eng", hearingImpaired: true)       // index 2
             .Build();
 
-        var flags = _svc.MapSub(probe, new[] { "en" }, isMatroska: true, excludeSdh: true);
+        var flags = _svc.MapSub(probe, new[] { "en" }, container: "mkv", excludeSdh: true);
         flags.Should().Contain("-map 0:1");
         flags.Should().NotContain("-map 0:2");
     }
@@ -185,7 +185,7 @@ public sealed class SubtitleMappingTests
             .Subtitle(codec: "subrip", lang: "eng", title: "English [SDH]")      // index 2
             .Build();
 
-        var flags = _svc.MapSub(probe, new[] { "en" }, isMatroska: true, excludeSdh: true);
+        var flags = _svc.MapSub(probe, new[] { "en" }, container: "mkv", excludeSdh: true);
         flags.Should().Contain("-map 0:1");
         flags.Should().NotContain("-map 0:2");
     }
@@ -200,7 +200,7 @@ public sealed class SubtitleMappingTests
             .Subtitle(codec: "subrip", lang: "fre")
             .Build();
 
-        var flags = _svc.MapSub(probe, new[] { "fr", "en" }, isMatroska: true, autoSetDefault: true);
+        var flags = _svc.MapSub(probe, new[] { "fr", "en" }, container: "mkv", autoSetDefault: true);
         flags.Should().Contain("-disposition:s:0 default");
         flags.Should().Contain("-disposition:s:1 0");
     }

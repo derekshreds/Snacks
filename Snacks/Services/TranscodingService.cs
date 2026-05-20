@@ -96,6 +96,15 @@ public class TranscodingService
     /// </summary>
     private string _localNodeId = "master-local";
 
+    /// <summary>
+    ///     Codecs we've already logged an "auto → CPU software fallback" message
+    ///     for in this process. Deduped per codec so a queue full of AV1 files on
+    ///     a machine without AV1 hardware doesn't spam one line per job — the user
+    ///     gets a single explanation when the first job dispatches to CPU. Resets
+    ///     on process restart. Accessed under the scheduler semaphore, so no lock.
+    /// </summary>
+    private readonly HashSet<string> _loggedAutoCpuFallback = new();
+
     /// <summary>Lock protecting per-job <see cref="ActiveLocalJob.Process"/> publication.</summary>
     private readonly object _activeLock = new();
 
@@ -2031,7 +2040,11 @@ public class TranscodingService
     ///     <para>CPU rules:
     ///     <list type="bullet">
     ///         <item><c>none</c> (Software): CPU is the only acceptable slot.</item>
-    ///         <item><c>auto</c> on a machine with no hardware encoders: CPU is the auto-fallback.</item>
+    ///         <item><c>auto</c> on a machine where no hardware encoder supports the requested codec:
+    ///               CPU is the auto-fallback. Mirrors <c>VideoJobRouter</c>'s
+    ///               <c>nodeHasUsableHardware</c> predicate for the cluster path, so a node with
+    ///               hardware that can't do the chosen codec (e.g. UHD 630 + AV1) falls back to
+    ///               software instead of deadlocking the queue.</item>
     ///         <item>Anything else: CPU is excluded so jobs queue rather than spilling onto a slow software encode.</item>
     ///     </list></para>
     /// </summary>
@@ -2043,20 +2056,12 @@ public class TranscodingService
         if (devices.Count == 0) return null;
 
         var hwPref = (options.HardwareAcceleration ?? "auto").ToLowerInvariant();
-        bool hasHardware = devices.Any(d => d.DeviceId != "cpu");
+        bool hasHardwareThatCanEncode = devices.Any(d =>
+            d.DeviceId != "cpu" && DeviceCanEncode(d.DeviceId, workItem, options));
 
         foreach (var device in devices)
         {
-            bool isCpu = device.DeviceId == "cpu";
-
-            // Hardware-vs-CPU gating.
-            if (hwPref == "none" && !isCpu) continue;                          // Software ⇒ CPU only
-            if (hwPref != "none" && hwPref != "auto" && isCpu) continue;       // Specific vendor ⇒ never CPU
-            if (hwPref == "auto" && isCpu && hasHardware) continue;            // Auto with HW ⇒ never CPU
-
-            // Specific-vendor preference must match the device family exactly.
-            if (hwPref != "auto" && hwPref != "none"
-                && !string.Equals(hwPref, device.DeviceId, StringComparison.OrdinalIgnoreCase)) continue;
+            if (!IsDeviceEligibleUnderHwPref(device.DeviceId, hwPref, hasHardwareThatCanEncode)) continue;
 
             // Skip devices that can't encode this item's target codec —
             // the ledger only cares about capacity, not codec compatibility.
@@ -2066,9 +2071,46 @@ public class TranscodingService
             // is at capacity (MaxConcurrency / DefaultConcurrency / cpu=1)
             // or disabled (resolver returns 0).
             if (_slotLedger.TryReserve(_localNodeId, device.DeviceId, workItem.Id, workItem.FileName))
+            {
+                // Surface a one-time per-codec log when Auto lands on CPU because
+                // no hardware device can encode the codec. Otherwise the user sees
+                // jobs run slowly (or, before this fix, not at all) with no signal
+                // — the GitHub issue that motivated the fix called out "no errors
+                // reported to help track down the cause".
+                if (device.DeviceId == "cpu" && hwPref == "auto")
+                {
+                    var codec = (options.Codec ?? "").ToLowerInvariant();
+                    if (_loggedAutoCpuFallback.Add(codec))
+                        Console.WriteLine(
+                            $"No hardware encoder for '{codec}' on any detected device — " +
+                            $"using software fallback ({GetSoftwareFallbackEncoder(options)}). " +
+                            "Encodes will be significantly slower.");
+                }
                 return device.DeviceId;
+            }
         }
         return null;
+    }
+
+    /// <summary>
+    ///     Pure hw-vs-CPU gating predicate, extracted from
+    ///     <see cref="TryReserveLocalDeviceSlot"/> so it can be exercised by unit
+    ///     tests without standing up a slot ledger or detected-device list. Encodes
+    ///     the four-rule eligibility ladder used by both the local-master dispatcher
+    ///     and (in spirit) <c>VideoJobRouter.ScoreSlot</c> for cluster routing.
+    /// </summary>
+    internal static bool IsDeviceEligibleUnderHwPref(
+        string deviceId,
+        string hwPref,
+        bool hasHardwareThatCanEncode)
+    {
+        bool isCpu = deviceId == "cpu";
+        if (hwPref == "none" && !isCpu) return false;                              // Software ⇒ CPU only
+        if (hwPref != "none" && hwPref != "auto" && isCpu) return false;           // Specific vendor ⇒ never CPU
+        if (hwPref == "auto" && isCpu && hasHardwareThatCanEncode) return false;   // Auto with usable HW ⇒ never CPU
+        if (hwPref != "auto" && hwPref != "none"
+            && !string.Equals(hwPref, deviceId, StringComparison.OrdinalIgnoreCase)) return false; // Specific vendor must match
+        return true;
     }
 
     /// <summary>
@@ -2080,15 +2122,27 @@ public class TranscodingService
     private bool DeviceCanEncode(string deviceId, WorkItem workItem, EncoderOptions options)
     {
         var device = GetDetectedDevices().FirstOrDefault(d => d.DeviceId == deviceId);
-        if (device == null) return deviceId == "cpu"; // CPU always works as a fallback
+        return CanDeviceEncodeCodec(device, deviceId, options.Codec);
+    }
 
-        var codec = (options.Codec ?? "").ToLowerInvariant();
-        var key   = codec switch
+    /// <summary>
+    ///     Pure codec-vs-device match, extracted from <see cref="DeviceCanEncode"/>
+    ///     so it can be unit-tested without standing up the detected-device list.
+    ///     CPU (no detected device row) is treated as always-capable. Unknown codecs
+    ///     return <see langword="true"/> so the value is handed to ffmpeg untouched
+    ///     rather than synthesising a refusal.
+    /// </summary>
+    internal static bool CanDeviceEncodeCodec(HardwareDevice? device, string deviceId, string? codec)
+    {
+        if (device == null) return deviceId == "cpu";
+
+        var codecLc = (codec ?? "").ToLowerInvariant();
+        var key = codecLc switch
         {
             "hevc" or "h265" => "h265",
             "avc"  or "h264" => "h264",
             "av1"            => "av1",
-            _                => codec,
+            _                => codecLc,
         };
         if (string.IsNullOrEmpty(key)) return true; // unknown codec — let ffmpeg decide
         return device.SupportedCodecs.Any(c => c.Equals(key, StringComparison.OrdinalIgnoreCase));
@@ -2461,6 +2515,14 @@ public class TranscodingService
         if (workItem.Probe == null)
             throw new Exception("No probe data available");
 
+        // WebM only allows AV1/VP8/VP9 video and Opus/Vorbis audio. If the user picked
+        // a non-AV1 codec alongside Format=webm, coerce the per-job clone to AV1 here so
+        // the rest of the pipeline (encoder resolution, MapAudio, BuildFfmpegCommand) sees
+        // a self-consistent options block. Audio is coerced inside MapAudio via
+        // ResolveAudioCodec. The user's settings.json is not modified — only this job's
+        // options object, which is already a per-job clone.
+        await CoerceForWebmAsync(workItem, options);
+
         // Resolve "auto" to a concrete hardware type before building the command
         await ResolveHardwareAccelerationAsync(options);
         await LogAsync(workItem.Id, $"Hardware acceleration: {options.HardwareAcceleration}");
@@ -2661,7 +2723,7 @@ public class TranscodingService
             doAudioWork ? options.AudioLanguagesToKeep : new List<string>(),
             doAudioWork ? options.PreserveOriginalAudio : true,
             doAudioWork ? options.AudioOutputs : null,
-            options.Format == "mkv",
+            options.Format,
             out var audioWarnings,
             autoSetDefault: doAudioWork && options.AutoSetDefaultTrack) + " ";
 
@@ -2764,9 +2826,9 @@ public class TranscodingService
             // subs (passed through as-is via per-stream -c:s:N copy) with the OCR'd SRTs
             // (encoded to the container's native text codec). When MKV pass-through is on,
             // bitmap streams are also kept here so the output has both PGS + OCR'd SRT.
-            string ocrCodec = options.Format == "mkv" ? "srt" : "mov_text";
+            string ocrCodec = FfprobeService.IsMatroska(options.Format) ? "srt" : "mov_text";
 
-            bool passBitmaps = options.Format == "mkv"
+            bool passBitmaps = FfprobeService.IsMatroska(options.Format)
                             && options.PassThroughImageSubtitlesMkv
                             && !dropImageSubtitlesOnly;
 
@@ -2854,13 +2916,13 @@ public class TranscodingService
             // On a mux pass that excludes subs (MuxStreams.Audio), keep every subtitle track by
             // passing an empty language list — MapSub treats that as "keep all".
             var subLangs = doSubtitleWork ? options.SubtitleLanguagesToKeep : new List<string>();
-            bool passBitmaps = options.Format == "mkv"
+            bool passBitmaps = FfprobeService.IsMatroska(options.Format)
                             && options.PassThroughImageSubtitlesMkv
                             && !dropImageSubtitlesOnly;
             subtitleFlags = _ffprobeService.MapSub(
                 workItem.Probe!,
                 subLangs,
-                options.Format == "mkv",
+                options.Format,
                 passBitmaps,
                 excludeSdh:     doSubtitleWork && options.ExcludeSdhSubtitles,
                 autoSetDefault: doSubtitleWork && options.AutoSetDefaultTrack) + " ";
@@ -3145,7 +3207,7 @@ public class TranscodingService
         // would disappear from the output. MP4 always strips bitmap subs (MapSub returns
         // -sn for non-Matroska anyway), so the format check is "are we keeping the MKV
         // copy path AND has the user opted out of pass-through?"
-        bool isMatroskaOutput = string.Equals(options.Format, "mkv", StringComparison.OrdinalIgnoreCase);
+        bool isMatroskaOutput = FfprobeService.IsMatroska(options.Format);
         if (isMatroskaOutput && !options.PassThroughImageSubtitlesMkv)
         {
             foreach (var s in subStreams)
@@ -3671,12 +3733,12 @@ public class TranscodingService
     /// <summary>
     ///     Assembles the final ffmpeg command string from the per-section flag fragments
     ///     produced upstream. The format toggles two things: the container muxer
-    ///     (<c>matroska</c> vs <c>mp4</c>) and the variable flags (MP4 needs
-    ///     <c>-movflags +faststart</c>; MKV doesn't). Extracted from
+    ///     (<c>matroska</c> / <c>mp4</c> / <c>webm</c>) and the variable flags
+    ///     (MP4 needs <c>-movflags +faststart</c>; MKV/WebM don't). Extracted from
     ///     <c>ConvertVideoAsync</c> so the wire format can be unit-tested without
     ///     spinning up the encode pipeline.
     /// </summary>
-    /// <param name="format">"mkv" or "mp4". Anything else is treated as MP4.</param>
+    /// <param name="format">"mkv", "mp4", or "webm". Anything else is treated as MP4.</param>
     /// <param name="initFlags">Hardware init flags (from <see cref="GetInitFlags"/>).</param>
     /// <param name="analyzeFlags">Probe-size / analyze-duration flags.</param>
     /// <param name="inputPath">Source file path. Quoted into the command.</param>
@@ -3699,13 +3761,47 @@ public class TranscodingService
         string subtitleFlags,
         string outputPath)
     {
-        bool isMkv      = string.Equals(format, "mkv", StringComparison.OrdinalIgnoreCase);
-        string varFlags = isMkv
-            ? "-max_muxing_queue_size 9999 "
-            : "-movflags +faststart -max_muxing_queue_size 9999 ";
-        string muxer = isMkv ? "matroska" : "mp4";
+        bool isMp4 = FfprobeService.IsMp4(format);
+        // MP4 alone needs +faststart for progressive playback; MKV and WebM don't.
+        string varFlags = isMp4
+            ? "-movflags +faststart -max_muxing_queue_size 9999 "
+            : "-max_muxing_queue_size 9999 ";
+        string muxer = FormatMuxer(format);
 
         return $"{initFlags} {analyzeFlags}-i \"{inputPath}\" {extraInputs}{videoFlags}{compressionFlags}{audioFlags}{subtitleFlags}{varFlags}-f {muxer} \"{outputPath}\"";
+    }
+
+    /// <summary> Maps an output container token to its ffmpeg <c>-f</c> muxer name. </summary>
+    internal static string FormatMuxer(string format) =>
+        FfprobeService.IsMatroska(format) ? "matroska"
+      : FfprobeService.IsWebm(format)     ? "webm"
+      : "mp4";
+
+    /// <summary> Maps an output container token to its on-disk file extension. </summary>
+    internal static string FormatExtension(string format) =>
+        FfprobeService.IsMatroska(format) ? ".mkv"
+      : FfprobeService.IsWebm(format)     ? ".webm"
+      : ".mp4";
+
+    /// <summary>
+    ///     Coerces the per-job options clone so the encode is internally consistent when
+    ///     <see cref="EncoderOptions.Format"/> is <c>"webm"</c>. WebM's official codec list is
+    ///     AV1/VP9/VP8 + Opus/Vorbis; ffmpeg's <c>webm</c> muxer rejects everything else. This
+    ///     forces <c>Codec=av1</c> + <c>Encoder=libsvtav1</c> when the user picked H.264/H.265,
+    ///     so the rest of the pipeline doesn't have to think about it. Audio coercion happens
+    ///     inside <see cref="FfprobeService.MapAudio"/>.
+    /// </summary>
+    private async Task CoerceForWebmAsync(WorkItem workItem, EncoderOptions options)
+    {
+        if (!FfprobeService.IsWebm(options.Format)) return;
+
+        if (!string.Equals(options.Codec, "av1", StringComparison.OrdinalIgnoreCase))
+        {
+            await LogAsync(workItem.Id,
+                $"WebM output requires AV1 video — coercing codec from '{options.Codec}' to 'av1'.");
+            options.Codec   = "av1";
+            options.Encoder = "libsvtav1";
+        }
     }
 
     internal static (string target, string min, string max, bool copy) CalculateBitrates(WorkItem workItem, EncoderOptions options)
@@ -4523,7 +4619,7 @@ public class TranscodingService
     private string GetOutputPath(WorkItem workItem, EncoderOptions options)
     {
         string fileName = _fileService.RemoveExtension(workItem.FileName);
-        string extension = options.Format == "mkv" ? ".mkv" : ".mp4";
+        string extension = FormatExtension(options.Format);
         string snacksName = $"{fileName} [snacks]{extension}";
 
         if (!string.IsNullOrEmpty(options.EncodeDirectory))
@@ -5328,7 +5424,7 @@ public class TranscodingService
         // streams. Bitmap streams (PGS/VOBSUB/DVB) are the most common cause of subtitle
         // failures; many failures clear once they're removed without sacrificing the rest
         // of the user's subtitles. Only relevant when the user opted into MKV pass-through.
-        bool wasPassingBitmaps = options.Format == "mkv" && options.PassThroughImageSubtitlesMkv;
+        bool wasPassingBitmaps = FfprobeService.IsMatroska(options.Format) && options.PassThroughImageSubtitlesMkv;
         if (!subtitlesWereStripped && !imageSubtitlesAlreadyDropped && wasPassingBitmaps)
         {
             await LogAsync(workItem.Id, "Retrying without image-based subtitles...");
@@ -6289,7 +6385,12 @@ public class TranscodingService
             }
             else
             {
-                // In-place processing — output is in the same directory as the original with [snacks] tag
+                // No OutputDirectory configured — final destination is the original's directory.
+                // The staged file may be alongside the original, or in EncodeDirectory if scratch
+                // was used; either way, route the move target through workItem.Path's directory so
+                // we don't strand the encode on the scratch volume.
+                string originalDir = _fileService.GetDirectory(workItem.Path);
+
                 if (options.DeleteOriginalFile)
                 {
                     // Replace original: delete it and rename transcoded file to take its place
@@ -6297,15 +6398,27 @@ public class TranscodingService
                     await LogAsync(workItem.Id, $"Deleting original: {workItem.Path}");
                     await _fileService.FileDeleteAsync(workItem.Path, log);
 
-                    string cleanPath = GetCleanOutputName(outputPath);
-                    await LogAsync(workItem.Id, $"Moving encoded output: {outputPath} -> {cleanPath}");
-                    await _fileService.FileMoveAsync(outputPath, cleanPath, log);
-                    await MoveSidecarsAlongsideAsync(outputPath, cleanPath, workItem);
-                    await LogAsync(workItem.Id, $"Final output: {cleanPath}");
+                    string cleanName = Path.GetFileNameWithoutExtension(outputPath).Replace(" [snacks]", "") + Path.GetExtension(outputPath);
+                    string finalPath = Path.Combine(originalDir, cleanName);
+                    await LogAsync(workItem.Id, $"Moving encoded output: {outputPath} -> {finalPath}");
+                    await _fileService.FileMoveAsync(outputPath, finalPath, log);
+                    await MoveSidecarsAlongsideAsync(outputPath, finalPath, workItem);
+                    await LogAsync(workItem.Id, $"Final output: {finalPath}");
                 }
                 else
                 {
-                    // Keep both — original untouched, transcoded file has [snacks] tag
+                    // Keep both — original untouched, transcoded file keeps [snacks] tag.
+                    // If staged in EncodeDirectory, move it next to the original so the user
+                    // isn't surprised to find their encode on the scratch drive.
+                    if (!string.IsNullOrEmpty(options.EncodeDirectory))
+                    {
+                        string finalPath = Path.Combine(originalDir, Path.GetFileName(outputPath));
+                        await LogAsync(workItem.Id, $"Moving encoded output: {outputPath} -> {finalPath}");
+                        await _fileService.FileMoveAsync(outputPath, finalPath, log);
+                        await MoveSidecarsAlongsideAsync(outputPath, finalPath, workItem);
+                        outputPath = finalPath;
+                    }
+
                     await LogAsync(workItem.Id,
                         $"Original kept at: {workItem.Path}");
                     await LogAsync(workItem.Id,

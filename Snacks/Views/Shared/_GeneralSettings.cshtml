@@ -12,8 +12,9 @@
                 <select class="form-select" id="@(formPrefix)Format" name="Format">
                     <option value="mkv" selected>MKV (Matroska)</option>
                     <option value="mp4">MP4</option>
+                    <option value="webm">WebM (AV1 + Opus)</option>
                 </select>
-                <div class="form-text">MKV preserves every stream; MP4 is more broadly compatible but drops some subtitle types.</div>
+                <div class="form-text">MKV preserves every stream; MP4 is more broadly compatible but drops some subtitle types. WebM plays natively in browsers and forces AV1 video + Opus audio (subtitles stripped).</div>
             </div>
 
             <div class="mb-3">

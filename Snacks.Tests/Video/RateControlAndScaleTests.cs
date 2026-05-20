@@ -277,7 +277,7 @@ public sealed class RateControlAndScaleTests
     // =====================================================================
 
     /// <summary>Rows: (audio codec, MP4 copy supported).</summary>
-    public static IEnumerable<object[]> ContainerCopyRows() => new[]
+    public static IEnumerable<object[]> Mp4CopyRows() => new[]
     {
         // MP4 can carry these without re-muxing
         new object[] { "aac",        true  },
@@ -300,9 +300,49 @@ public sealed class RateControlAndScaleTests
     };
 
     [Theory]
-    [MemberData(nameof(ContainerCopyRows))]
-    public void ContainerCanCopySource(string? codec, bool expected)
+    [MemberData(nameof(Mp4CopyRows))]
+    public void ContainerCanCopySource_Mp4(string? codec, bool expected)
     {
-        FfprobeService.ContainerCanCopySource(codec).Should().Be(expected);
+        FfprobeService.ContainerCanCopySource(codec, "mp4").Should().Be(expected);
+    }
+
+
+    /// <summary>Rows: (audio codec, WebM copy supported).</summary>
+    public static IEnumerable<object[]> WebmCopyRows() => new[]
+    {
+        // WebM only allows Opus + Vorbis audio.
+        new object[] { "opus",       true  },
+        new object[] { "vorbis",     true  },
+        new object[] { "OPUS",       true  },   // case-insensitive
+
+        // Everything else gets re-encoded.
+        new object[] { "aac",        false },
+        new object[] { "ac3",        false },
+        new object[] { "eac3",       false },
+        new object[] { "mp3",        false },
+        new object[] { "flac",       false },
+        new object[] { "truehd",     false },
+        new object[] { "dts",        false },
+        new object[] { "",           false },
+        new object[] { null!,        false },
+    };
+
+    [Theory]
+    [MemberData(nameof(WebmCopyRows))]
+    public void ContainerCanCopySource_Webm(string? codec, bool expected)
+    {
+        FfprobeService.ContainerCanCopySource(codec, "webm").Should().Be(expected);
+    }
+
+
+    [Fact]
+    public void ContainerCanCopySource_Matroska_is_permissive()
+    {
+        // Matroska is permissive — copies anything, including obscure codecs.
+        FfprobeService.ContainerCanCopySource("truehd",    "mkv").Should().BeTrue();
+        FfprobeService.ContainerCanCopySource("dts",       "mkv").Should().BeTrue();
+        FfprobeService.ContainerCanCopySource("flac",      "mkv").Should().BeTrue();
+        FfprobeService.ContainerCanCopySource("opus",      "mkv").Should().BeTrue();
+        FfprobeService.ContainerCanCopySource("pcm_s16le", "mkv").Should().BeTrue();
     }
 }
