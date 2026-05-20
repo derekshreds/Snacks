@@ -43,7 +43,7 @@ public sealed class EncoderOptions
      *  Core Video
      ******************************************************************/
 
-    /// <summary> Output container format (e.g. "mkv", "mp4"). </summary>
+    /// <summary> Output container format ("mkv", "mp4", or "webm"). WebM coerces the video codec to AV1 and audio to Opus per the WebM spec. </summary>
     public string Format { get; set; } = "mkv";
 
     /// <summary> Logical codec name (e.g. "h265", "h264"). </summary>

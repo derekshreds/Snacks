@@ -45,7 +45,12 @@ public sealed class FullCommandScenarioTests
         command.TrimEnd().Should().EndWith($"\"{outputPath}\"");
 
         //  4. Specify the muxer with -f.
-        var expectedMuxer = format == "mkv" ? "matroska" : "mp4";
+        var expectedMuxer = format switch
+        {
+            "mkv"  => "matroska",
+            "webm" => "webm",
+            _      => "mp4",
+        };
         command.Should().Contain($"-f {expectedMuxer}");
 
         //  5. The -f muxer flag comes BEFORE the output path (ffmpeg arg order requirement).
@@ -142,7 +147,7 @@ public sealed class FullCommandScenarioTests
             options.AudioLanguagesToKeep,
             options.PreserveOriginalAudio,
             options.AudioOutputs,
-            options.Format == "mkv",
+            options.Format,
             out _) + " ";
 
         string subtitleFlags = stripSubs
@@ -150,7 +155,7 @@ public sealed class FullCommandScenarioTests
             : _ffprobe.MapSub(
                   probe,
                   options.SubtitleLanguagesToKeep,
-                  options.Format == "mkv",
+                  options.Format,
                   includeBitmaps: includeBitmapSubs) + " ";
 
         return TranscodingService.BuildFfmpegCommand(
@@ -463,7 +468,7 @@ public sealed class FullCommandScenarioTests
                                   target, min, max, useConservativeHwFlags: false) + " ",
             audioFlags:       _ffprobe.MapAudio(probe, opts.AudioLanguagesToKeep,
                                   opts.PreserveOriginalAudio, opts.AudioOutputs,
-                                  isMatroska: true, out _) + " ",
+                                  container: "mkv", out _) + " ",
             subtitleFlags:    "-sn ",
             outputPath:       "/m/out.mkv");
 
@@ -931,5 +936,109 @@ public sealed class FullCommandScenarioTests
 
         cmd.Should().Contain("\"/path with spaces/in file.mkv\"");
         cmd.Should().Contain("\"/path with spaces/out file.mkv\"");
+    }
+
+
+    // =====================================================================
+    //  Scenario 16: WebM happy path — AV1 video + Opus audio + WebM output.
+    //  AC3 source audio is re-encoded to Opus (AC3 is not allowed in WebM).
+    //  Subtitles are always stripped for WebM regardless of source.
+    // =====================================================================
+
+    [Fact]
+    public void Scenario_AV1_Opus_WebM_emits_webm_muxer_and_strips_subs()
+    {
+        var probe = new ProbeBuilder()
+            .Video(codec: "h264", width: 1920, height: 1080)
+            .Audio(codec: "ac3", channels: 6, lang: "eng")
+            .Subtitle(codec: "subrip", lang: "eng")
+            .Build();
+
+        var opts = new EncoderOptions
+        {
+            Format                = "webm",
+            Codec                 = "av1",
+            Encoder               = "libsvtav1",
+            FfmpegQualityPreset   = "medium",
+            HardwareAcceleration  = "none",
+            TargetBitrate         = 2500,
+            PreserveOriginalAudio = true,
+            AudioOutputs          = new(),
+        };
+        var item = new WorkItem { Bitrate = 6000, IsHevc = false, Probe = probe };
+
+        var cmd = BuildScenarioCommand(probe, opts, item,
+            outputPath: "/output/out.webm");
+
+        AssertWellFormed(cmd, "webm", "/source/in.mkv", "/output/out.webm");
+
+        // Video: AV1 via libsvtav1.
+        cmd.Should().Contain("-c:v libsvtav1");
+
+        // Audio: AC3 source is not WebM-safe; the copy path falls back to a libopus re-encode.
+        cmd.Should().Contain("-c:a:0 libopus");
+        cmd.Should().NotContain("-c:a:0 copy");
+
+        // Subtitles always stripped for WebM (subrip text track is dropped).
+        cmd.Should().Contain("-sn");
+        cmd.Should().NotContain("-c:s copy");
+
+        // WebM uses the same mux-queue safeguard as MKV but no +faststart.
+        cmd.Should().NotContain("-movflags +faststart");
+    }
+
+
+    // =====================================================================
+    //  Scenario 17: Opus source into WebM passes through as -c:a copy
+    //  (Opus is the one stream-copy-safe audio codec for WebM).
+    // =====================================================================
+
+    [Fact]
+    public void Scenario_Opus_source_in_WebM_is_copied()
+    {
+        var probe = new ProbeBuilder()
+            .Video(codec: "av1", width: 1920, height: 1080)
+            .Audio(codec: "opus", channels: 2, lang: "eng")
+            .Build();
+
+        var opts = new EncoderOptions
+        {
+            Format                = "webm",
+            Codec                 = "av1",
+            Encoder               = "libsvtav1",
+            FfmpegQualityPreset   = "medium",
+            HardwareAcceleration  = "none",
+            TargetBitrate         = 2500,
+            PreserveOriginalAudio = true,
+            AudioOutputs          = new(),
+        };
+        var item = new WorkItem { Bitrate = 2000, IsHevc = false, Probe = probe };
+
+        var cmd = BuildScenarioCommand(probe, opts, item,
+            outputPath: "/output/out.webm");
+
+        AssertWellFormed(cmd, "webm", "/source/in.mkv", "/output/out.webm");
+        cmd.Should().Contain("-c:a:0 copy");
+        cmd.Should().NotContain("libopus");
+    }
+
+
+    [Fact]
+    public void FormatExtension_maps_each_known_container()
+    {
+        TranscodingService.FormatExtension("mkv") .Should().Be(".mkv");
+        TranscodingService.FormatExtension("mp4") .Should().Be(".mp4");
+        TranscodingService.FormatExtension("webm").Should().Be(".webm");
+        // Unknown falls back to .mp4 to match the prior ternary's default branch.
+        TranscodingService.FormatExtension("nope").Should().Be(".mp4");
+    }
+
+
+    [Fact]
+    public void FormatMuxer_maps_each_known_container()
+    {
+        TranscodingService.FormatMuxer("mkv") .Should().Be("matroska");
+        TranscodingService.FormatMuxer("mp4") .Should().Be("mp4");
+        TranscodingService.FormatMuxer("webm").Should().Be("webm");
     }
 }

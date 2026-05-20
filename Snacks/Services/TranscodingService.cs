@@ -2461,6 +2461,14 @@ public class TranscodingService
         if (workItem.Probe == null)
             throw new Exception("No probe data available");
 
+        // WebM only allows AV1/VP8/VP9 video and Opus/Vorbis audio. If the user picked
+        // a non-AV1 codec alongside Format=webm, coerce the per-job clone to AV1 here so
+        // the rest of the pipeline (encoder resolution, MapAudio, BuildFfmpegCommand) sees
+        // a self-consistent options block. Audio is coerced inside MapAudio via
+        // ResolveAudioCodec. The user's settings.json is not modified — only this job's
+        // options object, which is already a per-job clone.
+        await CoerceForWebmAsync(workItem, options);
+
         // Resolve "auto" to a concrete hardware type before building the command
         await ResolveHardwareAccelerationAsync(options);
         await LogAsync(workItem.Id, $"Hardware acceleration: {options.HardwareAcceleration}");
@@ -2661,7 +2669,7 @@ public class TranscodingService
             doAudioWork ? options.AudioLanguagesToKeep : new List<string>(),
             doAudioWork ? options.PreserveOriginalAudio : true,
             doAudioWork ? options.AudioOutputs : null,
-            options.Format == "mkv",
+            options.Format,
             out var audioWarnings,
             autoSetDefault: doAudioWork && options.AutoSetDefaultTrack) + " ";
 
@@ -2764,9 +2772,9 @@ public class TranscodingService
             // subs (passed through as-is via per-stream -c:s:N copy) with the OCR'd SRTs
             // (encoded to the container's native text codec). When MKV pass-through is on,
             // bitmap streams are also kept here so the output has both PGS + OCR'd SRT.
-            string ocrCodec = options.Format == "mkv" ? "srt" : "mov_text";
+            string ocrCodec = FfprobeService.IsMatroska(options.Format) ? "srt" : "mov_text";
 
-            bool passBitmaps = options.Format == "mkv"
+            bool passBitmaps = FfprobeService.IsMatroska(options.Format)
                             && options.PassThroughImageSubtitlesMkv
                             && !dropImageSubtitlesOnly;
 
@@ -2854,13 +2862,13 @@ public class TranscodingService
             // On a mux pass that excludes subs (MuxStreams.Audio), keep every subtitle track by
             // passing an empty language list — MapSub treats that as "keep all".
             var subLangs = doSubtitleWork ? options.SubtitleLanguagesToKeep : new List<string>();
-            bool passBitmaps = options.Format == "mkv"
+            bool passBitmaps = FfprobeService.IsMatroska(options.Format)
                             && options.PassThroughImageSubtitlesMkv
                             && !dropImageSubtitlesOnly;
             subtitleFlags = _ffprobeService.MapSub(
                 workItem.Probe!,
                 subLangs,
-                options.Format == "mkv",
+                options.Format,
                 passBitmaps,
                 excludeSdh:     doSubtitleWork && options.ExcludeSdhSubtitles,
                 autoSetDefault: doSubtitleWork && options.AutoSetDefaultTrack) + " ";
@@ -3145,7 +3153,7 @@ public class TranscodingService
         // would disappear from the output. MP4 always strips bitmap subs (MapSub returns
         // -sn for non-Matroska anyway), so the format check is "are we keeping the MKV
         // copy path AND has the user opted out of pass-through?"
-        bool isMatroskaOutput = string.Equals(options.Format, "mkv", StringComparison.OrdinalIgnoreCase);
+        bool isMatroskaOutput = FfprobeService.IsMatroska(options.Format);
         if (isMatroskaOutput && !options.PassThroughImageSubtitlesMkv)
         {
             foreach (var s in subStreams)
@@ -3671,12 +3679,12 @@ public class TranscodingService
     /// <summary>
     ///     Assembles the final ffmpeg command string from the per-section flag fragments
     ///     produced upstream. The format toggles two things: the container muxer
-    ///     (<c>matroska</c> vs <c>mp4</c>) and the variable flags (MP4 needs
-    ///     <c>-movflags +faststart</c>; MKV doesn't). Extracted from
+    ///     (<c>matroska</c> / <c>mp4</c> / <c>webm</c>) and the variable flags
+    ///     (MP4 needs <c>-movflags +faststart</c>; MKV/WebM don't). Extracted from
     ///     <c>ConvertVideoAsync</c> so the wire format can be unit-tested without
     ///     spinning up the encode pipeline.
     /// </summary>
-    /// <param name="format">"mkv" or "mp4". Anything else is treated as MP4.</param>
+    /// <param name="format">"mkv", "mp4", or "webm". Anything else is treated as MP4.</param>
     /// <param name="initFlags">Hardware init flags (from <see cref="GetInitFlags"/>).</param>
     /// <param name="analyzeFlags">Probe-size / analyze-duration flags.</param>
     /// <param name="inputPath">Source file path. Quoted into the command.</param>
@@ -3699,13 +3707,47 @@ public class TranscodingService
         string subtitleFlags,
         string outputPath)
     {
-        bool isMkv      = string.Equals(format, "mkv", StringComparison.OrdinalIgnoreCase);
-        string varFlags = isMkv
-            ? "-max_muxing_queue_size 9999 "
-            : "-movflags +faststart -max_muxing_queue_size 9999 ";
-        string muxer = isMkv ? "matroska" : "mp4";
+        bool isMp4 = FfprobeService.IsMp4(format);
+        // MP4 alone needs +faststart for progressive playback; MKV and WebM don't.
+        string varFlags = isMp4
+            ? "-movflags +faststart -max_muxing_queue_size 9999 "
+            : "-max_muxing_queue_size 9999 ";
+        string muxer = FormatMuxer(format);
 
         return $"{initFlags} {analyzeFlags}-i \"{inputPath}\" {extraInputs}{videoFlags}{compressionFlags}{audioFlags}{subtitleFlags}{varFlags}-f {muxer} \"{outputPath}\"";
+    }
+
+    /// <summary> Maps an output container token to its ffmpeg <c>-f</c> muxer name. </summary>
+    internal static string FormatMuxer(string format) =>
+        FfprobeService.IsMatroska(format) ? "matroska"
+      : FfprobeService.IsWebm(format)     ? "webm"
+      : "mp4";
+
+    /// <summary> Maps an output container token to its on-disk file extension. </summary>
+    internal static string FormatExtension(string format) =>
+        FfprobeService.IsMatroska(format) ? ".mkv"
+      : FfprobeService.IsWebm(format)     ? ".webm"
+      : ".mp4";
+
+    /// <summary>
+    ///     Coerces the per-job options clone so the encode is internally consistent when
+    ///     <see cref="EncoderOptions.Format"/> is <c>"webm"</c>. WebM's official codec list is
+    ///     AV1/VP9/VP8 + Opus/Vorbis; ffmpeg's <c>webm</c> muxer rejects everything else. This
+    ///     forces <c>Codec=av1</c> + <c>Encoder=libsvtav1</c> when the user picked H.264/H.265,
+    ///     so the rest of the pipeline doesn't have to think about it. Audio coercion happens
+    ///     inside <see cref="FfprobeService.MapAudio"/>.
+    /// </summary>
+    private async Task CoerceForWebmAsync(WorkItem workItem, EncoderOptions options)
+    {
+        if (!FfprobeService.IsWebm(options.Format)) return;
+
+        if (!string.Equals(options.Codec, "av1", StringComparison.OrdinalIgnoreCase))
+        {
+            await LogAsync(workItem.Id,
+                $"WebM output requires AV1 video — coercing codec from '{options.Codec}' to 'av1'.");
+            options.Codec   = "av1";
+            options.Encoder = "libsvtav1";
+        }
     }
 
     internal static (string target, string min, string max, bool copy) CalculateBitrates(WorkItem workItem, EncoderOptions options)
@@ -4523,7 +4565,7 @@ public class TranscodingService
     private string GetOutputPath(WorkItem workItem, EncoderOptions options)
     {
         string fileName = _fileService.RemoveExtension(workItem.FileName);
-        string extension = options.Format == "mkv" ? ".mkv" : ".mp4";
+        string extension = FormatExtension(options.Format);
         string snacksName = $"{fileName} [snacks]{extension}";
 
         if (!string.IsNullOrEmpty(options.EncodeDirectory))
@@ -5328,7 +5370,7 @@ public class TranscodingService
         // streams. Bitmap streams (PGS/VOBSUB/DVB) are the most common cause of subtitle
         // failures; many failures clear once they're removed without sacrificing the rest
         // of the user's subtitles. Only relevant when the user opted into MKV pass-through.
-        bool wasPassingBitmaps = options.Format == "mkv" && options.PassThroughImageSubtitlesMkv;
+        bool wasPassingBitmaps = FfprobeService.IsMatroska(options.Format) && options.PassThroughImageSubtitlesMkv;
         if (!subtitlesWereStripped && !imageSubtitlesAlreadyDropped && wasPassingBitmaps)
         {
             await LogAsync(workItem.Id, "Retrying without image-based subtitles...");
