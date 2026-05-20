@@ -96,6 +96,15 @@ public class TranscodingService
     /// </summary>
     private string _localNodeId = "master-local";
 
+    /// <summary>
+    ///     Codecs we've already logged an "auto → CPU software fallback" message
+    ///     for in this process. Deduped per codec so a queue full of AV1 files on
+    ///     a machine without AV1 hardware doesn't spam one line per job — the user
+    ///     gets a single explanation when the first job dispatches to CPU. Resets
+    ///     on process restart. Accessed under the scheduler semaphore, so no lock.
+    /// </summary>
+    private readonly HashSet<string> _loggedAutoCpuFallback = new();
+
     /// <summary>Lock protecting per-job <see cref="ActiveLocalJob.Process"/> publication.</summary>
     private readonly object _activeLock = new();
 
@@ -2031,7 +2040,11 @@ public class TranscodingService
     ///     <para>CPU rules:
     ///     <list type="bullet">
     ///         <item><c>none</c> (Software): CPU is the only acceptable slot.</item>
-    ///         <item><c>auto</c> on a machine with no hardware encoders: CPU is the auto-fallback.</item>
+    ///         <item><c>auto</c> on a machine where no hardware encoder supports the requested codec:
+    ///               CPU is the auto-fallback. Mirrors <c>VideoJobRouter</c>'s
+    ///               <c>nodeHasUsableHardware</c> predicate for the cluster path, so a node with
+    ///               hardware that can't do the chosen codec (e.g. UHD 630 + AV1) falls back to
+    ///               software instead of deadlocking the queue.</item>
     ///         <item>Anything else: CPU is excluded so jobs queue rather than spilling onto a slow software encode.</item>
     ///     </list></para>
     /// </summary>
@@ -2043,20 +2056,12 @@ public class TranscodingService
         if (devices.Count == 0) return null;
 
         var hwPref = (options.HardwareAcceleration ?? "auto").ToLowerInvariant();
-        bool hasHardware = devices.Any(d => d.DeviceId != "cpu");
+        bool hasHardwareThatCanEncode = devices.Any(d =>
+            d.DeviceId != "cpu" && DeviceCanEncode(d.DeviceId, workItem, options));
 
         foreach (var device in devices)
         {
-            bool isCpu = device.DeviceId == "cpu";
-
-            // Hardware-vs-CPU gating.
-            if (hwPref == "none" && !isCpu) continue;                          // Software ⇒ CPU only
-            if (hwPref != "none" && hwPref != "auto" && isCpu) continue;       // Specific vendor ⇒ never CPU
-            if (hwPref == "auto" && isCpu && hasHardware) continue;            // Auto with HW ⇒ never CPU
-
-            // Specific-vendor preference must match the device family exactly.
-            if (hwPref != "auto" && hwPref != "none"
-                && !string.Equals(hwPref, device.DeviceId, StringComparison.OrdinalIgnoreCase)) continue;
+            if (!IsDeviceEligibleUnderHwPref(device.DeviceId, hwPref, hasHardwareThatCanEncode)) continue;
 
             // Skip devices that can't encode this item's target codec —
             // the ledger only cares about capacity, not codec compatibility.
@@ -2066,9 +2071,46 @@ public class TranscodingService
             // is at capacity (MaxConcurrency / DefaultConcurrency / cpu=1)
             // or disabled (resolver returns 0).
             if (_slotLedger.TryReserve(_localNodeId, device.DeviceId, workItem.Id, workItem.FileName))
+            {
+                // Surface a one-time per-codec log when Auto lands on CPU because
+                // no hardware device can encode the codec. Otherwise the user sees
+                // jobs run slowly (or, before this fix, not at all) with no signal
+                // — the GitHub issue that motivated the fix called out "no errors
+                // reported to help track down the cause".
+                if (device.DeviceId == "cpu" && hwPref == "auto")
+                {
+                    var codec = (options.Codec ?? "").ToLowerInvariant();
+                    if (_loggedAutoCpuFallback.Add(codec))
+                        Console.WriteLine(
+                            $"No hardware encoder for '{codec}' on any detected device — " +
+                            $"using software fallback ({GetSoftwareFallbackEncoder(options)}). " +
+                            "Encodes will be significantly slower.");
+                }
                 return device.DeviceId;
+            }
         }
         return null;
+    }
+
+    /// <summary>
+    ///     Pure hw-vs-CPU gating predicate, extracted from
+    ///     <see cref="TryReserveLocalDeviceSlot"/> so it can be exercised by unit
+    ///     tests without standing up a slot ledger or detected-device list. Encodes
+    ///     the four-rule eligibility ladder used by both the local-master dispatcher
+    ///     and (in spirit) <c>VideoJobRouter.ScoreSlot</c> for cluster routing.
+    /// </summary>
+    internal static bool IsDeviceEligibleUnderHwPref(
+        string deviceId,
+        string hwPref,
+        bool hasHardwareThatCanEncode)
+    {
+        bool isCpu = deviceId == "cpu";
+        if (hwPref == "none" && !isCpu) return false;                              // Software ⇒ CPU only
+        if (hwPref != "none" && hwPref != "auto" && isCpu) return false;           // Specific vendor ⇒ never CPU
+        if (hwPref == "auto" && isCpu && hasHardwareThatCanEncode) return false;   // Auto with usable HW ⇒ never CPU
+        if (hwPref != "auto" && hwPref != "none"
+            && !string.Equals(hwPref, deviceId, StringComparison.OrdinalIgnoreCase)) return false; // Specific vendor must match
+        return true;
     }
 
     /// <summary>
@@ -2080,15 +2122,27 @@ public class TranscodingService
     private bool DeviceCanEncode(string deviceId, WorkItem workItem, EncoderOptions options)
     {
         var device = GetDetectedDevices().FirstOrDefault(d => d.DeviceId == deviceId);
-        if (device == null) return deviceId == "cpu"; // CPU always works as a fallback
+        return CanDeviceEncodeCodec(device, deviceId, options.Codec);
+    }
 
-        var codec = (options.Codec ?? "").ToLowerInvariant();
-        var key   = codec switch
+    /// <summary>
+    ///     Pure codec-vs-device match, extracted from <see cref="DeviceCanEncode"/>
+    ///     so it can be unit-tested without standing up the detected-device list.
+    ///     CPU (no detected device row) is treated as always-capable. Unknown codecs
+    ///     return <see langword="true"/> so the value is handed to ffmpeg untouched
+    ///     rather than synthesising a refusal.
+    /// </summary>
+    internal static bool CanDeviceEncodeCodec(HardwareDevice? device, string deviceId, string? codec)
+    {
+        if (device == null) return deviceId == "cpu";
+
+        var codecLc = (codec ?? "").ToLowerInvariant();
+        var key = codecLc switch
         {
             "hevc" or "h265" => "h265",
             "avc"  or "h264" => "h264",
             "av1"            => "av1",
-            _                => codec,
+            _                => codecLc,
         };
         if (string.IsNullOrEmpty(key)) return true; // unknown codec — let ffmpeg decide
         return device.SupportedCodecs.Any(c => c.Equals(key, StringComparison.OrdinalIgnoreCase));
