@@ -341,6 +341,33 @@ public sealed class HardwareEncoderTests
     }
 
 
+    /// <summary>
+    ///     Rows: (UI preset, expected AMF quality preset). AMF only exposes three steps
+    ///     — speed / balanced / quality — so the five UI presets collapse onto that
+    ///     ladder. Anything unrecognised lands on "balanced", which is AMF's own
+    ///     default and matches the UI's default of "medium".
+    /// </summary>
+    public static IEnumerable<object[]> AmfPresetRows() => new[]
+    {
+        new object[] { "veryslow",  "quality"  },
+        new object[] { "slow",      "quality"  },
+        new object[] { "medium",    "balanced" },
+        new object[] { "fast",      "speed"    },
+        new object[] { "veryfast",  "speed"    },
+        new object[] { "VERYSLOW",  "quality"  }, // case-insensitive
+        new object[] { "",          "balanced" }, // unknown → default
+        new object[] { "garbage",   "balanced" },
+        new object[] { "ultrafast", "balanced" }, // not in the ladder → default
+    };
+
+    [Theory]
+    [MemberData(nameof(AmfPresetRows))]
+    public void MapAmfPreset_handles_known_and_unknown_inputs(string preset, string expected)
+    {
+        TranscodingService.MapAmfPreset(preset).Should().Be(expected);
+    }
+
+
     /// <summary>Rows: (target string, expected height). Unknown targets fall back to 1080p.</summary>
     public static IEnumerable<object[]> DownscaleTargetRows() => new[]
     {

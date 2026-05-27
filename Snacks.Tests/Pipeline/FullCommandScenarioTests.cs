@@ -113,14 +113,18 @@ public sealed class FullCommandScenarioTests
 
         string videoMap = _ffprobe.MapVideo(probe);
 
-        // Preset: SVT-AV1 takes a numeric preset, VAAPI takes none, others take the user string.
+        // Preset: SVT-AV1 takes a numeric preset, VAAPI takes none, AMF takes its own
+        // three-step quality ladder, others take the user string.
+        bool isAmf = encoder.Contains("amf");
         string presetFlag = videoCopy
             ? ""
             : useVaapi
                 ? ""
                 : isSvtAv1
                     ? $"-preset {TranscodingService.MapSvtAv1Preset(options.FfmpegQualityPreset)} "
-                    : $"-preset {options.FfmpegQualityPreset} ";
+                    : isAmf
+                        ? $"-quality {TranscodingService.MapAmfPreset(options.FfmpegQualityPreset)} "
+                        : $"-preset {options.FfmpegQualityPreset} ";
 
         // Build the -vf filter chain (or empty when nothing applies). This is the missing
         // wiring — without it scale/tonemap/crop wouldn't surface in the assembled command.

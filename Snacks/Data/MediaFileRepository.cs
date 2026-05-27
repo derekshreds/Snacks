@@ -537,6 +537,22 @@ public class MediaFileRepository
         }
 
         /// <summary>
+        ///     Deletes the row for a single file by its normalized path. Used by the
+        ///     mid-cycle missing-source cleanup so callers don't have to wait for the
+        ///     next scan's <see cref="PruneDeletedFilesAsync" /> sweep.
+        /// </summary>
+        /// <param name="normalizedPath"> The normalized absolute path of the row to remove. </param>
+        /// <returns> <see langword="true" /> if a row was deleted, <see langword="false" /> if no row matched. </returns>
+        public async Task<bool> RemoveByPathAsync(string normalizedPath)
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            var deleted = await context.MediaFiles
+                .Where(f => f.FilePath == normalizedPath)
+                .ExecuteDeleteAsync();
+            return deleted > 0;
+        }
+
+        /// <summary>
         ///     Removes database records for files that no longer exist on disk.
         ///     Processes in batches of 1000 to bound per-iteration memory consumption.
         /// </summary>

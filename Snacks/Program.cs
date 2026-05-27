@@ -212,6 +212,7 @@ builder.Services.AddScoped<ClusterAuthFilter>();
 builder.Services.AddScoped<LocalNetworkOnlyFilter>();
 builder.Services.AddSingleton<AutoScanService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<AutoScanService>());
+builder.Services.AddHostedService<LogRetentionService>();
 
 var app = builder.Build();
 
