@@ -485,7 +485,7 @@ public sealed class FullCommandScenarioTests
 
         // VAAPI rate-control uses CQP, not -b:v.
         cmd.Should().Contain("-rc_mode CQP");
-        cmd.Should().Contain("-global_quality 25");
+        cmd.Should().Contain("-global_quality:v 25");
     }
 
 
@@ -554,7 +554,7 @@ public sealed class FullCommandScenarioTests
         // Encoder + VAAPI-only rate-control (CQP, no -b:v).
         cmd.Should().Contain("-c:v hevc_vaapi");
         cmd.Should().Contain("-rc_mode CQP");
-        cmd.Should().Contain("-global_quality 25");
+        cmd.Should().Contain("-global_quality:v 25");
         cmd.Should().NotContain("-b:v ");
 
         // VAAPI takes no -preset.

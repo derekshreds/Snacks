@@ -2668,7 +2668,7 @@ public class TranscodingService
             }
             else
             {
-                compressionFlags = $"-g 25 -rc_mode CQP -global_quality {quality} ";
+                compressionFlags = $"-g 25 -rc_mode CQP -global_quality:v {quality} ";
             }
         }
         else if (encoder == "libsvtav1")
@@ -4010,7 +4010,7 @@ public class TranscodingService
     {
         int maxBitrateVal = int.Parse(maxBitrate.TrimEnd('k'));
         if (useVaapi)
-            return $"-g 25 -rc_mode CQP -global_quality 25 ";
+            return $"-g 25 -rc_mode CQP -global_quality:v 25 ";
         if (isSvtAv1)
         {
             long tbr = long.Parse(targetBitrate.TrimEnd('k'));
@@ -4425,7 +4425,7 @@ public class TranscodingService
             if (encoder.Contains("vaapi"))
             {
                 vf = "-vf format=nv12|vaapi,hwupload";
-                extra = "-rc_mode CQP -global_quality 25";
+                extra = "-rc_mode CQP -global_quality:v 25";
             }
             else
             {
@@ -5180,7 +5180,7 @@ public class TranscodingService
     private async Task<long> RunTestEncodeAsync(string inputPath, string initFlags, string encoder, string hwFilter, string lpFlag, int qp, string seekTime, int duration)
     {
         string command = $"{initFlags} -ss {seekTime} -i \"{inputPath}\" -t {duration} " +
-            $"-c:v {encoder} {lpFlag}{hwFilter} -g 25 -rc_mode CQP -global_quality {qp} " +
+            $"-c:v {encoder} {lpFlag}{hwFilter} -g 25 -rc_mode CQP -global_quality:v {qp} " +
             $"-an -sn -f null -";
 
         Console.WriteLine($"Calibration command: ffmpeg {command}");

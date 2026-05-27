@@ -32,7 +32,7 @@ public sealed class RateControlAndScaleTests
             useConservativeHwFlags: false);
 
         flags.Should().Contain("-rc_mode CQP");
-        flags.Should().Contain("-global_quality 25");
+        flags.Should().Contain("-global_quality:v 25");
         // VAAPI doesn't drive bitrate via -b:v in this path (CQP is quality-based).
         flags.Should().NotContain("-b:v");
     }
