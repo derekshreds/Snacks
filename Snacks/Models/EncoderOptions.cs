@@ -67,6 +67,24 @@ public sealed class EncoderOptions
     /// <summary> FFmpeg quality preset string (e.g. "medium", "slow"). </summary>
     public string FfmpegQualityPreset { get; set; } = "medium";
 
+    /// <summary>
+    ///     Optional H.264 profile override for libx264 encodes. <see langword="null"/>
+    ///     lets libx264 pick (High in most cases). Set to <c>"baseline"</c>, <c>"main"</c>, or
+    ///     <c>"high"</c> to force a profile for device compatibility &mdash; the iPod Classic
+    ///     preset uses this to emit <c>-profile:v baseline -level 3.0 -bf 0 -coder 0 -pix_fmt yuv420p</c>
+    ///     because iPod 5G/Classic hardware decoders strictly require Baseline + level 3.0
+    ///     and reject any stream with B-frames or CABAC. Ignored for non-libx264 encoders.
+    /// </summary>
+    public string? H264Profile { get; set; }
+
+    /// <summary>
+    ///     Optional H.264 level override (e.g. <c>"3.0"</c>, <c>"4.0"</c>) for libx264 encodes.
+    ///     Only honored when <see cref="H264Profile"/> is non-<see langword="null"/>. Combined
+    ///     with the profile to emit <c>-level &lt;value&gt;</c>. <see langword="null"/> lets
+    ///     libx264 auto-select per the resolution/bitrate combination.
+    /// </summary>
+    public string? H264Level { get; set; }
+
     /******************************************************************
      *  Audio
      ******************************************************************/
@@ -236,6 +254,37 @@ public sealed class EncoderOptions
      ******************************************************************/
 
     /// <summary>
+    ///     Clears every field whose value only makes sense on the machine that
+    ///     configured it - currently <see cref="OutputDirectory"/> and
+    ///     <see cref="EncodeDirectory"/>. Used by the policy layer: a policy is
+    ///     a portable bundle that the user can share with another install, so
+    ///     baking in <c>/mnt/myraid/output</c> from the author's machine would
+    ///     be meaningless (and surprising) on the importing machine. Both
+    ///     "save current as policy" and "import from file" run this on the
+    ///     snapshot before persisting.
+    /// </summary>
+    public void ClearMachineLocalFields()
+    {
+        OutputDirectory = null;
+        EncodeDirectory = null;
+    }
+
+    /// <summary>
+    ///     Copies machine-local fields from <paramref name="source"/> into this
+    ///     instance, leaving every other field alone. Used when applying a policy:
+    ///     the policy controls encoding decisions but the user's local
+    ///     <see cref="OutputDirectory"/> / <see cref="EncodeDirectory"/> must
+    ///     survive the switch - otherwise picking a new policy would silently
+    ///     unset paths the user explicitly configured.
+    /// </summary>
+    public void MergeMachineLocalFrom(EncoderOptions source)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        OutputDirectory = source.OutputDirectory;
+        EncodeDirectory = source.EncodeDirectory;
+    }
+
+    /// <summary>
     ///     Deep copy of this options instance. The two language lists are
     ///     cloned so per-item mutation can't bleed back into shared state.
     /// </summary>
@@ -249,6 +298,8 @@ public sealed class EncoderOptions
         FourKBitrateMultiplier     = FourKBitrateMultiplier,
         Skip4K                     = Skip4K,
         FfmpegQualityPreset        = FfmpegQualityPreset,
+        H264Profile                = H264Profile,
+        H264Level                  = H264Level,
         TwoChannelAudio            = TwoChannelAudio,
         AudioLanguagesToKeep       = new List<string>(AudioLanguagesToKeep),
         KeepOriginalLanguage       = KeepOriginalLanguage,

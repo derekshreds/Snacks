@@ -182,6 +182,8 @@ builder.Services.AddSingleton<FfprobeService>();
 builder.Services.AddSingleton<FileService>();
 builder.Services.AddSingleton<LogArchiveService>();
 builder.Services.AddSingleton<ConfigFileService>();
+builder.Services.AddSingleton<PolicyService>();
+builder.Services.AddSingleton<SettingsPersistenceService>();
 builder.Services.AddHttpClient();
 builder.Services.AddSingleton<NotificationService>();
 builder.Services.AddSingleton<IntegrationService>();

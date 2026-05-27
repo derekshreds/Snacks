@@ -1,0 +1,296 @@
+@*
+    Policies tab (a.k.a. "Quick Setups").
+
+    Per the PM strategy doc, this is a first-class product surface, not a settings
+    convenience. Layout reflects that:
+
+      1. ONE dropdown picks the active or previewed policy. "+ Save current as new
+         policy..." is the last option, after a separator.
+      2. A tagline + status line under the picker tells the user, in plain English,
+         what they're looking at and whether it's currently applied.
+      3. An outcome-bullet list is the PRIMARY explanation: "Files end up roughly
+         half the size", "Plays on phones, TVs, browsers". Never tech specs at this
+         level - those are for power users behind the advanced disclosure.
+      4. A "Show technical settings" disclosure reveals the per-field diff table for
+         power users / auditing. Closed by default.
+      5. Footer with Apply / Cancel only lights up when there's something to do.
+      6. Manage menu (...) top-right exposes Rename / Duplicate / Delete / Export /
+         Import. Built-ins disable Rename and Delete.
+*@
+
+<div id="policiesPanel">
+
+    <div class="encoder-panel rounded">
+
+        <!-- Section title + Manage menu --------------------------------- -->
+        <div class="d-flex align-items-center mb-3">
+            <h6 class="fw-bold mb-0 flex-grow-1">
+                <i class="fas fa-wand-magic-sparkles me-2 text-primary"></i>
+                Quick Setups
+            </h6>
+
+            <div class="dropdown">
+                <button type="button"
+                        class="btn btn-sm btn-outline-secondary dropdown-toggle"
+                        id="policiesManageBtn"
+                        data-bs-toggle="dropdown"
+                        aria-expanded="false"
+                        title="Rename, duplicate, delete, import or export">
+                    <i class="fas fa-ellipsis"></i>
+                    <span class="visually-hidden">Manage</span>
+                </button>
+                <ul class="dropdown-menu dropdown-menu-end" aria-labelledby="policiesManageBtn">
+                    <li>
+                        <button type="button" class="dropdown-item" data-policies-action="rename">
+                            <i class="fas fa-pen fa-fw me-2"></i>Edit details&hellip;
+                        </button>
+                    </li>
+                    <li>
+                        <button type="button" class="dropdown-item" data-policies-action="duplicate">
+                            <i class="fas fa-clone fa-fw me-2"></i>Duplicate
+                        </button>
+                    </li>
+                    <li>
+                        <button type="button" class="dropdown-item text-danger" data-policies-action="delete">
+                            <i class="fas fa-trash fa-fw me-2"></i>Delete&hellip;
+                        </button>
+                    </li>
+                    <li><hr class="dropdown-divider"></li>
+                    <li>
+                        <button type="button" class="dropdown-item" data-policies-action="export">
+                            <i class="fas fa-download fa-fw me-2"></i>Export to file&hellip;
+                        </button>
+                    </li>
+                    <li>
+                        <button type="button" class="dropdown-item" data-policies-action="import">
+                            <i class="fas fa-upload fa-fw me-2"></i>Import from file&hellip;
+                        </button>
+                    </li>
+                </ul>
+                <input type="file"
+                       id="policiesImportFile"
+                       accept=".json,.snackspolicy.json,application/json"
+                       hidden>
+            </div>
+        </div>
+
+        <!-- Picker ------------------------------------------------------- -->
+        <div class="mb-2">
+            <label for="policiesSelect" class="form-label">Choose a setup</label>
+            <select class="form-select" id="policiesSelect" aria-describedby="policiesTagline">
+                <option value="" disabled selected>Loading&hellip;</option>
+            </select>
+        </div>
+
+        <!-- Status line: "Now using" / "Trying out" + tagline + Recommended badge -->
+        <div class="d-flex flex-wrap align-items-center gap-2 mb-2" id="policiesStatusLine">
+            <span class="small" id="policiesStatusBadge">
+                <i class="fas fa-circle-check text-success me-1"></i>
+                <strong>Now using</strong>
+            </span>
+            <span class="text-muted small">&middot;</span>
+            <span class="small text-muted" id="policiesTagline">&mdash;</span>
+            <span class="badge bg-primary-subtle text-primary border border-primary-subtle ms-1" id="policiesRecommendedBadge" style="display:none;">
+                <i class="fas fa-star me-1"></i>Recommended
+            </span>
+        </div>
+
+        <!-- Outcome bullets - the PRIMARY explanation for non-experts.
+             Heading flips between "What this does to your library:" (steady/drifted)
+             and "Switching to {name} will:" (previewing). JS owns the text. -->
+        <div class="mt-3 mb-3" id="policiesOutcomeSection">
+            <div class="text-muted small mb-2" id="policiesOutcomeHeading">
+                What this does to your library:
+            </div>
+            <ul class="list-unstyled mb-0" id="policiesOutcomeList">
+                <!-- populated by policies-panel.js -->
+            </ul>
+        </div>
+
+        <!-- Drifted-mode banner: "You started from X but customized it." JS toggles. -->
+        <div class="alert alert-secondary py-2 px-3 small mb-3" id="policiesDriftedBanner" style="display:none;">
+            <i class="fas fa-circle-info me-1 text-warning"></i>
+            <span id="policiesDriftedBannerText">You started from this setup but customized it. Your changes are saved.</span>
+        </div>
+
+        <!-- Advanced disclosure. Custom styling — Bootstrap's btn-link defaults to
+             link-blue, which clashes hard with the rest of the purple/dark palette. -->
+        <div class="mb-3">
+            <button type="button"
+                    class="policies-disclosure"
+                    id="policiesAdvancedToggle"
+                    aria-expanded="false"
+                    aria-controls="policiesAdvancedSection">
+                <i class="fas fa-chevron-right me-1 small policies-disclosure-chev" id="policiesAdvancedChevron"></i>
+                <span id="policiesAdvancedToggleLabel">Show technical settings</span>
+            </button>
+        </div>
+
+        <!-- Technical settings table - hidden by default. Styling mirrors the
+             dashboard's .dash-table: small uppercase headers in text-secondary,
+             thin bottom borders only (no harsh grid), subtle primary hover tint.
+             Diff row indicator is a left-edge accent + bold weight on the changed
+             value cell - no swap-arrow icons (noise) and no surrounding border-box. -->
+        <div id="policiesAdvancedSection" style="display:none;">
+            <table class="policies-table mb-3" id="policiesTable">
+                <thead>
+                    <tr>
+                        <th style="min-width: 14rem;">Setting</th>
+                        <th id="policiesColCurrent"  style="min-width: 12rem;">Value</th>
+                        <th id="policiesColSelected" style="min-width: 12rem; display:none;">Selected</th>
+                    </tr>
+                </thead>
+                <tbody id="policiesTableBody"></tbody>
+            </table>
+        </div>
+
+        <!-- Empty state: no policies at all. Built-ins always seed, so this only
+             ever shows if config is wedged - kept for safety. -->
+        <div id="policiesEmptyState" class="text-muted text-center py-5" style="display:none;">
+            <i class="fas fa-wand-magic-sparkles fa-2x mb-2 text-secondary"></i>
+            <div class="mb-1"><strong>No quick setups available yet.</strong></div>
+            <div class="form-text mb-3">
+                Save your current encoder settings as your own setup, or import a
+                <code>.snackspolicy.json</code> file shared by another Snacks install.
+            </div>
+            <button type="button" class="btn btn-sm btn-outline-primary me-1" data-policies-action="save-as">
+                <i class="fas fa-floppy-disk me-1"></i> Save current as new setup&hellip;
+            </button>
+            <button type="button" class="btn btn-sm btn-outline-secondary" data-policies-action="import">
+                <i class="fas fa-upload me-1"></i> Import&hellip;
+            </button>
+        </div>
+
+        <!-- Footer ------------------------------------------------------ -->
+        <div class="d-flex justify-content-end align-items-center gap-2 mt-3 pt-3 border-top">
+            <span class="text-muted small me-auto" id="policiesFooterHint">
+                Edits to other tabs are saved as you go.
+            </span>
+            <button type="button" class="btn btn-sm btn-outline-secondary" id="policiesCancelBtn" disabled>
+                Never mind
+            </button>
+            <button type="button" class="btn btn-sm btn-primary" id="policiesApplyBtn" disabled>
+                <i class="fas fa-check me-1"></i> Use this setup
+            </button>
+        </div>
+
+    </div>
+
+    <!-- Row templates cloned per-row by policies-panel.js. -->
+    <template id="policiesRowSingleTemplate">
+        <tr>
+            <td data-field="label"></td>
+            <td data-field="current"></td>
+        </tr>
+    </template>
+
+    <template id="policiesRowDiffTemplate">
+        <tr>
+            <td data-field="label"></td>
+            <td data-field="current"></td>
+            <td data-field="selected">
+                <span data-field="selected-value"></span>
+            </td>
+        </tr>
+    </template>
+
+    <!-- Outcome-bullet item template. JS clones one per OutcomeBullets entry. -->
+    <template id="policiesBulletTemplate">
+        <li class="mb-2 d-flex align-items-start">
+            <i class="fas fa-circle-check text-success mt-1 me-2"></i>
+            <span data-field="text"></span>
+        </li>
+    </template>
+
+</div>
+
+@*
+    Scoped styles for the Policies pane. Two goals:
+
+      1. The disclosure toggle must read as part of the Snacks purple palette.
+         Bootstrap's btn-link defaults to link-blue and clashes hard with everything
+         else in the modal - so we ship a custom .policies-disclosure that picks up
+         --primary from the global theme.
+
+      2. The advanced table must match the dashboard's table aesthetic (.dash-table
+         style: thin bottom borders only, uppercase small headers in text-secondary,
+         subtle purple hover) rather than Bootstrap's heavy default table look.
+*@
+<style>
+    /* --- Disclosure toggle ------------------------------------------------- */
+    .policies-disclosure {
+        background: transparent;
+        border: 0;
+        padding: 0.25rem 0;
+        color: var(--text-secondary);
+        font-size: 0.875rem;
+        cursor: pointer;
+        transition: color 0.15s ease;
+    }
+    .policies-disclosure:hover,
+    .policies-disclosure[aria-expanded="true"] {
+        color: var(--primary);
+    }
+    .policies-disclosure:focus-visible {
+        outline: 2px solid var(--primary);
+        outline-offset: 2px;
+        border-radius: 3px;
+    }
+    .policies-disclosure-chev {
+        transition: transform 0.15s ease;
+    }
+    .policies-disclosure[aria-expanded="true"] .policies-disclosure-chev {
+        transform: rotate(90deg);
+    }
+
+    /* --- Advanced table --------------------------------------------------- */
+    .policies-table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 0.875rem;
+    }
+    .policies-table thead th {
+        background: transparent;
+        color: var(--text-secondary);
+        font-weight: 600;
+        text-transform: uppercase;
+        font-size: 0.7rem;
+        letter-spacing: 0.04em;
+        padding: 0.5rem 0.75rem;
+        border-bottom: 1px solid var(--border-color);
+        text-align: left;
+    }
+    .policies-table tbody td {
+        padding: 0.55rem 0.75rem;
+        border-bottom: 1px solid var(--border-color);
+        color: var(--text-primary);
+        vertical-align: middle;
+    }
+    .policies-table tbody td:first-child {
+        color: var(--text-secondary);
+    }
+    .policies-table tbody tr:last-child td {
+        border-bottom: 0;
+    }
+    .policies-table tbody tr:hover {
+        background: rgba(139, 92, 246, 0.04);
+    }
+    /* Diff row: thin left-edge accent on the FIRST cell + bold on the SELECTED cell.
+       No row-background fill and no swap-arrow icon - both add visual noise that
+       drowns out the actual change. */
+    .policies-table tr.policy-row-changed td:first-child {
+        box-shadow: inset 3px 0 0 0 var(--primary);
+    }
+    .policies-table tr.policy-row-changed td:nth-child(3) {
+        font-weight: 600;
+        color: var(--text-primary);
+    }
+
+    /* --- Dropdown action entry tint ---------------------------------------- */
+    /* Tints the synthesized "Save current as..." dropdown entry so it reads as
+       an action rather than a policy name. */
+    #policiesSelect option[data-action="save-as"] {
+        color: var(--primary);
+        font-style: italic;
+    }
+</style>

@@ -123,7 +123,8 @@
                 <div class="settings-tabs-wrapper">
                     <button type="button" class="settings-tab-arrow settings-tab-arrow-left" aria-label="Scroll tabs left"><i class="fas fa-chevron-left"></i></button>
                     <ul class="nav nav-tabs settings-tabs" role="tablist">
-                        <li class="nav-item" data-role-visible="master standalone"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#generalTab" type="button" role="tab"><i class="fas fa-sliders me-1"></i> General</button></li>
+                        <li class="nav-item" data-role-visible="master standalone"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#policiesTab" type="button" role="tab"><i class="fas fa-clipboard-list me-1"></i> Policies</button></li>
+                        <li class="nav-item" data-role-visible="master standalone"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#generalTab" type="button" role="tab"><i class="fas fa-sliders me-1"></i> General</button></li>
                         <li class="nav-item" data-role-visible="master standalone"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#audioTab" type="button" role="tab"><i class="fas fa-volume-high me-1"></i> Audio</button></li>
                         <li class="nav-item" data-role-visible="master standalone"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#musicTab" type="button" role="tab"><i class="fas fa-music me-1"></i> Music</button></li>
                         <li class="nav-item" data-role-visible="master standalone"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#subtitleTab" type="button" role="tab"><i class="fas fa-closed-captioning me-1"></i> Subtitles</button></li>
@@ -141,7 +142,8 @@
                     <button type="button" class="settings-tab-arrow settings-tab-arrow-right" aria-label="Scroll tabs right"><i class="fas fa-chevron-right"></i></button>
                 </div>
                 <div class="tab-content mt-3">
-                    <div class="tab-pane fade show active" id="generalTab"      role="tabpanel" data-role-visible="master standalone">@await Html.PartialAsync("_GeneralSettings", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })</div>
+                    <div class="tab-pane fade show active" id="policiesTab"     role="tabpanel" data-role-visible="master standalone">@await Html.PartialAsync("_PoliciesSettings")</div>
+                    <div class="tab-pane fade"             id="generalTab"      role="tabpanel" data-role-visible="master standalone">@await Html.PartialAsync("_GeneralSettings", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })</div>
                     <div class="tab-pane fade"             id="audioTab"        role="tabpanel" data-role-visible="master standalone">@await Html.PartialAsync("_AudioSettings", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })</div>
                     <div class="tab-pane fade"             id="musicTab"        role="tabpanel" data-role-visible="master standalone">@await Html.PartialAsync("_MusicSettings", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })</div>
                     <div class="tab-pane fade"             id="subtitleTab"     role="tabpanel" data-role-visible="master standalone">@await Html.PartialAsync("_SubtitleSettings", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })</div>

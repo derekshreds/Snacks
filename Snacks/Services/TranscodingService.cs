@@ -2712,9 +2712,28 @@ public class TranscodingService
             ? (useLowPower ? "-low_power 1 " : "")
             : isSvtAv1 ? $"-preset {MapSvtAv1Preset(options.FfmpegQualityPreset)} "
                         : $"-preset {options.FfmpegQualityPreset} ";
+
+        // libx264 profile/level override - emitted only for the software H.264 encoder
+        // and only when the user (or the iPod-class preset) explicitly pinned a profile.
+        // The baseline-profile flags are non-negotiable for iPod 5G/Classic playback:
+        // libx264's default High profile enables CABAC and B-frames, both of which the
+        // iPod hardware decoder rejects. -bf 0 disables B-frames, -coder 0 selects CAVLC
+        // (Baseline's required entropy coder), -pix_fmt yuv420p locks the chroma layout
+        // to what Baseline allows.
+        string h264ProfileFlag = "";
+        if (encoder == "libx264" && !string.IsNullOrEmpty(options.H264Profile))
+        {
+            var profile = options.H264Profile.Trim().ToLowerInvariant();
+            h264ProfileFlag = $"-profile:v {profile} ";
+            if (!string.IsNullOrEmpty(options.H264Level))
+                h264ProfileFlag += $"-level {options.H264Level} ";
+            if (profile == "baseline")
+                h264ProfileFlag += "-bf 0 -coder 0 -pix_fmt yuv420p ";
+        }
+
         string videoFlags = videoCopy ?
             $"{_ffprobeService.MapVideo(workItem.Probe!)} -c:v copy " :
-            $"{_ffprobeService.MapVideo(workItem.Probe!)} -c:v {encoder} {presetFlag}{vfFlag}";
+            $"{_ffprobeService.MapVideo(workItem.Probe!)} -c:v {encoder} {presetFlag}{h264ProfileFlag}{vfFlag}";
 
         // On a mux pass that excludes audio (MuxStreams.Subtitles), keep every audio track as-is:
         // empty language list = keep all, preserve-only profile = no re-encode.
@@ -3886,6 +3905,7 @@ public class TranscodingService
         "1080p" => 1080,
         "720p"  => 720,
         "480p"  => 480,
+        "240p"  => 240,
         _       => 1080,
     };
 

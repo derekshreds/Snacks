@@ -16,30 +16,24 @@ namespace Snacks.Controllers;
 [ApiController]
 public sealed class SettingsController : ControllerBase
 {
-    private readonly TranscodingService  _transcodingService;
-    private readonly FileService         _fileService;
-    private readonly MediaFileRepository _mediaFileRepo;
+    private readonly TranscodingService          _transcodingService;
+    private readonly MediaFileRepository         _mediaFileRepo;
+    private readonly SettingsPersistenceService  _settingsPersistence;
     private readonly ILogger<SettingsController>? _log;
-
-    private static readonly JsonSerializerOptions _jsonOptions = new()
-    {
-        WriteIndented            = true,
-        PropertyNameCaseInsensitive = true,
-    };
 
     public SettingsController(
         TranscodingService transcodingService,
-        FileService fileService,
         MediaFileRepository mediaFileRepo,
+        SettingsPersistenceService settingsPersistence,
         ILogger<SettingsController>? logger = null)
     {
         ArgumentNullException.ThrowIfNull(transcodingService);
-        ArgumentNullException.ThrowIfNull(fileService);
         ArgumentNullException.ThrowIfNull(mediaFileRepo);
-        _transcodingService = transcodingService;
-        _fileService        = fileService;
-        _mediaFileRepo      = mediaFileRepo;
-        _log                = logger;
+        ArgumentNullException.ThrowIfNull(settingsPersistence);
+        _transcodingService  = transcodingService;
+        _mediaFileRepo       = mediaFileRepo;
+        _settingsPersistence = settingsPersistence;
+        _log                 = logger;
     }
 
     /******************************************************************
@@ -53,29 +47,8 @@ public sealed class SettingsController : ControllerBase
     [HttpGet]
     public IActionResult Get()
     {
-        var path   = GetSettingsPath();
-        var backup = path + ".bak";
-
-        foreach (var candidate in new[] { path, backup })
-        {
-            if (!System.IO.File.Exists(candidate)) continue;
-            try
-            {
-                var json   = System.IO.File.ReadAllText(candidate);
-                var parsed = JsonSerializer.Deserialize<EncoderOptions>(json, _jsonOptions);
-                if (parsed == null) continue;
-
-                MigrateLegacyAudioIfNeeded(parsed, json);
-                return new JsonResult(parsed);
-            }
-            catch
-            {
-                Console.WriteLine($"Settings file corrupted: {candidate}");
-            }
-        }
-
-        // Fresh install / no saved file — defaults are already in the new shape, no migration.
-        return new JsonResult(new EncoderOptions());
+        var (options, _) = _settingsPersistence.LoadWithRawJson();
+        return new JsonResult(options ?? new EncoderOptions());
     }
 
     /// <summary>
@@ -88,10 +61,7 @@ public sealed class SettingsController : ControllerBase
     ///     shape, migration is permanently a no-op for that file.
     /// </summary>
     internal static void MigrateLegacyAudioIfNeeded(EncoderOptions parsed, string rawJson)
-    {
-        if (HasNewAudioShape(rawJson)) return;
-        parsed.ApplyLegacyAudioMigration();
-    }
+        => SettingsPersistenceService.MigrateLegacyAudioIfNeeded(parsed, rawJson);
 
     /// <summary>
     ///     Returns <see langword="true"/> when the raw JSON carries either
@@ -100,24 +70,7 @@ public sealed class SettingsController : ControllerBase
     ///     value is the empty default — and migration must respect that.
     /// </summary>
     internal static bool HasNewAudioShape(string rawJson)
-    {
-        try
-        {
-            using var doc = JsonDocument.Parse(rawJson);
-            if (doc.RootElement.ValueKind != JsonValueKind.Object) return false;
-
-            foreach (var prop in doc.RootElement.EnumerateObject())
-            {
-                if (string.Equals(prop.Name, "PreserveOriginalAudio", StringComparison.OrdinalIgnoreCase)) return true;
-                if (string.Equals(prop.Name, "AudioOutputs",          StringComparison.OrdinalIgnoreCase)) return true;
-            }
-            return false;
-        }
-        catch
-        {
-            return false;
-        }
-    }
+        => SettingsPersistenceService.HasNewAudioShape(rawJson);
 
     /// <summary>
     ///     Persists updated encoder settings using an atomic write-then-rename. The previous
@@ -134,30 +87,7 @@ public sealed class SettingsController : ControllerBase
     {
         try
         {
-            var path   = GetSettingsPath();
-            var backup = path + ".bak";
-            var temp   = path + ".tmp";
-            var json   = JsonSerializer.Serialize(settings, _jsonOptions);
-
-            System.IO.File.WriteAllText(temp, json);
-            if (System.IO.File.Exists(path))
-                System.IO.File.Copy(path, backup, overwrite: true);
-            System.IO.File.Move(temp, path, overwrite: true);
-
-            try
-            {
-                var parsed = JsonSerializer.Deserialize<EncoderOptions>(json, _jsonOptions);
-                if (parsed != null)
-                {
-                    MigrateLegacyAudioIfNeeded(parsed, json);
-                    _transcodingService.UpdateOptions(parsed);
-                }
-            }
-            catch
-            {
-                /* non-fatal — in-memory options retain their previous values */
-            }
-
+            _settingsPersistence.PersistAndActivate(settings);
             return new JsonResult(new { success = true });
         }
         catch (Exception ex)
@@ -203,7 +133,7 @@ public sealed class SettingsController : ControllerBase
 
         try
         {
-            EncoderOptions? options = LoadOptions();
+            EncoderOptions? options = _settingsPersistence.Load();
             if (options == null)
             {
                 return new JsonResult(new
@@ -264,43 +194,5 @@ public sealed class SettingsController : ControllerBase
         {
             _reevaluateLock.Release();
         }
-    }
-
-    /// <summary>
-    ///     Reads the persisted settings from disk into an <see cref="EncoderOptions"/>,
-    ///     applying the legacy audio migration only when the file pre-dates the new shape.
-    ///     Mirrors the read path in <see cref="Get"/> — kept as a private helper so the
-    ///     re-evaluate endpoint and the GET endpoint always see the same shape.
-    /// </summary>
-    private EncoderOptions? LoadOptions()
-    {
-        var path   = GetSettingsPath();
-        var backup = path + ".bak";
-
-        foreach (var candidate in new[] { path, backup })
-        {
-            if (!System.IO.File.Exists(candidate)) continue;
-            try
-            {
-                var json   = System.IO.File.ReadAllText(candidate);
-                var parsed = JsonSerializer.Deserialize<EncoderOptions>(json, _jsonOptions);
-                if (parsed == null) continue;
-                MigrateLegacyAudioIfNeeded(parsed, json);
-                return parsed;
-            }
-            catch { /* fall through to backup or default */ }
-        }
-        return null;
-    }
-
-    /******************************************************************
-     *  Helpers
-     ******************************************************************/
-
-    private string GetSettingsPath()
-    {
-        var configDir = Path.Combine(_fileService.GetWorkingDirectory(), "config");
-        if (!Directory.Exists(configDir)) Directory.CreateDirectory(configDir);
-        return Path.Combine(configDir, "settings.json");
     }
 }

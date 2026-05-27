@@ -98,6 +98,88 @@ export const settingsApi = {
 
 
 // ---------------------------------------------------------------------------
+// Policies
+// ---------------------------------------------------------------------------
+
+/**
+ * Named encoder-policy bundles. Built-ins ship with Snacks and are read-only;
+ * custom policies are user-created via "Save current as…" or by importing a
+ * `.snackspolicy.json` file exported from another install.
+ *
+ * Applying a policy overwrites the current `settings.json` with the policy's
+ * Options block — the same persistence path as `settingsApi.save`.
+ */
+export const policiesApi = {
+    /** Lists every policy (built-ins first, then custom). */
+    list:   ()      => getJson('/api/policies'),
+
+    /**
+     * Returns which policy (if any) the current settings.json matches and whether
+     * the user has tweaked anything since applying it.
+     *
+     * @returns {Promise<{ id: string|null, name: string, modified: boolean }>}
+     */
+    active: ()      => getJson('/api/policies/active'),
+
+    /** Returns one policy by id, or rejects on 404. */
+    get:    (id)    => getJson(`/api/policies/${encodeURIComponent(id)}`),
+
+    /**
+     * Creates a new custom policy. Forwards the entire body verbatim so the wrapper
+     * doesn't have to track which fields the server-side request shape carries -
+     * outcomeBullets is the field this used to silently drop and break custom
+     * bullet display end-to-end.
+     */
+    create: (body) =>
+        postJson('/api/policies', body),
+
+    /** Updates a custom policy. Built-ins return 400. Same forward-everything rule as create. */
+    update: (id, body) =>
+        fetch(`/api/policies/${encodeURIComponent(id)}`, {
+            method:  'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body:    JSON.stringify(body),
+        }).then(r => r.ok ? r.json() : Promise.reject(new Error(`PUT /api/policies/${id} → ${r.status}`))),
+
+    /** Deletes a custom policy. The server rejects deletes of built-ins. */
+    remove: (id) =>
+        deleteJson(`/api/policies/${encodeURIComponent(id)}`),
+
+    /** Server-side clone — typically used to "duplicate this built-in so I can customize it". */
+    duplicate: (id) =>
+        postJson(`/api/policies/${encodeURIComponent(id)}/duplicate`),
+
+    /**
+     * Applies a policy: server overwrites settings.json with the policy's Options
+     * and pushes the new EncoderOptions into the in-memory transcoding service.
+     * Callers should re-run restoreEncoderOptions() afterward to repaint the form.
+     */
+    apply: (id) =>
+        postJson(`/api/policies/${encodeURIComponent(id)}/apply`),
+
+    /**
+     * Triggers a browser download of a single policy as `.snackspolicy.json`.
+     * Uses `window.location` so the browser handles the Content-Disposition save.
+     */
+    exportOne: (id) => {
+        window.location.href = `/api/policies/${encodeURIComponent(id)}/export`;
+    },
+
+    /** Triggers a browser download of every custom policy as one `.snackspolicies.json`. */
+    exportAll: () => {
+        window.location.href = '/api/policies/export-all';
+    },
+
+    /**
+     * Imports a parsed PolicyDocument. Each entry is treated as a new custom policy:
+     * fresh Id, BuiltIn forced to false, renamed on name collision.
+     */
+    importDocument: (document) =>
+        postJson('/api/policies/import', document),
+};
+
+
+// ---------------------------------------------------------------------------
 // Queue
 // ---------------------------------------------------------------------------
 

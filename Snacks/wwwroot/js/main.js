@@ -61,6 +61,7 @@ import { initAdvancedPanel,      loadAdvancedPanel }      from './settings/panel
 import { initNodeSyncPanel,      loadNodeSyncPanel }      from './settings/panels/node-sync-panel.js';
 import { initSchedulingPanel,    loadSchedulingPanel }    from './settings/panels/scheduling-panel.js';
 import { initNetworkingPanel }                             from './settings/panels/networking-panel.js';
+import { initPoliciesPanel,      loadPoliciesPanel }     from './settings/panels/policies-panel.js';
 
 // Side-effect import: dashboard.js calls `registerPage('dashboard', ...)` at
 // module load time so the navigation shell finds it when the user lands on
@@ -166,6 +167,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initNodeSyncPanel();
     initSchedulingPanel();
     initNetworkingPanel();
+    initPoliciesPanel();
 
 
     // 4. Initial data loads (shared — not page-specific).
@@ -194,6 +196,7 @@ document.addEventListener('DOMContentLoaded', () => {
             loadExclusionPanel();
             loadAdvancedPanel();
             loadNodeSyncPanel();
+            loadPoliciesPanel();
         }
 
         // Scheduling panel reloads on every open so newly-joined nodes (and

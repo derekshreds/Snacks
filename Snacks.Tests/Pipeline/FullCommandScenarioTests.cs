@@ -134,9 +134,22 @@ public sealed class FullCommandScenarioTests
                   canHwDecode: useVaapi && !hasFilter,   // SW-decode when filters are active
                   vaapiFormat: tonemap ? "nv12" : "nv12");
 
+        // Mirror the production H264 profile injection: libx264 + H264Profile set emits
+        // -profile:v / -level / (for baseline) -bf 0 -coder 0 -pix_fmt yuv420p.
+        string h264ProfileFlag = "";
+        if (!videoCopy && encoder == "libx264" && !string.IsNullOrEmpty(options.H264Profile))
+        {
+            var profile = options.H264Profile.Trim().ToLowerInvariant();
+            h264ProfileFlag = $"-profile:v {profile} ";
+            if (!string.IsNullOrEmpty(options.H264Level))
+                h264ProfileFlag += $"-level {options.H264Level} ";
+            if (profile == "baseline")
+                h264ProfileFlag += "-bf 0 -coder 0 -pix_fmt yuv420p ";
+        }
+
         string videoFlags = videoCopy
             ? $"{videoMap} -c:v copy "
-            : $"{videoMap} -c:v {encoder} {presetFlag}{vfFlag}";
+            : $"{videoMap} -c:v {encoder} {presetFlag}{h264ProfileFlag}{vfFlag}";
         string compressionFlags = videoCopy
             ? ""
             : TranscodingService.GetForcedReencodeCompressionFlags(
@@ -223,6 +236,68 @@ public sealed class FullCommandScenarioTests
         // Subtitle: English text track passed through.
         cmd.Should().Contain("-map 0:2");
         cmd.Should().Contain("-c:s copy");
+    }
+
+
+    // =====================================================================
+    //  Scenario 1b: iPod Classic baseline-profile MP4.
+    //  Pins the load-bearing flags for iPod 5G/Classic playback: baseline
+    //  profile + level 3.0 + no B-frames + CAVLC + yuv420p. Without these
+    //  flags libx264's default High-profile output won't play on the device.
+    // =====================================================================
+
+    [Fact]
+    public void Scenario_iPod_Classic_baseline_profile_flags_emitted()
+    {
+        var probe = new ProbeBuilder()
+            .Video(codec: "h264", width: 1920, height: 1080)
+            .Audio(codec: "aac", channels: 2, lang: "eng")
+            .Build();
+
+        var opts = new EncoderOptions
+        {
+            Format                 = "mp4",
+            Codec                  = "h264",
+            Encoder                = "libx264",
+            H264Profile            = "baseline",
+            H264Level              = "3.0",
+            FfmpegQualityPreset    = "medium",
+            TargetBitrate          = 1200,
+            FourKBitrateMultiplier = 2,
+            DownscalePolicy        = "CapAtTarget",
+            DownscaleTarget        = "240p",
+            HardwareAcceleration   = "none",
+            PreserveOriginalAudio  = false,
+            AudioOutputs           = new()
+            {
+                new AudioOutputProfile { Codec = "aac", Layout = "Stereo", BitrateKbps = 128 },
+            },
+            AudioLanguagesToKeep   = new() { "en" },
+        };
+        var item = new WorkItem { Bitrate = 8000, IsHevc = false, Probe = probe };
+
+        var cmd = BuildScenarioCommand(probe, opts, item,
+            inputPath: "/m/movie.mkv", outputPath: "/m/movie.mp4");
+
+        AssertWellFormed(cmd, "mp4", "/m/movie.mkv", "/m/movie.mp4");
+
+        cmd.Should().Contain("-c:v libx264");
+        cmd.Should().Contain("-preset medium");
+
+        // The five non-negotiable baseline flags.
+        cmd.Should().Contain("-profile:v baseline", "iPod hardware decoder rejects Main and High profile streams");
+        cmd.Should().Contain("-level 3.0",          "iPod video tops out at level 3.0");
+        cmd.Should().Contain("-bf 0",               "Baseline forbids B-frames");
+        cmd.Should().Contain("-coder 0",            "Baseline requires CAVLC, not CABAC");
+        cmd.Should().Contain("-pix_fmt yuv420p",    "Baseline locks chroma to 4:2:0 8-bit");
+
+        // Flag ordering: profile/level must come AFTER -c:v / -preset so they don't get
+        // shadowed by libx264's preset internals, and BEFORE the rate-control flags.
+        var encoderIdx = cmd.IndexOf("-c:v libx264", StringComparison.Ordinal);
+        var profileIdx = cmd.IndexOf("-profile:v baseline", StringComparison.Ordinal);
+        var bitrateIdx = cmd.IndexOf("-b:v ", StringComparison.Ordinal);
+        profileIdx.Should().BeGreaterThan(encoderIdx);
+        profileIdx.Should().BeLessThan(bitrateIdx);
     }
 
 
