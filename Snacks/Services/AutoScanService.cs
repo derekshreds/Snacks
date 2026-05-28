@@ -658,6 +658,14 @@ public sealed class AutoScanService : IHostedService, IDisposable
 
             await _mediaFileRepo.PruneDeletedFilesAsync();
 
+            // Mirror the DB prune into the live work queue: PruneDeletedFiles only
+            // touches the database, so a queued/failed WorkItem whose source has
+            // since vanished would otherwise linger in memory (and in the queue UI)
+            // until the next app restart. Skips active encodes — those have their
+            // own missing-source handling on the encode path.
+            try { await _transcodingService.PruneMissingWorkItemsAsync(); }
+            catch (Exception ex) { Console.WriteLine($"AutoScan: PruneMissingWorkItems failed: {ex.Message}"); }
+
             _config.LastScanTime     = DateTime.UtcNow;
             _config.LastScanNewFiles = newFileCount;
             SaveConfig();

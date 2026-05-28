@@ -269,6 +269,7 @@ export function getEncoderOptions(prefix = 'settings') {
         FourKBitrateMultiplier: num('FourKBitrateMultiplier', 4),
         Skip4K:                 bool('Skip4K'),
         SkipPercentAboveTarget: Math.max(0, num('SkipPercentAboveTarget', 20)),
+        EncodingLogRetentionDays: Math.max(0, num('EncodingLogRetentionDays', 7)),
 
         // Paths.
         OutputDirectory: str('OutputDirectory'),
@@ -382,6 +383,7 @@ export async function restoreEncoderOptions(prefix = 'settings') {
         set('FourKBitrateMultiplier', pick('FourKBitrateMultiplier'));
         set('Skip4K',                 pick('Skip4K'));
         set('SkipPercentAboveTarget', Math.max(0, pick('SkipPercentAboveTarget') ?? 20));
+        set('EncodingLogRetentionDays', Math.max(0, pick('EncodingLogRetentionDays') ?? 7));
 
         // Paths.
         set('OutputDirectory', pick('OutputDirectory') || '');

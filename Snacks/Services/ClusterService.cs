@@ -1479,6 +1479,17 @@ public sealed class ClusterService : IHostedService, IDisposable
                 });
                 if (workItem == null) break;
 
+                // Source-vanished guard: the source can disappear between scan-time
+                // enqueue and remote dispatch (user deletes the folder, file is renamed,
+                // network share drops the path). Drop the item now rather than upload
+                // a stale path to a worker and have it fail with "source missing".
+                if (!File.Exists(workItem.Path))
+                {
+                    Console.WriteLine($"Cluster: Dropping {workItem.FileName}: source file no longer exists at dispatch time");
+                    await _transcodingService.DropMissingWorkItemAsync(workItem);
+                    continue;
+                }
+
                 // Resolve folder-level overrides for worker selection (GPU/encoder matching)
                 var folderOverride = FolderOverrideResolver?.Invoke(workItem.Path);
                 var folderOptions  = EncoderOptionsOverride.ApplyOverrides(globalOptions, folderOverride, null);

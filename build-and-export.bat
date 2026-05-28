@@ -2,10 +2,21 @@
 REM Snacks - Build and Push to Docker Hub
 REM Builds the Docker image and pushes to derekshreds/snacks-docker
 
-set VERSION=2.13.0
+set VERSION=2.13.1
 
 echo Snacks - Build and Push (v%VERSION%)
 echo ==========================
+echo.
+echo This will tag and push BOTH :latest AND :%VERSION% to:
+echo   - derekshreds/snacks-docker
+echo   - derekshreds/snacksweb
+echo.
+set /p CONFIRM="Type YES to continue, anything else to abort: "
+if /i not "%CONFIRM%"=="YES" (
+    echo Aborted.
+    pause
+    exit /b 1
+)
 echo.
 
 REM Build the image with both :latest and pinned version tags

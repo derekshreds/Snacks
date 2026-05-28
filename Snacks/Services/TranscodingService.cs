@@ -500,6 +500,17 @@ public class TranscodingService
     /// <returns>The work item ID (may be a previously existing ID if the file was already tracked).</returns>
     public async Task<string> AddFileAsync(string filePath, EncoderOptions options, bool force = false, CancellationToken cancellationToken = default)
     {
+        // Don't queue something the encoder will only fail on. Scan-time callers
+        // pass files they just enumerated so they exist by definition, but the
+        // retry button and other ad-hoc entry points can be called minutes or
+        // hours after a file was last seen on disk.
+        if (!File.Exists(filePath))
+        {
+            Console.WriteLine($"AddFile: Skipping {Path.GetFileName(filePath)} — source file no longer exists");
+            try { await _mediaFileRepo.RemoveByPathAsync(Path.GetFullPath(filePath)); } catch { }
+            return string.Empty;
+        }
+
         // Music files take a much leaner code path — no HDR/4K/HW-accel logic, no
         // per-track audio profiles, no subtitle handling. Dispatch on extension here
         // so the video path below stays unchanged.
@@ -1502,6 +1513,60 @@ public class TranscodingService
     /// <summary>Removes a work item from the in-memory tracking dictionary (e.g. after remote job cleanup).</summary>
     public void RemoveWorkItem(string id) => _workItems.TryRemove(id, out _);
 
+    /// <summary>
+    ///     Drops a work item whose source file is no longer on disk. Removes it from
+    ///     <c>_workItems</c> and <c>_workQueue</c>, deletes the matching DB row immediately
+    ///     so the next scan doesn't have to do it, and pushes a <c>WorkItemRemoved</c>
+    ///     event so the UI clears the stale row without waiting for a page refresh.
+    ///     Callers must already have verified the item is not actively encoding.
+    /// </summary>
+    public async Task DropMissingWorkItemAsync(WorkItem item)
+    {
+        _workItems.TryRemove(item.Id, out _);
+        lock (_queueLock)
+        {
+            _workQueue.Remove(item);
+        }
+
+        try { await _mediaFileRepo.RemoveByPathAsync(Path.GetFullPath(item.Path)); }
+        catch (Exception ex) { Console.WriteLine($"DropMissingWorkItem: DB cleanup failed for {item.FileName}: {ex.Message}"); }
+
+        try { await _hubContext.Clients.All.SendAsync("WorkItemRemoved", item.Id); }
+        catch { /* SignalR failures are non-fatal — UI will reconcile on next refresh */ }
+    }
+
+    /// <summary>
+    ///     Sweeps every non-active work item and drops any whose source file has
+    ///     disappeared since it was queued. Active encodes (Processing / Uploading /
+    ///     Downloading) are left alone — yanking them mid-stream would race with
+    ///     ffmpeg / the cluster transfer, and their own completion paths already
+    ///     surface a "source missing" failure if it really has gone.
+    /// </summary>
+    /// <returns> The number of items dropped. </returns>
+    public async Task<int> PruneMissingWorkItemsAsync()
+    {
+        var snapshot = _workItems.Values
+            .Where(w => w.Status is not (WorkItemStatus.Processing
+                                          or WorkItemStatus.Uploading
+                                          or WorkItemStatus.Downloading))
+            .ToList();
+
+        int dropped = 0;
+        foreach (var item in snapshot)
+        {
+            try
+            {
+                if (File.Exists(item.Path)) continue;
+            }
+            catch { continue; }
+
+            Console.WriteLine($"PruneMissingWorkItems: dropping {item.FileName} — source no longer exists");
+            await DropMissingWorkItemAsync(item);
+            dropped++;
+        }
+        return dropped;
+    }
+
 
     /// <summary>
     ///     Permanently cancels a work item. The file will not be reprocessed unless explicitly reset.
@@ -1843,6 +1908,11 @@ public class TranscodingService
                     {
                         _workItems.TryRemove(musicItem.Id, out _);
                     }
+                    else if (!File.Exists(musicItem.Path))
+                    {
+                        Console.WriteLine($"Dropping {musicItem.FileName}: source file no longer exists at dispatch time");
+                        await DropMissingWorkItemAsync(musicItem);
+                    }
                     else if (!_slotLedger.TryReserve(_localNodeId, MusicDeviceId, musicItem.Id, musicItem.FileName))
                     {
                         // Master at music capacity (or master music encoding is
@@ -1916,6 +1986,18 @@ public class TranscodingService
                 {
                     if (!dispatched)
                         await WaitForSchedulerProgressAsync(inflight);
+                    continue;
+                }
+
+                // Source-vanished guard: the source can disappear between scan-time
+                // enqueue and dispatch (user deletes the folder, file is renamed,
+                // network share drops the path). Drop the item now rather than burn a
+                // device slot and have ConvertVideoAsync throw "Source file not found"
+                // mid-encode.
+                if (!File.Exists(workItem.Path))
+                {
+                    Console.WriteLine($"Dropping {workItem.FileName}: source file no longer exists at dispatch time");
+                    await DropMissingWorkItemAsync(workItem);
                     continue;
                 }
 
@@ -2586,7 +2668,7 @@ public class TranscodingService
             }
             else
             {
-                compressionFlags = $"-g 25 -rc_mode CQP -global_quality {quality} ";
+                compressionFlags = $"-g 25 -rc_mode CQP -global_quality:v {quality} ";
             }
         }
         else if (encoder == "libsvtav1")
@@ -2708,9 +2790,11 @@ public class TranscodingService
             cropExpr: cropExpr, tonemap: tonemap, scaleExpr: scaleExpr,
             useVaapi: useVaapi, canHwDecode: canHwDecode, vaapiFormat: vaapiFormat);
         bool isSvtAv1 = encoder == "libsvtav1";
+        bool isAmf    = encoder.Contains("amf");
         string presetFlag = useVaapi
             ? (useLowPower ? "-low_power 1 " : "")
             : isSvtAv1 ? $"-preset {MapSvtAv1Preset(options.FfmpegQualityPreset)} "
+            : isAmf    ? $"-quality {MapAmfPreset(options.FfmpegQualityPreset)} "
                         : $"-preset {options.FfmpegQualityPreset} ";
         string videoFlags = videoCopy ?
             $"{_ffprobeService.MapVideo(workItem.Probe!)} -c:v copy " :
@@ -3926,7 +4010,7 @@ public class TranscodingService
     {
         int maxBitrateVal = int.Parse(maxBitrate.TrimEnd('k'));
         if (useVaapi)
-            return $"-g 25 -rc_mode CQP -global_quality 25 ";
+            return $"-g 25 -rc_mode CQP -global_quality:v 25 ";
         if (isSvtAv1)
         {
             long tbr = long.Parse(targetBitrate.TrimEnd('k'));
@@ -4341,7 +4425,7 @@ public class TranscodingService
             if (encoder.Contains("vaapi"))
             {
                 vf = "-vf format=nv12|vaapi,hwupload";
-                extra = "-rc_mode CQP -global_quality 25";
+                extra = "-rc_mode CQP -global_quality:v 25";
             }
             else
             {
@@ -4609,6 +4693,22 @@ public class TranscodingService
         "fast"     => 8,
         "veryfast" => 10,
         _          => 6,
+    };
+
+    /// <summary>
+    ///     AMD AMF encoders (h264_amf, hevc_amf, av1_amf) only accept three quality
+    ///     presets: "speed", "balanced", "quality". Passing the libx265-style names
+    ///     ("veryslow" etc.) makes FFmpeg fail with "Unable to parse preset option
+    ///     value". Maps the shared UI preset onto AMF's three-step ladder.
+    /// </summary>
+    internal static string MapAmfPreset(string preset) => (preset ?? "").ToLowerInvariant() switch
+    {
+        "veryslow" => "quality",
+        "slow"     => "quality",
+        "medium"   => "balanced",
+        "fast"     => "speed",
+        "veryfast" => "speed",
+        _          => "balanced",
     };
 
     /// <summary>
@@ -5080,7 +5180,7 @@ public class TranscodingService
     private async Task<long> RunTestEncodeAsync(string inputPath, string initFlags, string encoder, string hwFilter, string lpFlag, int qp, string seekTime, int duration)
     {
         string command = $"{initFlags} -ss {seekTime} -i \"{inputPath}\" -t {duration} " +
-            $"-c:v {encoder} {lpFlag}{hwFilter} -g 25 -rc_mode CQP -global_quality {qp} " +
+            $"-c:v {encoder} {lpFlag}{hwFilter} -g 25 -rc_mode CQP -global_quality:v {qp} " +
             $"-an -sn -f null -";
 
         Console.WriteLine($"Calibration command: ffmpeg {command}");

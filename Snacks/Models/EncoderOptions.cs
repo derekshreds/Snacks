@@ -198,6 +198,13 @@ public sealed class EncoderOptions
     /// <summary> Percentage above target bitrate at which an already-efficient file is skipped. </summary>
     public int SkipPercentAboveTarget { get; set; } = 20;
 
+    /// <summary>
+    ///     Number of days to retain per-job FFmpeg log files in <c>{workdir}/logs/</c>.
+    ///     <c>0</c> disables the sweep (keep forever). The Serilog rolling app log
+    ///     (<c>snacks-*.log</c>) is unaffected — it has its own 7-day / 10MB cap.
+    /// </summary>
+    public int EncodingLogRetentionDays { get; set; } = 7;
+
     /// <summary> Optional output directory override. When <see langword="null"/>, output is written beside the source. </summary>
     public string? OutputDirectory { get; set; }
 
@@ -273,6 +280,7 @@ public sealed class EncoderOptions
         DeleteOriginalFile         = DeleteOriginalFile,
         RetryOnFail                = RetryOnFail,
         SkipPercentAboveTarget     = SkipPercentAboveTarget,
+        EncodingLogRetentionDays   = EncodingLogRetentionDays,
         OutputDirectory            = OutputDirectory,
         EncodeDirectory            = EncodeDirectory,
         HardwareAcceleration       = HardwareAcceleration,

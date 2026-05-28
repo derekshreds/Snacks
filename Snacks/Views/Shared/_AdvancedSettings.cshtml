@@ -42,4 +42,16 @@
             </div>
         </div>
     </div>
+
+    <div class="col-md-6">
+        <div class="encoder-panel rounded">
+            <h6 class="fw-bold mb-3"><i class="fas fa-file-lines me-2 text-secondary"></i>Logs</h6>
+
+            <div class="mb-3">
+                <label for="settingsEncodingLogRetentionDays" class="form-label">Per-job log retention (days)</label>
+                <input type="number" class="form-control" id="settingsEncodingLogRetentionDays" min="0" step="1">
+                <div class="form-text">How long to keep per-job FFmpeg logs in the working directory. Each encode writes one file; over time they accumulate. Set to <code>0</code> to keep them forever. The app's rolling log is unaffected.</div>
+            </div>
+        </div>
+    </div>
 </div>
