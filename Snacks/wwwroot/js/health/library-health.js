@@ -2,10 +2,12 @@
  * Library Health page.
  *
  * Renders the file-level issues surfaced by /api/library/health — videos with
- * no audio track, no decodable video stream, zero duration, and failed
- * encodes — with summary-card filters, a text filter, and a per-row "Verify"
- * action that runs bounded ffmpeg decode samples on the server to confirm
- * whether a flagged file is actually damaged.
+ * no audio track, no decodable video stream, zero duration, failed encodes,
+ * and failed deep-verifications — with summary-card filters, a search box, a
+ * per-row "Verify" action (bounded ffmpeg decode samples), and rolling-verify
+ * coverage stats. Filtering, search, and pagination are SERVER-side: category
+ * counts are whole-library SQL COUNTs and the table pages 100 rows at a time,
+ * so the page stays honest and fast on 500k-file libraries.
  */
 
 import { libraryApi }   from '../api.js';
@@ -15,14 +17,21 @@ import { registerPage } from '../core/navigation.js';
 
 /** Maps issue keys to badge labels + styles (status pills from site.css). */
 const ISSUE_BADGE = {
-    'no-audio':    ['status-uploading', 'No audio'],
-    'no-video':    ['status-failed',    'No video'],
-    'no-duration': ['status-failed',    'No duration'],
-    'failed':      ['status-failed',    'Encode failed'],
+    'no-audio':      ['status-uploading', 'No audio'],
+    'no-video':      ['status-failed',    'No video'],
+    'no-duration':   ['status-failed',    'No duration'],
+    'failed':        ['status-failed',    'Encode failed'],
+    'verify-failed': ['status-failed',    'Verify failed'],
 };
 
-let items = [];           // full report rows
+const PAGE_SIZE = 100;
+
+let items = [];           // current page of report rows
+let totalItems = 0;       // total rows for the active filter
 let issueFilter = 'all';  // active summary-card filter
+let page = 0;
+let searchTimer = null;
+let refreshGen = 0;       // stale-response guard: only the newest fetch may render
 
 
 // ---------------------------------------------------------------------------
@@ -102,30 +111,37 @@ async function loadInsights() {
 // ---------------------------------------------------------------------------
 
 function renderSummary(summary) {
-    document.getElementById('healthCountAll').textContent        = summary.total.toLocaleString();
-    document.getElementById('healthCountNoAudio').textContent    = summary.noAudio.toLocaleString();
-    document.getElementById('healthCountNoVideo').textContent    = summary.noVideo.toLocaleString();
-    document.getElementById('healthCountNoDuration').textContent = summary.noDuration.toLocaleString();
-    document.getElementById('healthCountFailed').textContent     = summary.failed.toLocaleString();
+    document.getElementById('healthCountAll').textContent          = summary.total.toLocaleString();
+    document.getElementById('healthCountNoAudio').textContent      = summary.noAudio.toLocaleString();
+    document.getElementById('healthCountNoVideo').textContent      = summary.noVideo.toLocaleString();
+    document.getElementById('healthCountNoDuration').textContent   = summary.noDuration.toLocaleString();
+    document.getElementById('healthCountFailed').textContent       = summary.failed.toLocaleString();
+    document.getElementById('healthCountVerifyFailed').textContent = (summary.verifyFailed ?? 0).toLocaleString();
+
+    // Rolling-verify coverage line: "12,400 of 515,000 files deep-verified".
+    const coverage = document.getElementById('healthVerifyCoverage');
+    if (coverage) {
+        coverage.textContent = summary.totalScanned > 0
+            ? `${(summary.verifiedCount ?? 0).toLocaleString()} of ${summary.totalScanned.toLocaleString()} files deep-verified`
+            : '';
+    }
 }
 
 function renderTable() {
-    const text = (document.getElementById('healthFilterText')?.value || '').toLowerCase();
-    const filtered = items.filter(i => {
-        if (issueFilter !== 'all' && !i.issues.includes(issueFilter)) return false;
-        if (text && !i.fileName.toLowerCase().includes(text) && !i.filePath.toLowerCase().includes(text)) return false;
-        return true;
-    });
-
     const wrap  = document.getElementById('healthTableWrap');
     const empty = document.getElementById('healthEmpty');
-    document.getElementById('healthShownCount').textContent =
-        filtered.length === items.length ? `(${items.length})` : `(${filtered.length} of ${items.length})`;
+    const shown = items.length;
 
-    if (filtered.length === 0) {
+    document.getElementById('healthShownCount').textContent = totalItems > shown
+        ? `(${(page * PAGE_SIZE + 1).toLocaleString()}–${(page * PAGE_SIZE + shown).toLocaleString()} of ${totalItems.toLocaleString()})`
+        : `(${totalItems.toLocaleString()})`;
+
+    renderPager();
+
+    if (shown === 0) {
         wrap.style.display  = 'none';
         empty.style.display = '';
-        document.getElementById('healthEmptyMsg').textContent = items.length === 0
+        document.getElementById('healthEmptyMsg').textContent = totalItems === 0
             ? 'No file-level issues found. Your library looks healthy.'
             : 'No flagged files match the current filter.';
         return;
@@ -133,7 +149,7 @@ function renderTable() {
     empty.style.display = 'none';
     wrap.style.display  = '';
 
-    document.getElementById('healthTableBody').innerHTML = filtered.map((r, idx) => `
+    document.getElementById('healthTableBody').innerHTML = items.map((r, idx) => `
         <tr data-health-row="${idx}">
             <td class="text-truncate" style="max-width: 420px;" title="${escapeHtml(r.filePath)}">
                 <i class="fas ${r.kind === 'Music' ? 'fa-music' : 'fa-file-video'} me-2 text-primary"></i>${escapeHtml(r.fileName)}
@@ -147,6 +163,9 @@ function renderTable() {
                     ${r.issues.map(renderIssueBadge).join('')}
                 </div>
                 ${r.failureReason ? `<div class="small text-muted mt-1">${escapeHtml(r.failureReason)}</div>` : ''}
+                ${r.verifyResult && r.verifyResult !== 'ok'
+                    ? `<div class="small text-danger mt-1"><i class="fas fa-triangle-exclamation me-1"></i>${escapeHtml(r.verifyResult)}</div>`
+                    : ''}
                 <div class="small mt-1" data-verify-result style="display:none;"></div>
             </td>
             <td style="white-space: nowrap;">
@@ -155,6 +174,18 @@ function renderTable() {
                 </button>
             </td>
         </tr>`).join('');
+}
+
+function renderPager() {
+    const pager = document.getElementById('healthPager');
+    if (!pager) return;
+    const totalPages = Math.max(1, Math.ceil(totalItems / PAGE_SIZE));
+    pager.style.display = totalPages > 1 ? 'flex' : 'none';
+    if (totalPages > 1) {
+        document.getElementById('healthPageLabel').textContent = `Page ${page + 1} of ${totalPages.toLocaleString()}`;
+        document.getElementById('healthPagePrev').disabled = page <= 0;
+        document.getElementById('healthPageNext').disabled = page >= totalPages - 1;
+    }
 }
 
 function renderIssueBadge(issue) {
@@ -211,16 +242,34 @@ async function refresh() {
     document.getElementById('healthTableWrap').style.display = 'none';
     document.getElementById('healthEmpty').style.display = 'none';
 
+    const gen = ++refreshGen;
     try {
-        const data = await libraryApi.getHealth();
-        // The user may have SPA-navigated away while the report loaded — the
-        // health DOM is gone and every render below would null-deref.
+        const data = await libraryApi.getHealth({
+            filter: issueFilter === 'all' ? null : issueFilter,
+            q:      document.getElementById('healthFilterText')?.value || null,
+            skip:   page * PAGE_SIZE,
+            limit:  PAGE_SIZE,
+        });
+        // Two staleness checks: the user may have SPA-navigated away (DOM gone),
+        // or clicked another filter card whose (faster) fetch already rendered —
+        // a slow earlier response must not paint over it.
+        if (gen !== refreshGen) return;
         if (!document.getElementById('healthLoading')) return;
-        items = data.items || [];
-        renderSummary(data.summary || { total: 0, noAudio: 0, noVideo: 0, noDuration: 0, failed: 0 });
+        items      = data.items || [];
+        totalItems = data.total ?? items.length;
+
+        // The active filter shrank beneath the current page (e.g. category
+        // switch) — clamp back to the last real page and refetch once.
+        if (items.length === 0 && totalItems > 0 && page > 0) {
+            page = Math.max(0, Math.ceil(totalItems / PAGE_SIZE) - 1);
+            refresh();
+            return;
+        }
+        renderSummary(data.summary || { total: 0, noAudio: 0, noVideo: 0, noDuration: 0, failed: 0, verifyFailed: 0, verifiedCount: 0, totalScanned: 0 });
         loading.style.display = 'none';
         renderTable();
     } catch (err) {
+        if (gen !== refreshGen) return; // superseded — a newer fetch owns the UI
         const empty = document.getElementById('healthEmpty');
         if (!empty) return; // page swapped away mid-fetch
         loading.style.display = 'none';
@@ -234,23 +283,29 @@ async function refresh() {
 // Page lifecycle
 // ---------------------------------------------------------------------------
 
-/** Delegated click handler for the whole page (filter cards + verify buttons). */
+/** Delegated click handler for the whole page (filter cards, pager, verify buttons). */
 function onPageClick(e) {
     const card = e.target.closest('.health-filter-card');
     if (card) {
         issueFilter = card.dataset.healthFilter || 'all';
+        page = 0;
         document.querySelectorAll('.health-filter-card').forEach(c =>
             c.classList.toggle('active', c === card));
-        renderTable();
+        refresh();
         return;
     }
+    if (e.target.closest('#healthPagePrev')) { if (page > 0) { page--; refresh(); } return; }
+    if (e.target.closest('#healthPageNext')) { page++; refresh(); return; }
     const verifyBtn = e.target.closest('[data-verify-path]');
     if (verifyBtn) onVerifyClick(verifyBtn);
     if (e.target.closest('#healthRefreshBtn')) refresh();
 }
 
+/** Debounced server-side search — each keystroke would otherwise be a query. */
 function onFilterInput(e) {
-    if (e.target.id === 'healthFilterText') renderTable();
+    if (e.target.id !== 'healthFilterText') return;
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => { page = 0; refresh(); }, 350);
 }
 
 registerPage('library-health', {
@@ -261,10 +316,12 @@ registerPage('library-health', {
         root?.addEventListener('click', onPageClick);
         root?.addEventListener('input', onFilterInput);
         issueFilter = 'all';
+        page = 0;
         refresh();
         loadInsights();
     },
     unmount: () => {
         items = [];
+        clearTimeout(searchTimer);
     },
 });

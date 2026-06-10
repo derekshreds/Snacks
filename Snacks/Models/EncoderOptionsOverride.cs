@@ -115,6 +115,18 @@ public sealed class EncoderOptionsOverride
     public bool? TonemapHdrToSdr { get; set; }
 
     /******************************************************************
+     *  Queue
+     ******************************************************************/
+
+    /// <summary>
+    ///     Base queue priority stamped onto every file queued from this folder.
+    ///     Higher dispatches first (before the bitrate/recency tiebreaker). Lets a
+    ///     "new downloads" folder jump a months-deep backlog without per-file
+    ///     clicking. <see langword="null"/> = 0 (no boost).
+    /// </summary>
+    public int? QueuePriority { get; set; }
+
+    /******************************************************************
      *  Output and Scratch
      ******************************************************************/
 

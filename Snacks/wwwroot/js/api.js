@@ -205,8 +205,8 @@ export const libraryApi = {
      * @param {string}  path
      * @param {boolean} [recursive=true] When false, only the immediate children of `path` are returned.
      */
-    getFiles: (path, recursive = true) =>
-        getJson(`/api/library/files?directoryPath=${encodeURIComponent(path)}&recursive=${recursive}`),
+    getFiles: (path, recursive = true, skip = 0, limit = 1000) =>
+        getJson(`/api/library/files?directoryPath=${encodeURIComponent(path)}&recursive=${recursive}&skip=${skip}&limit=${limit}`),
 
     /** Enqueues every video file under `directoryPath` (optionally recursive) with `options`. */
     processDirectory: (directoryPath, recursive, options) =>
@@ -235,10 +235,19 @@ export const libraryApi = {
     analyzeCancel: jobId => postJson(`/api/library/analyze-cancel/${jobId}`),
 
     /**
-     * Library health report: `{ items, summary }` where each item carries an
-     * `issues` array (`no-audio` | `no-video` | `no-duration` | `failed`).
+     * Library health report: `{ items, total, summary }` where each item carries an
+     * `issues` array (`no-audio` | `no-video` | `no-duration` | `failed` | `verify-failed`).
+     * Category filter, search, and pagination are applied server-side; summary
+     * counts are whole-library SQL COUNTs regardless of the page returned.
      */
-    getHealth: () => getJson('/api/library/health'),
+    getHealth: ({ filter = null, q = null, skip = 0, limit = 100 } = {}) => {
+        const params = new URLSearchParams();
+        if (filter) params.set('filter', filter);
+        if (q)      params.set('q', q);
+        if (skip)   params.set('skip', skip);
+        params.set('limit', limit);
+        return getJson('/api/library/health?' + params.toString());
+    },
 
     /** Deep-verifies one file with bounded ffmpeg decode samples. Resolves `{ ok, issues }`. */
     verifyFile: filePath => postJson('/api/library/health/verify', { filePath }),

@@ -209,6 +209,20 @@ public sealed class EncoderOptions
     /// </summary>
     public int EncodingLogRetentionDays { get; set; } = 7;
 
+    /// <summary>
+    ///     Daily budget for the rolling deep-verifier (ffmpeg decode samples per file,
+    ///     oldest-verified first). <c>0</c> (default) disables it. Spread evenly across
+    ///     hourly ticks so the I/O cost is a trickle, not a nightly storm.
+    /// </summary>
+    public int VerifyFilesPerDay { get; set; } = 0;
+
+    /// <summary>
+    ///     When <see langword="true"/>, the pending-queue tiebreaker (after user/folder
+    ///     priority) is recency — newest files first — instead of bitrate descending.
+    ///     The right setting for "convert new downloads before the backlog".
+    /// </summary>
+    public bool QueueNewestFirst { get; set; } = false;
+
     /// <summary> Optional output directory override. When <see langword="null"/>, output is written beside the source. </summary>
     public string? OutputDirectory { get; set; }
 
@@ -289,6 +303,8 @@ public sealed class EncoderOptions
         RetryOnFail                = RetryOnFail,
         SkipPercentAboveTarget     = SkipPercentAboveTarget,
         EncodingLogRetentionDays   = EncodingLogRetentionDays,
+        VerifyFilesPerDay          = VerifyFilesPerDay,
+        QueueNewestFirst           = QueueNewestFirst,
         OutputDirectory            = OutputDirectory,
         EncodeDirectory            = EncodeDirectory,
         HardwareAcceleration       = HardwareAcceleration,

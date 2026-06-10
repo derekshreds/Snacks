@@ -206,23 +206,37 @@ export class LibraryBrowser {
         this._selectedFiles.clear();
 
         const container = document.getElementById('fileList');
+        container.innerHTML = '<div class="text-center py-4"><div class="spinner-border" role="status"></div></div>';
+        await this._loadFilePage(directoryPath, 0, /* replace */ true);
+    }
+
+    /**
+     * Fetches one server-side page of files (the endpoint never returns more
+     * than its cap, so a flat 50k-file folder can't melt the modal) and either
+     * replaces the panel or appends below the existing rows. A "Load more"
+     * footer appears whenever the server reports the listing was truncated.
+     *
+     * @param {string}  directoryPath
+     * @param {number}  skip     Entries already shown.
+     * @param {boolean} replace  Replace the panel (true) or append (false).
+     */
+    async _loadFilePage(directoryPath, skip, replace) {
+        const container = document.getElementById('fileList');
 
         try {
-            container.innerHTML = '<div class="text-center py-4"><div class="spinner-border" role="status"></div></div>';
-            const data = await libraryApi.getFiles(directoryPath, false);
+            const data = await libraryApi.getFiles(directoryPath, false, skip);
+            if (this._currentDir !== directoryPath) return; // user navigated away mid-fetch
 
-            if (data.files.length === 0) {
+            if (replace && data.files.length === 0) {
                 container.innerHTML = '<div class="text-muted text-center py-4"><i class="fas fa-photo-film fa-2x mb-2"></i><br>No media files in this folder</div>';
                 return;
             }
 
-            const videoCount = data.files.filter(f => (f.kind ?? 'Video') !== 'Music').length;
-            const musicCount = data.files.length - videoCount;
-            const breakdownHtml = (videoCount && musicCount)
-                ? `<div class="text-muted small mb-2 px-2">${videoCount} video · ${musicCount} music</div>`
+            const breakdownHtml = (replace && data.videoTotal && data.musicTotal)
+                ? `<div class="text-muted small mb-2 px-2">${data.videoTotal.toLocaleString()} video · ${data.musicTotal.toLocaleString()} music</div>`
                 : '';
 
-            container.innerHTML = breakdownHtml + data.files.map(file => {
+            const rowsHtml = data.files.map(file => {
                 const isMusic = (file.kind ?? 'Video') === 'Music';
                 const icon  = isMusic ? 'fa-music'      : 'fa-file-video';
                 const tone  = isMusic ? 'text-info'     : 'text-primary';
@@ -243,15 +257,41 @@ export class LibraryBrowser {
                 </div>`;
             }).join('');
 
+            const shown = skip + data.files.length;
+            const moreHtml = data.truncated
+                ? `<div class="text-center py-2" id="fileListMore">
+                       <button type="button" class="btn btn-sm btn-outline-secondary" data-load-more="${shown}">
+                           <i class="fas fa-angles-down me-1"></i>Load more (${shown.toLocaleString()} of ${data.total.toLocaleString()})
+                       </button>
+                   </div>`
+                : '';
+
+            // Remove any previous "load more" footer before appending.
+            document.getElementById('fileListMore')?.remove();
+            if (replace) container.innerHTML = breakdownHtml + rowsHtml + moreHtml;
+            else         container.insertAdjacentHTML('beforeend', rowsHtml + moreHtml);
+
             container.querySelectorAll('input[type="checkbox"]').forEach(checkbox => {
+                if (checkbox.dataset.bound) return;
+                checkbox.dataset.bound = '1';
                 checkbox.addEventListener('change', () => {
                     if (checkbox.checked) this._selectedFiles.add(checkbox.value);
                     else                  this._selectedFiles.delete(checkbox.value);
                     this._updateProcessButton();
                 });
             });
+
+            const moreBtn = container.querySelector('[data-load-more]');
+            if (moreBtn && !moreBtn.dataset.bound) {
+                moreBtn.dataset.bound = '1';
+                moreBtn.addEventListener('click', () => {
+                    moreBtn.disabled = true;
+                    this._loadFilePage(directoryPath, parseInt(moreBtn.dataset.loadMore, 10), false);
+                });
+            }
         } catch (err) {
-            container.innerHTML = `<div class="alert alert-danger">Error: ${escapeHtml(err.message)}</div>`;
+            if (replace) container.innerHTML = `<div class="alert alert-danger">Error: ${escapeHtml(err.message)}</div>`;
+            else showToast('Failed to load more files: ' + err.message, 'danger');
         }
     }
 

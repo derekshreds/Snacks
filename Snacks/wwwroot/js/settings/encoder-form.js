@@ -318,6 +318,8 @@ export function getEncoderOptions(prefix = 'settings') {
         Skip4K:                 bool('Skip4K'),
         SkipPercentAboveTarget: Math.max(0, num('SkipPercentAboveTarget', 20)),
         EncodingLogRetentionDays: Math.max(0, num('EncodingLogRetentionDays', 7)),
+        QueueNewestFirst:       bool('QueueNewestFirst'),
+        VerifyFilesPerDay:      Math.max(0, num('VerifyFilesPerDay', 0)),
 
         // Paths.
         OutputDirectory: str('OutputDirectory'),
@@ -519,6 +521,9 @@ export function applyEncoderOptionsToForm(prefix, saved) {
         set('SkipPercentAboveTarget', skipPct === undefined ? undefined : Math.max(0, skipPct));
         const logDays = pick('EncodingLogRetentionDays');
         set('EncodingLogRetentionDays', logDays === undefined ? undefined : Math.max(0, logDays));
+        set('QueueNewestFirst', pick('QueueNewestFirst'));
+        const verifyPerDay = pick('VerifyFilesPerDay');
+        set('VerifyFilesPerDay', verifyPerDay === undefined ? undefined : Math.max(0, verifyPerDay));
 
         // Paths — null on the server means "unset"; render as empty string.
         const outDir = pick('OutputDirectory');

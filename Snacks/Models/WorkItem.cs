@@ -64,6 +64,14 @@ public sealed class WorkItem
     /// </summary>
     public int Priority { get; set; }
 
+    /// <summary>
+    ///     When the file entered the queue (the DB row's CreatedAt, stamped at
+    ///     hydration). The newest-first policy's tiebreaker — kept separate from
+    ///     <see cref="CreatedAt"/>, which records when THIS in-memory object was
+    ///     built and feeds encode-history timing fallbacks.
+    /// </summary>
+    public DateTime QueuedAt { get; set; } = DateTime.UtcNow;
+
     /// <summary> Duration of the video in seconds. </summary>
     public double Length { get; set; } = 0;
 

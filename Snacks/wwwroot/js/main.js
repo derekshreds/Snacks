@@ -361,6 +361,13 @@ document.addEventListener('DOMContentLoaded', () => {
         clusterDashboard.onWorkItemUpdated?.(wi);
     });
     signalR.on('WorkItemRemoved',   (id)      => queueManager.removeItem(id));
+    // Lightweight "the pending queue changed" signal — pending tiles are
+    // DB-sourced, so the server pushes no per-item payload; we just refetch.
+    signalR.on('QueueChanged',      ()        => queueManager.queueChanged());
+    // Aggregate sweep progress (one event per directory chunk, never per file).
+    // The queue page's throttled refresh keeps the pending count/tiles live
+    // through a multi-hour first sweep without a 500k-event flood.
+    signalR.on('ScanProgress',      ()        => queueManager.queueChanged());
     signalR.on('TranscodingLog',    (id, msg) => logViewer.appendLine(id, msg));
 
     signalR.on('AutoScanCompleted', (newFiles) => {

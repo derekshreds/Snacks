@@ -91,6 +91,30 @@ public sealed class MediaFile
     /// <summary> Current processing status of this file. </summary>
     public MediaFileStatus Status { get; set; } = MediaFileStatus.Unseen;
 
+    /// <summary>
+    ///     Queue priority. 0 for everything by default; "move to front" sets it above
+    ///     the current maximum, and per-folder overrides can stamp a base priority at
+    ///     queue time. The pending queue IS the set of <see cref="MediaFileStatus.Queued"/>
+    ///     rows ordered by this column (descending) then by the policy tiebreaker
+    ///     (bitrate or recency) — the scheduler hydrates only the top of that order.
+    /// </summary>
+    public int Priority { get; set; }
+
+    /// <summary>
+    ///     UTC timestamp of the most recent deep verification (ffmpeg decode samples)
+    ///     by the rolling health verifier. Null = never verified. The verifier
+    ///     processes oldest-first so the whole library is continuously re-checked.
+    /// </summary>
+    public DateTime? LastVerifiedAt { get; set; }
+
+    /// <summary>
+    ///     Outcome of the most recent deep verification: <see langword="null"/> when
+    ///     never verified, <c>"ok"</c> on a clean decode, otherwise the (truncated)
+    ///     decoder-issue summary. Non-ok values surface as the "failed verification"
+    ///     category on the Library Health page.
+    /// </summary>
+    public string? LastVerifyResult { get; set; }
+
     /// <summary> Number of local encoding failures for this file. </summary>
     public int FailureCount { get; set; }
 

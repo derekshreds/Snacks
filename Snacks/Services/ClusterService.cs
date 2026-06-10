@@ -861,11 +861,15 @@ public sealed class ClusterService : IHostedService, IDisposable
         _discovery.Config = _config;
         _nodeJobs.Config  = _config;
 
-        // UDP discovery
-        bool needsDiscovery = _config.AutoDiscovery ||
-            (_config.Role == "node" && string.IsNullOrEmpty(_config.MasterUrl));
-        if (needsDiscovery)
-            _discovery.Start(_cts.Token);
+        // Always start the discovery service — it gates its own sub-tasks
+        // internally: UDP broadcast only when auto-discovery is enabled (or a
+        // node has no master URL), master-URL registration for nodes, and
+        // manual-node connections when entries exist. Gating the whole call on
+        // the UDP condition here silently disabled node registration AND manual
+        // nodes for every autoDiscovery=false deployment (different subnets,
+        // Docker bridge networks) — the cluster looked configured but no worker
+        // ever joined.
+        _discovery.Start(_cts.Token);
 
         // Heartbeat with jitter
         var heartbeatInterval = TimeSpan.FromSeconds(_config.HeartbeatIntervalSeconds);
@@ -958,7 +962,7 @@ public sealed class ClusterService : IHostedService, IDisposable
 
         var localIp = ClusterDiscoveryService.GetLocalIpAddress();
         var port    = _discovery.GetListeningPort();
-        Console.WriteLine($"Cluster started: role={_config.Role}, localIp={localIp}, port={port}, discovery={needsDiscovery}");
+        Console.WriteLine($"Cluster started: role={_config.Role}, localIp={localIp}, port={port}, autoDiscovery={_config.AutoDiscovery}");
     }
 
     /// <summary> Stops all timers and the discovery sub-service. </summary>
@@ -1486,6 +1490,12 @@ public sealed class ClusterService : IHostedService, IDisposable
                     }
                     if (hasMusicSlotFree && hasVideoSlotFree) break;
                 }
+
+                // The pending queue lives in the DB; the in-memory window the dequeue
+                // below reads from may have run dry (master paused/off-schedule means
+                // no local scheduler is refilling it). Top it up so workers keep
+                // pulling work straight through a 500k-row backlog.
+                await _transcodingService.EnsureQueueWindowAsync();
 
                 var workItem = _transcodingService.DequeueForRemoteProcessing(item =>
                 {

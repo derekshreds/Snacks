@@ -125,6 +125,12 @@
                 <div class="form-text">Re-queue failed files so the next auto-scan picks them up again.</div>
             </div>
 
+            <div class="form-check mb-3">
+                <input class="form-check-input" type="checkbox" id="@(formPrefix)QueueNewestFirst" name="QueueNewestFirst">
+                <label class="form-check-label" for="@(formPrefix)QueueNewestFirst"><i class="fas fa-arrow-down-1-9 me-1"></i> Newest Files First</label>
+                <div class="form-text">Convert recently added files before the backlog — ideal when new downloads should never wait behind a deep library conversion. Off = biggest files first (maximum space savings early).</div>
+            </div>
+
             <div class="mb-3">
                 <label for="@(formPrefix)OutputDirectory" class="form-label"><i class="fas fa-folder me-1"></i> Output Directory</label>
                 <div class="input-group">

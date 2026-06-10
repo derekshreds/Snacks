@@ -137,8 +137,14 @@ public sealed class LibraryController : ControllerBase
     /// </summary>
     /// <param name="directoryPath"> The root directory to search. </param>
     /// <param name="recursive"> Whether to recurse into subdirectories. Defaults to <see langword="true"/>. </param>
+    /// <param name="skip"> Entries to skip (lazy paging). </param>
+    /// <param name="limit"> Maximum entries to return; clamped to 5000. </param>
     [HttpGet("files")]
-    public IActionResult GetDirectoryFiles([FromQuery] string directoryPath, [FromQuery] bool recursive = true)
+    public IActionResult GetDirectoryFiles(
+        [FromQuery] string directoryPath,
+        [FromQuery] bool recursive = true,
+        [FromQuery] int skip = 0,
+        [FromQuery] int limit = 1000)
     {
         try
         {
@@ -146,34 +152,54 @@ public sealed class LibraryController : ControllerBase
             if (!_fileService.IsPathAllowed(directoryPath))
                 return BadRequest("Directory is not within allowed library path");
 
+            limit = Math.Clamp(limit, 1, 5000);
+
             var allDirs = new List<string> { directoryPath };
             if (recursive)
                 allDirs.AddRange(Directory.GetDirectories(directoryPath, "*", SearchOption.AllDirectories));
 
             var relativeRoot = _fileService.AllowAllPaths() ? directoryPath : _fileService.GetUploadsDirectory();
-            var mediaFiles   = _fileService.GetAllMediaFiles(allDirs)
-                .Select(t =>
+
+            // Enumerate + sort PATHS only (cheap even at 500k entries), then stat
+            // just the requested page — per-file FileInfo against NAS storage is
+            // the expensive part, and an unpaged flat folder of tens of thousands
+            // of files used to stat every one of them in a single response.
+            var entries = _fileService.GetAllMediaFiles(allDirs)
+                .Select(t => new { t.Path, t.Kind, Rel = Path.GetRelativePath(relativeRoot, t.Path) })
+                .OrderBy(e => e.Rel, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            int total      = entries.Count;
+            int videoTotal = entries.Count(e => e.Kind != MediaKind.Music);
+
+            var page = entries.Skip(skip).Take(limit)
+                .Select(e =>
                 {
-                    // One FileInfo per file (NAS metadata I/O is slow — the previous
-                    // code stat'ed each file twice), and skip entries deleted between
-                    // enumeration and projection instead of failing the whole listing.
-                    var fi = new FileInfo(t.Path);
+                    // Skip entries deleted between enumeration and projection
+                    // instead of failing the whole listing.
+                    var fi = new FileInfo(e.Path);
                     if (!fi.Exists) return null;
                     return new
                     {
-                        path         = t.Path,
+                        path         = e.Path,
                         name         = fi.Name,
                         size         = fi.Length,
                         modified     = fi.LastWriteTime,
-                        relativePath = Path.GetRelativePath(relativeRoot, t.Path),
-                        kind         = t.Kind.ToString(),
+                        relativePath = e.Rel,
+                        kind         = e.Kind.ToString(),
                     };
                 })
                 .Where(f => f != null)
-                .OrderBy(f => f!.relativePath)
                 .ToArray();
 
-            return new JsonResult(new { files = mediaFiles });
+            return new JsonResult(new
+            {
+                files      = page,
+                total,
+                videoTotal,
+                musicTotal = total - videoTotal,
+                truncated  = skip + page.Length < total,
+            });
         }
         catch (Exception ex)
         {
@@ -250,7 +276,12 @@ public sealed class LibraryController : ControllerBase
         });
     }
 
-    /// <summary> Result set of a completed analysis job. 409 while the job is still running. </summary>
+    /// <summary>
+    ///     Result set of a completed analysis job. 409 while the job is still running.
+    ///     For very large runs (&gt;20k files) <c>results</c> is a preview subset,
+    ///     <c>truncated</c> is true, and <c>summary</c> carries the authoritative
+    ///     per-decision totals.
+    /// </summary>
     /// <param name="jobId"> Job ID returned by <c>analyze-directory</c>. </param>
     [HttpGet("analyze-results/{jobId}")]
     public IActionResult AnalyzeResults(string jobId)
@@ -259,7 +290,15 @@ public sealed class LibraryController : ControllerBase
         if (job == null) return NotFound("Unknown or expired analysis job");
         if (job.State == LibraryAnalysisJobService.JobState.Running)
             return Conflict("Analysis still running");
-        return new JsonResult(new { state = job.State, error = job.Error, results = job.Results });
+        return new JsonResult(new
+        {
+            state        = job.State,
+            error        = job.Error,
+            results      = job.Results,
+            truncated    = job.Truncated,
+            totalResults = job.TotalResults,
+            summary      = job.Summary,
+        });
     }
 
     /// <summary> Cancels a running analysis job. No-op (success: false) when already finished. </summary>
@@ -297,36 +336,52 @@ public sealed class LibraryController : ControllerBase
      ******************************************************************/
 
     /// <summary>
-    ///     Library health report: every scanned file with a file-level problem —
-    ///     no audio track, no decodable video, zero duration, or a failed encode —
-    ///     with the issue list computed per file so the UI can filter by category.
-    ///     Sourced entirely from scan-time DB data; no files are touched.
+    ///     Library health report: scanned files with file-level problems — no audio
+    ///     track, no decodable video, zero duration, a failed encode, or a failed
+    ///     deep verification. Category counts are whole-library SQL COUNTs (never
+    ///     derived from the returned page), and the item list is server-paginated
+    ///     with optional category + search narrowing — honest at 500k rows.
     /// </summary>
+    /// <param name="filter"> Optional category: no-audio | no-video | no-duration | failed | verify-failed. </param>
+    /// <param name="q"> Optional name/path substring filter. </param>
     [HttpGet("health")]
-    public async Task<IActionResult> GetHealthReport()
+    public async Task<IActionResult> GetHealthReport(
+        [FromQuery] string? filter = null,
+        [FromQuery] string? q = null,
+        [FromQuery] int skip = 0,
+        [FromQuery] int limit = 100)
     {
-        var files = await _mediaFileRepo.GetHealthIssuesAsync();
-        var items = files.Select(f =>
+        limit = Math.Clamp(limit, 1, 500);
+        var summaryTask = _mediaFileRepo.GetHealthSummaryAsync();
+        var verifyTask  = _mediaFileRepo.GetVerificationStatsAsync();
+        var (rows, total) = await _mediaFileRepo.GetHealthPageAsync(filter, q, skip, limit);
+        var (noAudio, noVideo, noDuration, failed, verifyFailed, allIssues) = await summaryTask;
+        var (verifiedCount, _, totalScanned) = await verifyTask;
+
+        var items = rows.Select(f =>
         {
             var issues = new List<string>();
-            if (f.Kind == MediaKind.Video && f.AudioStreams == "[]")                       issues.Add("no-audio");
+            if (f.Kind == MediaKind.Video && f.AudioStreams == "[]")                           issues.Add("no-audio");
             if (f.Kind == MediaKind.Video && f.Codec != "" && (f.Width <= 0 || f.Height <= 0)) issues.Add("no-video");
-            if (f.Codec != "" && f.Duration <= 0)                                          issues.Add("no-duration");
-            if (f.Status == MediaFileStatus.Failed)                                        issues.Add("failed");
+            if (f.Codec != "" && f.Duration <= 0)                                              issues.Add("no-duration");
+            if (f.Status == MediaFileStatus.Failed)                                            issues.Add("failed");
+            if (f.LastVerifyResult is { } vr && vr != "ok")                                    issues.Add("verify-failed");
             return new
             {
-                filePath      = f.FilePath,
-                fileName      = f.FileName,
-                directory     = f.Directory,
-                sizeBytes     = f.FileSize,
-                codec         = f.Codec,
-                width         = f.Width,
-                height        = f.Height,
-                duration      = f.Duration,
-                kind          = f.Kind.ToString(),
-                status        = f.Status.ToString(),
-                failureReason = f.FailureReason,
-                lastScannedAt = f.LastScannedAt,
+                filePath       = f.FilePath,
+                fileName       = f.FileName,
+                directory      = f.Directory,
+                sizeBytes      = f.FileSize,
+                codec          = f.Codec,
+                width          = f.Width,
+                height         = f.Height,
+                duration       = f.Duration,
+                kind           = f.Kind.ToString(),
+                status         = f.Status.ToString(),
+                failureReason  = f.FailureReason,
+                lastScannedAt  = f.LastScannedAt,
+                lastVerifiedAt = f.LastVerifiedAt,
+                verifyResult   = f.LastVerifyResult,
                 issues,
             };
         }).ToList();
@@ -334,13 +389,17 @@ public sealed class LibraryController : ControllerBase
         return new JsonResult(new
         {
             items,
+            total,
             summary = new
             {
-                noAudio    = items.Count(i => i.issues.Contains("no-audio")),
-                noVideo    = items.Count(i => i.issues.Contains("no-video")),
-                noDuration = items.Count(i => i.issues.Contains("no-duration")),
-                failed     = items.Count(i => i.issues.Contains("failed")),
-                total      = items.Count,
+                noAudio,
+                noVideo,
+                noDuration,
+                failed,
+                verifyFailed,
+                total = allIssues,
+                verifiedCount,
+                totalScanned,
             },
         });
     }

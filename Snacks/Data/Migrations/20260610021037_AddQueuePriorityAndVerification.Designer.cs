@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Snacks.Data;
 
@@ -10,9 +11,11 @@ using Snacks.Data;
 namespace Snacks.Data.Migrations
 {
     [DbContext(typeof(SnacksDbContext))]
-    partial class SnacksDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260610021037_AddQueuePriorityAndVerification")]
+    partial class AddQueuePriorityAndVerification
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder.HasAnnotation("ProductVersion", "10.0.0");
@@ -213,10 +216,6 @@ namespace Snacks.Data.Migrations
                         .HasColumnType("TEXT");
 
                     b.Property<DateTime?>("LastVerifiedAt")
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("LastVerifyResult")
-                        .HasMaxLength(2048)
                         .HasColumnType("TEXT");
 
                     b.Property<string>("OriginalLanguage")

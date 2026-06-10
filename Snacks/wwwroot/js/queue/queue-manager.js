@@ -294,6 +294,16 @@ export class QueueManager {
 
             this._reconcileQueueContainer(queueItems);
 
+            // Prune DB-sourced pending entries ("mf-…") that left the current
+            // page. Only the full loadItems() reconciles deletions, and during a
+            // multi-hour sweep this queue-only path runs thousands of times —
+            // without pruning, every tile that ever crossed page 1 stays in the
+            // map for the session.
+            const fetchedIds = new Set(queueItems.map((i) => i.id));
+            for (const id of [...this._workItems.keys()]) {
+                if (id.startsWith('mf-') && !fetchedIds.has(id)) this._workItems.delete(id);
+            }
+
             if (queueItems.length === 0) {
                 this._renderEmptyQueue(stats);
             }
@@ -671,6 +681,15 @@ export class QueueManager {
             showToast('Item is no longer pending', 'warning');
         }
         this.loadItems();
+    }
+
+    /**
+     * Called on SignalR `QueueChanged` — the server-side pending queue changed
+     * (add, cancel, prioritize, bulk reset). Pending tiles are fetch-driven, so
+     * a throttled queued-container refresh is all that's needed.
+     */
+    queueChanged() {
+        this._scheduleQueueRefresh();
     }
 
     /** Called on SignalR `WorkItemRemoved`. Drops the card from the in-memory map and DOM. */

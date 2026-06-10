@@ -52,6 +52,19 @@
                 <input type="number" class="form-control" id="settingsEncodingLogRetentionDays" min="0" step="1">
                 <div class="form-text">How long to keep per-job FFmpeg logs in the working directory. Each encode writes one file; over time they accumulate. Set to <code>0</code> to keep them forever. The app's rolling log is unaffected.</div>
             </div>
+
+            <h6 class="fw-bold mb-3 mt-4"><i class="fas fa-heart-pulse me-2 text-info"></i>Rolling Verification</h6>
+
+            <div class="mb-3">
+                <label for="settingsVerifyFilesPerDay" class="form-label">Files deep-verified per day</label>
+                <input type="number" class="form-control" id="settingsVerifyFilesPerDay" min="0" max="10000" step="10" value="0">
+                <div class="form-text">
+                    Continuously re-checks your library for silent corruption by decoding short
+                    samples of each file (oldest-checked first), spread evenly through the day.
+                    Problems appear on the Library Health page. <code>0</code> disables it;
+                    <code>100</code>–<code>500</code> is a gentle setting for NAS hardware.
+                </div>
+            </div>
         </div>
     </div>
 </div>

@@ -41,6 +41,7 @@ const FOLDER_OVERRIDE_FIELDS = Object.freeze({
     FourKBitrateMultiplier:     'select',
     Skip4K:                     'bool',
     SkipPercentAboveTarget:     'number',
+    QueuePriority:              'number',
     DeleteOriginalFile:         'bool',
     RetryOnFail:                'bool',
 
@@ -116,6 +117,7 @@ const NUMBER_DEFAULTS = Object.freeze({
     TargetBitrate:          '3500',
     FourKBitrateMultiplier: '4',
     SkipPercentAboveTarget: '20',
+    QueuePriority:          '0',
 });
 
 

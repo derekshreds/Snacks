@@ -400,3 +400,8 @@ Snacks/tools/wordlists/*.txt
 
 # Claude Code
 .claude/
+# E2E harness artifacts — the published app copy and per-run output
+# (synthetic libraries, instance work dirs, logs, memory CSVs). The harness
+# scripts themselves (e2e/*.sh, scenarios/) ARE tracked.
+e2e/.build/
+e2e/.runs/

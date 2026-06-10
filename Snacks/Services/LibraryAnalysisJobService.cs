@@ -36,11 +36,36 @@ public sealed class LibraryAnalysisJobService
         public DateTime StartedAt { get; } = DateTime.UtcNow;
         public DateTime? FinishedAt { get; set; }
 
-        /// <summary> Populated when the job completes. Fetched once by the UI, then pruned with the job. </summary>
+        /// <summary>
+        ///     Populated when the job completes. Capped: when the analysis covers more
+        ///     than <see cref="FullResultCap"/> files, only the first
+        ///     <see cref="TruncatedPreviewRows"/> rows are kept (and shipped) and
+        ///     <see cref="Summary"/> carries the authoritative per-decision totals —
+        ///     a whole-library run would otherwise pin hundreds of MB in this singleton
+        ///     and ship a multi-MB payload the modal can't usefully render anyway.
+        /// </summary>
         public List<FileAnalysisResult> Results { get; set; } = new();
+
+        /// <summary> True when <see cref="Results"/> is a preview subset (see above). </summary>
+        public bool Truncated { get; set; }
+
+        /// <summary> Total analyzed file count (equals Results.Count unless truncated). </summary>
+        public int TotalResults { get; set; }
+
+        /// <summary> Per-decision totals, computed server-side so truncation never skews the cards. </summary>
+        public List<DecisionSummary> Summary { get; set; } = new();
 
         internal CancellationTokenSource Cts { get; } = new();
     }
+
+    /// <summary> One decision bucket of an analysis: how many files and how many source bytes. </summary>
+    public sealed record DecisionSummary(string Decision, int Count, long Bytes, int Borderline);
+
+    /// <summary> Above this many analyzed files, results are summarized instead of shipped in full. </summary>
+    public const int FullResultCap = 20_000;
+
+    /// <summary> How many preview rows a truncated job keeps for the modal's table. </summary>
+    public const int TruncatedPreviewRows = 1_000;
 
     private readonly TranscodingService _transcodingService;
     private readonly ConcurrentDictionary<string, AnalysisJob> _jobs = new();
@@ -89,8 +114,25 @@ public sealed class LibraryAnalysisJobService
                         if (processed > job.Processed) job.Processed = processed;
                         job.Total = total;
                     });
-                job.Results = results;
-                job.State   = JobState.Completed;
+
+                job.TotalResults = results.Count;
+                job.Summary = results
+                    .GroupBy(r => r.Decision)
+                    .Select(g => new DecisionSummary(
+                        g.Key, g.Count(), g.Sum(r => r.SizeBytes), g.Count(r => r.Borderline)))
+                    .OrderByDescending(s => s.Count)
+                    .ToList();
+
+                if (results.Count > FullResultCap)
+                {
+                    job.Truncated = true;
+                    job.Results   = results.Take(TruncatedPreviewRows).ToList();
+                }
+                else
+                {
+                    job.Results = results;
+                }
+                job.State = JobState.Completed;
             }
             catch (OperationCanceledException)
             {

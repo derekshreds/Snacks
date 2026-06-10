@@ -82,6 +82,7 @@
                 </div>
                 <div id="analyzeContent" style="display: none;">
                     <div id="analyzeSummary" class="row g-2 mb-3"></div>
+                    <div id="analyzeTruncatedNotice" class="alert alert-info py-2 small" style="display: none;"></div>
                     <div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
                         <div id="analyzeFilterTabs" class="btn-group btn-group-sm"></div>
                         <input type="text" class="form-control form-control-sm" id="analyzeFilterText" placeholder="Filter by name..." style="max-width: 260px;">
@@ -287,6 +288,12 @@
                     </div>
                 </div>
                 <div class="col-md-6">
+                    <div class="form-check mb-2" data-context="folder">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_QueuePriority" data-field="QueuePriority">
+                        <label class="form-check-label" for="ovr_QueuePriority">Queue Priority</label>
+                        <input type="number" class="form-control form-control-sm mt-1" id="ovrQueuePriority" min="0" max="1000" step="1" value="0" disabled>
+                        <div class="form-text">Files from this folder dispatch before lower-priority backlog — set it on a "new downloads" folder so fresh content never waits.</div>
+                    </div>
                     <div class="form-check mb-2" data-context="folder">
                         <input class="form-check-input override-toggle" type="checkbox" id="ovr_Skip4K" data-field="Skip4K">
                         <label class="form-check-label" for="ovr_Skip4K">Skip 4K Videos</label>

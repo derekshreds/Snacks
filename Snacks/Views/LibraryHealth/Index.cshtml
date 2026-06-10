@@ -82,12 +82,23 @@
                 </div>
             </button>
         </div>
+        <div class="col-6 col-md">
+            <button type="button" class="card w-100 text-start health-filter-card" data-health-filter="verify-failed" style="border-left:3px solid var(--bs-danger);">
+                <div class="card-body p-2">
+                    <div class="small text-muted text-uppercase" style="letter-spacing:0.5px; font-size:0.7rem;">Failed Verification</div>
+                    <div class="h4 mb-0 mt-1" id="healthCountVerifyFailed">—</div>
+                </div>
+            </button>
+        </div>
     </div>
 
     <div class="card">
         <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
             <h6 class="mb-0"><i class="fas fa-stethoscope me-2"></i>Flagged Files <small class="text-muted ms-1" id="healthShownCount"></small></h6>
-            <input type="text" class="form-control form-control-sm" id="healthFilterText" placeholder="Filter by name or path..." style="max-width: 280px;">
+            <div class="d-flex align-items-center gap-3 flex-wrap">
+                <small class="text-muted" id="healthVerifyCoverage" title="Rolling deep-verification coverage — enable in Settings → System → Rolling Verification"></small>
+                <input type="text" class="form-control form-control-sm" id="healthFilterText" placeholder="Search by name or path..." style="max-width: 280px;">
+            </div>
         </div>
         <div class="card-body p-0">
             <div id="healthLoading" class="text-center text-muted py-5">
@@ -111,6 +122,12 @@
                     <tbody id="healthTableBody"></tbody>
                 </table>
             </div>
+        </div>
+        @* No d-flex class — its !important display:flex would defeat the JS show/hide toggle. *@
+        <div class="card-footer justify-content-center align-items-center gap-3 py-2" id="healthPager" style="display:none;">
+            <button type="button" class="btn btn-sm btn-outline-secondary" id="healthPagePrev"><i class="fas fa-chevron-left"></i></button>
+            <small class="text-muted" id="healthPageLabel"></small>
+            <button type="button" class="btn btn-sm btn-outline-secondary" id="healthPageNext"><i class="fas fa-chevron-right"></i></button>
         </div>
     </div>
 </div>

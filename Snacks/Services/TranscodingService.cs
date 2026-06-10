@@ -19,11 +19,55 @@ namespace Snacks.Services;
 /// </summary>
 public class TranscodingService
 {
-    /// <summary>All known work items keyed by ID, including completed and failed items.</summary>
+    /// <summary>
+    ///     In-memory work items keyed by ID: active jobs, the hydrated pending
+    ///     window, and recently finished items. NOT the full queue — pending work
+    ///     beyond the window lives only as <see cref="MediaFileStatus.Queued"/> rows
+    ///     in the database (see <see cref="SyncQueueWindowAsync"/>).
+    /// </summary>
     private readonly ConcurrentDictionary<string, WorkItem> _workItems = new();
 
-    /// <summary>Ordered list of pending work items; sorted by bitrate descending.</summary>
+    /// <summary>
+    ///     Normalized-path → work-item-id index over <see cref="_workItems"/>.
+    ///     Duplicate detection used to scan every in-memory item per add — O(n²)
+    ///     across a sweep. Maintained exclusively by <see cref="RegisterWorkItem"/> /
+    ///     <see cref="UnregisterWorkItem"/>; never mutate <see cref="_workItems"/> directly.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, string> _pathIndex = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    ///     The scheduler's working window: the hydrated top of the DB pending queue
+    ///     (at most <see cref="QueueWindowSize"/> items), sorted by <see cref="CompareQueueOrder"/>.
+    /// </summary>
     private readonly List<WorkItem> _workQueue = new();
+
+    /// <summary>
+    ///     How many pending rows the scheduler keeps hydrated. Large enough that the
+    ///     local scheduler and the cluster dispatcher never starve between syncs,
+    ///     small enough that a 500k-row backlog costs no meaningful memory.
+    /// </summary>
+    internal const int QueueWindowSize = 50;
+
+    /// <summary>1 when the window may be stale relative to the DB (item added/cancelled/prioritized/dispatched).</summary>
+    private int _queueWindowDirty = 1;
+
+    /// <summary>Serializes window syncs; concurrent callers coalesce on the dirty flag.</summary>
+    private readonly SemaphoreSlim _windowSyncLock = new(1, 1);
+
+    /// <summary>
+    ///     Row offset for window rotation. Normally 0 (window = top of the queue).
+    ///     When every hydrated item is locally unservable (e.g. 50 consecutive 4K
+    ///     items with master-excludes-4K) but the DB holds more pending rows, the
+    ///     scheduler advances this by <see cref="QueueWindowSize"/> per pass so deeper
+    ///     servable items rotate in instead of starving behind the unservable head.
+    /// </summary>
+    private int _windowRotationOffset;
+
+    /// <summary>
+    ///     When true, the pending order tiebreaker is recency (newest first) instead
+    ///     of bitrate. Mirrors <c>EncoderOptions.QueueOrderNewestFirst</c>.
+    /// </summary>
+    private volatile bool _queueNewestFirst;
 
     /// <summary>Lock protecting access to <see cref="_workQueue"/>.</summary>
     private readonly object _queueLock = new();
@@ -547,10 +591,9 @@ public class TranscodingService
             // Re-adding an already-processed library used to re-probe every file just
             // to print "already completed" — thousands of sequential ffprobe/ffmpeg
             // spawns against NAS storage for nothing.
-            if (_workItems.Values.Any(w =>
-                w.NormalizedPath.Equals(earlyNormalizedPath, StringComparison.OrdinalIgnoreCase) &&
-                w.Status is WorkItemStatus.Pending or WorkItemStatus.Processing
-                    or WorkItemStatus.Uploading or WorkItemStatus.Downloading))
+            if (FindWorkItemByPath(earlyNormalizedPath) is { Status: WorkItemStatus.Pending
+                    or WorkItemStatus.Processing or WorkItemStatus.Uploading
+                    or WorkItemStatus.Downloading })
             {
                 return string.Empty;
             }
@@ -561,14 +604,18 @@ public class TranscodingService
                 return string.Empty;
             }
 
-            // Terminal-status early-out, but only when the file is provably unchanged
+            // Settled-status early-out, but only when the file is provably unchanged
             // (mtime + size match) — otherwise fall through to the full change-detection
-            // logic below, which needs probe data (duration delta).
+            // logic below, which needs probe data (duration delta). Queued counts as
+            // settled here: the queue is the DB now, and an unchanged already-queued
+            // row needs no re-probe and no re-add (the in-memory check above only
+            // covers rows hydrated into the working window).
             var earlyDbFile = await _mediaFileRepo.GetByPathAsync(earlyNormalizedPath);
             if (!force && earlyDbFile != null
                 && earlyDbFile.FileMtime == fileInfo.LastWriteTimeUtc.Ticks
                 && earlyDbFile.FileSize == fileInfo.Length
-                && earlyDbFile.Status is MediaFileStatus.Failed or MediaFileStatus.Cancelled or MediaFileStatus.Completed)
+                && earlyDbFile.Status is MediaFileStatus.Failed or MediaFileStatus.Cancelled
+                    or MediaFileStatus.Completed or MediaFileStatus.Queued)
             {
                 Console.WriteLine($"Skipping {Path.GetFileName(filePath)}: previously {earlyDbFile.Status} (unchanged on disk)");
                 return string.Empty;
@@ -766,10 +813,9 @@ public class TranscodingService
 
             Console.WriteLine($"Queuing {workItem.FileName}: {sourceCodec} {bitrate}kbps {(isHighDef ? "4K" : "HD")}");
 
-            if (_workItems.Values.Any(w =>
-                w.NormalizedPath.Equals(normalizedPath, StringComparison.OrdinalIgnoreCase) &&
-                w.Status is WorkItemStatus.Pending or WorkItemStatus.Processing
-                    or WorkItemStatus.Uploading or WorkItemStatus.Downloading))
+            if (FindWorkItemByPath(normalizedPath) is { Status: WorkItemStatus.Pending
+                    or WorkItemStatus.Processing or WorkItemStatus.Uploading
+                    or WorkItemStatus.Downloading })
             {
                 return workItem.Id;
             }
@@ -809,10 +855,9 @@ public class TranscodingService
             // Force-add must clear any stale in-memory entry so AddFileAsync won't skip it on the duplicate path check.
             if (force)
             {
-                var existing = _workItems.Values.FirstOrDefault(w =>
-                    w.NormalizedPath.Equals(normalizedPath, StringComparison.OrdinalIgnoreCase));
+                var existing = FindWorkItemByPath(normalizedPath);
                 if (existing != null)
-                    _workItems.TryRemove(existing.Id, out _);
+                    UnregisterWorkItem(existing.Id);
             }
 
             await _mediaFileRepo.UpsertAsync(new MediaFile
@@ -832,6 +877,7 @@ public class TranscodingService
                 IsHdr = isHdr,
                 Is4K = isHighDef,
                 Status = MediaFileStatus.Queued,
+                Priority = ResolveFolderOverride(filePath)?.QueuePriority ?? 0,
                 LastScannedAt = DateTime.UtcNow,
                 FileMtime = fileInfo.LastWriteTimeUtc.Ticks,
                 AudioStreams    = MuxStreamSummary.Serialize(ProjectAudioSummaries(probe)),
@@ -839,20 +885,11 @@ public class TranscodingService
                 OriginalLanguage = originalLanguage,
             });
 
-            // Release the probe before parking — every encode path lazily
-            // re-probes when Probe is null, and holding 10–30 KB of stream
-            // metadata per pending item is what let a 30k-file sweep grow the
-            // in-memory queue into multi-GB territory.
-            workItem.Probe = null;
-
-            _workItems[workItem.Id] = workItem;
-            lock (_queueLock)
-            {
-                _workQueue.Add(workItem);
-                _workQueue.Sort(CompareQueueOrder);
-            }
-
-            await _hubContext.Clients.All.SendAsync("WorkItemAdded", workItem);
+            // The Queued row IS the queue entry — no WorkItem is parked in memory.
+            // The scheduler hydrates the row when it reaches the top of the queue
+            // order, so pending items beyond the working window cost nothing.
+            MarkQueueWindowDirty();
+            await NotifyQueueChangedAsync();
 
             // Wake the cluster dispatcher in parallel with the local scheduler
             // so workers compete for fast jobs (music) instead of losing every
@@ -972,10 +1009,9 @@ public class TranscodingService
 
             var dbFile = await _mediaFileRepo.GetByPathAsync(normalizedPath);
 
-            if (_workItems.Values.Any(w =>
-                w.NormalizedPath.Equals(normalizedPath, StringComparison.OrdinalIgnoreCase) &&
-                w.Status is WorkItemStatus.Pending or WorkItemStatus.Processing
-                    or WorkItemStatus.Uploading or WorkItemStatus.Downloading))
+            if (FindWorkItemByPath(normalizedPath) is { Status: WorkItemStatus.Pending
+                    or WorkItemStatus.Processing or WorkItemStatus.Uploading
+                    or WorkItemStatus.Downloading })
             {
                 return workItem.Id;
             }
@@ -1014,14 +1050,18 @@ public class TranscodingService
                     Console.WriteLine($"Skipping {workItem.FileName}: already completed");
                     return workItem.Id;
                 }
+                else if (!force && dbFile.Status is MediaFileStatus.Queued)
+                {
+                    // Already in the DB queue and unchanged on disk — nothing to do.
+                    return workItem.Id;
+                }
             }
 
             if (force)
             {
-                var existing = _workItems.Values.FirstOrDefault(w =>
-                    w.NormalizedPath.Equals(normalizedPath, StringComparison.OrdinalIgnoreCase));
+                var existing = FindWorkItemByPath(normalizedPath);
                 if (existing != null)
-                    _workItems.TryRemove(existing.Id, out _);
+                    UnregisterWorkItem(existing.Id);
             }
 
             await _mediaFileRepo.UpsertAsync(new MediaFile
@@ -1036,26 +1076,17 @@ public class TranscodingService
                 Duration      = length,
                 Kind          = MediaKind.Music,
                 Status        = MediaFileStatus.Queued,
+                Priority      = ResolveFolderOverride(filePath)?.QueuePriority ?? 0,
                 LastScannedAt = DateTime.UtcNow,
                 FileMtime     = fileInfo.LastWriteTimeUtc.Ticks,
             });
 
             Console.WriteLine($"Queuing music {workItem.FileName}: {sourceCodec} {sourceKbps}kbps {sourceChans}ch → {music.Codec} {music.BitrateKbps}kbps");
 
-            // Release the probe before parking — every encode path lazily
-            // re-probes when Probe is null, and holding 10–30 KB of stream
-            // metadata per pending item is what let a 30k-file sweep grow the
-            // in-memory queue into multi-GB territory.
-            workItem.Probe = null;
-
-            _workItems[workItem.Id] = workItem;
-            lock (_queueLock)
-            {
-                _workQueue.Add(workItem);
-                _workQueue.Sort(CompareQueueOrder);
-            }
-
-            await _hubContext.Clients.All.SendAsync("WorkItemAdded", workItem);
+            // The Queued row IS the queue entry — no WorkItem is parked in memory.
+            // The scheduler hydrates the row when it reaches the top of the queue order.
+            MarkQueueWindowDirty();
+            await NotifyQueueChangedAsync();
 
             // Wake the cluster dispatcher in parallel with the local scheduler
             // so workers compete for music items instead of losing every one to
@@ -1576,9 +1607,14 @@ public class TranscodingService
     /// <param name="workItem"> The work item whose <c>Id</c> property will also be updated. </param>
     public void ReplaceWorkItemId(string oldId, string newId, WorkItem workItem)
     {
-        _workItems.TryRemove(oldId, out _);
+        // Register-then-unregister: the reverse order leaves a window where the
+        // item is in neither the dictionary nor the path index, and a concurrent
+        // window sync would hydrate a duplicate Pending item for a job that is
+        // mid-dispatch. UnregisterWorkItem only clears the path-index entry when
+        // it still points at the removed id, so the new registration survives.
         workItem.Id = newId;
-        _workItems[newId] = workItem;
+        RegisterWorkItem(workItem);
+        UnregisterWorkItem(oldId);
     }
 
     /// <summary>Returns <c>true</c> if the specified file path is currently Pending or Processing in the queue.</summary>
@@ -1599,21 +1635,19 @@ public class TranscodingService
     }
 
     /// <summary>
-    ///     Status counts for the stats endpoint. A single pass over the live
-    ///     dictionary — the stats poll fires every few seconds, and materializing
-    ///     plus sorting the full item list (as <see cref="GetAllWorkItems"/> does)
-    ///     just to count is measurable churn once a big sweep has queued tens of
-    ///     thousands of items.
+    ///     Status counts for the stats endpoint. Pending comes from the DB — the
+    ///     authoritative queue — via one indexed COUNT (hydrated window items are
+    ///     Queued rows too, so memory must not add to it). Processing and the
+    ///     recent completed/failed counts come from the in-memory registry, which
+    ///     matches what the queue page can actually list.
     /// </summary>
-    public (int Pending, int Processing, int Completed, int Failed, int Total) GetWorkItemCounts()
+    public async Task<(int Pending, int Processing, int Completed, int Failed, int Total)> GetWorkItemCountsAsync()
     {
-        int pending = 0, processing = 0, completed = 0, failed = 0, total = 0;
+        int processing = 0, completed = 0, failed = 0;
         foreach (var item in _workItems.Values)
         {
-            total++;
             switch (item.Status)
             {
-                case WorkItemStatus.Pending:    pending++;    break;
                 case WorkItemStatus.Completed:  completed++;  break;
                 case WorkItemStatus.Failed:     failed++;     break;
                 case WorkItemStatus.Processing:
@@ -1621,11 +1655,53 @@ public class TranscodingService
                 case WorkItemStatus.Downloading: processing++; break;
             }
         }
-        return (pending, processing, completed, failed, total);
+        int pending = await _mediaFileRepo.CountQueuedLocalAsync();
+        return (pending, processing, completed, failed, pending + processing + completed + failed);
     }
 
     /// <summary>Removes a work item from the in-memory tracking dictionary (e.g. after remote job cleanup).</summary>
-    public void RemoveWorkItem(string id) => _workItems.TryRemove(id, out _);
+    public void RemoveWorkItem(string id) => UnregisterWorkItem(id);
+
+    /******************************************************************
+     *  Work-item registration (keeps the path index coherent)
+     ******************************************************************/
+
+    /// <summary>
+    ///     Inserts (or re-inserts) a work item into <see cref="_workItems"/> and the
+    ///     path index. The sole write path into the dictionary — direct mutation
+    ///     would silently desynchronize duplicate detection.
+    /// </summary>
+    private void RegisterWorkItem(WorkItem item)
+    {
+        _workItems[item.Id] = item;
+        if (item.NormalizedPath.Length > 0)
+            _pathIndex[item.NormalizedPath] = item.Id;
+    }
+
+    /// <summary> Removes a work item and its path-index entry (only when the entry still points at this id). </summary>
+    private void UnregisterWorkItem(string id)
+    {
+        if (!_workItems.TryRemove(id, out var item)) return;
+        if (item.NormalizedPath.Length > 0)
+            _pathIndex.TryRemove(new KeyValuePair<string, string>(item.NormalizedPath, id));
+    }
+
+    /// <summary> Clears the dictionary and index together. </summary>
+    private void ClearWorkItems()
+    {
+        _workItems.Clear();
+        _pathIndex.Clear();
+    }
+
+    /// <summary>
+    ///     O(1) lookup of the in-memory work item (any status) registered for a
+    ///     normalized path, or null. Replaces the full-dictionary scans the add
+    ///     paths used for duplicate detection.
+    /// </summary>
+    private WorkItem? FindWorkItemByPath(string normalizedPath)
+        => _pathIndex.TryGetValue(normalizedPath, out var id) && _workItems.TryGetValue(id, out var item)
+            ? item
+            : null;
 
     /// <summary>
     ///     Canonical pending-queue ordering: user priority first ("move to front"),
@@ -1634,31 +1710,283 @@ public class TranscodingService
     ///     listing mirrors it so the on-screen order matches dispatch order.
     /// </summary>
     internal static int CompareQueueOrder(WorkItem a, WorkItem b)
+        => CompareQueueOrder(a, b, newestFirst: false);
+
+    /// <summary>
+    ///     Policy-aware variant: with newest-first enabled the tiebreaker is queue
+    ///     recency instead of bitrate, matching the DB ordering so the window's
+    ///     internal dispatch order agrees with what the queue page shows.
+    /// </summary>
+    internal static int CompareQueueOrder(WorkItem a, WorkItem b, bool newestFirst)
     {
         int byPriority = b.Priority.CompareTo(a.Priority);
-        return byPriority != 0 ? byPriority : b.Bitrate.CompareTo(a.Bitrate);
+        if (byPriority != 0) return byPriority;
+        return newestFirst
+            ? b.QueuedAt.CompareTo(a.QueuedAt)
+            : b.Bitrate.CompareTo(a.Bitrate);
+    }
+
+    /******************************************************************
+     *  DB-first queue window
+     ******************************************************************/
+
+    /// <summary>
+    ///     Flags the working window as stale relative to the DB queue and nudges
+    ///     the scheduler. Cheap and idempotent — call after anything that changes
+    ///     which rows belong at the head of the queue (add, cancel, prioritize,
+    ///     policy change, remote requeue).
+    /// </summary>
+    public void MarkQueueWindowDirty()
+    {
+        // External queue changes (add/cancel/prioritize/policy) may have changed
+        // the head of the order — abandon any in-progress rotation so the window
+        // snaps back to the true top.
+        _windowRotationOffset = 0;
+        Interlocked.Exchange(ref _queueWindowDirty, 1);
+        WakeScheduler();
+    }
+
+    /// <summary> Applies the queue-order policy from saved options (item-8 wiring). </summary>
+    public void SetQueueOrderNewestFirst(bool newestFirst)
+    {
+        if (_queueNewestFirst == newestFirst) return;
+        _queueNewestFirst = newestFirst;
+        MarkQueueWindowDirty();
     }
 
     /// <summary>
-    ///     Moves a pending work item to the front of the queue by assigning it a
-    ///     priority above the current maximum, then resorting. Returns false when
-    ///     the item is unknown or no longer pending.
+    ///     Reconciles the in-memory working window with the top of the DB pending
+    ///     queue: hydrates rows that should be in the window, evicts pending items
+    ///     that fell out of the top-N (their rows remain Queued — nothing is lost),
+    ///     and lazily quarantines rows whose source file vanished. No-op unless the
+    ///     window has been marked dirty, so calling per scheduler tick is free.
     /// </summary>
-    public bool PrioritizeWorkItem(string id)
+    /// <param name="rotationOffset">
+    ///     Row offset into the queue order; non-zero only when the scheduler is
+    ///     rotating past a locally-unservable head (see <see cref="_windowRotationOffset"/>).
+    /// </param>
+    internal async Task SyncQueueWindowAsync(int rotationOffset = 0)
     {
+        if (Volatile.Read(ref _queueWindowDirty) == 0) return;
+
+        await _windowSyncLock.WaitAsync();
+        try
+        {
+            if (Interlocked.Exchange(ref _queueWindowDirty, 0) == 0) return;
+
+            var topRows = await _mediaFileRepo.GetQueueWindowAsync(
+                QueueWindowSize, _queueNewestFirst, rotationOffset);
+
+            // Kind representation: the global order is bitrate-weighted, so 50+
+            // pending videos would keep every music row out of the window forever —
+            // and the dedicated music slots (master + workers) dispatch only from
+            // the window. Reserve a few slots for whichever kind got shut out.
+            const int KindFloor = 8;
+            if (topRows.Count > 0)
+            {
+                if (!topRows.Any(r => r.Kind == MediaKind.Music))
+                {
+                    var music = await _mediaFileRepo.GetQueueWindowAsync(KindFloor, _queueNewestFirst, kind: MediaKind.Music);
+                    if (music.Count > 0) topRows = topRows.Take(QueueWindowSize - music.Count).Concat(music).ToList();
+                }
+                else if (!topRows.Any(r => r.Kind == MediaKind.Video))
+                {
+                    var video = await _mediaFileRepo.GetQueueWindowAsync(KindFloor, _queueNewestFirst, kind: MediaKind.Video);
+                    if (video.Count > 0) topRows = topRows.Take(QueueWindowSize - video.Count).Concat(video).ToList();
+                }
+            }
+
+            // Storage-outage guard: if EVERY window row's source is unreachable,
+            // the library mount is down — bail without evicting or quarantining.
+            // Quarantining here would convert the whole backlog to Unseen at full
+            // sync speed during a transient NAS outage, destroying queue state
+            // (and every move-to-front priority) that would otherwise survive it.
+            if (topRows.Count >= 5 && topRows.All(r => !File.Exists(r.FilePath)))
+            {
+                Console.WriteLine("QueueWindow: library storage appears offline — leaving the queue untouched until it returns");
+                return;
+            }
+
+            var topPaths = new HashSet<string>(topRows.Select(r => r.FilePath), StringComparer.OrdinalIgnoreCase);
+
+            // Evict pending window items no longer in the target set. Safe: a
+            // pending hydrated item carries no state beyond its DB row.
+            lock (_queueLock)
+            {
+                foreach (var stale in _workQueue.Where(w =>
+                             w.Status == WorkItemStatus.Pending &&
+                             !topPaths.Contains(w.NormalizedPath)).ToList())
+                {
+                    _workQueue.Remove(stale);
+                    UnregisterWorkItem(stale.Id);
+                }
+            }
+
+            foreach (var row in topRows)
+            {
+                // Skip rows already represented in memory in any live state —
+                // hydrated pending, actively encoding, or mid-transfer.
+                var existing = FindWorkItemByPath(row.FilePath);
+                if (existing != null && existing.Status is WorkItemStatus.Pending
+                        or WorkItemStatus.Processing or WorkItemStatus.Uploading
+                        or WorkItemStatus.Downloading)
+                    continue;
+
+                if (!File.Exists(row.FilePath))
+                {
+                    // Source vanished while queued — back to Unseen so the next
+                    // scan re-evaluates (and the row stops occupying the window).
+                    try { await _mediaFileRepo.SetStatusAsync(row.FilePath, MediaFileStatus.Unseen); }
+                    catch (Exception ex) { Console.WriteLine($"QueueWindow: failed to quarantine missing {row.FileName}: {ex.Message}"); }
+                    continue;
+                }
+
+                var item = new WorkItem
+                {
+                    FileName = row.FileName,
+                    Path     = row.FilePath,
+                    Size     = row.FileSize,
+                    Bitrate  = row.Bitrate,
+                    Length   = row.Duration,
+                    IsHevc   = row.IsHevc,
+                    Is4K     = row.Is4K,
+                    Kind     = row.Kind,
+                    Priority = row.Priority,
+                    QueuedAt = row.CreatedAt,
+                    Probe    = null, // lazily probed when processing starts
+                };
+
+                RegisterWorkItem(item);
+                lock (_queueLock)
+                {
+                    _workQueue.Add(item);
+                    _workQueue.Sort((a, b) => CompareQueueOrder(a, b, _queueNewestFirst));
+                }
+            }
+        }
+        finally
+        {
+            _windowSyncLock.Release();
+        }
+    }
+
+    /// <summary> Test accessor: a copy of the hydrated working window. </summary>
+    internal List<WorkItem> GetQueueWindowSnapshot()
+    {
+        lock (_queueLock) return _workQueue.ToList();
+    }
+
+    /// <summary>
+    ///     Cluster-dispatcher entry point: tops up the window when it has run dry
+    ///     but the DB still holds pending rows, so worker nodes keep pulling work
+    ///     even when the master's local scheduler loop has exited (paused local
+    ///     encoding, off-schedule master, every device disabled).
+    /// </summary>
+    public async Task EnsureQueueWindowAsync()
+    {
+        bool windowHasPending;
+        lock (_queueLock)
+        {
+            windowHasPending = _workQueue.Any(w => w.Status == WorkItemStatus.Pending);
+        }
+        if (!windowHasPending)
+            MarkQueueWindowDirty();
+        await SyncQueueWindowAsync();
+    }
+
+    /// <summary>
+    ///     Moves a pending work item to the front of the queue. Accepts either a
+    ///     hydrated work-item GUID or a DB-row id of the form <c>mf-{rowId}</c>
+    ///     (how the queue UI addresses pending rows beyond the window). The
+    ///     authoritative write is the row's Priority column; the hydrated copy
+    ///     (when one exists) is updated in place so dispatch order changes now.
+    /// </summary>
+    public async Task<bool> PrioritizeWorkItemAsync(string id)
+    {
+        // DB-row addressing (queue UI tiles).
+        if (TryParseRowId(id, out var rowId))
+        {
+            var newPriority = await _mediaFileRepo.BumpPriorityToFrontAsync(rowId);
+            if (newPriority == null) return false;
+
+            var row = await _mediaFileRepo.GetByIdAsync(rowId);
+            if (row != null && FindWorkItemByPath(row.FilePath) is { Status: WorkItemStatus.Pending } hydrated)
+            {
+                hydrated.Priority = newPriority.Value;
+                lock (_queueLock) { _workQueue.Sort((a, b) => CompareQueueOrder(a, b, _queueNewestFirst)); }
+            }
+
+            MarkQueueWindowDirty();
+            await SyncQueueWindowAsync();
+            await NotifyQueueChangedAsync();
+            Console.WriteLine($"Queue: moved row {rowId} to the front (priority {newPriority})");
+            return true;
+        }
+
+        // Hydrated-item addressing (legacy path; still used by anything holding a GUID).
         if (!_workItems.TryGetValue(id, out var item) || item.Status != WorkItemStatus.Pending)
             return false;
 
-        lock (_queueLock)
-        {
-            int maxPriority = _workQueue.Count > 0 ? _workQueue.Max(w => w.Priority) : 0;
-            item.Priority = maxPriority + 1;
-            _workQueue.Sort(CompareQueueOrder);
-        }
-
-        _ = _hubContext.Clients.All.SendAsync("WorkItemUpdated", item);
+        var bumped = await _mediaFileRepo.BumpPriorityToFrontAsync(
+            await ResolveRowIdByPathAsync(item.NormalizedPath) ?? -1);
+        item.Priority = bumped ?? item.Priority + 1;
+        lock (_queueLock) { _workQueue.Sort((a, b) => CompareQueueOrder(a, b, _queueNewestFirst)); }
+        MarkQueueWindowDirty();
+        await NotifyQueueChangedAsync();
         Console.WriteLine($"Queue: moved {item.FileName} to the front");
         return true;
+    }
+
+    /// <summary> Parses the queue UI's <c>mf-{rowId}</c> addressing form. </summary>
+    internal static bool TryParseRowId(string id, out int rowId)
+    {
+        rowId = 0;
+        return id.StartsWith("mf-", StringComparison.Ordinal)
+            && int.TryParse(id.AsSpan(3), out rowId);
+    }
+
+    /// <summary> Looks up the DB row id for a normalized path, or null. </summary>
+    private async Task<int?> ResolveRowIdByPathAsync(string normalizedPath)
+        => (await _mediaFileRepo.GetByPathAsync(normalizedPath))?.Id;
+
+    /// <summary>UTC ticks of the last QueueChanged broadcast (Interlocked access).</summary>
+    private long _lastQueueChangedTicks;
+
+    /// <summary>1 while a trailing-edge QueueChanged send is scheduled.</summary>
+    private int _queueChangedPending;
+
+    /// <summary>
+    ///     Broadcasts a lightweight "the pending queue changed" signal. The queue UI
+    ///     fetches a fresh page in response — pending tiles are DB-sourced, so there
+    ///     is no per-item payload to push. Throttled to one broadcast per second with
+    ///     a guaranteed trailing send, so a parallel sweep adding hundreds of files a
+    ///     minute produces a steady tick instead of an event flood — and the burst's
+    ///     final add is never silently dropped.
+    /// </summary>
+    private async Task NotifyQueueChangedAsync()
+    {
+        var now  = DateTime.UtcNow.Ticks;
+        var last = Interlocked.Read(ref _lastQueueChangedTicks);
+        if (now - last >= TimeSpan.TicksPerSecond
+            && Interlocked.CompareExchange(ref _lastQueueChangedTicks, now, last) == last)
+        {
+            try { await _hubContext.Clients.All.SendAsync("QueueChanged"); }
+            catch { /* SignalR failures are non-fatal — UI reconciles on next poll */ }
+            return;
+        }
+
+        // Inside the throttle window — schedule exactly one trailing send.
+        if (Interlocked.CompareExchange(ref _queueChangedPending, 1, 0) == 0)
+        {
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(1100);
+                Interlocked.Exchange(ref _queueChangedPending, 0);
+                Interlocked.Exchange(ref _lastQueueChangedTicks, DateTime.UtcNow.Ticks);
+                try { await _hubContext.Clients.All.SendAsync("QueueChanged"); }
+                catch { /* non-fatal */ }
+            });
+        }
     }
 
     /// <summary>
@@ -1670,7 +1998,7 @@ public class TranscodingService
     /// </summary>
     public async Task DropMissingWorkItemAsync(WorkItem item)
     {
-        _workItems.TryRemove(item.Id, out _);
+        UnregisterWorkItem(item.Id);
         lock (_queueLock)
         {
             _workQueue.Remove(item);
@@ -1720,8 +2048,8 @@ public class TranscodingService
             // Re-check right before removal — a Stopped item can be requeued to
             // Pending at any time, and restore it if the flip lands mid-removal.
             if (!IsTerminal(victim.Status)) continue;
-            _workItems.TryRemove(victim.Id, out _);
-            if (!IsTerminal(victim.Status)) _workItems[victim.Id] = victim;
+            UnregisterWorkItem(victim.Id);
+            if (!IsTerminal(victim.Status)) RegisterWorkItem(victim);
             else evicted++;
         }
         if (evicted > 0)
@@ -1768,6 +2096,34 @@ public class TranscodingService
     /// <param name="id"> The ID of the work item to cancel. </param>
     public async Task CancelWorkItemAsync(string id)
     {
+        // DB-row addressing ("mf-{rowId}") — how the queue UI refers to pending
+        // rows. When the row is hydrated into the working window, fall through to
+        // the normal in-memory path so the window copy is cancelled too.
+        if (TryParseRowId(id, out var cancelRowId))
+        {
+            var row = await _mediaFileRepo.GetByIdAsync(cancelRowId);
+            if (row == null) return;
+
+            // Redirect only to a LIVE in-memory copy. A stale terminal item (recent
+            // history for a file that was since re-queued) would swallow the cancel —
+            // none of the status branches below match it — leaving the row Queued.
+            if (FindWorkItemByPath(row.FilePath) is { Status: WorkItemStatus.Pending
+                    or WorkItemStatus.Processing or WorkItemStatus.Uploading
+                    or WorkItemStatus.Downloading } hydrated)
+            {
+                await CancelWorkItemAsync(hydrated.Id);
+                return;
+            }
+
+            if (await _mediaFileRepo.SetQueuedRowStatusAsync(cancelRowId, MediaFileStatus.Cancelled))
+            {
+                MarkQueueWindowDirty();
+                await NotifyQueueChangedAsync();
+                Console.WriteLine($"Cancel: queued row {cancelRowId} ({row.FileName}) cancelled");
+            }
+            return;
+        }
+
         if (!_workItems.TryGetValue(id, out var workItem))
             return;
 
@@ -1913,6 +2269,33 @@ public class TranscodingService
     /// <param name="id"> The ID of the work item to stop. </param>
     public async Task StopWorkItemAsync(string id)
     {
+        // DB-row addressing — mirrors CancelWorkItemAsync. Stop on a pending row
+        // maps to Unseen (re-discoverable on the next scan), same as the in-memory
+        // pending path below.
+        if (TryParseRowId(id, out var stopRowId))
+        {
+            var row = await _mediaFileRepo.GetByIdAsync(stopRowId);
+            if (row == null) return;
+
+            // Live-status filter mirrors CancelWorkItemAsync — a stale terminal
+            // history item must not swallow the stop.
+            if (FindWorkItemByPath(row.FilePath) is { Status: WorkItemStatus.Pending
+                    or WorkItemStatus.Processing or WorkItemStatus.Uploading
+                    or WorkItemStatus.Downloading } hydrated)
+            {
+                await StopWorkItemAsync(hydrated.Id);
+                return;
+            }
+
+            if (await _mediaFileRepo.SetQueuedRowStatusAsync(stopRowId, MediaFileStatus.Unseen))
+            {
+                MarkQueueWindowDirty();
+                await NotifyQueueChangedAsync();
+                Console.WriteLine($"Stop: queued row {stopRowId} ({row.FileName}) returned to Unseen");
+            }
+            return;
+        }
+
         if (!_workItems.TryGetValue(id, out var workItem))
             return;
 
@@ -1973,7 +2356,7 @@ public class TranscodingService
             w.NormalizedPath.Equals(normalizedPath, StringComparison.OrdinalIgnoreCase));
         if (existing != null)
         {
-            _workItems.TryRemove(existing.Id, out _);
+            UnregisterWorkItem(existing.Id);
             try { await _hubContext.Clients.All.SendAsync("WorkItemRemoved", existing.Id); }
             catch { /* SignalR errors are non-fatal */ }
         }
@@ -2039,6 +2422,10 @@ public class TranscodingService
 
         var inflight = new List<Task>();
 
+        // True when a servable item has been seen since the last rotation wrap —
+        // a full backlog walk without one means nothing here is locally servable.
+        bool servedSinceRotationWrap = false;
+
         try
         {
             while (true)
@@ -2069,7 +2456,11 @@ public class TranscodingService
 
                 var current = _lastOptions ?? options;
 
+                // Top up the working window from the DB queue (no-op unless dirty).
+                await SyncQueueWindowAsync(_windowRotationOffset);
+
                 bool anyVideoPending, anyMusicPending;
+                int windowPending;
                 lock (_queueLock)
                 {
                     _workQueue.RemoveAll(w => w.Status is WorkItemStatus.Cancelled or WorkItemStatus.Stopped);
@@ -2081,20 +2472,79 @@ public class TranscodingService
                         w.Kind == MediaKind.Music &&
                         w.Status == WorkItemStatus.Pending &&
                         (_shouldSkipLocal == null || !_shouldSkipLocal(w)));
+                    windowPending = _workQueue.Count(w => w.Status == WorkItemStatus.Pending);
                 }
 
                 bool queueEmpty = !anyVideoPending && !anyMusicPending;
 
-                if (queueEmpty && inflight.Count == 0) break;
-
-                // Queue is empty but encodes are still finishing — wait for
-                // one to drain or for an explicit wake (settings change)
-                // before re-checking.
                 if (queueEmpty)
                 {
+                    // The window says empty, but the real queue is the DB — there
+                    // may be more rows than the window holds, or the whole window
+                    // may be locally-unservable (skip-local exclusions) with
+                    // servable rows sitting deeper in the order.
+                    int dbPending = await _mediaFileRepo.CountQueuedLocalAsync();
+                    if (dbPending > windowPending)
+                    {
+                        if (windowPending == 0)
+                        {
+                            // Window drained — refill from the head of the queue.
+                            _windowRotationOffset = 0;
+                            Interlocked.Exchange(ref _queueWindowDirty, 1);
+                            await SyncQueueWindowAsync();
+
+                            // If nothing hydrated (e.g. rows mid-transition to
+                            // Processing, or missing files being quarantined),
+                            // pace the retry instead of hot-looping on the DB.
+                            bool hydratedAny;
+                            lock (_queueLock) hydratedAny = _workQueue.Any(w => w.Status == WorkItemStatus.Pending);
+                            if (!hydratedAny) await WaitForSchedulerProgressAsync(inflight);
+                            continue;
+                        }
+
+                        // Window full of items this machine can't serve — rotate
+                        // deeper so servable rows get a turn. Cluster nodes keep
+                        // consuming the head regardless. The dirty flag is set
+                        // directly (NOT via MarkQueueWindowDirty, which resets the
+                        // offset) so the rotation position survives the sync.
+                        _windowRotationOffset += QueueWindowSize;
+                        if (_windowRotationOffset >= dbPending)
+                        {
+                            _windowRotationOffset = 0;
+
+                            // A full walk of the backlog produced nothing servable —
+                            // stop churning (each pass costs a window rebuild plus
+                            // File.Exists per row against the NAS). The items belong
+                            // to the cluster loop; any add/cancel/settings change
+                            // re-kicks this scheduler via MarkQueueWindowDirty.
+                            if (!servedSinceRotationWrap)
+                            {
+                                if (inflight.Count == 0) break;
+                                await WaitForSchedulerProgressAsync(inflight);
+                                continue;
+                            }
+                            servedSinceRotationWrap = false;
+                        }
+                        Interlocked.Exchange(ref _queueWindowDirty, 1);
+                        await SyncQueueWindowAsync(_windowRotationOffset);
+                        await WaitForSchedulerProgressAsync(inflight);
+                        continue;
+                    }
+
+                    if (inflight.Count == 0) break;
+
+                    // Queue is empty but encodes are still finishing — wait for
+                    // one to drain or for an explicit wake (settings change)
+                    // before re-checking.
                     await WaitForSchedulerProgressAsync(inflight);
                     continue;
                 }
+
+                // A servable item is visible. Deliberately do NOT reset the rotation
+                // offset here — resetting on every dispatch snapped the window back
+                // to the unservable head and re-walked the whole backlog per item.
+                // External queue changes reset it via MarkQueueWindowDirty.
+                servedSinceRotationWrap = true;
 
                 bool dispatched = false;
 
@@ -2122,7 +2572,7 @@ public class TranscodingService
                     }
                     else if (musicItem.Status is WorkItemStatus.Cancelled or WorkItemStatus.Stopped)
                     {
-                        _workItems.TryRemove(musicItem.Id, out _);
+                        UnregisterWorkItem(musicItem.Id);
                     }
                     else if (!File.Exists(musicItem.Path))
                     {
@@ -2139,12 +2589,14 @@ public class TranscodingService
                         lock (_queueLock)
                         {
                             _workQueue.Add(musicItem);
-                            _workQueue.Sort(CompareQueueOrder);
+                            _workQueue.Sort((a, b) => CompareQueueOrder(a, b, _queueNewestFirst));
                         }
                     }
                     else
                     {
                         _slotLedger.TransitionPhase(musicItem.Id, SlotPhase.Encoding);
+                        // Item left the window — flag it so refill tops up from the DB.
+                        Interlocked.Exchange(ref _queueWindowDirty, 1);
 
                         var musicFolderOverride = ResolveFolderOverride(musicItem.Path);
                         var musicPerJobOptions = EncoderOptionsOverride.ApplyOverrides(current, musicFolderOverride, null);
@@ -2227,13 +2679,15 @@ public class TranscodingService
                     lock (_queueLock)
                     {
                         _workQueue.Add(workItem);
-                        _workQueue.Sort(CompareQueueOrder);
+                        _workQueue.Sort((a, b) => CompareQueueOrder(a, b, _queueNewestFirst));
                     }
                     if (!dispatched)
                         await WaitForSchedulerProgressAsync(inflight);
                     continue;
                 }
                 _slotLedger?.TransitionPhase(workItem.Id, SlotPhase.Encoding);
+                // Item left the window — flag it so refill tops up from the DB.
+                Interlocked.Exchange(ref _queueWindowDirty, 1);
 
                 // Resolve any per-folder override and merge it into the per-job options.
                 // Cluster dispatch already does this via ClusterService.ResolveOptionsForJob;
@@ -2272,7 +2726,7 @@ public class TranscodingService
                 if (workItem.Status is WorkItemStatus.Cancelled or WorkItemStatus.Stopped)
                 {
                     Console.WriteLine($"Dropping {workItem.FileName}: cancelled/stopped during dispatch finalisation");
-                    _workItems.TryRemove(workItem.Id, out _);
+                    UnregisterWorkItem(workItem.Id);
                     _slotLedger?.Release(workItem.Id, ReleaseReason.Cancelled);
                     try { await _hubContext.Clients.All.SendAsync("WorkItemRemoved", workItem.Id); } catch { /* SignalR errors are non-fatal */ }
                     continue;
@@ -3821,7 +4275,7 @@ public class TranscodingService
             await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Skipped);
         }
         catch { /* DB blip — next scan re-evaluates */ }
-        _workItems.TryRemove(workItem.Id, out _);
+        UnregisterWorkItem(workItem.Id);
         workItem.Status = WorkItemStatus.Cancelled;
         try { await _hubContext.Clients.All.SendAsync("WorkItemRemoved", workItem.Id); }
         catch { /* SignalR errors are non-fatal */ }
@@ -5994,8 +6448,12 @@ public class TranscodingService
     public void UpdateOptions(EncoderOptions options)
     {
         _lastOptions = options;
+        SetQueueOrderNewestFirst(options.QueueNewestFirst);
         WakeScheduler();
     }
+
+    /// <summary> Current queue-order policy, exposed so the queue API pages the DB in the same order the scheduler dispatches. </summary>
+    public bool QueueNewestFirst => _queueNewestFirst;
 
     /// <summary>
     ///     Resolves and persists <see cref="MediaFile.OriginalLanguage"/> for every row in
@@ -6121,13 +6579,11 @@ public class TranscodingService
                 removed.Add(item);
             }
         }
-        if (removed.Count == 0) return 0;
-
         // Step 4: drop from the work-item registry, notify the UI, and persist the
         // MediaFile transition to Skipped so the next scan respects the reverted setting.
         foreach (var item in removed)
         {
-            _workItems.TryRemove(item.Id, out _);
+            UnregisterWorkItem(item.Id);
             item.Status = WorkItemStatus.Cancelled;
             try
             {
@@ -6141,8 +6597,28 @@ public class TranscodingService
             catch { /* DB failures don't block queue cleanup; next scan corrects via WouldSkipUnderOptions */ }
         }
 
-        Console.WriteLine($"Settings change: dropped {removed.Count} now-obsolete pending queue item(s).");
-        return removed.Count;
+        // Step 5: the window only holds the top ~50 — the rest of the pending queue
+        // lives in the DB. Walk it in pages and flip the now-obsolete rows too.
+        // (The Reevaluate endpoint backfilled OriginalLanguage on queued rows before
+        // calling us, so the predicate sees merged keep lists without live lookups.)
+        int backlogFlipped = 0;
+        try
+        {
+            backlogFlipped = await _mediaFileRepo.ReevaluateQueuedAsync(mf =>
+                WouldSkipUnderOptions(mf, newOptions));
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Settings change: backlog re-evaluation failed: {ex.Message}");
+        }
+
+        if (removed.Count + backlogFlipped > 0)
+        {
+            MarkQueueWindowDirty();
+            await NotifyQueueChangedAsync();
+            Console.WriteLine($"Settings change: dropped {removed.Count} hydrated + {backlogFlipped} backlog now-obsolete queue item(s).");
+        }
+        return removed.Count + backlogFlipped;
     }
 
     /// <summary>
@@ -6364,7 +6840,7 @@ public class TranscodingService
             _workQueue.Clear();
         }
 
-        // Reset all pending items to Unseen so the node doesn't inherit master-mode queue state.
+        // Reset hydrated pending items to Unseen so the node doesn't inherit master-mode queue state.
         foreach (var item in pendingItems)
         {
             item.Status = WorkItemStatus.Stopped;
@@ -6376,79 +6852,36 @@ public class TranscodingService
             catch { }
         }
 
-        _workItems.Clear();
+        ClearWorkItems();
 
-        Console.WriteLine($"Cluster: Queue cleared ({pendingItems.Count} items stopped)");
+        // The window above is only the hydrated top of the queue — bulk-reset the
+        // rest of the DB backlog or it re-hydrates straight back into the window.
+        int resetRows = 0;
+        try { resetRows = await _mediaFileRepo.ResetAllQueuedAsync(); }
+        catch (Exception ex) { Console.WriteLine($"StopAndClearQueue: bulk queue reset failed: {ex.Message}"); }
+        MarkQueueWindowDirty();
+        await NotifyQueueChangedAsync();
+
+        Console.WriteLine($"Cluster: Queue cleared ({pendingItems.Count} hydrated + {resetRows} backlog rows stopped)");
     }
 
     /// <summary>
-    ///     Fast-path queue restoration from a database record. Skips ffprobe entirely by
-    ///     building the WorkItem from persisted fields. The probe will be performed lazily
-    ///     when the item is actually picked up for processing or cluster dispatch.
-    ///     Used during startup to avoid re-probing every file in the queue.
+    ///     Starts (or wakes) the queue scheduler under the given options. The DB-first
+    ///     replacement for the old per-row restore: startup just marks the window
+    ///     dirty and calls this once — Queued rows hydrate on demand. Also wakes the
+    ///     cluster dispatcher so workers can pull straight from the refilled window.
     /// </summary>
-    public async Task<string?> RestoreToQueueAsync(MediaFile dbFile, EncoderOptions options)
+    public Task KickQueueAsync(EncoderOptions options)
     {
         _lastOptions ??= options;
-
-        if (!File.Exists(dbFile.FilePath))
-            return null;
-
-        var normalizedPath = Path.GetFullPath(dbFile.FilePath);
-
-        // Skip if already in memory
-        if (_workItems.Values.Any(w =>
-            w.NormalizedPath.Equals(normalizedPath, StringComparison.OrdinalIgnoreCase) &&
-            w.Status is WorkItemStatus.Pending or WorkItemStatus.Processing
-                or WorkItemStatus.Uploading or WorkItemStatus.Downloading))
-        {
-            return null;
-        }
-
-        if (_isRemoteJobChecker != null && await _isRemoteJobChecker(normalizedPath))
-            return null;
-
-        var workItem = new WorkItem
-        {
-            FileName = dbFile.FileName,
-            Path     = dbFile.FilePath,
-            Size     = dbFile.FileSize,
-            Bitrate  = dbFile.Bitrate,
-            Length   = dbFile.Duration,
-            IsHevc   = dbFile.IsHevc,
-            Is4K     = dbFile.Is4K,
-            Kind     = dbFile.Kind,
-            Probe    = null // Lazily probed when processing starts
-        };
-
-        _workItems[workItem.Id] = workItem;
-        lock (_queueLock)
-        {
-            _workQueue.Add(workItem);
-            _workQueue.Sort(CompareQueueOrder);
-        }
-
-        await _hubContext.Clients.All.SendAsync("WorkItemAdded", workItem);
-
-        // Wake the cluster dispatcher so restored items can be sent to workers
-        // immediately on startup instead of waiting for the 2-second timer tick.
+        SetQueueOrderNewestFirst(options.QueueNewestFirst);
         try { _onWorkItemQueued?.Invoke(); } catch { }
-
-        // Also kick the local scheduler. Without this, standalone-mode
-        // restores leave items stuck in Pending forever: _onWorkItemQueued
-        // is unset (the cluster dispatcher only exists in master/node modes)
-        // and no other path wakes ProcessQueueAsync until the user manually
-        // re-saves a setting or toggles something. AddFileAsync (fresh
-        // queue from the UI) already does this — restore was the lone path
-        // that didn't, which is why fresh adds work but a restart leaves
-        // the queue frozen.
         _ = Task.Run(async () =>
         {
             try { await ProcessQueueAsync(options); }
-            catch (Exception ex) { Console.WriteLine($"Error in ProcessQueueAsync after restore: {ex.Message}"); }
+            catch (Exception ex) { Console.WriteLine($"Error in ProcessQueueAsync after kick: {ex.Message}"); }
         });
-
-        return workItem.Id;
+        return Task.CompletedTask;
     }
 
     /// <summary>
@@ -6485,7 +6918,7 @@ public class TranscodingService
         {
             _workQueue.Clear();
         }
-        _workItems.Clear();
+        ClearWorkItems();
 
         Console.WriteLine("TranscodingService: In-memory state cleared");
     }
@@ -6505,6 +6938,8 @@ public class TranscodingService
             {
                 item.Status = WorkItemStatus.Processing;
                 _workQueue.Remove(item);
+                // Item left the window — flag it so the next sync refills from the DB.
+                Interlocked.Exchange(ref _queueWindowDirty, 1);
             }
             return item;
         }
@@ -6528,12 +6963,12 @@ public class TranscodingService
         // deciding to revive it. A queue entry without a dictionary entry is
         // invisible to cancel/logs/duplicate-detection — heal it here rather
         // than trying to make sweep-vs-requeue atomic.
-        _workItems[item.Id] = item;
+        RegisterWorkItem(item);
 
         lock (_queueLock)
         {
             _workQueue.Add(item);
-            _workQueue.Sort(CompareQueueOrder);
+            _workQueue.Sort((a, b) => CompareQueueOrder(a, b, _queueNewestFirst));
         }
 
         if (!silent)
@@ -6687,7 +7122,7 @@ public class TranscodingService
                 StartedAt = DateTime.UtcNow
             };
 
-            _workItems[id] = workItem;
+            RegisterWorkItem(workItem);
             return workItem;
         }
         catch (Exception ex)
@@ -6715,7 +7150,7 @@ public class TranscodingService
     /// <param name="cancellationToken">Token to abort encoding if the job is cancelled.</param>
     public async Task ConvertVideoForRemoteAsync(WorkItem workItem, EncoderOptions options, CancellationToken cancellationToken = default)
     {
-        _workItems[workItem.Id] = workItem;
+        RegisterWorkItem(workItem);
 
         try
         {
@@ -6741,7 +7176,7 @@ public class TranscodingService
     /// <param name="cancellationToken">Token to abort encoding if the job is cancelled.</param>
     public async Task ConvertMusicForRemoteAsync(WorkItem workItem, EncoderOptions options, CancellationToken cancellationToken = default)
     {
-        _workItems[workItem.Id] = workItem;
+        RegisterWorkItem(workItem);
 
         if (!string.IsNullOrEmpty(options.EncodeDirectory))
             options.Music.OutputDirectory = options.EncodeDirectory;

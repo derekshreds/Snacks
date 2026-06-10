@@ -200,7 +200,10 @@ export class AnalyzeModal {
             const data = await libraryApi.analyzeResults(jobId);
             if (gen !== this._pollGen) return;
             this._jobId = null;
-            this._ctx.results = data.results || [];
+            this._ctx.results      = data.results || [];
+            this._ctx.truncated    = !!data.truncated;
+            this._ctx.totalResults = data.totalResults || this._ctx.results.length;
+            this._ctx.summary      = data.summary || null;
             this._renderResults();
             return;
         }
@@ -228,7 +231,9 @@ export class AnalyzeModal {
         document.getElementById('analyzeLoading').style.display = 'none';
         document.getElementById('analyzeContent').style.display = '';
 
-        // Bucket counts and rough byte totals for the summary cards.
+        // Bucket counts and rough byte totals for the summary cards. For very
+        // large runs the server ships a preview subset plus authoritative
+        // per-decision totals — use those so truncation never skews the cards.
         const counts = {
             all: ctx.results.length,
             Queue: 0, Shrink: 0, Copy: 0, Mux: 0, Skip: 0, Excluded: 0,
@@ -236,12 +241,34 @@ export class AnalyzeModal {
         };
         let encodeSize = 0, copySize = 0, muxSize = 0, skipSize = 0;
 
-        for (const r of ctx.results) {
-            counts[r.decision] = (counts[r.decision] || 0) + 1;
-            if      (ENCODE_SET.has(r.decision)) encodeSize += r.sizeBytes || 0;
-            else if (r.decision === 'Copy')      copySize   += r.sizeBytes || 0;
-            else if (r.decision === 'Mux')       muxSize    += r.sizeBytes || 0;
-            else if (r.decision === 'Skip')      skipSize   += r.sizeBytes || 0;
+        if (ctx.truncated && ctx.summary) {
+            counts.all = ctx.totalResults;
+            for (const s of ctx.summary) {
+                counts[s.decision] = s.count;
+                if      (ENCODE_SET.has(s.decision)) encodeSize += s.bytes || 0;
+                else if (s.decision === 'Copy')      copySize   += s.bytes || 0;
+                else if (s.decision === 'Mux')       muxSize    += s.bytes || 0;
+                else if (s.decision === 'Skip')      skipSize   += s.bytes || 0;
+            }
+        } else {
+            for (const r of ctx.results) {
+                counts[r.decision] = (counts[r.decision] || 0) + 1;
+                if      (ENCODE_SET.has(r.decision)) encodeSize += r.sizeBytes || 0;
+                else if (r.decision === 'Copy')      copySize   += r.sizeBytes || 0;
+                else if (r.decision === 'Mux')       muxSize    += r.sizeBytes || 0;
+                else if (r.decision === 'Skip')      skipSize   += r.sizeBytes || 0;
+            }
+        }
+
+        const truncNotice = document.getElementById('analyzeTruncatedNotice');
+        if (truncNotice) {
+            truncNotice.style.display = ctx.truncated ? '' : 'none';
+            if (ctx.truncated) {
+                truncNotice.textContent =
+                    `Large analysis — the table below previews the first ${ctx.results.length.toLocaleString()} of ` +
+                    `${ctx.totalResults.toLocaleString()} files. The totals above cover everything; ` +
+                    `analyze a subfolder for a full row-by-row view.`;
+            }
         }
 
         const encodeTotal  = counts.Queue + counts.Shrink;
@@ -251,7 +278,7 @@ export class AnalyzeModal {
         const skipPlusExcl = counts.Skip + counts.Excluded;
 
         document.getElementById('analyzeSummary').innerHTML = [
-            renderCard('fa-film',    'Total Files',  ctx.results.length, '',                                       '--border-color'),
+            renderCard('fa-film',    'Total Files',  counts.all,         '',                                       '--border-color'),
             renderCard('fa-cog',     'Will Encode',  encodeTotal,        encodeSize > 0 ? formatSize(encodeSize) : '', '--bs-primary'),
             renderCard('fa-random',  'Mux Pass',     counts.Mux,         muxSize    > 0 ? formatSize(muxSize)    : '', '--bs-info'),
             renderCard('fa-copy',    'Copy / Remux', counts.Copy,        copySize   > 0 ? formatSize(copySize)   : '', '--bs-info'),
