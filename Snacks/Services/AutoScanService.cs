@@ -200,7 +200,17 @@ public sealed class AutoScanService : IHostedService, IDisposable
         WatchedFolder? best = null;
         int bestLen = -1;
 
-        foreach (var folder in _config.Directories)
+        // Snapshot under the config lock — this is called from scan/dispatch
+        // threads while AddDirectory/RemoveDirectory mutate the list on request
+        // threads; enumerating the live list races a concurrent add/remove and
+        // throws "Collection was modified", failing that dispatch.
+        WatchedFolder[] directories;
+        lock (_configLock)
+        {
+            directories = _config.Directories.ToArray();
+        }
+
+        foreach (var folder in directories)
         {
             var folderPath = folder.Path.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
             if (fullPath.StartsWith(folderPath, StringComparison.OrdinalIgnoreCase) && folderPath.Length > bestLen)
@@ -304,7 +314,12 @@ public sealed class AutoScanService : IHostedService, IDisposable
         Console.WriteLine("ClearHistory: Starting full state reset...");
 
         // Cancel any in-flight scan before acquiring the lock to avoid deadlock.
-        _scanCts?.Cancel();
+        // RunScanAsync disposes/replaces _scanCts under _scanLock, which we don't
+        // hold yet — guard against cancelling a just-disposed CTS, otherwise the
+        // ObjectDisposedException propagates to the controller as a 500 AND the
+        // in-flight scan keeps running, blocking the WaitAsync below.
+        try { _scanCts?.Cancel(); }
+        catch (ObjectDisposedException) { }
 
         await _scanLock.WaitAsync();
         try
@@ -323,9 +338,12 @@ public sealed class AutoScanService : IHostedService, IDisposable
             }
             catch { }
 
-            _config.LastScanTime     = null;
-            _config.LastScanNewFiles = 0;
-            SaveConfig();
+            lock (_configLock)
+            {
+                _config.LastScanTime     = null;
+                _config.LastScanNewFiles = 0;
+                SaveConfig();
+            }
 
             await _hubContext.Clients.All.SendAsync("HistoryCleared");
 
@@ -611,28 +629,51 @@ public sealed class AutoScanService : IHostedService, IDisposable
 
                 if (snacksFiles.Count > 0)
                 {
-                    bool validSnacksExists = false;
-                    foreach (var snacksFile in snacksFiles)
+                    // Probe the original ONCE — re-probing it per companion both wasted
+                    // an ffprobe spawn per file and, worse, meant a failed probe of the
+                    // ORIGINAL deleted a perfectly good [snacks] companion below.
+                    ProbeResult? originalProbe = null;
+                    try
                     {
-                        try
+                        originalProbe = await _ffprobeService.ProbeAsync(file, ct);
+                        // ProbeAsync returns an EMPTY result (not an exception) when
+                        // ffprobe produced unparsable output. For video, duration 0
+                        // would fail the companion tolerance check and delete valid
+                        // encodes — treat it the same as an unreadable original.
+                        // (Music probes legitimately have no video duration; their
+                        // companion check passes through a duration-agnostic path.)
+                        if (_fileService.GetMediaKind(file) == MediaKind.Video
+                            && _ffprobeService.GetVideoDuration(originalProbe) <= 0)
+                            originalProbe = null;
+                    }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+                    catch { /* original unreadable — leave companions alone, fall through to AddFile */ }
+
+                    bool validSnacksExists = false;
+                    if (originalProbe != null)
+                    {
+                        foreach (var snacksFile in snacksFiles)
                         {
-                            var originalProbe = await _ffprobeService.ProbeAsync(file, ct);
-                            var snacksProbe   = await _ffprobeService.ProbeAsync(snacksFile, ct);
-                            if (_ffprobeService.ConvertedSuccessfully(originalProbe, snacksProbe))
+                            try
                             {
-                                validSnacksExists = true;
-                                break;
+                                var snacksProbe = await _ffprobeService.ProbeAsync(snacksFile, ct);
+                                if (_ffprobeService.ConvertedSuccessfully(originalProbe, snacksProbe))
+                                {
+                                    validSnacksExists = true;
+                                    break;
+                                }
+                                else
+                                {
+                                    Console.WriteLine($"AutoScan: Partial [snacks] file detected, deleting: {snacksFile}");
+                                    try { File.Delete(snacksFile); } catch { }
+                                }
                             }
-                            else
+                            catch (OperationCanceledException) { throw; }
+                            catch
                             {
-                                Console.WriteLine($"AutoScan: Partial [snacks] file detected, deleting: {snacksFile}");
+                                Console.WriteLine($"AutoScan: Corrupt [snacks] file detected, deleting: {snacksFile}");
                                 try { File.Delete(snacksFile); } catch { }
                             }
-                        }
-                        catch
-                        {
-                            Console.WriteLine($"AutoScan: Corrupt [snacks] file detected, deleting: {snacksFile}");
-                            try { File.Delete(snacksFile); } catch { }
                         }
                     }
 
@@ -666,9 +707,12 @@ public sealed class AutoScanService : IHostedService, IDisposable
             try { await _transcodingService.PruneMissingWorkItemsAsync(); }
             catch (Exception ex) { Console.WriteLine($"AutoScan: PruneMissingWorkItems failed: {ex.Message}"); }
 
-            _config.LastScanTime     = DateTime.UtcNow;
-            _config.LastScanNewFiles = newFileCount;
-            SaveConfig();
+            lock (_configLock)
+            {
+                _config.LastScanTime     = DateTime.UtcNow;
+                _config.LastScanNewFiles = newFileCount;
+                SaveConfig();
+            }
 
             await _hubContext.Clients.All.SendAsync("AutoScanCompleted", newFileCount, allMediaFiles.Count);
 

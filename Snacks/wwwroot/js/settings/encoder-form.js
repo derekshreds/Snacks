@@ -65,6 +65,33 @@ function el(prefix, suffix) {
     return document.getElementById(`${prefix}${suffix}`);
 }
 
+/**
+ * Tracks whether {@link restoreEncoderOptions} has completed successfully for
+ * a prefix. Until it has, {@link getEncoderOptions} must NOT auto-persist:
+ * the form would still hold HTML defaults, and saving them would overwrite
+ * the user's real settings on disk (the classic "opened the app during a
+ * server blip and all my settings reset" bug).
+ *
+ * @type {Set<string>}
+ */
+const restoredPrefixes = new Set();
+
+/**
+ * Legacy/alias values that older settings.json files (or hand edits) may
+ * contain for select-backed fields. Mapped to the current UI values on
+ * restore so the select doesn't silently blank out and re-persist "".
+ */
+const LEGACY_SELECT_VALUES = {
+    DownscalePolicy: { IfLarger: 'CapAtTarget' },
+    HardwareAcceleration: {
+        nvenc: 'nvidia',
+        cuda:  'nvidia',
+        vaapi: 'intel',
+        qsv:   'intel',
+        amf:   'amd',
+    },
+};
+
 
 // ---------------------------------------------------------------------------
 // Audio output rows (row editor for AudioOutputs)
@@ -230,16 +257,37 @@ function ensureAudioOutputAddBound(prefix) {
  */
 export function getEncoderOptions(prefix = 'settings') {
 
-    /** Reads a string value with a default for a missing or empty input. */
+    /** Reads a string value with a default for a missing input. */
     const str = (id, d = '') => el(prefix, id)?.value ?? d;
+
+    /**
+     * Reads a select-backed value, treating "" as missing. A select whose
+     * value was blanked (e.g. by assigning an unknown saved value) must fall
+     * back to the default instead of persisting "" — `??` alone doesn't
+     * catch the empty string.
+     */
+    const sel = (id, d) => {
+        const v = el(prefix, id)?.value;
+        return v ? v : d;
+    };
 
     /** Reads a checkbox state with a default when the element is absent. */
     const bool = (id, d = false) => el(prefix, id)?.checked ?? d;
 
-    /** Reads a numeric input, falling back to `d` for NaN. */
+    /**
+     * Reads a numeric input, falling back to `d` for NaN and clamping to the
+     * input's own min/max attributes so out-of-range typed values (or a
+     * mid-edit save catching a partial number) can't persist.
+     */
     const num = (id, d = 0) => {
-        const n = parseInt(el(prefix, id)?.value);
-        return Number.isNaN(n) ? d : n;
+        const node = el(prefix, id);
+        let n = parseInt(node?.value, 10);
+        if (Number.isNaN(n)) return d;
+        const min = node?.min !== '' ? parseInt(node?.min ?? '', 10) : NaN;
+        const max = node?.max !== '' ? parseInt(node?.max ?? '', 10) : NaN;
+        if (!Number.isNaN(min)) n = Math.max(min, n);
+        if (!Number.isNaN(max)) n = Math.min(max, n);
+        return n;
     };
 
     /**
@@ -251,14 +299,14 @@ export function getEncoderOptions(prefix = 'settings') {
         return root ? getChipValues(`${prefix}${suffix}Chips`) : null;
     };
 
-    const codec = str('Codec', 'h265');
+    const codec = sel('Codec', 'h265');
 
     const options = {
         // Container + codec + hardware.
-        Format:  str('Format', 'mkv'),
+        Format:  sel('Format', 'mkv'),
         Codec:   codec,
         Encoder: ENCODER_MAP[codec] || 'libx265',
-        HardwareAcceleration: str('HardwareAcceleration', 'auto'),
+        HardwareAcceleration: sel('HardwareAcceleration', 'auto'),
 
         // Bitrate + skip policy.
         TargetBitrate:          num('TargetBitrate', 3500),
@@ -278,7 +326,7 @@ export function getEncoderOptions(prefix = 'settings') {
         // Audio.
         AudioLanguagesToKeep:     chips('AudioLanguagesToKeep') ?? ['en'],
         KeepOriginalLanguage:     bool('KeepOriginalLanguage'),
-        OriginalLanguageProvider: str('OriginalLanguageProvider', 'None'),
+        OriginalLanguageProvider: sel('OriginalLanguageProvider', 'None'),
         PreserveOriginalAudio:    bool('PreserveOriginalAudio', true),
         AudioOutputs:             readAudioOutputs(prefix),
         AutoSetDefaultTrack:      bool('AutoSetDefaultTrack'),
@@ -286,28 +334,28 @@ export function getEncoderOptions(prefix = 'settings') {
         // Subtitles.
         SubtitleLanguagesToKeep:      chips('SubtitleLanguagesToKeep') ?? ['en'],
         ExtractSubtitlesToSidecar:    bool('ExtractSubtitlesToSidecar'),
-        SidecarSubtitleFormat:        str('SidecarSubtitleFormat', 'srt'),
+        SidecarSubtitleFormat:        sel('SidecarSubtitleFormat', 'srt'),
         ConvertImageSubtitlesToSrt:   bool('ConvertImageSubtitlesToSrt'),
         PassThroughImageSubtitlesMkv: bool('PassThroughImageSubtitlesMkv'),
         ExcludeSdhSubtitles:          bool('ExcludeSdhSubtitles'),
 
         // Encoding mode.
-        EncodingMode: str('EncodingMode', 'Transcode'),
-        MuxStreams:   str('MuxStreams',   'Both'),
+        EncodingMode: sel('EncodingMode', 'Transcode'),
+        MuxStreams:   sel('MuxStreams',   'Both'),
 
         // Video.
-        DownscalePolicy:     str('DownscalePolicy', 'Never'),
-        DownscaleTarget:     str('DownscaleTarget', '1080p'),
+        DownscalePolicy:     sel('DownscalePolicy', 'Never'),
+        DownscaleTarget:     sel('DownscaleTarget', '1080p'),
         TonemapHdrToSdr:     bool('TonemapHdrToSdr'),
-        FfmpegQualityPreset: str('FfmpegQualityPreset', 'medium'),
+        FfmpegQualityPreset: sel('FfmpegQualityPreset', 'medium'),
 
         // Music — nested object on EncoderOptions, codec is derived from the format selector.
         Music: {
-            Format:                   str('MusicFormat', 'm4a'),
-            Codec:                    musicCodecForFormat(str('MusicFormat', 'm4a')),
+            Format:                   sel('MusicFormat', 'm4a'),
+            Codec:                    musicCodecForFormat(sel('MusicFormat', 'm4a')),
             BitrateKbps:              num('MusicBitrate', 192),
-            SampleRatePolicy:         str('MusicSampleRate', 'Source'),
-            ChannelPolicy:            str('MusicChannels', 'Source'),
+            SampleRatePolicy:         sel('MusicSampleRate', 'Source'),
+            ChannelPolicy:            sel('MusicChannels', 'Source'),
             SkipIfAlreadyTargetCodec: bool('MusicSkipIfTarget', true),
             BitrateMatchTolerancePct: Math.max(0, num('MusicTolerance', 15)),
             CopyMetadataAndArt:       bool('MusicCopyMetadata', true),
@@ -317,12 +365,49 @@ export function getEncoderOptions(prefix = 'settings') {
         },
     };
 
-    // Best-effort auto-save. A failure here doesn't block the return value;
-    // callers already have what they need, and the next save attempt will
-    // usually succeed.
-    settingsApi.save(options).catch(() => { /* non-fatal */ });
+    // Best-effort auto-save — but ONLY once a successful restore has run for
+    // this prefix. Before that, the form holds HTML defaults and persisting
+    // them would overwrite the user's real settings.json. Don't fail silently
+    // in the disarmed state either: the user is editing a form whose changes
+    // are NOT being persisted, and they need to know.
+    if (restoredPrefixes.has(prefix)) {
+        settingsApi.save(options)
+            .then(() => reportAutoSaveStatus(true))
+            .catch(() => reportAutoSaveStatus(false));
+    } else {
+        reportAutoSaveStatus(false,
+            "⚠ Settings couldn't be loaded from the server — changes are not being saved. Close and reopen Settings to retry.");
+    }
 
     return options;
+}
+
+/** Handle for clearing the transient "Saved" footer indicator. */
+let autoSaveStatusTimer = null;
+
+/**
+ * Surfaces auto-save outcomes in the settings-modal footer. Failures used to
+ * be swallowed entirely — the user kept editing a form that wasn't persisting.
+ *
+ * @param {boolean} ok
+ * @param {string} [failureMessage] Custom message for the failure case.
+ */
+function reportAutoSaveStatus(ok, failureMessage) {
+    const elStatus = document.getElementById('settingsAutoSaveStatus');
+    if (!elStatus) return;
+
+    clearTimeout(autoSaveStatusTimer);
+    if (ok) {
+        elStatus.textContent = '✓ Saved';
+        elStatus.classList.remove('text-danger');
+        elStatus.classList.add('text-success');
+        autoSaveStatusTimer = setTimeout(() => { elStatus.textContent = ''; }, 2500);
+    } else {
+        elStatus.textContent = failureMessage
+            ?? "⚠ Couldn't save — changes may not persist. Retry by editing again.";
+        elStatus.classList.remove('text-success');
+        elStatus.classList.add('text-danger');
+    }
 }
 
 
@@ -344,8 +429,36 @@ export function getEncoderOptions(prefix = 'settings') {
 export async function restoreEncoderOptions(prefix = 'settings') {
     try {
         const saved = await settingsApi.get();
-        if (!saved || Object.keys(saved).length === 0) return;
+        if (!saved || Object.keys(saved).length === 0) {
+            // Nothing saved yet (fresh install) — the HTML defaults ARE the
+            // settings, so it's safe to arm auto-save.
+            restoredPrefixes.add(prefix);
+            return;
+        }
 
+        applyEncoderOptionsToForm(prefix, saved);
+
+        // Restore completed — the form now reflects the server's settings,
+        // so auto-saves from this point write real data, not defaults.
+        restoredPrefixes.add(prefix);
+
+    } catch { /* silent — restore is best-effort; auto-save stays disarmed */ }
+}
+
+/**
+ * Writes an options object (server settings or a preset) into the encoder
+ * form. STRICTLY SPARSE: a key that is absent from `saved` leaves its input
+ * completely untouched — the defaults below only translate present-but-null
+ * values (e.g. a null OutputDirectory) into a usable form value. This is what
+ * lets a built-in preset carry just five fields without wiping the user's
+ * audio outputs, paths, languages, or music config on apply. Unknown SELECT
+ * values are ignored rather than blanking the control. Shared by the restore
+ * path above and the preset system (settings/presets.js).
+ *
+ * @param {string} prefix Id prefix shared by all form inputs.
+ * @param {object} saved  Options object in either PascalCase or camelCase.
+ */
+export function applyEncoderOptionsToForm(prefix, saved) {
         /**
          * Returns the first value found among the given keys, checking both
          * the original casing and the same key with a lower-cased first letter.
@@ -360,13 +473,33 @@ export async function restoreEncoderOptions(prefix = 'settings') {
             return undefined;
         };
 
+        /**
+         * Maps a present-but-falsy value (null, "") to a default while keeping
+         * ABSENT values absent — `pick(k) || d` alone would invent a value for
+         * a key the caller never supplied and clobber the user's setting.
+         */
+        const or = (val, d) => (val === undefined ? undefined : (val || d));
+
         /** Writes a saved value into a form input, leaving the input alone if the value is absent. */
         const set = (id, val) => {
             const node = el(prefix, id);
             if (!node || val === undefined) return;
 
-            if (node.type === 'checkbox') node.checked = !!val;
-            else                          node.value   = val;
+            if (node.type === 'checkbox') { node.checked = !!val; return; }
+
+            if (node.tagName === 'SELECT') {
+                // Map legacy aliases (e.g. DownscalePolicy "IfLarger", HW accel
+                // "nvenc"/"vaapi") to the current option values. If the value
+                // still matches no option, keep the select's current value —
+                // assigning an unknown value blanks the select to "", and the
+                // next auto-save would persist "" over the user's real setting.
+                const mapped = LEGACY_SELECT_VALUES[id]?.[val] ?? val;
+                const known = Array.from(node.options).some((o) => o.value === String(mapped));
+                if (known) node.value = mapped;
+                return;
+            }
+
+            node.value = val;
         };
 
         // Container + codec + hardware.
@@ -382,73 +515,82 @@ export async function restoreEncoderOptions(prefix = 'settings') {
         set('StrictBitrate',          pick('StrictBitrate'));
         set('FourKBitrateMultiplier', pick('FourKBitrateMultiplier'));
         set('Skip4K',                 pick('Skip4K'));
-        set('SkipPercentAboveTarget', Math.max(0, pick('SkipPercentAboveTarget') ?? 20));
-        set('EncodingLogRetentionDays', Math.max(0, pick('EncodingLogRetentionDays') ?? 7));
+        const skipPct = pick('SkipPercentAboveTarget');
+        set('SkipPercentAboveTarget', skipPct === undefined ? undefined : Math.max(0, skipPct));
+        const logDays = pick('EncodingLogRetentionDays');
+        set('EncodingLogRetentionDays', logDays === undefined ? undefined : Math.max(0, logDays));
 
-        // Paths.
-        set('OutputDirectory', pick('OutputDirectory') || '');
-        set('EncodeDirectory', pick('EncodeDirectory') || '');
+        // Paths — null on the server means "unset"; render as empty string.
+        const outDir = pick('OutputDirectory');
+        if (outDir !== undefined) set('OutputDirectory', outDir || '');
+        const encDir = pick('EncodeDirectory');
+        if (encDir !== undefined) set('EncodeDirectory', encDir || '');
 
         // Audio.
         set('KeepOriginalLanguage',     pick('KeepOriginalLanguage'));
-        set('OriginalLanguageProvider', pick('OriginalLanguageProvider') || 'None');
+        set('OriginalLanguageProvider', or(pick('OriginalLanguageProvider'), 'None'));
+        set('PreserveOriginalAudio',    pick('PreserveOriginalAudio'));
 
-        // PreserveOriginalAudio defaults to true (the old "AudioCodec=copy" default behavior).
-        // Settings that come back from the server have already been migrated server-side, so
-        // we just trust the value here and only fall back to true when it's missing entirely.
-        const preserve = pick('PreserveOriginalAudio');
-        set('PreserveOriginalAudio', preserve === undefined ? true : !!preserve);
-
-        ensureAudioOutputAddBound(prefix);
-        setAudioOutputs(prefix, pick('AudioOutputs') ?? []);
+        const audioOutputs = pick('AudioOutputs');
+        if (audioOutputs !== undefined) {
+            ensureAudioOutputAddBound(prefix);
+            setAudioOutputs(prefix, audioOutputs ?? []);
+        }
 
         // Subtitles.
         set('ExtractSubtitlesToSidecar',    pick('ExtractSubtitlesToSidecar'));
-        set('SidecarSubtitleFormat',        pick('SidecarSubtitleFormat') || 'srt');
+        set('SidecarSubtitleFormat',        or(pick('SidecarSubtitleFormat'), 'srt'));
         set('ConvertImageSubtitlesToSrt',   pick('ConvertImageSubtitlesToSrt'));
         set('PassThroughImageSubtitlesMkv', pick('PassThroughImageSubtitlesMkv'));
         set('ExcludeSdhSubtitles',          pick('ExcludeSdhSubtitles'));
         set('AutoSetDefaultTrack',          pick('AutoSetDefaultTrack'));
 
         // Encoding mode.
-        set('EncodingMode', pick('EncodingMode') || 'Transcode');
-        set('MuxStreams',   pick('MuxStreams')   || 'Both');
+        set('EncodingMode', or(pick('EncodingMode'), 'Transcode'));
+        set('MuxStreams',   or(pick('MuxStreams'),   'Both'));
 
         // Video.
-        set('DownscalePolicy',     pick('DownscalePolicy')     || 'Never');
-        set('DownscaleTarget',     pick('DownscaleTarget')     || '1080p');
+        set('DownscalePolicy',     or(pick('DownscalePolicy'),     'Never'));
+        set('DownscaleTarget',     or(pick('DownscaleTarget'),     '1080p'));
         set('TonemapHdrToSdr',     pick('TonemapHdrToSdr'));
-        set('FfmpegQualityPreset', pick('FfmpegQualityPreset') || 'medium');
+        set('FfmpegQualityPreset', or(pick('FfmpegQualityPreset'), 'medium'));
 
-        // Chip inputs — use explicit defaults so a fresh install gets sane values.
-        setChipValues(`${prefix}AudioLanguagesToKeepChips`,    pick('AudioLanguagesToKeep')    ?? ['en']);
-        setChipValues(`${prefix}SubtitleLanguagesToKeepChips`, pick('SubtitleLanguagesToKeep') ?? ['en']);
+        // Chip inputs — only when the key is present; null falls back to a sane default.
+        const audioLangs = pick('AudioLanguagesToKeep');
+        if (audioLangs !== undefined)
+            setChipValues(`${prefix}AudioLanguagesToKeepChips`, audioLangs ?? ['en']);
+        const subLangs = pick('SubtitleLanguagesToKeep');
+        if (subLangs !== undefined)
+            setChipValues(`${prefix}SubtitleLanguagesToKeepChips`, subLangs ?? ['en']);
 
-        // Music settings (nested object). Pre-pivot settings.json files have no
-        // Music block — fall back to defaults so the panel renders with the
-        // documented out-of-the-box values.
-        const music = pick('Music') ?? {};
-        const mPick = (...keys) => {
-            for (const k of keys) {
-                if (music[k] !== undefined) return music[k];
-                const lower = k.charAt(0).toLowerCase() + k.slice(1);
-                if (music[lower] !== undefined) return music[lower];
-            }
-            return undefined;
-        };
+        // Music settings (nested object) — skipped entirely when absent so a
+        // video-only preset can't reset the music panel.
+        const music = pick('Music');
+        if (music) {
+            const mPick = (...keys) => {
+                for (const k of keys) {
+                    if (music[k] !== undefined) return music[k];
+                    const lower = k.charAt(0).toLowerCase() + k.slice(1);
+                    if (music[lower] !== undefined) return music[lower];
+                }
+                return undefined;
+            };
 
-        set('MusicFormat',         mPick('Format')                   ?? 'm4a');
-        set('MusicBitrate',        mPick('BitrateKbps')              ?? 192);
-        set('MusicSampleRate',     mPick('SampleRatePolicy')         ?? 'Source');
-        set('MusicChannels',       mPick('ChannelPolicy')            ?? 'Source');
-        set('MusicSkipIfTarget',   mPick('SkipIfAlreadyTargetCodec') ?? true);
-        set('MusicTolerance',      mPick('BitrateMatchTolerancePct') ?? 15);
-        set('MusicCopyMetadata',   mPick('CopyMetadataAndArt')       ?? true);
-        set('MusicDeleteOriginal', mPick('DeleteOriginalFile')       ?? false);
-        set('MusicConcurrency',    mPick('MasterMusicConcurrency')   ?? 2);
-        set('MusicCluster',        mPick('DispatchToCluster')        ?? true);
+            set('MusicFormat',         mPick('Format')                   ?? 'm4a');
+            set('MusicBitrate',        mPick('BitrateKbps')              ?? 192);
+            set('MusicSampleRate',     mPick('SampleRatePolicy')         ?? 'Source');
+            set('MusicChannels',       mPick('ChannelPolicy')            ?? 'Source');
+            set('MusicSkipIfTarget',   mPick('SkipIfAlreadyTargetCodec') ?? true);
+            set('MusicTolerance',      mPick('BitrateMatchTolerancePct') ?? 15);
+            set('MusicCopyMetadata',   mPick('CopyMetadataAndArt')       ?? true);
+            set('MusicDeleteOriginal', mPick('DeleteOriginalFile')       ?? false);
+            set('MusicConcurrency',    mPick('MasterMusicConcurrency')   ?? 2);
+            set('MusicCluster',        mPick('DispatchToCluster')        ?? true);
+        }
 
-        // Hide the bitrate row when the format is FLAC (lossless).
+        // Hide the bitrate row when the format is FLAC (lossless). Bound once —
+        // this function now runs on every preset apply, and re-binding would
+        // stack a listener per click for the life of the page.
         const formatEl  = el(prefix, 'MusicFormat');
         const bitrateEl = el(prefix, 'MusicBitrate')?.closest('[data-music-bitrate-row]');
         if (formatEl && bitrateEl) {
@@ -456,8 +598,21 @@ export async function restoreEncoderOptions(prefix = 'settings') {
                 bitrateEl.style.display = formatEl.value === 'flac' ? 'none' : '';
             };
             refreshBitrateRow();
-            formatEl.addEventListener('change', refreshBitrateRow);
+            if (!formatEl.dataset.bitrateRowSyncBound) {
+                formatEl.dataset.bitrateRowSyncBound = '1';
+                formatEl.addEventListener('change', refreshBitrateRow);
+            }
         }
+}
 
-    } catch { /* silent — restore is best-effort */ }
+/**
+ * Re-runs {@link restoreEncoderOptions} only when the startup restore never
+ * completed (auth redirect, transient server error). Called when the settings
+ * modal opens so a failed boot-time restore doesn't leave auto-save disarmed
+ * (and the form showing defaults) for the whole session.
+ *
+ * @param {string} [prefix='settings']
+ */
+export function retryRestoreEncoderOptionsIfNeeded(prefix = 'settings') {
+    if (!restoredPrefixes.has(prefix)) restoreEncoderOptions(prefix);
 }

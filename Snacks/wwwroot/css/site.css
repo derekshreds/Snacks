@@ -1934,3 +1934,57 @@ footer a.text-muted:hover {
     border-radius: 6px;
     background: rgba(0, 0, 0, 0.02);
 }
+
+/* ---------------------------------------------------------------------------
+   Library Health page — summary cards that double as issue filters
+   --------------------------------------------------------------------------- */
+
+.health-filter-card {
+    /* <button class="card"> — strip button chrome, keep card visuals */
+    appearance: none;
+    cursor: pointer;
+    transition: border-color 0.15s ease, transform 0.15s ease;
+}
+
+.health-filter-card:hover {
+    transform: translateY(-1px);
+}
+
+.health-filter-card.active {
+    border-color: var(--primary, #8b5cf6);
+    box-shadow: 0 0 0 1px var(--primary, #8b5cf6);
+}
+
+/* ---------------------------------------------------------------------------
+   Quality preset cards (settings → General)
+   --------------------------------------------------------------------------- */
+
+.preset-card {
+    appearance: none;
+    cursor: pointer;
+    transition: border-color 0.15s ease, transform 0.15s ease;
+}
+
+.preset-card:hover {
+    transform: translateY(-1px);
+    border-color: var(--primary, #8b5cf6);
+}
+
+.preset-card.active {
+    border-color: var(--primary, #8b5cf6);
+    box-shadow: 0 0 0 1px var(--primary, #8b5cf6);
+}
+
+/* ---------------------------------------------------------------------------
+   Settings — section titles inside merged tab panes (Video+Mode, Audio+Subs,
+   Cluster+Networking+Scheduling, Security+Advanced)
+   --------------------------------------------------------------------------- */
+
+.settings-section-title {
+    font-size: 0.95rem;
+    font-weight: 700;
+    color: var(--text-primary, #e5e7eb);
+    border-bottom: 1px solid var(--border-color, rgba(255, 255, 255, 0.1));
+    padding-bottom: 0.4rem;
+    margin-bottom: 1rem;
+}

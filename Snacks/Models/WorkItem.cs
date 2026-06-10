@@ -19,8 +19,26 @@ public sealed class WorkItem
     /// <summary> Display name of the file being processed (e.g., "Movie.mkv"). </summary>
     public string FileName { get; set; } = "";
 
+    private string _path = "";
+
     /// <summary> Absolute path to the source file on the master's filesystem. </summary>
-    public string Path { get; set; } = "";
+    public string Path
+    {
+        get => _path;
+        set { _path = value; _normalizedPath = null; }
+    }
+
+    private string? _normalizedPath;
+
+    /// <summary>
+    ///     <see cref="Path"/> normalized via <c>Path.GetFullPath</c>, computed once and
+    ///     cached (invalidated if <see cref="Path"/> changes). Duplicate-detection scans
+    ///     used to call <c>GetFullPath</c> per item per lookup — O(n²) normalizations
+    ///     across a large library rescan.
+    /// </summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public string NormalizedPath =>
+        _normalizedPath ??= string.IsNullOrEmpty(_path) ? "" : System.IO.Path.GetFullPath(_path);
 
     /// <summary> File size in bytes of the source file. </summary>
     public long Size { get; set; } = 0;
@@ -38,6 +56,13 @@ public sealed class WorkItem
     ///     to maximize perceived throughput.
     /// </summary>
     public long Bitrate { get; set; } = 0;
+
+    /// <summary>
+    ///     User-assigned queue priority. 0 for everything by default; "move to
+    ///     front" sets it above the current maximum so the item dispatches next.
+    ///     Sorts before <see cref="Bitrate"/> in every queue ordering.
+    /// </summary>
+    public int Priority { get; set; }
 
     /// <summary> Duration of the video in seconds. </summary>
     public double Length { get; set; } = 0;
@@ -62,8 +87,18 @@ public sealed class WorkItem
 
     /// <summary>
     ///     Full ffprobe analysis of the source file, including stream details.
-    ///     Used to build FFmpeg command lines and validate output.
+    ///     Used to build FFmpeg command lines and validate output. Populated lazily
+    ///     when processing starts (every encode path re-probes when this is null)
+    ///     and released once the item reaches a terminal state — at 10–30 KB per
+    ///     probe, retaining it on thousands of queued/finished items was the
+    ///     dominant cost of the multi-GB blowups reported on large library sweeps.
     /// </summary>
+    /// <remarks>
+    ///     Excluded from JSON on purpose: the queue API and SignalR broadcasts
+    ///     serialize whole <see cref="WorkItem"/>s, and no client reads the probe.
+    ///     Cluster dispatch sends probes via its own <c>JobMetadata.Probe</c>.
+    /// </remarks>
+    [System.Text.Json.Serialization.JsonIgnore]
     public ProbeResult? Probe { get; set; }
 
     private WorkItemStatus _status = WorkItemStatus.Pending;

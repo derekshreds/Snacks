@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.Mvc;
+using Snacks.Data;
 using Snacks.Models;
 using Snacks.Models.Requests;
 using Snacks.Services;
@@ -12,21 +13,33 @@ namespace Snacks.Controllers;
 [ApiController]
 public sealed class LibraryController : ControllerBase
 {
-    private readonly FileService        _fileService;
-    private readonly TranscodingService _transcodingService;
-    private readonly AutoScanService    _autoScanService;
+    private readonly FileService               _fileService;
+    private readonly TranscodingService        _transcodingService;
+    private readonly AutoScanService           _autoScanService;
+    private readonly LibraryAnalysisJobService _analysisJobs;
+    private readonly MediaFileRepository       _mediaFileRepo;
+    private readonly FileHealthService         _fileHealth;
 
     public LibraryController(
         FileService fileService,
         TranscodingService transcodingService,
-        AutoScanService autoScanService)
+        AutoScanService autoScanService,
+        LibraryAnalysisJobService analysisJobs,
+        MediaFileRepository mediaFileRepo,
+        FileHealthService fileHealth)
     {
         ArgumentNullException.ThrowIfNull(fileService);
         ArgumentNullException.ThrowIfNull(transcodingService);
         ArgumentNullException.ThrowIfNull(autoScanService);
+        ArgumentNullException.ThrowIfNull(analysisJobs);
+        ArgumentNullException.ThrowIfNull(mediaFileRepo);
+        ArgumentNullException.ThrowIfNull(fileHealth);
         _fileService        = fileService;
         _transcodingService = transcodingService;
         _autoScanService    = autoScanService;
+        _analysisJobs       = analysisJobs;
+        _mediaFileRepo      = mediaFileRepo;
+        _fileHealth         = fileHealth;
     }
 
     /******************************************************************
@@ -139,16 +152,25 @@ public sealed class LibraryController : ControllerBase
 
             var relativeRoot = _fileService.AllowAllPaths() ? directoryPath : _fileService.GetUploadsDirectory();
             var mediaFiles   = _fileService.GetAllMediaFiles(allDirs)
-                .Select(t => new
+                .Select(t =>
                 {
-                    path         = t.Path,
-                    name         = Path.GetFileName(t.Path),
-                    size         = new FileInfo(t.Path).Length,
-                    modified     = new FileInfo(t.Path).LastWriteTime,
-                    relativePath = Path.GetRelativePath(relativeRoot, t.Path),
-                    kind         = t.Kind.ToString(),
+                    // One FileInfo per file (NAS metadata I/O is slow — the previous
+                    // code stat'ed each file twice), and skip entries deleted between
+                    // enumeration and projection instead of failing the whole listing.
+                    var fi = new FileInfo(t.Path);
+                    if (!fi.Exists) return null;
+                    return new
+                    {
+                        path         = t.Path,
+                        name         = fi.Name,
+                        size         = fi.Length,
+                        modified     = fi.LastWriteTime,
+                        relativePath = Path.GetRelativePath(relativeRoot, t.Path),
+                        kind         = t.Kind.ToString(),
+                    };
                 })
-                .OrderBy(f => f.relativePath)
+                .Where(f => f != null)
+                .OrderBy(f => f!.relativePath)
                 .ToArray();
 
             return new JsonResult(new { files = mediaFiles });
@@ -184,32 +206,67 @@ public sealed class LibraryController : ControllerBase
     }
 
     /// <summary>
-    ///     Dry-run preview: returns per-file Queue/Mux/Skip predictions for a directory under
-    ///     the supplied options without writing to the DB or queueing any work. Used by the
-    ///     "Analyze (Dry Run)" UI before the user commits to a real <c>process-directory</c>.
+    ///     Starts a dry-run preview as a background job: per-file Queue/Mux/Skip predictions
+    ///     for a directory under the supplied options, without writing to the DB or queueing
+    ///     any work. Returns a job ID immediately — whole-library analyses used to run inside
+    ///     this request and time out on large libraries. The UI polls
+    ///     <c>analyze-status</c> and fetches <c>analyze-results</c> when the job completes.
     /// </summary>
     /// <param name="request"> Directory path, encoder options, and recursion flag. </param>
     [HttpPost("analyze-directory")]
-    public async Task<IActionResult> AnalyzeDirectory([FromBody] ProcessDirectoryRequest request)
+    public IActionResult AnalyzeDirectory([FromBody] ProcessDirectoryRequest request)
     {
+        ArgumentNullException.ThrowIfNull(request);
+        if (string.IsNullOrEmpty(request.DirectoryPath)) return BadRequest("Directory path is required");
+        if (request.Options == null) return BadRequest("Encoder options are required");
+        if (!Directory.Exists(request.DirectoryPath)) return BadRequest($"Directory does not exist: {request.DirectoryPath}");
+        if (!_fileService.IsPathAllowed(request.DirectoryPath))
+            return BadRequest("Directory is not within allowed library path");
+
         try
         {
-            ArgumentNullException.ThrowIfNull(request);
-            if (string.IsNullOrEmpty(request.DirectoryPath)) return BadRequest("Directory path is required");
-            if (request.Options == null) return BadRequest("Encoder options are required");
-            if (!Directory.Exists(request.DirectoryPath)) return BadRequest($"Directory does not exist: {request.DirectoryPath}");
-            if (!_fileService.IsPathAllowed(request.DirectoryPath))
-                return BadRequest("Directory is not within allowed library path");
-
-            var results = await _transcodingService.AnalyzeDirectoryAsync(
-                request.DirectoryPath, request.Options, request.Recursive, HttpContext.RequestAborted);
-            return new JsonResult(new { success = true, results });
+            var job = _analysisJobs.Start(request.DirectoryPath, request.Options, request.Recursive);
+            return new JsonResult(new { success = true, jobId = job.Id });
         }
-        catch (OperationCanceledException)
+        catch (InvalidOperationException ex)
         {
-            return StatusCode(499, "Analysis cancelled");
+            return Conflict(ex.Message);
         }
     }
+
+    /// <summary> Progress of a running (or finished) analysis job. </summary>
+    /// <param name="jobId"> Job ID returned by <c>analyze-directory</c>. </param>
+    [HttpGet("analyze-status/{jobId}")]
+    public IActionResult AnalyzeStatus(string jobId)
+    {
+        var job = _analysisJobs.Get(jobId);
+        if (job == null) return NotFound("Unknown or expired analysis job");
+        return new JsonResult(new
+        {
+            state     = job.State,
+            processed = job.Processed,
+            total     = job.Total,
+            error     = job.Error,
+        });
+    }
+
+    /// <summary> Result set of a completed analysis job. 409 while the job is still running. </summary>
+    /// <param name="jobId"> Job ID returned by <c>analyze-directory</c>. </param>
+    [HttpGet("analyze-results/{jobId}")]
+    public IActionResult AnalyzeResults(string jobId)
+    {
+        var job = _analysisJobs.Get(jobId);
+        if (job == null) return NotFound("Unknown or expired analysis job");
+        if (job.State == LibraryAnalysisJobService.JobState.Running)
+            return Conflict("Analysis still running");
+        return new JsonResult(new { state = job.State, error = job.Error, results = job.Results });
+    }
+
+    /// <summary> Cancels a running analysis job. No-op (success: false) when already finished. </summary>
+    /// <param name="jobId"> Job ID returned by <c>analyze-directory</c>. </param>
+    [HttpPost("analyze-cancel/{jobId}")]
+    public IActionResult AnalyzeCancel(string jobId)
+        => new JsonResult(new { success = _analysisJobs.Cancel(jobId) });
 
     /// <summary> Enqueues a single video file using the supplied encoder options. </summary>
     /// <param name="request"> File path and encoder options. </param>
@@ -233,5 +290,84 @@ public sealed class LibraryController : ControllerBase
 
         var workItemId = await _transcodingService.AddFileAsync(request.FilePath, fileOptions, force: true);
         return new JsonResult(new { success = true, workItemId });
+    }
+
+    /******************************************************************
+     *  Library Health
+     ******************************************************************/
+
+    /// <summary>
+    ///     Library health report: every scanned file with a file-level problem —
+    ///     no audio track, no decodable video, zero duration, or a failed encode —
+    ///     with the issue list computed per file so the UI can filter by category.
+    ///     Sourced entirely from scan-time DB data; no files are touched.
+    /// </summary>
+    [HttpGet("health")]
+    public async Task<IActionResult> GetHealthReport()
+    {
+        var files = await _mediaFileRepo.GetHealthIssuesAsync();
+        var items = files.Select(f =>
+        {
+            var issues = new List<string>();
+            if (f.Kind == MediaKind.Video && f.AudioStreams == "[]")                       issues.Add("no-audio");
+            if (f.Kind == MediaKind.Video && f.Codec != "" && (f.Width <= 0 || f.Height <= 0)) issues.Add("no-video");
+            if (f.Codec != "" && f.Duration <= 0)                                          issues.Add("no-duration");
+            if (f.Status == MediaFileStatus.Failed)                                        issues.Add("failed");
+            return new
+            {
+                filePath      = f.FilePath,
+                fileName      = f.FileName,
+                directory     = f.Directory,
+                sizeBytes     = f.FileSize,
+                codec         = f.Codec,
+                width         = f.Width,
+                height        = f.Height,
+                duration      = f.Duration,
+                kind          = f.Kind.ToString(),
+                status        = f.Status.ToString(),
+                failureReason = f.FailureReason,
+                lastScannedAt = f.LastScannedAt,
+                issues,
+            };
+        }).ToList();
+
+        return new JsonResult(new
+        {
+            items,
+            summary = new
+            {
+                noAudio    = items.Count(i => i.issues.Contains("no-audio")),
+                noVideo    = items.Count(i => i.issues.Contains("no-video")),
+                noDuration = items.Count(i => i.issues.Contains("no-duration")),
+                failed     = items.Count(i => i.issues.Contains("failed")),
+                total      = items.Count,
+            },
+        });
+    }
+
+    /// <summary>
+    ///     Aggregate library composition (codec / resolution / status distributions
+    ///     plus totals) for the insights panel on the Library Health page.
+    /// </summary>
+    [HttpGet("insights")]
+    public async Task<IActionResult> GetInsights()
+        => new JsonResult(await _mediaFileRepo.GetLibraryInsightsAsync());
+
+    /// <summary>
+    ///     Deep verification of a single file: ffmpeg decode samples at the start,
+    ///     middle, and end. Returns <c>{ ok, issues }</c> where issues are the
+    ///     decoder error lines. Bounded (~30s of decoding) — not a full-file pass.
+    /// </summary>
+    /// <param name="request"> The file to verify. </param>
+    [HttpPost("health/verify")]
+    public async Task<IActionResult> VerifyFile([FromBody] ProcessFileRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        if (string.IsNullOrEmpty(request.FilePath)) return BadRequest("File path is required");
+        if (!_fileService.IsFilePathAllowed(request.FilePath))
+            return BadRequest("File is not within allowed library path");
+
+        var result = await _fileHealth.VerifyAsync(request.FilePath, HttpContext.RequestAborted);
+        return new JsonResult(new { ok = result.Ok, issues = result.Issues });
     }
 }

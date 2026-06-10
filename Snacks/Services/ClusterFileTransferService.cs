@@ -166,12 +166,16 @@ public sealed class ClusterFileTransferService
             workItem.Path, FileMode.Open, FileAccess.Read, FileShare.Read);
         fileStream.Seek(offset, SeekOrigin.Begin);
 
+        // One buffer for the whole transfer — chunk size is fixed per upload, and
+        // a fresh large-object-heap allocation per chunk causes serious GC churn
+        // on multi-GB transfers.
+        var chunkBuffer = new byte[chunkSize];
+
         while (offset < totalSize)
         {
             ct.ThrowIfCancellationRequested();
 
             var chunkLength = (int)Math.Min(chunkSize, totalSize - offset);
-            var chunkBuffer = new byte[chunkLength];
             var bytesRead   = 0;
 
             while (bytesRead < chunkLength)
@@ -181,6 +185,16 @@ public sealed class ClusterFileTransferService
                 if (read == 0) break;
                 bytesRead += read;
             }
+
+            // EOF before the expected length means the source shrank on disk after
+            // scan time (re-muxed / replaced / truncated by another process). With
+            // bytesRead == 0 the offset never advances — without this check the
+            // loop would spin PUTting empty chunks at full network speed forever,
+            // because the requests all succeed and never trip the failure counter.
+            if (bytesRead == 0)
+                throw new InvalidOperationException(
+                    $"Source file truncated during upload: expected {totalSize} bytes but hit EOF at {offset}. " +
+                    "The file changed on disk after it was scanned — it will be re-evaluated on the next scan.");
 
             // Bandwidth gate: wait for enough tokens to send this chunk's
             // bytes through the cluster-wide and per-node upload buckets.

@@ -472,6 +472,39 @@ public sealed class EncodeSkipPredicateTests
     }
 
 
+    /// <summary>
+    ///     Regression: with an H.264 target, "already at target codec" used to be computed
+    ///     as <c>!isHevc</c>, which misclassified MPEG-2 / VC-1 / VP9 / XviD sources as
+    ///     "already H.264" — a 2000 kbps MPEG-2 file was skipped (or hybrid-mux video-copied)
+    ///     instead of converted. The predicate must match the actual source codec.
+    /// </summary>
+    [Theory]
+    [InlineData("h264", true)]   // genuinely H.264 → meets target
+    [InlineData("avc", true)]    // alias
+    [InlineData("mpeg2video", false)]
+    [InlineData("vc1", false)]
+    [InlineData("vp9", false)]
+    [InlineData("mpeg4", false)]
+    public void MeetsBitrateTarget_h264_target_matches_actual_source_codec(string sourceCodec, bool expected)
+    {
+        var opts = new EncoderOptions { Encoder = "libx264", TargetBitrate = 3500, SkipPercentAboveTarget = 20 };
+        var item = new WorkItem
+        {
+            Bitrate = 2000,
+            IsHevc  = false,
+            Is4K    = false,
+            Probe   = new ProbeResult
+            {
+                Streams = new[]
+                {
+                    new Stream { Index = 0, CodecType = "video", CodecName = sourceCodec, Width = 1920, Height = 1080 },
+                },
+            },
+        };
+
+        TranscodingService.MeetsBitrateTarget(item, opts).Should().Be(expected);
+    }
+
     [Fact]
     public void MeetsBitrateTarget_applies_4K_multiplier()
     {
@@ -584,6 +617,32 @@ public sealed class EncodeSkipPredicateTests
         var mf = MakeMediaFile(bitrate: 3000, isHevc: true, is4K: false);
 
         TranscodingService.WouldSkipUnderOptions(mf, opts).Should().BeTrue();
+    }
+
+
+    /// <summary>
+    ///     Regression: an H.264 target used to treat any non-HEVC source as "already at
+    ///     target codec" — a low-bitrate MPEG-2 file was skipped instead of converted.
+    /// </summary>
+    [Theory]
+    [InlineData("h264", true)]
+    [InlineData("mpeg2video", false)]
+    [InlineData("vp9", false)]
+    public void WouldSkipUnderOptions_h264_target_requires_h264_source(string sourceCodec, bool expected)
+    {
+        var opts = new EncoderOptions
+        {
+            Encoder                 = "libx264",
+            TargetBitrate           = 3500,
+            SkipPercentAboveTarget  = 20,
+            PreserveOriginalAudio   = true,
+            AudioOutputs            = new(),
+            AudioLanguagesToKeep    = new(),
+            SubtitleLanguagesToKeep = new(),
+        };
+        var mf = MakeMediaFile(bitrate: 2000, isHevc: false, is4K: false, codec: sourceCodec);
+
+        TranscodingService.WouldSkipUnderOptions(mf, opts).Should().Be(expected);
     }
 
 

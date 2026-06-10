@@ -137,7 +137,13 @@ public sealed class SettingsController : ControllerBase
             var path   = GetSettingsPath();
             var backup = path + ".bak";
             var temp   = path + ".tmp";
-            var json   = JsonSerializer.Serialize(settings, _jsonOptions);
+
+            // Merge the incoming form payload OVER the existing file instead of
+            // replacing it wholesale. The settings form builds its payload from
+            // scratch and only knows about fields it renders — properties with
+            // no UI (e.g. Music.VbrQuality, hand-edited extras) used to be
+            // silently deleted on the first auto-save.
+            var json = MergeWithExistingSettings(path, settings);
 
             System.IO.File.WriteAllText(temp, json);
             if (System.IO.File.Exists(path))
@@ -163,6 +169,50 @@ public sealed class SettingsController : ControllerBase
         catch (Exception ex)
         {
             return BadRequest(ex.Message);
+        }
+    }
+
+    /// <summary>
+    ///     Returns the JSON to persist: the incoming payload deep-merged over the
+    ///     current settings.json (incoming values win; keys absent from the incoming
+    ///     payload are preserved). Falls back to the incoming payload verbatim when
+    ///     the existing file is missing or unparsable.
+    /// </summary>
+    internal string MergeWithExistingSettings(string path, JsonElement settings)
+    {
+        var incomingJson = JsonSerializer.Serialize(settings, _jsonOptions);
+        try
+        {
+            if (System.Text.Json.Nodes.JsonNode.Parse(incomingJson) is not System.Text.Json.Nodes.JsonObject incoming)
+                return incomingJson;
+            if (!System.IO.File.Exists(path))
+                return incomingJson;
+            if (System.Text.Json.Nodes.JsonNode.Parse(System.IO.File.ReadAllText(path)) is not System.Text.Json.Nodes.JsonObject existing)
+                return incomingJson;
+
+            DeepMergeJson(existing, incoming);
+            return existing.ToJsonString(_jsonOptions);
+        }
+        catch
+        {
+            return incomingJson;
+        }
+    }
+
+    /// <summary> Recursively copies <paramref name="source"/> properties into <paramref name="target"/>; nested objects merge, everything else (incl. arrays) replaces. </summary>
+    private static void DeepMergeJson(System.Text.Json.Nodes.JsonObject target, System.Text.Json.Nodes.JsonObject source)
+    {
+        foreach (var prop in source.ToList())
+        {
+            if (prop.Value is System.Text.Json.Nodes.JsonObject srcObj
+                && target[prop.Key] is System.Text.Json.Nodes.JsonObject tgtObj)
+            {
+                DeepMergeJson(tgtObj, srcObj);
+            }
+            else
+            {
+                target[prop.Key] = prop.Value?.DeepClone();
+            }
         }
     }
 
@@ -294,6 +344,160 @@ public sealed class SettingsController : ControllerBase
     }
 
     /******************************************************************
+     *  Presets
+     ******************************************************************/
+
+    /// <summary> Serialized lock for preset-file read-modify-write cycles. </summary>
+    private static readonly object _presetsLock = new();
+
+    /// <summary> Hard cap on stored presets — they're tiny, this is an anti-runaway guard. </summary>
+    private const int MaxPresets = 50;
+
+    /// <summary> One named, shareable snapshot of encoder options. </summary>
+    public sealed class SavedPreset
+    {
+        public string Name { get; set; } = "";
+        public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+
+        /// <summary>
+        ///     Kept as a raw JSON element (not <see cref="EncoderOptions"/>) so presets
+        ///     exported by a newer version round-trip through an older one untouched.
+        /// </summary>
+        public JsonElement Options { get; set; }
+    }
+
+    /// <summary> Body for save/import. <c>Name</c> + the options snapshot. </summary>
+    public sealed class PresetRequest
+    {
+        public string Name { get; set; } = "";
+        public JsonElement Options { get; set; }
+    }
+
+    /// <summary> Lists all saved presets (name, creation time, full options snapshot). </summary>
+    [HttpGet("presets")]
+    public IActionResult GetPresets()
+    {
+        // Same lock the writers hold: an unlocked ReadAllText racing the
+        // writers' File.Move(overwrite: true) fails the move on Windows.
+        lock (_presetsLock)
+        {
+            return new JsonResult(new { presets = LoadPresets() });
+        }
+    }
+
+    /// <summary>
+    ///     Saves (or overwrites, matched case-insensitively by name) a preset. The options
+    ///     snapshot comes from the client's current form state, so a preset captures
+    ///     everything the form knows — video, audio, subtitles, music.
+    /// </summary>
+    [HttpPost("presets")]
+    public IActionResult SavePreset([FromBody] PresetRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        var name = (request.Name ?? "").Trim();
+        if (name.Length is 0 or > 80) return BadRequest("Preset name must be 1–80 characters");
+        if (request.Options.ValueKind != JsonValueKind.Object) return BadRequest("Preset options must be an object");
+
+        lock (_presetsLock)
+        {
+            var presets = LoadPresets();
+            presets.RemoveAll(p => string.Equals(p.Name, name, StringComparison.OrdinalIgnoreCase));
+            if (presets.Count >= MaxPresets)
+                return BadRequest($"Preset limit reached ({MaxPresets}) — delete one first");
+            presets.Add(new SavedPreset { Name = name, Options = request.Options.Clone() });
+            WritePresets(presets);
+        }
+        return new JsonResult(new { success = true });
+    }
+
+    /// <summary> Deletes a preset by name (case-insensitive). </summary>
+    [HttpDelete("presets/{name}")]
+    public IActionResult DeletePreset(string name)
+    {
+        lock (_presetsLock)
+        {
+            var presets = LoadPresets();
+            int removed = presets.RemoveAll(p => string.Equals(p.Name, name, StringComparison.OrdinalIgnoreCase));
+            if (removed == 0) return NotFound("No preset with that name");
+            WritePresets(presets);
+        }
+        return new JsonResult(new { success = true });
+    }
+
+    /// <summary>
+    ///     Downloads a preset as a standalone <c>.json</c> file for sharing. The
+    ///     <c>snacksPreset</c> version marker lets the import path (and, later, the
+    ///     community preset site) validate the file shape.
+    /// </summary>
+    [HttpGet("presets/export/{name}")]
+    public IActionResult ExportPreset(string name)
+    {
+        SavedPreset? preset;
+        lock (_presetsLock)
+        {
+            preset = LoadPresets().FirstOrDefault(p => string.Equals(p.Name, name, StringComparison.OrdinalIgnoreCase));
+        }
+        if (preset == null) return NotFound("No preset with that name");
+
+        var payload = JsonSerializer.SerializeToUtf8Bytes(new
+        {
+            snacksPreset = 1,
+            name         = preset.Name,
+            createdAt    = preset.CreatedAt,
+            options      = preset.Options,
+        }, _jsonOptions);
+
+        var safeName = string.Concat(preset.Name.Select(c => char.IsLetterOrDigit(c) || c is '-' or '_' or ' ' ? c : '_')).Trim();
+        if (safeName.Length == 0) safeName = "preset";
+        return File(payload, "application/json", $"{safeName}.snacks-preset.json");
+    }
+
+    /// <summary>
+    ///     Imports a preset file produced by <see cref="ExportPreset"/> (the client reads
+    ///     the file and posts its parsed JSON). Same name-collision rule as save: an
+    ///     existing preset with the same name is replaced.
+    /// </summary>
+    [HttpPost("presets/import")]
+    public IActionResult ImportPreset([FromBody] JsonElement file)
+    {
+        if (file.ValueKind != JsonValueKind.Object
+            || !file.TryGetProperty("snacksPreset", out _)
+            || !file.TryGetProperty("name", out var nameEl) || nameEl.ValueKind != JsonValueKind.String
+            || !file.TryGetProperty("options", out var optionsEl) || optionsEl.ValueKind != JsonValueKind.Object)
+        {
+            return BadRequest("Not a Snacks preset file");
+        }
+
+        return SavePreset(new PresetRequest { Name = nameEl.GetString() ?? "", Options = optionsEl });
+    }
+
+    /// <summary> Reads the preset list, tolerating a missing or corrupt file. </summary>
+    private List<SavedPreset> LoadPresets()
+    {
+        var path = GetPresetsPath();
+        if (!System.IO.File.Exists(path)) return new List<SavedPreset>();
+        try
+        {
+            return JsonSerializer.Deserialize<List<SavedPreset>>(System.IO.File.ReadAllText(path), _jsonOptions)
+                   ?? new List<SavedPreset>();
+        }
+        catch
+        {
+            Console.WriteLine($"Presets file corrupted: {path}");
+            return new List<SavedPreset>();
+        }
+    }
+
+    /// <summary> Atomic write-then-rename, mirroring the settings.json persistence pattern. </summary>
+    private void WritePresets(List<SavedPreset> presets)
+    {
+        var path = GetPresetsPath();
+        var temp = path + ".tmp";
+        System.IO.File.WriteAllText(temp, JsonSerializer.Serialize(presets, _jsonOptions));
+        System.IO.File.Move(temp, path, overwrite: true);
+    }
+
+    /******************************************************************
      *  Helpers
      ******************************************************************/
 
@@ -302,5 +506,12 @@ public sealed class SettingsController : ControllerBase
         var configDir = Path.Combine(_fileService.GetWorkingDirectory(), "config");
         if (!Directory.Exists(configDir)) Directory.CreateDirectory(configDir);
         return Path.Combine(configDir, "settings.json");
+    }
+
+    private string GetPresetsPath()
+    {
+        var configDir = Path.Combine(_fileService.GetWorkingDirectory(), "config");
+        if (!Directory.Exists(configDir)) Directory.CreateDirectory(configDir);
+        return Path.Combine(configDir, "presets.json");
     }
 }

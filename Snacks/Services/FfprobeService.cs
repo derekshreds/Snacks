@@ -38,17 +38,18 @@ public class FfprobeService
     {
         ArgumentNullException.ThrowIfNull(fileInput);
 
-        string flags = "-v quiet -print_format json -show_streams -show_format";
-        string command = $"{flags} \"{fileInput}\"";
-
+        // ArgumentList (not a quoted Arguments string) so filenames containing
+        // double quotes can't split the argument or inject extra ffprobe options.
         var processStartInfo = new ProcessStartInfo(_ffprobePath)
         {
-            Arguments = command,
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             CreateNoWindow = true
         };
+        foreach (var flag in new[] { "-v", "quiet", "-print_format", "json", "-show_streams", "-show_format" })
+            processStartInfo.ArgumentList.Add(flag);
+        processStartInfo.ArgumentList.Add(fileInput);
 
         using var process = new Process { StartInfo = processStartInfo };
 
@@ -71,14 +72,27 @@ public class FfprobeService
         process.BeginOutputReadLine();
         process.BeginErrorReadLine();
 
+        // Hard watchdog on top of the caller's token: ffprobe is known to hang on
+        // damaged containers, and several callers (notably the auto-scan loop) pass
+        // tokens that are never cancelled. A hung probe used to hold the scan lock
+        // forever — every future scan tick silently no-oped until restart.
+        using var watchdog = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        watchdog.CancelAfter(TimeSpan.FromMinutes(5));
+
         try
         {
-            await process.WaitForExitAsync(cancellationToken);
+            await process.WaitForExitAsync(watchdog.Token);
         }
         catch (OperationCanceledException)
         {
             try { if (!process.HasExited) process.Kill(entireProcessTree: true); } catch { }
-            throw;
+            // Only propagate cancellation the caller asked for. A watchdog kill
+            // must THROW, not return an empty ProbeResult — an empty result is
+            // indistinguishable from a real probe of a broken file, and callers
+            // like the auto-scan companion validator would treat duration=0 as
+            // "encode didn't match the original" and delete valid outputs.
+            if (cancellationToken.IsCancellationRequested) throw;
+            throw new TimeoutException($"ffprobe timed out after 5 minutes: {fileInput}");
         }
         process.WaitForExit(); // Ensures async OutputDataReceived/ErrorDataReceived events have finished firing
 
@@ -822,19 +836,23 @@ public class FfprobeService
         if (tailSeconds <= 0) return (0, 0, false);
         double clampedEnd = startSec + tailSeconds;
 
-        string args =
-            $"-v info -nostats -ss {startSec.ToString("0.###", CultureInfo.InvariantCulture)} " +
-            $"-to {clampedEnd.ToString("0.###", CultureInfo.InvariantCulture)} " +
-            $"-i \"{sourcePath}\" -map 0:v:0 -vf blackdetect=d=0.1:pic_th=0.98 -an -sn -f null -";
-
         var psi = new ProcessStartInfo(_ffmpegPath)
         {
-            Arguments              = args,
             UseShellExecute        = false,
             RedirectStandardOutput = true,
             RedirectStandardError  = true,
             CreateNoWindow         = true,
         };
+        foreach (var flag in new[]
+        {
+            "-v", "info", "-nostats",
+            "-ss", startSec.ToString("0.###", CultureInfo.InvariantCulture),
+            "-to", clampedEnd.ToString("0.###", CultureInfo.InvariantCulture),
+            "-i", sourcePath,
+            "-map", "0:v:0", "-vf", "blackdetect=d=0.1:pic_th=0.98",
+            "-an", "-sn", "-f", "null", "-",
+        })
+            psi.ArgumentList.Add(flag);
 
         using var proc = new Process { StartInfo = psi };
         var stderr = new StringBuilder();
@@ -937,19 +955,20 @@ public class FfprobeService
 
         // 99999%+#100 seeks ffprobe to EOF and reads only the last 100 packets, so this
         // stays fast on multi-GB files while still surfacing the real last-frame PTS.
-        string args =
-            "-v error -select_streams v:0 -read_intervals \"99999%+#100\" " +
-            "-show_entries packet=pts_time,duration_time -of json " +
-            $"\"{filePath}\"";
-
         var psi = new ProcessStartInfo(_ffprobePath)
         {
-            Arguments              = args,
             UseShellExecute        = false,
             RedirectStandardOutput = true,
             RedirectStandardError  = true,
             CreateNoWindow         = true,
         };
+        foreach (var flag in new[]
+        {
+            "-v", "error", "-select_streams", "v:0", "-read_intervals", "99999%+#100",
+            "-show_entries", "packet=pts_time,duration_time", "-of", "json",
+        })
+            psi.ArgumentList.Add(flag);
+        psi.ArgumentList.Add(filePath);
 
         var stdout = new StringBuilder();
         using var proc = new Process { StartInfo = psi };

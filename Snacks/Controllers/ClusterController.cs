@@ -419,8 +419,16 @@ public sealed class ClusterController : ControllerBase
     {
         var nodes = _clusterService.GetNodes();
         var remoteIp = HttpContext.Connection.RemoteIpAddress?.ToString();
-        var node = nodes.FirstOrDefault(n =>
-            n.IpAddress == remoteIp || n.IpAddress == HttpContext.Connection.RemoteIpAddress?.MapToIPv4().ToString());
+        var remoteIpV4 = HttpContext.Connection.RemoteIpAddress?.MapToIPv4().ToString();
+        var ipCandidates = nodes.Where(n => n.IpAddress == remoteIp || n.IpAddress == remoteIpV4).ToList();
+
+        // Two workers can share one host on different ports, so IP alone is
+        // ambiguous — picking the first match would download the output from
+        // the wrong worker's port. Prefer the node the job was actually
+        // assigned to; the caller-IP check remains as the anti-SSRF gate.
+        var assignedNodeId = _clusterService.GetRemoteJobAssignedNodeId(jobId);
+        var node = ipCandidates.FirstOrDefault(n => n.NodeId == assignedNodeId)
+                   ?? ipCandidates.FirstOrDefault();
 
         if (node == null)
             return Unauthorized(new { error = "Unknown node" });
@@ -472,7 +480,10 @@ public sealed class ClusterController : ControllerBase
     /// <param name="jobId"> The job ID this file belongs to. </param>
     /// <returns> JSON with the total received byte count and whether the chunk hash matched. </returns>
     [HttpPut("files/{jobId}")]
-    [RequestSizeLimit(75_000_000)] // 75MB — chunks are 50MB with headroom
+    // Sized from the SAME constant that bounds the configurable chunk size —
+    // a fixed 75MB here used to 413 every chunk when the user raised
+    // Networking → chunk size above ~71MB, stalling all uploads.
+    [RequestSizeLimit(Snacks.Services.Cluster.TransferLimits.MaxChunkRequestBytes)]
     public async Task<IActionResult> ReceiveFile(string jobId)
     {
         // Cancel any in-flight request for this job — the old handler's body-read will

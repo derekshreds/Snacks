@@ -187,7 +187,11 @@ public sealed class EncoderOptionsOverride
         if (over.EncodeDirectory != null)             target.EncodeDirectory            = over.EncodeDirectory;
         if (over.HardwareAcceleration != null)        target.HardwareAcceleration       = over.HardwareAcceleration;
         if (over.SkipPercentAboveTarget.HasValue)     target.SkipPercentAboveTarget     = over.SkipPercentAboveTarget.Value;
-        if (over.AudioLanguagesToKeep != null)        target.AudioLanguagesToKeep       = over.AudioLanguagesToKeep;
+        // Copy, don't alias: the override object is the LIVE persisted config
+        // (WatchedFolder.EncodingOverrides). Aliasing its lists into per-job
+        // options lets dispatch-time merges (eg. KeepOriginalLanguage appending
+        // the resolved language) mutate the user's saved configuration.
+        if (over.AudioLanguagesToKeep != null)        target.AudioLanguagesToKeep       = new List<string>(over.AudioLanguagesToKeep);
         if (over.KeepOriginalLanguage.HasValue)       target.KeepOriginalLanguage       = over.KeepOriginalLanguage.Value;
         if (over.OriginalLanguageProvider != null)    target.OriginalLanguageProvider   = over.OriginalLanguageProvider;
         // Audio: a non-null AudioOutputs/PreserveOriginalAudio override is the new shape and
@@ -213,7 +217,7 @@ public sealed class EncoderOptionsOverride
         }
         if (over.EncodingMode.HasValue)               target.EncodingMode               = over.EncodingMode.Value;
         if (over.MuxStreams.HasValue)                 target.MuxStreams                 = over.MuxStreams.Value;
-        if (over.SubtitleLanguagesToKeep != null)     target.SubtitleLanguagesToKeep    = over.SubtitleLanguagesToKeep;
+        if (over.SubtitleLanguagesToKeep != null)     target.SubtitleLanguagesToKeep    = new List<string>(over.SubtitleLanguagesToKeep);
         if (over.ExtractSubtitlesToSidecar.HasValue)  target.ExtractSubtitlesToSidecar  = over.ExtractSubtitlesToSidecar.Value;
         if (over.SidecarSubtitleFormat != null)       target.SidecarSubtitleFormat      = over.SidecarSubtitleFormat;
         if (over.ConvertImageSubtitlesToSrt.HasValue)   target.ConvertImageSubtitlesToSrt   = over.ConvertImageSubtitlesToSrt.Value;

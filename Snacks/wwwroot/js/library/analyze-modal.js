@@ -54,8 +54,11 @@ export class AnalyzeModal {
         /** @type {{dirPath: string, recursive: boolean, options: object, results: any[], filter: string} | null} */
         this._ctx = null;
 
-        /** AbortController for the in-flight analyze request; null when idle. */
-        this._abort = null;
+        /** Server-side job ID of the running analysis; null when idle. */
+        this._jobId = null;
+
+        /** Poll-loop generation counter — bumping it stops any in-flight loop. */
+        this._pollGen = 0;
     }
 
 
@@ -82,11 +85,13 @@ export class AnalyzeModal {
         }
     }
 
-    /** Aborts any in-flight analyze fetch and clears its controller. No-op when idle. */
+    /** Stops the poll loop and cancels the server-side job. No-op when idle. */
     _cancelInFlight() {
-        if (this._abort) {
-            this._abort.abort();
-            this._abort = null;
+        this._pollGen++;
+        if (this._jobId) {
+            // Fire-and-forget — the job service treats cancel of a finished job as a no-op.
+            libraryApi.analyzeCancel(this._jobId).catch(() => {});
+            this._jobId = null;
         }
     }
 
@@ -107,9 +112,8 @@ export class AnalyzeModal {
             return;
         }
 
-        // A previous run might still be in flight (user reopened before the first
-        // request finished) — abort it so its late-arriving response can't render
-        // into the modal we're about to reset.
+        // A previous run might still be going (user reopened before it finished) —
+        // cancel it so its poll loop can't render into the modal we're resetting.
         this._cancelInFlight();
 
         const options = getEncoderOptions('settings');
@@ -122,6 +126,9 @@ export class AnalyzeModal {
         document.getElementById('analyzeLoading').style.display = '';
         document.getElementById('analyzeContent').style.display = 'none';
         document.getElementById('analyzeError')  .style.display = 'none';
+        document.getElementById('analyzeProgressLabel').textContent = 'Scanning folder…';
+        document.getElementById('analyzeProgressWrap').style.display = 'none';
+        document.getElementById('analyzeProgressBar').style.width = '0%';
 
         // Reset Proceed to its initial state — otherwise it briefly shows the
         // count from the previous directory's results until the new fetch lands.
@@ -131,24 +138,80 @@ export class AnalyzeModal {
 
         openModal(MODAL_ID);
 
-        const controller = new AbortController();
-        this._abort = controller;
+        const gen = ++this._pollGen;
         try {
-            const data = await libraryApi.analyzeDirectory(dirPath, recursive, options, controller.signal);
-            // Late responses from a since-aborted request must not paint over a
-            // newer one — `_abort` is reassigned on each call, so identity check.
-            if (this._abort !== controller) return;
+            const start = await libraryApi.analyzeDirectory(dirPath, recursive, options);
+            if (gen !== this._pollGen) {
+                // Modal was closed/reopened while the start call was in flight —
+                // this job has no owner anymore, kill it server-side.
+                libraryApi.analyzeCancel(start.jobId).catch(() => {});
+                return;
+            }
+            this._jobId = start.jobId;
+            await this._pollUntilDone(gen, start.jobId);
+        } catch (err) {
+            if (gen !== this._pollGen) return; // superseded — stay silent
+            this._showError(err.message);
+        }
+    }
+
+    /**
+     * Polls job progress until it leaves the running state, then fetches and
+     * renders the results. The generation guard makes stale loops drop out the
+     * moment a newer open()/close() bumps `_pollGen`.
+     */
+    async _pollUntilDone(gen, jobId) {
+        // A whole-library analysis can run for many minutes (= thousands of
+        // polls); a single transient failure (proxy blip, server busy under
+        // encode load) must not kill the modal while the job runs on fine.
+        let consecutiveFailures = 0;
+
+        while (true) {
+            await new Promise(resolve => setTimeout(resolve, 750));
+            if (gen !== this._pollGen) return;
+
+            let status;
+            try {
+                status = await libraryApi.analyzeStatus(jobId);
+                consecutiveFailures = 0;
+            } catch (err) {
+                if (++consecutiveFailures < 8) continue;
+                throw err; // ~6s of consistent failure — surface it
+            }
+            if (gen !== this._pollGen) return;
+
+            if (status.state === 'running') {
+                if (status.total >= 0) {
+                    const pct = status.total > 0 ? Math.round((status.processed / status.total) * 100) : 100;
+                    document.getElementById('analyzeProgressWrap').style.display = '';
+                    document.getElementById('analyzeProgressBar').style.width = pct + '%';
+                    document.getElementById('analyzeProgressLabel').textContent =
+                        `Analyzing ${status.processed.toLocaleString()} of ${status.total.toLocaleString()} files…`;
+                }
+                continue;
+            }
+
+            if (status.state === 'cancelled') return;
+            if (status.state === 'failed') {
+                this._showError(status.error || 'Analysis failed on the server');
+                return;
+            }
+
+            const data = await libraryApi.analyzeResults(jobId);
+            if (gen !== this._pollGen) return;
+            this._jobId = null;
             this._ctx.results = data.results || [];
             this._renderResults();
-        } catch (err) {
-            if (err.name === 'AbortError') return; // user closed the modal — silent
-            document.getElementById('analyzeLoading').style.display = 'none';
-            const errEl = document.getElementById('analyzeError');
-            errEl.textContent  = 'Analysis failed: ' + err.message;
-            errEl.style.display = '';
-        } finally {
-            if (this._abort === controller) this._abort = null;
+            return;
         }
+    }
+
+    /** Swaps the loading pane for the error alert. */
+    _showError(message) {
+        document.getElementById('analyzeLoading').style.display = 'none';
+        const errEl = document.getElementById('analyzeError');
+        errEl.textContent  = 'Analysis failed: ' + message;
+        errEl.style.display = '';
     }
 
 

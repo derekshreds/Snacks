@@ -76,7 +76,9 @@ public sealed class QueueController : ControllerBase
                 _                        => 4
             };
             int cmp = StatusPriority(a.Status).CompareTo(StatusPriority(b.Status));
-            return cmp != 0 ? cmp : b.Bitrate.CompareTo(a.Bitrate);
+            // Within a status bucket, mirror the dispatcher's order (user priority,
+            // then bitrate) so a "move to front" is visible immediately.
+            return cmp != 0 ? cmp : TranscodingService.CompareQueueOrder(a, b);
         });
 
         var total = queueItems.Count;
@@ -89,16 +91,8 @@ public sealed class QueueController : ControllerBase
     [HttpGet("stats")]
     public IActionResult GetStats()
     {
-        var workItems = _transcodingService.GetAllWorkItems();
-        return new JsonResult(new
-        {
-            pending    = workItems.Count(w => w.Status == WorkItemStatus.Pending),
-            processing = workItems.Count(w => w.Status is WorkItemStatus.Processing
-                                                  or WorkItemStatus.Uploading or WorkItemStatus.Downloading),
-            completed  = workItems.Count(w => w.Status == WorkItemStatus.Completed),
-            failed     = workItems.Count(w => w.Status == WorkItemStatus.Failed),
-            total      = workItems.Count
-        });
+        var (pending, processing, completed, failed, total) = _transcodingService.GetWorkItemCounts();
+        return new JsonResult(new { pending, processing, completed, failed, total });
     }
 
     /// <summary> Returns a single work item by ID, or 404 if not found. </summary>
@@ -134,6 +128,18 @@ public sealed class QueueController : ControllerBase
             return BadRequest(ex.Message);
         }
     }
+
+    /// <summary>
+    ///     Moves a pending work item to the front of the queue. 404 when the item
+    ///     is unknown or no longer pending (it may have started processing between
+    ///     render and click — the UI just refreshes in that case).
+    /// </summary>
+    /// <param name="id"> The work item ID to prioritize. </param>
+    [HttpPost("prioritize/{id}")]
+    public IActionResult Prioritize(string id)
+        => _transcodingService.PrioritizeWorkItem(id)
+            ? new JsonResult(new { success = true })
+            : NotFound("Item is not pending");
 
     /// <summary> Stops the active FFmpeg process for a work item without cancelling it. </summary>
     /// <param name="id"> The work item ID to stop. </param>

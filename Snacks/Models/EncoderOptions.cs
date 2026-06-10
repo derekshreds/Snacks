@@ -173,7 +173,11 @@ public sealed class EncoderOptions
      *  Video Pipeline
      ******************************************************************/
 
-    /// <summary> Downscale policy: "Never", "Always", or "IfLarger". </summary>
+    /// <summary>
+    ///     Downscale policy: "Never", "CapAtTarget", or "Always" (the values the UI writes).
+    ///     The legacy alias "IfLarger" is still accepted by the backend and mapped to
+    ///     "CapAtTarget" on settings restore.
+    /// </summary>
     public string DownscalePolicy { get; set; } = "Never";
 
     /// <summary> Target resolution for downscaling (e.g. "1080p", "720p"). </summary>
@@ -211,7 +215,11 @@ public sealed class EncoderOptions
     /// <summary> Optional intermediate encode directory. When <see langword="null"/>, the system temp directory is used. </summary>
     public string? EncodeDirectory { get; set; }
 
-    /// <summary> Hardware acceleration mode (e.g. "auto", "nvenc", "vaapi", "none"). </summary>
+    /// <summary>
+    ///     Hardware acceleration mode: "auto", "intel", "amd", "nvidia", "apple", or "none"
+    ///     (the values the UI writes). Legacy aliases ("nvenc", "vaapi", "qsv", "amf") are
+    ///     mapped to these on settings restore.
+    /// </summary>
     public string HardwareAcceleration { get; set; } = "auto";
 
     /// <summary>

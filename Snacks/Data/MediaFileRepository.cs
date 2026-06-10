@@ -322,6 +322,81 @@ public class MediaFileRepository
         }
 
         /// <summary>
+        ///     Aggregate library composition for the insights panel: file/byte totals
+        ///     plus codec, resolution-bucket, and status distributions. All grouping
+        ///     happens in SQL — nothing row-shaped crosses into memory, so this stays
+        ///     cheap on 100k-row libraries.
+        /// </summary>
+        public async Task<LibraryInsights> GetLibraryInsightsAsync()
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            var files = context.MediaFiles.Where(f => f.LastScannedAt != null);
+
+            var codecs = await files
+                .Where(f => f.Codec != "")
+                .GroupBy(f => f.Codec)
+                .Select(g => new LibraryInsights.Slice(g.Key, g.Count(), g.Sum(f => f.FileSize)))
+                .ToListAsync();
+
+            // Width buckets follow the app's own 4K rule (Width > 1920).
+            var resolutions = new List<LibraryInsights.Slice>
+            {
+                new("4K",    await files.CountAsync(f => f.Kind == MediaKind.Video && f.Width > 1920), 0),
+                new("1080p", await files.CountAsync(f => f.Kind == MediaKind.Video && f.Width > 1280 && f.Width <= 1920), 0),
+                new("720p",  await files.CountAsync(f => f.Kind == MediaKind.Video && f.Width > 960  && f.Width <= 1280), 0),
+                new("SD",    await files.CountAsync(f => f.Kind == MediaKind.Video && f.Width > 0    && f.Width <= 960), 0),
+            };
+
+            var statuses = await files
+                .GroupBy(f => f.Status)
+                .Select(g => new { g.Key, Count = g.Count() })
+                .ToListAsync();
+
+            return new LibraryInsights
+            {
+                TotalFiles  = await files.CountAsync(),
+                TotalBytes  = await files.SumAsync(f => (long?)f.FileSize) ?? 0,
+                HdrFiles    = await files.CountAsync(f => f.IsHdr),
+                MusicFiles  = await files.CountAsync(f => f.Kind == MediaKind.Music),
+                Codecs      = codecs.OrderByDescending(c => c.Count).ToList(),
+                Resolutions = resolutions.Where(r => r.Count > 0).ToList(),
+                Statuses    = statuses.OrderByDescending(s => s.Count)
+                                      .Select(s => new LibraryInsights.Slice(s.Key.ToString(), s.Count, 0))
+                                      .ToList(),
+            };
+        }
+
+        /// <summary>
+        ///     Returns every scanned file exhibiting a file-level health issue, for the
+        ///     library-health page. Flagged conditions (a file can match several):
+        ///     <list type="bullet">
+        ///       <item>video file whose stream summary records zero audio tracks
+        ///         (<c>AudioStreams == "[]"</c> — explicitly empty; <see langword="null"/>
+        ///         means "scanned before summaries existed" and is NOT flagged),</item>
+        ///       <item>video file with no decodable video stream (probed — codec known —
+        ///         but zero dimensions),</item>
+        ///       <item>probed file with a zero/unknown duration (typical of truncated or
+        ///         corrupt containers),</item>
+        ///       <item>files whose encode permanently failed.</item>
+        ///     </list>
+        /// </summary>
+        /// <param name="limit"> Cap on returned rows (the counts in the UI come from this list client-side). </param>
+        public async Task<List<MediaFile>> GetHealthIssuesAsync(int limit = 2000)
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            return await context.MediaFiles
+                .Where(f => f.LastScannedAt != null && (
+                       (f.Kind == MediaKind.Video && f.AudioStreams == "[]")
+                    || (f.Kind == MediaKind.Video && f.Codec != "" && (f.Width <= 0 || f.Height <= 0))
+                    || (f.Codec != "" && f.Duration <= 0)
+                    || f.Status == MediaFileStatus.Failed))
+                .OrderByDescending(f => f.Status == MediaFileStatus.Failed)
+                .ThenBy(f => f.FilePath)
+                .Take(limit)
+                .ToListAsync();
+        }
+
+        /// <summary>
         ///     Deletes every <see cref="MediaFile" /> row whose status is
         ///     <see cref="MediaFileStatus.Failed" />. The next library scan re-discovers
         ///     any source file still on disk as <see cref="MediaFileStatus.Unseen" />,

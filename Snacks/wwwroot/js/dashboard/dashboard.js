@@ -660,5 +660,8 @@ registerPage('dashboard', {
             clearTimeout(refreshTimer);
             refreshTimer = null;
         }
+        // The chart tooltip is appended to document.body (so it can escape the
+        // SVG's overflow), which means the page-content swap doesn't remove it.
+        document.getElementById('dashTooltip')?.remove();
     },
 });

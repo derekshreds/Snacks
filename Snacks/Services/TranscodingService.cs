@@ -28,6 +28,20 @@ public class TranscodingService
     /// <summary>Lock protecting access to <see cref="_workQueue"/>.</summary>
     private readonly object _queueLock = new();
 
+    /// <summary>Fires <see cref="SweepTerminalWorkItems"/> every 5 minutes.</summary>
+    private readonly Timer _workItemSweepTimer;
+
+    /// <summary>
+    ///     Maximum number of terminal (Completed/Failed/Cancelled/Stopped/NoSavings)
+    ///     work items kept in <see cref="_workItems"/>. The queue UI only pages
+    ///     through recent history — the permanent record lives in the database
+    ///     (<see cref="MediaFile.Status"/> and the encode-history ledger) — so
+    ///     anything beyond this is pure memory cost. A 30k-file sweep used to pin
+    ///     every finished item (plus its probe) forever, which is how the app
+    ///     reached 6+ GB and got OOM-killed on NAS hardware.
+    /// </summary>
+    private const int TerminalWorkItemCap = 1000;
+
     private readonly FileService _fileService;
     private readonly FfprobeService _ffprobeService;
     private readonly IHubContext<TranscodingHub> _hubContext;
@@ -386,6 +400,12 @@ public class TranscodingService
         _log                       = logger;
         _ffmpegPath          = Environment.GetEnvironmentVariable("FFMPEG_PATH") ?? "ffmpeg";
 
+        // Periodic memory sweep — releases probe data on finished items and caps
+        // how many terminal items stay resident. The service is an app-lifetime
+        // singleton, so the timer is never disposed.
+        _workItemSweepTimer = new Timer(_ => SweepTerminalWorkItems(), null,
+            TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(5));
+
         _ = Task.Run(async () =>
         {
             try
@@ -521,6 +541,39 @@ public class TranscodingService
         {
             cancellationToken.ThrowIfCancellationRequested();
             var fileInfo = new FileInfo(filePath);
+            var earlyNormalizedPath = Path.GetFullPath(filePath);
+
+            // Cheap early-outs BEFORE the expensive ffprobe + 15s bitrate sampling.
+            // Re-adding an already-processed library used to re-probe every file just
+            // to print "already completed" — thousands of sequential ffprobe/ffmpeg
+            // spawns against NAS storage for nothing.
+            if (_workItems.Values.Any(w =>
+                w.NormalizedPath.Equals(earlyNormalizedPath, StringComparison.OrdinalIgnoreCase) &&
+                w.Status is WorkItemStatus.Pending or WorkItemStatus.Processing
+                    or WorkItemStatus.Uploading or WorkItemStatus.Downloading))
+            {
+                return string.Empty;
+            }
+
+            if (_isRemoteJobChecker != null && await _isRemoteJobChecker(earlyNormalizedPath))
+            {
+                Console.WriteLine($"Skipping {Path.GetFileName(filePath)}: already active as a remote job");
+                return string.Empty;
+            }
+
+            // Terminal-status early-out, but only when the file is provably unchanged
+            // (mtime + size match) — otherwise fall through to the full change-detection
+            // logic below, which needs probe data (duration delta).
+            var earlyDbFile = await _mediaFileRepo.GetByPathAsync(earlyNormalizedPath);
+            if (!force && earlyDbFile != null
+                && earlyDbFile.FileMtime == fileInfo.LastWriteTimeUtc.Ticks
+                && earlyDbFile.FileSize == fileInfo.Length
+                && earlyDbFile.Status is MediaFileStatus.Failed or MediaFileStatus.Cancelled or MediaFileStatus.Completed)
+            {
+                Console.WriteLine($"Skipping {Path.GetFileName(filePath)}: previously {earlyDbFile.Status} (unchanged on disk)");
+                return string.Empty;
+            }
+
             var probe = await _ffprobeService.ProbeAsync(filePath, cancellationToken);
 
             var length = _ffprobeService.GetVideoDuration(probe);
@@ -577,12 +630,15 @@ public class TranscodingService
             bool targetIsHevc = options.Encoder.Contains("265", StringComparison.OrdinalIgnoreCase);
             bool targetIsAv1 = options.Encoder.Contains("av1", StringComparison.OrdinalIgnoreCase) || options.Encoder.Contains("svt", StringComparison.OrdinalIgnoreCase);
             bool isAv1 = sourceCodec == "av1";
-            bool alreadyTargetCodec = targetIsAv1 ? isAv1 : (targetIsHevc ? isHevc : !isHevc);
+            // H.264 targets must match the actual source codec — "not HEVC" would
+            // misclassify MPEG-2/VC-1/XviD/VP9 sources as already-H.264 and skip them.
+            bool isH264 = sourceCodec is "h264" or "avc";
+            bool alreadyTargetCodec = targetIsAv1 ? isAv1 : (targetIsHevc ? isHevc : isH264);
             bool isHighDef = probe.Streams.Any(s => s.CodecType == "video" && s.Width > 1920);
             workItem.Is4K = isHighDef;
 
             var videoStream = probe.Streams.FirstOrDefault(s => s.CodecType == "video");
-            var normalizedPath = Path.GetFullPath(filePath);
+            var normalizedPath = earlyNormalizedPath;
 
             // Library exclusion rules — shared with the auto-scanner via a provider that
             // AutoScanService wires in StartAsync. Respect `force` so manually re-added
@@ -609,7 +665,8 @@ public class TranscodingService
             // effective keep lists that ConvertVideoAsync would build at encode time. Cached
             // on MediaFile.OriginalLanguage so re-scans avoid re-querying the integration
             // provider, and so WouldSkipUnderOptions / AnalyzeFileAsync can stay in sync.
-            var dbFile = await _mediaFileRepo.GetByPathAsync(normalizedPath);
+            // Reuses the row fetched before the probe — nothing else mutates it mid-add.
+            var dbFile = earlyDbFile;
             string? originalLanguage = await ResolveOriginalLanguageAsync(filePath, options, dbFile, cancellationToken);
             var effectiveOptions = WithOriginalLanguageMerged(options, originalLanguage);
             bool isHdr = FfprobeService.IsHdr(probe);
@@ -710,7 +767,7 @@ public class TranscodingService
             Console.WriteLine($"Queuing {workItem.FileName}: {sourceCodec} {bitrate}kbps {(isHighDef ? "4K" : "HD")}");
 
             if (_workItems.Values.Any(w =>
-                Path.GetFullPath(w.Path).Equals(normalizedPath, StringComparison.OrdinalIgnoreCase) &&
+                w.NormalizedPath.Equals(normalizedPath, StringComparison.OrdinalIgnoreCase) &&
                 w.Status is WorkItemStatus.Pending or WorkItemStatus.Processing
                     or WorkItemStatus.Uploading or WorkItemStatus.Downloading))
             {
@@ -753,7 +810,7 @@ public class TranscodingService
             if (force)
             {
                 var existing = _workItems.Values.FirstOrDefault(w =>
-                    Path.GetFullPath(w.Path).Equals(normalizedPath, StringComparison.OrdinalIgnoreCase));
+                    w.NormalizedPath.Equals(normalizedPath, StringComparison.OrdinalIgnoreCase));
                 if (existing != null)
                     _workItems.TryRemove(existing.Id, out _);
             }
@@ -782,11 +839,17 @@ public class TranscodingService
                 OriginalLanguage = originalLanguage,
             });
 
+            // Release the probe before parking — every encode path lazily
+            // re-probes when Probe is null, and holding 10–30 KB of stream
+            // metadata per pending item is what let a 30k-file sweep grow the
+            // in-memory queue into multi-GB territory.
+            workItem.Probe = null;
+
             _workItems[workItem.Id] = workItem;
             lock (_queueLock)
             {
                 _workQueue.Add(workItem);
-                _workQueue.Sort((a, b) => b.Bitrate.CompareTo(a.Bitrate));
+                _workQueue.Sort(CompareQueueOrder);
             }
 
             await _hubContext.Clients.All.SendAsync("WorkItemAdded", workItem);
@@ -910,7 +973,7 @@ public class TranscodingService
             var dbFile = await _mediaFileRepo.GetByPathAsync(normalizedPath);
 
             if (_workItems.Values.Any(w =>
-                Path.GetFullPath(w.Path).Equals(normalizedPath, StringComparison.OrdinalIgnoreCase) &&
+                w.NormalizedPath.Equals(normalizedPath, StringComparison.OrdinalIgnoreCase) &&
                 w.Status is WorkItemStatus.Pending or WorkItemStatus.Processing
                     or WorkItemStatus.Uploading or WorkItemStatus.Downloading))
             {
@@ -956,7 +1019,7 @@ public class TranscodingService
             if (force)
             {
                 var existing = _workItems.Values.FirstOrDefault(w =>
-                    Path.GetFullPath(w.Path).Equals(normalizedPath, StringComparison.OrdinalIgnoreCase));
+                    w.NormalizedPath.Equals(normalizedPath, StringComparison.OrdinalIgnoreCase));
                 if (existing != null)
                     _workItems.TryRemove(existing.Id, out _);
             }
@@ -979,11 +1042,17 @@ public class TranscodingService
 
             Console.WriteLine($"Queuing music {workItem.FileName}: {sourceCodec} {sourceKbps}kbps {sourceChans}ch → {music.Codec} {music.BitrateKbps}kbps");
 
+            // Release the probe before parking — every encode path lazily
+            // re-probes when Probe is null, and holding 10–30 KB of stream
+            // metadata per pending item is what let a 30k-file sweep grow the
+            // in-memory queue into multi-GB territory.
+            workItem.Probe = null;
+
             _workItems[workItem.Id] = workItem;
             lock (_queueLock)
             {
                 _workQueue.Add(workItem);
-                _workQueue.Sort((a, b) => b.Bitrate.CompareTo(a.Bitrate));
+                _workQueue.Sort(CompareQueueOrder);
             }
 
             await _hubContext.Clients.All.SendAsync("WorkItemAdded", workItem);
@@ -1060,23 +1129,39 @@ public class TranscodingService
     /// <param name="options">Encoder options used for the prediction.</param>
     /// <param name="recursive">When <see langword="true"/>, subdirectories are included.</param>
     /// <param name="cancellationToken">Token to abort a long-running analysis.</param>
+    /// <param name="progress">
+    ///     Optional per-file progress callback <c>(processed, total)</c>. Invoked from
+    ///     worker threads; total is reported once up front as <c>(0, total)</c>.
+    /// </param>
     public async Task<List<FileAnalysisResult>> AnalyzeDirectoryAsync(
-        string directoryPath, EncoderOptions options, bool recursive = true, CancellationToken cancellationToken = default)
+        string directoryPath, EncoderOptions options, bool recursive = true,
+        CancellationToken cancellationToken = default, Action<int, int>? progress = null)
     {
         var directories = recursive
             ? _fileService.RecursivelyFindDirectories(directoryPath)
             : new List<string> { directoryPath };
         var mediaFiles = _fileService.GetAllMediaFiles(directories);
+        progress?.Invoke(0, mediaFiles.Count);
 
-        var results = new List<FileAnalysisResult>(mediaFiles.Count);
-        foreach (var (file, kind) in mediaFiles)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            results.Add(kind == MediaKind.Music
-                ? await AnalyzeMusicFileAsync(file, options, cancellationToken)
-                : await AnalyzeFileAsync(file, options, cancellationToken));
-        }
-        return results;
+        // Bounded parallelism: DB-cached files resolve in microseconds, but stale
+        // ones cost an ffprobe each. A whole-library dry run used to walk them one
+        // at a time inside a single HTTP request, which is why it timed out on
+        // 30k-file libraries. Kept modest so a NAS isn't saturated with probes.
+        var parallelism = Math.Clamp(Environment.ProcessorCount / 2, 2, 8);
+        var results = new FileAnalysisResult[mediaFiles.Count];
+        int processed = 0;
+        await Parallel.ForEachAsync(
+            Enumerable.Range(0, mediaFiles.Count),
+            new ParallelOptions { MaxDegreeOfParallelism = parallelism, CancellationToken = cancellationToken },
+            async (i, token) =>
+            {
+                var (file, kind) = mediaFiles[i];
+                results[i] = kind == MediaKind.Music
+                    ? await AnalyzeMusicFileAsync(file, options, token)
+                    : await AnalyzeFileAsync(file, options, token);
+                progress?.Invoke(Interlocked.Increment(ref processed), mediaFiles.Count);
+            });
+        return results.ToList();
     }
 
     /// <summary>
@@ -1264,7 +1349,10 @@ public class TranscodingService
 
             bool targetIsHevc = options.Encoder.Contains("265", StringComparison.OrdinalIgnoreCase);
             bool targetIsAv1 = options.Encoder.Contains("av1", StringComparison.OrdinalIgnoreCase) || options.Encoder.Contains("svt", StringComparison.OrdinalIgnoreCase);
-            bool alreadyTargetCodec = targetIsAv1 ? isAv1 : (targetIsHevc ? isHevc : !isHevc);
+            // Match the actual source codec for H.264 targets — see AddFileAsync.
+            bool isH264 = sourceCodec.Equals("h264", StringComparison.OrdinalIgnoreCase)
+                       || sourceCodec.Equals("avc", StringComparison.OrdinalIgnoreCase);
+            bool alreadyTargetCodec = targetIsAv1 ? isAv1 : (targetIsHevc ? isHevc : isH264);
             bool isHighDef = width > 1920;
             result.Is4K = isHighDef;
 
@@ -1499,7 +1587,7 @@ public class TranscodingService
     {
         var normalizedPath = Path.GetFullPath(filePath);
         return _workItems.Values.Any(w =>
-            Path.GetFullPath(w.Path).Equals(normalizedPath, StringComparison.OrdinalIgnoreCase) &&
+            w.NormalizedPath.Equals(normalizedPath, StringComparison.OrdinalIgnoreCase) &&
             w.Status is WorkItemStatus.Pending or WorkItemStatus.Processing
                 or WorkItemStatus.Uploading or WorkItemStatus.Downloading);
     }
@@ -1510,8 +1598,68 @@ public class TranscodingService
         return _workItems.Values.OrderByDescending(x => x.CreatedAt).ToList();
     }
 
+    /// <summary>
+    ///     Status counts for the stats endpoint. A single pass over the live
+    ///     dictionary — the stats poll fires every few seconds, and materializing
+    ///     plus sorting the full item list (as <see cref="GetAllWorkItems"/> does)
+    ///     just to count is measurable churn once a big sweep has queued tens of
+    ///     thousands of items.
+    /// </summary>
+    public (int Pending, int Processing, int Completed, int Failed, int Total) GetWorkItemCounts()
+    {
+        int pending = 0, processing = 0, completed = 0, failed = 0, total = 0;
+        foreach (var item in _workItems.Values)
+        {
+            total++;
+            switch (item.Status)
+            {
+                case WorkItemStatus.Pending:    pending++;    break;
+                case WorkItemStatus.Completed:  completed++;  break;
+                case WorkItemStatus.Failed:     failed++;     break;
+                case WorkItemStatus.Processing:
+                case WorkItemStatus.Uploading:
+                case WorkItemStatus.Downloading: processing++; break;
+            }
+        }
+        return (pending, processing, completed, failed, total);
+    }
+
     /// <summary>Removes a work item from the in-memory tracking dictionary (e.g. after remote job cleanup).</summary>
     public void RemoveWorkItem(string id) => _workItems.TryRemove(id, out _);
+
+    /// <summary>
+    ///     Canonical pending-queue ordering: user priority first ("move to front"),
+    ///     then bitrate descending (big files first maximizes perceived throughput).
+    ///     Every <c>_workQueue.Sort</c> call uses this comparison; the API's queue
+    ///     listing mirrors it so the on-screen order matches dispatch order.
+    /// </summary>
+    internal static int CompareQueueOrder(WorkItem a, WorkItem b)
+    {
+        int byPriority = b.Priority.CompareTo(a.Priority);
+        return byPriority != 0 ? byPriority : b.Bitrate.CompareTo(a.Bitrate);
+    }
+
+    /// <summary>
+    ///     Moves a pending work item to the front of the queue by assigning it a
+    ///     priority above the current maximum, then resorting. Returns false when
+    ///     the item is unknown or no longer pending.
+    /// </summary>
+    public bool PrioritizeWorkItem(string id)
+    {
+        if (!_workItems.TryGetValue(id, out var item) || item.Status != WorkItemStatus.Pending)
+            return false;
+
+        lock (_queueLock)
+        {
+            int maxPriority = _workQueue.Count > 0 ? _workQueue.Max(w => w.Priority) : 0;
+            item.Priority = maxPriority + 1;
+            _workQueue.Sort(CompareQueueOrder);
+        }
+
+        _ = _hubContext.Clients.All.SendAsync("WorkItemUpdated", item);
+        Console.WriteLine($"Queue: moved {item.FileName} to the front");
+        return true;
+    }
 
     /// <summary>
     ///     Drops a work item whose source file is no longer on disk. Removes it from
@@ -1533,6 +1681,51 @@ public class TranscodingService
 
         try { await _hubContext.Clients.All.SendAsync("WorkItemRemoved", item.Id); }
         catch { /* SignalR failures are non-fatal — UI will reconcile on next refresh */ }
+    }
+
+    /// <summary>
+    ///     Memory sweep over finished work items. Two passes:
+    ///     <list type="number">
+    ///       <item>Releases <see cref="WorkItem.Probe"/> on any terminal item that has
+    ///         been quiet for a couple of minutes — completion bookkeeping (encode
+    ///         history, cluster keep/delete recompute) reads the probe immediately
+    ///         after the status flip, so a settle window avoids racing it.</item>
+    ///       <item>Evicts the oldest terminal items beyond <see cref="TerminalWorkItemCap"/>.
+    ///         The DB keeps the authoritative outcome; the queue UI reconciles
+    ///         dropped IDs on its next full refresh.</item>
+    ///     </list>
+    /// </summary>
+    internal void SweepTerminalWorkItems()
+    {
+        static bool IsTerminal(WorkItemStatus s) => s is WorkItemStatus.Completed
+            or WorkItemStatus.Failed or WorkItemStatus.Cancelled
+            or WorkItemStatus.Stopped or WorkItemStatus.NoSavings;
+
+        var now = DateTime.UtcNow;
+        var terminal = new List<WorkItem>();
+        foreach (var item in _workItems.Values)
+        {
+            if (!IsTerminal(item.Status)) continue;
+            terminal.Add(item);
+            if (item.Probe != null && now - item.LastUpdatedAt > TimeSpan.FromMinutes(2))
+                item.Probe = null;
+        }
+
+        if (terminal.Count <= TerminalWorkItemCap) return;
+
+        int evicted = 0;
+        foreach (var victim in terminal.OrderBy(w => w.CompletedAt ?? w.CreatedAt)
+                                       .Take(terminal.Count - TerminalWorkItemCap))
+        {
+            // Re-check right before removal — a Stopped item can be requeued to
+            // Pending at any time, and restore it if the flip lands mid-removal.
+            if (!IsTerminal(victim.Status)) continue;
+            _workItems.TryRemove(victim.Id, out _);
+            if (!IsTerminal(victim.Status)) _workItems[victim.Id] = victim;
+            else evicted++;
+        }
+        if (evicted > 0)
+            Console.WriteLine($"Queue sweep: evicted {evicted} finished items from memory (cap {TerminalWorkItemCap}; full history remains in the database)");
     }
 
     /// <summary>
@@ -1626,6 +1819,27 @@ public class TranscodingService
         }
     }
 
+    /// <summary>
+    ///     Records a Failed outcome for a job aborted by the per-job watchdog.
+    ///     A watchdog cancel raises the same OperationCanceledException as a
+    ///     user cancel, but nobody has set a terminal status — without this the
+    ///     item stays in Processing forever in standalone mode. No-op when a
+    ///     terminal status was already set (user cancel won the race).
+    /// </summary>
+    private async Task RecordWatchdogFailureAsync(WorkItem workItem)
+    {
+        if (workItem.Status != WorkItemStatus.Processing) return;
+
+        Interlocked.Increment(ref _localFailedJobs);
+        workItem.Status = WorkItemStatus.Failed;
+        workItem.ErrorMessage = "Watchdog: no progress for 15 minutes — job aborted.";
+        workItem.CompletedAt = DateTime.UtcNow;
+        try { await _mediaFileRepo.IncrementFailureCountAsync(Path.GetFullPath(workItem.Path), workItem.ErrorMessage); } catch { }
+
+        if (_notificationService != null && ShouldDispatchExternal)
+            _ = _notificationService.NotifyEncodeFailedAsync(Path.GetFileName(workItem.Path), workItem.ErrorMessage);
+    }
+
     /// <summary> Cancels a single local job's CTS without touching its peers. </summary>
     private void CancelLocalJobCts(string jobId)
     {
@@ -1666,8 +1880,10 @@ public class TranscodingService
                 OriginalCodec       = srcCodec,
                 EncodedCodec        = encodedCodec,
                 OriginalBitrateKbps = workItem.Bitrate,
+                // ÷1000, not ÷1024 — every other bitrate in the app (scan-time
+                // OriginalBitrateKbps included) uses decimal kilobits.
                 EncodedBitrateKbps  = workItem.Length > 0 && encodedSize > 0
-                    ? (long)(encodedSize * 8.0 / 1024.0 / workItem.Length)
+                    ? (long)(encodedSize * 8.0 / 1000.0 / workItem.Length)
                     : 0,
                 DurationSeconds     = workItem.Length,
                 EncodeSeconds       = (DateTime.UtcNow - encodeStart).TotalSeconds,
@@ -1754,7 +1970,7 @@ public class TranscodingService
         await _mediaFileRepo.ResetFileAsync(normalizedPath);
 
         var existing = _workItems.Values.FirstOrDefault(w =>
-            Path.GetFullPath(w.Path).Equals(normalizedPath, StringComparison.OrdinalIgnoreCase));
+            w.NormalizedPath.Equals(normalizedPath, StringComparison.OrdinalIgnoreCase));
         if (existing != null)
         {
             _workItems.TryRemove(existing.Id, out _);
@@ -1923,7 +2139,7 @@ public class TranscodingService
                         lock (_queueLock)
                         {
                             _workQueue.Add(musicItem);
-                            _workQueue.Sort((a, b) => b.Bitrate.CompareTo(a.Bitrate));
+                            _workQueue.Sort(CompareQueueOrder);
                         }
                     }
                     else
@@ -2011,7 +2227,7 @@ public class TranscodingService
                     lock (_queueLock)
                     {
                         _workQueue.Add(workItem);
-                        _workQueue.Sort((a, b) => b.Bitrate.CompareTo(a.Bitrate));
+                        _workQueue.Sort(CompareQueueOrder);
                     }
                     if (!dispatched)
                         await WaitForSchedulerProgressAsync(inflight);
@@ -2241,6 +2457,11 @@ public class TranscodingService
     /// </summary>
     private async Task ProcessWorkItemAsync(WorkItem workItem, EncoderOptions options, ActiveLocalJob active)
     {
+        // Set when the per-job watchdog (not the user) cancels the CTS, so the
+        // cancellation catch below can record a Failed outcome. Without this the
+        // item stays in Processing forever in standalone mode — only the cluster
+        // master's stuck-item watchdog would ever rescue it.
+        bool watchdogFired = false;
 
         try
         {
@@ -2276,6 +2497,7 @@ public class TranscodingService
                         if ((DateTime.UtcNow - workItem.LastUpdatedAt) > TimeSpan.FromMinutes(15))
                         {
                             await LogAsync(workItem.Id, "Watchdog: no progress for 15 min — aborting job");
+                            watchdogFired = true;
                             active.Cts.Cancel();
                             return;
                         }
@@ -2316,7 +2538,7 @@ public class TranscodingService
                 if (!noSavings && ShouldDispatchExternal)
                 {
                     if (_notificationService != null)
-                        _ = _notificationService.NotifyEncodeCompletedAsync(Path.GetFileName(workItem.Path), workItem.Size);
+                        _ = _notificationService.NotifyEncodeCompletedAsync(Path.GetFileName(workItem.Path), workItem.OutputSize);
                     if (_integrationService != null)
                         _ = _integrationService.TriggerRescansAsync(workItem.Path);
                 }
@@ -2332,9 +2554,15 @@ public class TranscodingService
         }
         catch (OperationCanceledException)
         {
-            // Cancelled — status already set by CancelWorkItemAsync, just clean up output
+            // Cancelled — clean up partial output. For a user cancel/stop the status was
+            // already set by CancelWorkItemAsync/StopWorkItemAsync; for a watchdog abort
+            // nobody set a terminal status, so record the failure here or the item is a
+            // Processing zombie until restart.
             var outputPath = GetOutputPath(workItem, options);
             try { await _fileService.FileDeleteAsync(outputPath); } catch { }
+
+            if (watchdogFired)
+                await RecordWatchdogFailureAsync(workItem);
         }
         catch (Exception ex)
         {
@@ -2364,6 +2592,10 @@ public class TranscodingService
     /// </summary>
     private async Task ProcessMusicWorkItemAsync(WorkItem workItem, EncoderOptions options, ActiveLocalJob active)
     {
+        // See ProcessWorkItemAsync — distinguishes a watchdog abort (must be
+        // recorded as Failed) from a user cancel (status already set).
+        bool watchdogFired = false;
+
         try
         {
             workItem.Status    = WorkItemStatus.Processing;
@@ -2393,6 +2625,7 @@ public class TranscodingService
                         if ((DateTime.UtcNow - workItem.LastUpdatedAt) > TimeSpan.FromMinutes(15))
                         {
                             await LogAsync(workItem.Id, "Watchdog: no music progress for 15 min — aborting job");
+                            watchdogFired = true;
                             active.Cts.Cancel();
                             return;
                         }
@@ -2424,7 +2657,7 @@ public class TranscodingService
                     DateTime.UtcNow);
 
                 if (!noSavings && _notificationService != null && ShouldDispatchExternal)
-                    _ = _notificationService.NotifyEncodeCompletedAsync(Path.GetFileName(workItem.Path), workItem.Size);
+                    _ = _notificationService.NotifyEncodeCompletedAsync(Path.GetFileName(workItem.Path), workItem.OutputSize);
 
                 _ = RecordLocalEncodeHistoryAsync(workItem, options, active.DeviceId);
             }
@@ -2438,6 +2671,9 @@ public class TranscodingService
                 await _fileService.FileDeleteAsync(outputPath);
             }
             catch { }
+
+            if (watchdogFired)
+                await RecordWatchdogFailureAsync(workItem);
         }
         catch (Exception ex)
         {
@@ -3706,9 +3942,11 @@ public class TranscodingService
         bool targetIsHevc = options.Encoder.Contains("265", StringComparison.OrdinalIgnoreCase);
         bool targetIsAv1  = options.Encoder.Contains("av1", StringComparison.OrdinalIgnoreCase) || options.Encoder.Contains("svt", StringComparison.OrdinalIgnoreCase);
         bool sourceIsAv1  = string.Equals(mf.Codec, "av1", StringComparison.OrdinalIgnoreCase);
+        bool sourceIsH264 = string.Equals(mf.Codec, "h264", StringComparison.OrdinalIgnoreCase)
+                         || string.Equals(mf.Codec, "avc", StringComparison.OrdinalIgnoreCase);
         bool alreadyTargetCodec = targetIsAv1 ? sourceIsAv1
                                 : targetIsHevc ? mf.IsHevc
-                                : !mf.IsHevc;
+                                : sourceIsH264;
         if (!alreadyTargetCodec || mf.Bitrate <= 0) return false;
 
         double skipMultiplier = 1.0 + (Math.Clamp(options.SkipPercentAboveTarget, 0, 100) / 100.0);
@@ -3794,9 +4032,11 @@ public class TranscodingService
         bool targetIsHevc = options.Encoder.Contains("265", StringComparison.OrdinalIgnoreCase);
         bool targetIsAv1  = options.Encoder.Contains("av1", StringComparison.OrdinalIgnoreCase) || options.Encoder.Contains("svt", StringComparison.OrdinalIgnoreCase);
         bool sourceIsAv1  = string.Equals(videoStream?.CodecName, "av1", StringComparison.OrdinalIgnoreCase);
+        bool sourceIsH264 = string.Equals(videoStream?.CodecName, "h264", StringComparison.OrdinalIgnoreCase)
+                         || string.Equals(videoStream?.CodecName, "avc", StringComparison.OrdinalIgnoreCase);
         bool alreadyTargetCodec = targetIsAv1 ? sourceIsAv1
                                 : targetIsHevc ? workItem.IsHevc
-                                : !workItem.IsHevc;
+                                : sourceIsH264;
         if (!alreadyTargetCodec) return false;
 
         double skipMultiplier = 1.0 + (Math.Clamp(options.SkipPercentAboveTarget, 0, 100) / 100.0);
@@ -4037,6 +4277,14 @@ public class TranscodingService
     private List<HardwareDevice>? _detectedDevices = null;
 
     /// <summary>
+    ///     Serializes hardware detection. The constructor kicks off a background
+    ///     detection, and any encode that starts with "auto" before it finishes
+    ///     would otherwise launch a SECOND concurrent detection — both mutate the
+    ///     process-wide LIBVA_DRIVER_NAME env var and corrupt each other's probes.
+    /// </summary>
+    private readonly SemaphoreSlim _detectionGate = new(1, 1);
+
+    /// <summary>
     ///     Set to <c>true</c> during Linux detection when the QSV probe on an Intel
     ///     render node succeeds. The static helpers <see cref="GetEncoder"/> and
     ///     <see cref="GetInitFlags"/> read this to pick QSV variants over the VAAPI
@@ -4082,6 +4330,23 @@ public class TranscodingService
         if (_detectedHardware != null)
             return _detectedHardware;
 
+        await _detectionGate.WaitAsync();
+        try
+        {
+            // Double-check after acquiring the gate — a concurrent caller may have
+            // just finished the full detection while we waited.
+            if (_detectedHardware != null)
+                return _detectedHardware;
+            return await DetectHardwareAccelerationCoreAsync();
+        }
+        finally
+        {
+            _detectionGate.Release();
+        }
+    }
+
+    private async Task<string> DetectHardwareAccelerationCoreAsync()
+    {
         var devices = new List<HardwareDevice>();
 
         // Windows GPU detection — probe all vendors so a laptop with an Intel iGPU
@@ -4400,9 +4665,19 @@ public class TranscodingService
 
             using var process = new Process { StartInfo = psi };
             process.Start();
-            var stdout = await process.StandardOutput.ReadToEndAsync();
-            var stderr = await process.StandardError.ReadToEndAsync();
-            process.WaitForExit(5000);
+
+            // Start both reads BEFORE waiting — awaiting ReadToEndAsync first would
+            // only complete when the process exits, making the timeout unreachable
+            // (and risking a pipe-buffer deadlock between stdout and stderr).
+            var stdoutTask = process.StandardOutput.ReadToEndAsync();
+            var stderrTask = process.StandardError.ReadToEndAsync();
+            await Task.WhenAny(process.WaitForExitAsync(), Task.Delay(5000));
+            if (!process.HasExited)
+            {
+                try { process.Kill(entireProcessTree: true); } catch { }
+            }
+            var stdout = await stdoutTask;
+            var stderr = await stderrTask;
 
             var output = !string.IsNullOrEmpty(stdout) ? stdout : stderr;
             Console.WriteLine($"Auto-detect vainfo ({firstNode}) output:\n{output.Substring(0, Math.Min(output.Length, 1000))}");
@@ -4445,15 +4720,20 @@ public class TranscodingService
             using var process = new Process { StartInfo = psi };
             process.Start();
 
-            var stderr = await process.StandardError.ReadToEndAsync();
+            // Start the read but DON'T await it before the timeout wait —
+            // ReadToEndAsync only completes when ffmpeg exits, so awaiting it
+            // first made the 10s hang-protection unreachable. A hung driver
+            // probe would wedge hardware detection forever.
+            var stderrTask = process.StandardError.ReadToEndAsync();
 
-            var completed = process.WaitForExit(10000);
-            if (!completed)
+            await Task.WhenAny(process.WaitForExitAsync(), Task.Delay(10000));
+            if (!process.HasExited)
             {
-                process.Kill();
+                try { process.Kill(entireProcessTree: true); } catch { }
                 Console.WriteLine($"Auto-detect: {encoder} test timed out");
                 return false;
             }
+            var stderr = await stderrTask;
 
             Console.WriteLine($"Auto-detect: {encoder} test exit={process.ExitCode}");
             if (process.ExitCode != 0)
@@ -5020,8 +5300,10 @@ public class TranscodingService
             var stderrTask = process.StandardError.ReadToEndAsync();
             var stdoutTask = process.StandardOutput.ReadToEndAsync();
 
-            var completed = process.WaitForExit(30000);
-            if (!completed)
+            // Async wait — the old synchronous WaitForExit pinned a threadpool
+            // thread for up to 30s per measured file during library scans.
+            await Task.WhenAny(process.WaitForExitAsync(), Task.Delay(30000));
+            if (!process.HasExited)
             {
                 try { process.Kill(entireProcessTree: true); } catch { }
                 return 0;
@@ -5153,8 +5435,9 @@ public class TranscodingService
             var stderrTask = process.StandardError.ReadToEndAsync();
             var stdoutTask = process.StandardOutput.ReadToEndAsync();
 
-            var completed = process.WaitForExit(180000);
-            if (!completed)
+            // Async wait — calibration runs can pin threadpool threads for minutes.
+            await Task.WhenAny(process.WaitForExitAsync(), Task.Delay(180000));
+            if (!process.HasExited)
             {
                 try { process.Kill(entireProcessTree: true); } catch { }
                 return 0;
@@ -5204,8 +5487,10 @@ public class TranscodingService
             // Drain stdout to prevent deadlock
             var stdoutTask = process.StandardOutput.ReadToEndAsync();
 
-            var completed = process.WaitForExit(120000);
-            if (!completed)
+            // Async wait — VAAPI calibration can run up to 6 iterations × 2 samples
+            // and used to pin a threadpool thread for the whole time.
+            await Task.WhenAny(process.WaitForExitAsync(), Task.Delay(120000));
+            if (!process.HasExited)
             {
                 try { process.Kill(entireProcessTree: true); } catch { }
                 return -1;
@@ -5241,9 +5526,27 @@ public class TranscodingService
 
         int lengthInMinutes = (int)workItem.Length / 60;
         string startTime = lengthInMinutes > 20 ? "00:10:00" : "00:00:00";
-        string duration = lengthInMinutes > 20 ? "00:10:00" : $"00:{Math.Min(lengthInMinutes, 10):D2}:00";
-        
-        string command = $"{GetInitFlags(options.HardwareAcceleration, options.HardwareDevicePath)} -ss {startTime} -i \"{inputPath}\" " +
+        // Seconds-granular so files under a minute don't end up with -t 00:00:00
+        // (which decodes zero frames and silently disables cropping).
+        int sampleSeconds = lengthInMinutes > 20
+            ? 600
+            : (int)Math.Clamp(workItem.Length, 1, 600);
+        string duration = TimeSpan.FromSeconds(sampleSeconds).ToString(@"hh\:mm\:ss");
+
+        // cropdetect is a software-only filter, so the sample must decode into
+        // system memory. VAAPI/QSV init flags include -hwaccel_output_format
+        // (frames stay on the GPU → the filter graph fails and crop detection
+        // silently no-ops), so those decode in software. NVIDIA/Apple emit a
+        // plain -hwaccel whose frames land in system memory — keep the
+        // hardware-assisted decode there; a 10-minute 4K sample is expensive
+        // on CPU.
+        bool hwDecodeSafeForCropdetect =
+            options.HardwareAcceleration.Equals("nvidia", StringComparison.OrdinalIgnoreCase) ||
+            options.HardwareAcceleration.Equals("apple", StringComparison.OrdinalIgnoreCase);
+        string initFlags = hwDecodeSafeForCropdetect
+            ? GetInitFlags(options.HardwareAcceleration, options.HardwareDevicePath) + " "
+            : "";
+        string command = $"{initFlags}-ss {startTime} -i \"{inputPath}\" " +
                         $"-t {duration} -vf cropdetect=24:2:8 -f null -";
 
         var cropValues = new ConcurrentDictionary<string, int>();
@@ -5276,14 +5579,17 @@ public class TranscodingService
         process.BeginErrorReadLine();
         process.BeginOutputReadLine();
 
-        // Timeout cropdetect at 3 minutes to prevent hangs
-        var completed = process.WaitForExit(180000);
-        if (!completed)
+        // Timeout cropdetect at 3 minutes to prevent hangs (async wait — the
+        // synchronous WaitForExit pinned a threadpool thread for the duration).
+        await Task.WhenAny(process.WaitForExitAsync(), Task.Delay(180000));
+        if (!process.HasExited)
         {
             try { process.Kill(entireProcessTree: true); } catch { }
             await LogAsync(workItem.Id, "Crop detection timed out, skipping.");
             return "";
         }
+        // Let the async event readers flush their final lines.
+        process.WaitForExit();
 
         if (cropValues.Count == 0)
             return "";
@@ -5401,58 +5707,70 @@ public class TranscodingService
             try { await process.StandardOutput.ReadToEndAsync(); } catch { }
         });
 
-        // Wait for exit but kill the process if it stalls (no output for stallTimeoutSeconds)
-        var exitTask = process.WaitForExitAsync();
-        while (!exitTask.IsCompleted)
+        // Wait for exit but kill the process if it stalls (no output for stallTimeoutSeconds).
+        // The finally block guarantees the reader tasks are drained and the Process handle
+        // is disposed on EVERY exit path — the cancel/stop throws used to leak both.
+        int exitCode;
+        try
         {
-            if (cancellationToken.IsCancellationRequested)
+            var exitTask = process.WaitForExitAsync();
+            while (!exitTask.IsCompleted)
             {
-                await LogAsync(workItem.Id, "Cancellation requested — killing FFmpeg process.");
-                try { process.Kill(entireProcessTree: true); } catch { }
-                await exitTask; // Wait for kill to complete
-                throw new OperationCanceledException("Encoding was cancelled.");
-            }
-
-            Task delayTask;
-            try { delayTask = Task.Delay(30000, cancellationToken); }
-            catch (OperationCanceledException)
-            {
-                await LogAsync(workItem.Id, "Cancellation requested — killing FFmpeg process.");
-                try { process.Kill(entireProcessTree: true); } catch { }
-                await exitTask;
-                throw new OperationCanceledException("Encoding was cancelled.");
-            }
-            var winner = await Task.WhenAny(exitTask, delayTask);
-            if (winner != exitTask && !process.HasExited)
-            {
-                if ((DateTime.UtcNow - lastActivity).TotalSeconds >= stallTimeoutSeconds)
+                if (cancellationToken.IsCancellationRequested)
                 {
-                    await LogAsync(workItem.Id,
-                        $"FFmpeg stalled (no output for {stallTimeoutSeconds} seconds). Killing process.");
+                    await LogAsync(workItem.Id, "Cancellation requested — killing FFmpeg process.");
                     try { process.Kill(entireProcessTree: true); } catch { }
                     await exitTask; // Wait for kill to complete
-                    break;
+                    throw new OperationCanceledException("Encoding was cancelled.");
+                }
+
+                Task delayTask;
+                try { delayTask = Task.Delay(30000, cancellationToken); }
+                catch (OperationCanceledException)
+                {
+                    await LogAsync(workItem.Id, "Cancellation requested — killing FFmpeg process.");
+                    try { process.Kill(entireProcessTree: true); } catch { }
+                    await exitTask;
+                    throw new OperationCanceledException("Encoding was cancelled.");
+                }
+                var winner = await Task.WhenAny(exitTask, delayTask);
+                if (winner != exitTask && !process.HasExited)
+                {
+                    if ((DateTime.UtcNow - lastActivity).TotalSeconds >= stallTimeoutSeconds)
+                    {
+                        await LogAsync(workItem.Id,
+                            $"FFmpeg stalled (no output for {stallTimeoutSeconds} seconds). Killing process.");
+                        try { process.Kill(entireProcessTree: true); } catch { }
+                        await exitTask; // Wait for kill to complete
+                        break;
+                    }
                 }
             }
+
+            if (workItem.Status is WorkItemStatus.Cancelled or WorkItemStatus.Stopped)
+                throw new OperationCanceledException("Encoding was cancelled.");
+
+            exitCode = process.ExitCode;
         }
-
-        // Wait for stream readers to finish before disposing the process
-        try { await stderrTask; } catch { }
-        try { await stdoutTask; } catch { }
-
-        lock (_activeLock)
+        finally
         {
-            if (_activeLocalJobs.TryGetValue(workItem.Id, out var slot)) slot.Process = null;
-        }
+            // Ensure ffmpeg is dead before awaiting the readers so they can't hang
+            // on an open pipe, then drain them and release the process handle.
+            try
+            {
+                if (!process.HasExited)
+                    process.Kill(entireProcessTree: true);
+            }
+            catch { }
+            try { await stderrTask; } catch { }
+            try { await stdoutTask; } catch { }
 
-        if (workItem.Status is WorkItemStatus.Cancelled or WorkItemStatus.Stopped)
-        {
+            lock (_activeLock)
+            {
+                if (_activeLocalJobs.TryGetValue(workItem.Id, out var slot)) slot.Process = null;
+            }
             process.Dispose();
-            throw new OperationCanceledException("Encoding was cancelled.");
         }
-
-        var exitCode = process.ExitCode;
-        process.Dispose();
 
         if (exitCode != 0)
         {
@@ -5604,11 +5922,11 @@ public class TranscodingService
             await LogAsync(workItem.Id, "Retrying with software encoding...");
             workItem.Progress = 0;
             await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
-            // Use the correct software encoder for the target codec
-            bool isAv1Target = options.Encoder.Contains("av1", StringComparison.OrdinalIgnoreCase)
-                            || options.Encoder.Contains("svt", StringComparison.OrdinalIgnoreCase)
-                            || string.Equals(options.Codec, "av1", StringComparison.OrdinalIgnoreCase);
-            options.Encoder = isAv1Target ? "libsvtav1" : "libx265";
+            // Use the correct software encoder for the target codec — an H.264 target
+            // must fall back to libx264, not libx265, or the retry silently changes
+            // the output codec the user asked for.
+            bool isAv1Target = string.Equals(options.Codec, "av1", StringComparison.OrdinalIgnoreCase);
+            options.Encoder = isAv1Target ? "libsvtav1" : GetSoftwareFallbackEncoder(options);
             options.HardwareAcceleration = "none";
             await ConvertVideoAsync(workItem, options,
                 stripSubtitles: false,
@@ -6080,7 +6398,7 @@ public class TranscodingService
 
         // Skip if already in memory
         if (_workItems.Values.Any(w =>
-            Path.GetFullPath(w.Path).Equals(normalizedPath, StringComparison.OrdinalIgnoreCase) &&
+            w.NormalizedPath.Equals(normalizedPath, StringComparison.OrdinalIgnoreCase) &&
             w.Status is WorkItemStatus.Pending or WorkItemStatus.Processing
                 or WorkItemStatus.Uploading or WorkItemStatus.Downloading))
         {
@@ -6107,7 +6425,7 @@ public class TranscodingService
         lock (_queueLock)
         {
             _workQueue.Add(workItem);
-            _workQueue.Sort((a, b) => b.Bitrate.CompareTo(a.Bitrate));
+            _workQueue.Sort(CompareQueueOrder);
         }
 
         await _hubContext.Clients.All.SendAsync("WorkItemAdded", workItem);
@@ -6205,10 +6523,17 @@ public class TranscodingService
         item.RemoteJobPhase = null;
         item.TransferProgress = 0;
 
+        // Re-register unconditionally: the terminal-item memory sweep may have
+        // evicted this item from _workItems while a cluster failure path was
+        // deciding to revive it. A queue entry without a dictionary entry is
+        // invisible to cancel/logs/duplicate-detection — heal it here rather
+        // than trying to make sweep-vs-requeue atomic.
+        _workItems[item.Id] = item;
+
         lock (_queueLock)
         {
             _workQueue.Add(item);
-            _workQueue.Sort((a, b) => b.Bitrate.CompareTo(a.Bitrate));
+            _workQueue.Sort(CompareQueueOrder);
         }
 
         if (!silent)

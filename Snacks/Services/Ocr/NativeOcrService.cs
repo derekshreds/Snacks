@@ -299,31 +299,33 @@ public sealed class NativeOcrService
 
         bool isVobSubFamily = !isPgs;  // dvd_subtitle / dvb_subtitle / xsub all take the vobsub path
 
-        string args;
         string outPath;
+        string subCodec;
 
         if (isPgs)
         {
-            outPath = Path.Combine(tmpDir, "stream.sup");
-            args = $"-y -i \"{sourceFile}\" -map 0:{streamIndex} -c:s copy \"{outPath}\"";
+            outPath  = Path.Combine(tmpDir, "stream.sup");
+            subCodec = "copy";
         }
         else
         {
             // For native VobSub we could `-c:s copy` into a .idx, but FFmpeg happily transcodes
             // any bitmap subtitle codec to dvdsub and writes the .idx+.sub pair in one shot —
             // same pipeline for DVD, DVB, and XSUB.
-            outPath = Path.Combine(tmpDir, "stream.idx");
-            args = $"-y -i \"{sourceFile}\" -map 0:{streamIndex} -c:s dvdsub \"{outPath}\"";
+            outPath  = Path.Combine(tmpDir, "stream.idx");
+            subCodec = "dvdsub";
         }
 
+        // ArgumentList so quotes in filenames can't split/inject arguments.
         var psi = new ProcessStartInfo(_ffmpegPath)
         {
-            Arguments              = args,
             UseShellExecute        = false,
             RedirectStandardOutput = true,
             RedirectStandardError  = true,
             CreateNoWindow         = true,
         };
+        foreach (var flag in new[] { "-y", "-i", sourceFile, "-map", $"0:{streamIndex}", "-c:s", subCodec, outPath })
+            psi.ArgumentList.Add(flag);
         using var proc = new Process { StartInfo = psi };
         proc.Start();
         var stdErrTask = proc.StandardError.ReadToEndAsync(ct);

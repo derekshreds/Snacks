@@ -99,7 +99,11 @@ export function getActionButtons(workItem) {
     switch (workItem.status) {
 
         case 'Pending':
-            return '<button class="btn btn-sm btn-outline-danger remove-btn" data-action="remove" title="Remove from queue"><i class="fas fa-times"></i></button>';
+            return `
+                <div class="btn-group" role="group">
+                    <button class="btn btn-sm btn-outline-primary prioritize-btn" data-action="prioritize" title="Move to front of queue"><i class="fas fa-angles-up"></i></button>
+                    <button class="btn btn-sm btn-outline-danger remove-btn" data-action="remove" title="Remove from queue"><i class="fas fa-times"></i></button>
+                </div>`;
 
         case 'Processing':
         case 'Uploading':
