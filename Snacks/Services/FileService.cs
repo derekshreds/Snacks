@@ -302,11 +302,16 @@ public sealed class FileService
 
     /// <summary>
     ///     Returns the application working directory, creating it if needed.
-    ///     Resolves from the <c>SNACKS_WORK_DIR</c> environment variable, defaulting to <c>/app/work</c>.
+    ///     Resolves from the <c>SNACKS_WORK_DIR</c> environment variable, falling back to
+    ///     the same per-user data directory the rest of the app uses (Program.cs, OCR,
+    ///     tessdata). The old fallback here was <c>/app/work</c>, which diverged from
+    ///     everything else: on a bare-metal run, configs landed in an unwritable
+    ///     <c>/app</c> while the DB and logs went to the per-user directory.
     /// </summary>
     public string GetWorkingDirectory()
     {
-        var baseDir = Environment.GetEnvironmentVariable("SNACKS_WORK_DIR") ?? "/app/work";
+        var baseDir = Environment.GetEnvironmentVariable("SNACKS_WORK_DIR")
+            ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Snacks", "work");
 
         if (!Directory.Exists(baseDir))
             Directory.CreateDirectory(baseDir);

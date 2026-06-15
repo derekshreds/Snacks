@@ -58,6 +58,54 @@ public sealed class SlotLedgerTests
     }
 
     [Fact]
+    public void Rekey_moves_reservation_to_new_id_preserving_slot_accounting()
+    {
+        var l = MakeLedger(capacity: 1);
+        l.TryReserve(NodeA, Intel, "old-id", "a.mkv").Should().BeTrue();
+        l.TransitionPhase("old-id", SlotPhase.Uploading);
+
+        l.Rekey("old-id", "new-id");
+
+        // Release paths key by the NEW id after an upload-resume ID swap —
+        // the old id must be gone or the slot leaks until master restart.
+        l.Contains("old-id").Should().BeFalse();
+        l.Contains("new-id").Should().BeTrue();
+        l.GetPhase("new-id").Should().Be(SlotPhase.Uploading);
+        l.UsedDeviceSlots(NodeA, Intel).Should().Be(1);
+
+        l.Release("new-id", ReleaseReason.Completed);
+        l.UsedDeviceSlots(NodeA, Intel).Should().Be(0);
+    }
+
+    [Fact]
+    public void Rekey_is_noop_for_unknown_or_identical_ids()
+    {
+        var l = MakeLedger(capacity: 2);
+        l.TryReserve(NodeA, Intel, "j1", null).Should().BeTrue();
+
+        l.Rekey("missing", "j2");
+        l.Contains("j2").Should().BeFalse();
+
+        l.Rekey("j1", "j1");
+        l.Contains("j1").Should().BeTrue();
+        l.UsedDeviceSlots(NodeA, Intel).Should().Be(1);
+    }
+
+    [Fact]
+    public void Rekey_drops_old_row_when_new_id_already_reserved()
+    {
+        var l = MakeLedger(capacity: 2);
+        l.TryReserve(NodeA, Intel, "j1", null).Should().BeTrue();
+        l.TryReserve(NodeA, Intel, "j2", null).Should().BeTrue();
+
+        l.Rekey("j1", "j2");
+
+        l.Contains("j1").Should().BeFalse();
+        l.Contains("j2").Should().BeTrue();
+        l.UsedDeviceSlots(NodeA, Intel).Should().Be(1);
+    }
+
+    [Fact]
     public void Release_is_idempotent()
     {
         var l = MakeLedger();

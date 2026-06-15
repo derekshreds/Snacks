@@ -74,17 +74,22 @@
             <div class="modal-body">
                 <div id="analyzeLoading" class="text-center py-5">
                     <div class="spinner-border text-info mb-3" role="status"><span class="visually-hidden">Analyzing...</span></div>
-                    <div class="text-muted">Probing files — this can take a moment on large folders.</div>
+                    <div class="text-muted mb-3" id="analyzeProgressLabel">Scanning folder…</div>
+                    <div class="progress mx-auto" style="max-width: 420px; height: 8px; display: none;" id="analyzeProgressWrap">
+                        <div class="progress-bar progress-bar-striped progress-bar-animated bg-info" id="analyzeProgressBar" style="width: 0%"></div>
+                    </div>
+                    <div class="small text-muted mt-2">Analysis runs on the server — closing this dialog cancels it.</div>
                 </div>
                 <div id="analyzeContent" style="display: none;">
                     <div id="analyzeSummary" class="row g-2 mb-3"></div>
+                    <div id="analyzeTruncatedNotice" class="alert alert-info py-2 small" style="display: none;"></div>
                     <div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
                         <div id="analyzeFilterTabs" class="btn-group btn-group-sm"></div>
                         <input type="text" class="form-control form-control-sm" id="analyzeFilterText" placeholder="Filter by name..." style="max-width: 260px;">
                     </div>
-                    <div class="border rounded" style="max-height: 55vh; overflow-y: auto;">
-                        <table class="table table-sm table-hover align-middle mb-0" id="analyzeTable">
-                            <thead class="sticky-top" style="background: var(--bg-surface, #1a1a1e);">
+                    <div class="dash-table-wrap border rounded" style="max-height: 55vh;">
+                        <table class="dash-table" id="analyzeTable">
+                            <thead>
                                 <tr>
                                     <th style="min-width: 260px;">File</th>
                                     <th style="min-width: 220px; white-space: nowrap;">Source</th>
@@ -123,61 +128,87 @@
                 <div class="settings-tabs-wrapper">
                     <button type="button" class="settings-tab-arrow settings-tab-arrow-left" aria-label="Scroll tabs left"><i class="fas fa-chevron-left"></i></button>
                     <ul class="nav nav-tabs settings-tabs" role="tablist">
+                        @* Eight tabs, grouped by mental model: what to make (General → Video),
+                           what to keep (Audio & Subtitles), then music, library sources,
+                           external connections, the cluster, and system housekeeping. Related
+                           panels that used to be standalone tabs (Mux, Networking, Scheduling,
+                           Security) now render as titled sections inside these panes — fewer
+                           tabs to scan for non-technical users, nothing removed for power users.
+                           Input element IDs are unchanged; only the grouping moved. *@
                         <li class="nav-item" data-role-visible="master standalone"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#generalTab" type="button" role="tab"><i class="fas fa-sliders me-1"></i> General</button></li>
-                        <li class="nav-item" data-role-visible="master standalone"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#audioTab" type="button" role="tab"><i class="fas fa-volume-high me-1"></i> Audio</button></li>
-                        <li class="nav-item" data-role-visible="master standalone"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#musicTab" type="button" role="tab"><i class="fas fa-music me-1"></i> Music</button></li>
-                        <li class="nav-item" data-role-visible="master standalone"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#subtitleTab" type="button" role="tab"><i class="fas fa-closed-captioning me-1"></i> Subtitles</button></li>
-                        <li class="nav-item" data-role-visible="master standalone"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#muxTab" type="button" role="tab"><i class="fas fa-layer-group me-1"></i> Mux</button></li>
                         <li class="nav-item" data-role-visible="master standalone"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#videoTab" type="button" role="tab"><i class="fas fa-film me-1"></i> Video</button></li>
+                        <li class="nav-item" data-role-visible="master standalone"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#audioTab" type="button" role="tab"><i class="fas fa-volume-high me-1"></i> Audio &amp; Subtitles</button></li>
+                        <li class="nav-item" data-role-visible="master standalone"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#musicTab" type="button" role="tab"><i class="fas fa-music me-1"></i> Music</button></li>
                         <li class="nav-item" data-role-visible="master standalone"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#libraryTab" type="button" role="tab"><i class="fas fa-folder-tree me-1"></i> Library</button></li>
-                        <li class="nav-item" data-role-visible="master standalone"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#integrationsTab" type="button" role="tab"><i class="fas fa-plug me-1"></i> Integrations</button></li>
-                        <li class="nav-item" data-role-visible="node"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#nodeSyncTab" type="button" role="tab"><i class="fas fa-sync me-1"></i> Integration Sync</button></li>
+                        <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#integrationsTab" type="button" role="tab"><i class="fas fa-plug me-1"></i> Connections</button></li>
                         <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#clusterTab" type="button" role="tab"><i class="fas fa-network-wired me-1"></i> Cluster</button></li>
-                        <li class="nav-item" data-role-visible="master standalone"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#networkingTab" type="button" role="tab"><i class="fas fa-gauge-high me-1"></i> Networking</button></li>
-                        <li class="nav-item" data-role-visible="master standalone"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#schedulingTab" type="button" role="tab"><i class="fas fa-clock me-1"></i> Scheduling</button></li>
-                        <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#securityTab" type="button" role="tab"><i class="fas fa-lock me-1"></i> Security</button></li>
-                        <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#advancedTab" type="button" role="tab"><i class="fas fa-screwdriver-wrench me-1"></i> Advanced</button></li>
+                        <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#systemTab" type="button" role="tab"><i class="fas fa-screwdriver-wrench me-1"></i> System</button></li>
                     </ul>
                     <button type="button" class="settings-tab-arrow settings-tab-arrow-right" aria-label="Scroll tabs right"><i class="fas fa-chevron-right"></i></button>
                 </div>
                 <div class="tab-content mt-3">
-                    <div class="tab-pane fade show active" id="generalTab"      role="tabpanel" data-role-visible="master standalone">@await Html.PartialAsync("_GeneralSettings", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })</div>
-                    <div class="tab-pane fade"             id="audioTab"        role="tabpanel" data-role-visible="master standalone">@await Html.PartialAsync("_AudioSettings", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })</div>
-                    <div class="tab-pane fade"             id="musicTab"        role="tabpanel" data-role-visible="master standalone">@await Html.PartialAsync("_MusicSettings", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })</div>
-                    <div class="tab-pane fade"             id="subtitleTab"     role="tabpanel" data-role-visible="master standalone">@await Html.PartialAsync("_SubtitleSettings", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })</div>
-                    <div class="tab-pane fade"             id="muxTab"          role="tabpanel" data-role-visible="master standalone">@await Html.PartialAsync("_MuxSettings", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })</div>
-                    <div class="tab-pane fade"             id="videoTab"        role="tabpanel" data-role-visible="master standalone">@await Html.PartialAsync("_VideoSettings", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })</div>
-                    <div class="tab-pane fade"             id="libraryTab"      role="tabpanel" data-role-visible="master standalone">@await Html.PartialAsync("_LibrarySettings")</div>
-                    <div class="tab-pane fade"             id="integrationsTab" role="tabpanel" data-role-visible="master standalone">@await Html.PartialAsync("_IntegrationSettings")</div>
-                    <div class="tab-pane fade"             id="clusterTab"      role="tabpanel">@await Html.PartialAsync("_ClusterSettings")</div>
-                    <div class="tab-pane fade"             id="networkingTab"   role="tabpanel" data-role-visible="master standalone">@await Html.PartialAsync("_NetworkingSettings", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })</div>
-                    <div class="tab-pane fade"             id="schedulingTab"   role="tabpanel" data-role-visible="master standalone">@await Html.PartialAsync("_SchedulingSettings", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })</div>
-                    <div class="tab-pane fade"             id="securityTab"     role="tabpanel">@await Html.PartialAsync("_SecuritySettings")</div>
-                    <div class="tab-pane fade"             id="advancedTab"     role="tabpanel">@await Html.PartialAsync("_AdvancedSettings")</div>
+                    <div class="tab-pane fade show active" id="generalTab" role="tabpanel" data-role-visible="master standalone">@await Html.PartialAsync("_GeneralSettings", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })</div>
 
-                    <div class="tab-pane fade" id="nodeSyncTab" role="tabpanel" data-role-visible="node">
-                        <div class="alert alert-info mb-4">
-                            <i class="fas fa-info-circle me-2"></i>
-                            <strong>Worker mode.</strong> Encoding settings (codec, bitrate, filters, integrations)
-                            are managed by the master. This worker pulls the master's integration credentials
-                            before every encode — they are never edited locally.
+                    <div class="tab-pane fade" id="videoTab" role="tabpanel" data-role-visible="master standalone">
+                        @await Html.PartialAsync("_MuxSettings", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })
+                        <div class="settings-section-title mt-4"><i class="fas fa-film me-2"></i>Video Processing</div>
+                        @await Html.PartialAsync("_VideoSettings", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })
+                    </div>
+
+                    <div class="tab-pane fade" id="audioTab" role="tabpanel" data-role-visible="master standalone">
+                        <div class="settings-section-title"><i class="fas fa-volume-high me-2"></i>Audio</div>
+                        @await Html.PartialAsync("_AudioSettings", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })
+                        <div class="settings-section-title mt-4"><i class="fas fa-closed-captioning me-2"></i>Subtitles</div>
+                        @await Html.PartialAsync("_SubtitleSettings", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })
+                    </div>
+
+                    <div class="tab-pane fade" id="musicTab"   role="tabpanel" data-role-visible="master standalone">@await Html.PartialAsync("_MusicSettings", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })</div>
+                    <div class="tab-pane fade" id="libraryTab" role="tabpanel" data-role-visible="master standalone">@await Html.PartialAsync("_LibrarySettings")</div>
+
+                    <div class="tab-pane fade" id="integrationsTab" role="tabpanel">
+                        <div data-role-visible="master standalone">@await Html.PartialAsync("_IntegrationSettings")</div>
+                        <div data-role-visible="node">
+                            <div class="alert alert-info mb-4">
+                                <i class="fas fa-info-circle me-2"></i>
+                                <strong>Worker mode.</strong> Encoding settings (codec, bitrate, filters, integrations)
+                                are managed by the master. This worker pulls the master's integration credentials
+                                before every encode — they are never edited locally.
+                            </div>
+                            <div class="encoder-panel rounded">
+                                <h6 class="fw-bold mb-3"><i class="fas fa-sync me-2 text-primary"></i>Integration Sync Status</h6>
+                                <dl class="row mb-3">
+                                    <dt class="col-sm-3">Master URL</dt>
+                                    <dd class="col-sm-9"><code id="nodeSyncMasterUrl">—</code></dd>
+                                    <dt class="col-sm-3">Last sync</dt>
+                                    <dd class="col-sm-9"><span id="nodeSyncLastAt">Never</span></dd>
+                                    <dt class="col-sm-3">Status</dt>
+                                    <dd class="col-sm-9"><span id="nodeSyncStatus" class="badge bg-secondary">Unknown</span></dd>
+                                </dl>
+                                <button class="btn btn-sm btn-outline-primary" id="nodeSyncRefreshBtn"><i class="fas fa-rotate me-1"></i>Pull from master now</button>
+                            </div>
                         </div>
-                        <div class="encoder-panel rounded">
-                            <h6 class="fw-bold mb-3"><i class="fas fa-sync me-2 text-primary"></i>Integration Sync Status</h6>
-                            <dl class="row mb-3">
-                                <dt class="col-sm-3">Master URL</dt>
-                                <dd class="col-sm-9"><code id="nodeSyncMasterUrl">—</code></dd>
-                                <dt class="col-sm-3">Last sync</dt>
-                                <dd class="col-sm-9"><span id="nodeSyncLastAt">Never</span></dd>
-                                <dt class="col-sm-3">Status</dt>
-                                <dd class="col-sm-9"><span id="nodeSyncStatus" class="badge bg-secondary">Unknown</span></dd>
-                            </dl>
-                            <button class="btn btn-sm btn-outline-primary" id="nodeSyncRefreshBtn"><i class="fas fa-rotate me-1"></i>Pull from master now</button>
+                    </div>
+
+                    <div class="tab-pane fade" id="clusterTab" role="tabpanel">
+                        @await Html.PartialAsync("_ClusterSettings")
+                        <div data-role-visible="master standalone">
+                            <div class="settings-section-title mt-4"><i class="fas fa-gauge-high me-2"></i>Transfers &amp; Bandwidth</div>
+                            @await Html.PartialAsync("_NetworkingSettings", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })
+                            <div class="settings-section-title mt-4"><i class="fas fa-clock me-2"></i>Encoding Schedule</div>
+                            @await Html.PartialAsync("_SchedulingSettings", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })
                         </div>
+                    </div>
+
+                    <div class="tab-pane fade" id="systemTab" role="tabpanel">
+                        <div class="settings-section-title"><i class="fas fa-lock me-2"></i>Security</div>
+                        @await Html.PartialAsync("_SecuritySettings")
+                        <div class="settings-section-title mt-4"><i class="fas fa-screwdriver-wrench me-2"></i>Advanced</div>
+                        @await Html.PartialAsync("_AdvancedSettings")
                     </div>
                 </div>
             </div>
             <div class="modal-footer">
+                <span id="settingsAutoSaveStatus" class="me-auto small text-muted" aria-live="polite"></span>
                 <button type="button" class="btn btn-secondary" onclick="document.getElementById('settingsModal').classList.remove('open')">Close</button>
             </div>
         </div>
@@ -257,6 +288,12 @@
                     </div>
                 </div>
                 <div class="col-md-6">
+                    <div class="form-check mb-2" data-context="folder">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_QueuePriority" data-field="QueuePriority">
+                        <label class="form-check-label" for="ovr_QueuePriority">Queue Priority</label>
+                        <input type="number" class="form-control form-control-sm mt-1" id="ovrQueuePriority" min="0" max="1000" step="1" value="0" disabled>
+                        <div class="form-text">Files from this folder dispatch before lower-priority backlog — set it on a "new downloads" folder so fresh content never waits.</div>
+                    </div>
                     <div class="form-check mb-2" data-context="folder">
                         <input class="form-check-input override-toggle" type="checkbox" id="ovr_Skip4K" data-field="Skip4K">
                         <label class="form-check-label" for="ovr_Skip4K">Skip 4K Videos</label>

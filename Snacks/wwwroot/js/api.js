@@ -98,6 +98,33 @@ export const settingsApi = {
 
 
 // ---------------------------------------------------------------------------
+// Presets
+// ---------------------------------------------------------------------------
+
+/**
+ * Named, shareable encoder-option snapshots. Export/import use plain JSON
+ * files so presets can be passed around (and, eventually, downloaded from a
+ * community site).
+ */
+export const presetsApi = {
+    /** Lists saved presets. Resolves `{ presets: [{ name, createdAt, options }] }`. */
+    list: () => getJson('/api/settings/presets'),
+
+    /** Saves (or overwrites by name) a preset from an options snapshot. */
+    save: (name, options) => postJson('/api/settings/presets', { name, options }),
+
+    /** Deletes a preset by name. */
+    remove: name => deleteJson(`/api/settings/presets/${encodeURIComponent(name)}`),
+
+    /** Imports a parsed `.snacks-preset.json` file object. */
+    importFile: fileJson => postJson('/api/settings/presets/import', fileJson),
+
+    /** Download URL for sharing a preset (use with streamDownload). */
+    exportUrl: name => `/api/settings/presets/export/${encodeURIComponent(name)}`,
+};
+
+
+// ---------------------------------------------------------------------------
 // Queue
 // ---------------------------------------------------------------------------
 
@@ -134,6 +161,9 @@ export const queueApi = {
 
     /** Cancels a queued or in-progress item (it won't be reprocessed). */
     cancel:    (id)       => postJson(`/api/queue/cancel/${encodeURIComponent(id)}`),
+
+    /** Moves a pending item to the front of the queue. */
+    prioritize: (id)      => postJson(`/api/queue/prioritize/${encodeURIComponent(id)}`),
 
     /** Stops an in-progress item (it will be re-queued on the next scan). */
     stop:      (id)       => postJson(`/api/queue/stop/${encodeURIComponent(id)}`),
@@ -175,8 +205,8 @@ export const libraryApi = {
      * @param {string}  path
      * @param {boolean} [recursive=true] When false, only the immediate children of `path` are returned.
      */
-    getFiles: (path, recursive = true) =>
-        getJson(`/api/library/files?directoryPath=${encodeURIComponent(path)}&recursive=${recursive}`),
+    getFiles: (path, recursive = true, skip = 0, limit = 1000) =>
+        getJson(`/api/library/files?directoryPath=${encodeURIComponent(path)}&recursive=${recursive}&skip=${skip}&limit=${limit}`),
 
     /** Enqueues every video file under `directoryPath` (optionally recursive) with `options`. */
     processDirectory: (directoryPath, recursive, options) =>
@@ -187,14 +217,50 @@ export const libraryApi = {
         postJson('/api/library/process-file', { filePath, options }),
 
     /**
-     * Dry-run preview: returns per-file decisions for `directoryPath` under `options`
-     * without writing to the DB or queueing any work. Resolves `{ success, results }`
-     * where each result has `decision`, `reason`, codec/bitrate metadata, and an
-     * `encodeTargetKbps` for Queue/Shrink/Copy rows. Pass an `AbortSignal` to cancel
-     * a long-running analysis (the server honors it via `HttpContext.RequestAborted`).
+     * Starts a dry-run preview of `directoryPath` under `options` as a background
+     * job on the server (whole-library analyses are too slow for one request).
+     * Resolves `{ success, jobId }` — poll `analyzeStatus(jobId)` and fetch
+     * `analyzeResults(jobId)` once `state === 'completed'`.
      */
-    analyzeDirectory: (directoryPath, recursive, options, signal) =>
-        postJson('/api/library/analyze-directory', { directoryPath, recursive, options }, signal),
+    analyzeDirectory: (directoryPath, recursive, options) =>
+        postJson('/api/library/analyze-directory', { directoryPath, recursive, options }),
+
+    /** Progress of an analysis job: `{ state, processed, total, error }`. `total` is -1 while enumerating. */
+    analyzeStatus: jobId => getJson(`/api/library/analyze-status/${jobId}`),
+
+    /** Result set of a finished analysis job: `{ state, error, results }`. 409 while still running. */
+    analyzeResults: jobId => getJson(`/api/library/analyze-results/${jobId}`),
+
+    /** Cancels a running analysis job. Resolves `{ success }`. */
+    analyzeCancel: jobId => postJson(`/api/library/analyze-cancel/${jobId}`),
+
+    /**
+     * Library health report: `{ items, total, summary }` where each item carries an
+     * `issues` array (`no-audio` | `no-video` | `no-duration` | `failed` | `verify-failed`).
+     * Category filter, search, and pagination are applied server-side; summary
+     * counts are whole-library SQL COUNTs regardless of the page returned.
+     */
+    getHealth: ({ filter = null, q = null, skip = 0, limit = 100 } = {}) => {
+        const params = new URLSearchParams();
+        if (filter) params.set('filter', filter);
+        if (q)      params.set('q', q);
+        if (skip)   params.set('skip', skip);
+        params.set('limit', limit);
+        return getJson('/api/library/health?' + params.toString());
+    },
+
+    /** Deep-verifies one file with bounded ffmpeg decode samples. Resolves `{ ok, issues }`. */
+    verifyFile: filePath => postJson('/api/library/health/verify', { filePath }),
+
+    /** Deletes one flagged file from disk and removes its DB row. */
+    deleteFlaggedFile: filePath => postJson('/api/library/health/delete', { filePath }),
+
+    /** Deletes every flagged file matching the active health filter + search. Resolves `{ deleted, failed, capped }`. */
+    deleteAllFlagged: ({ filter = null, q = null } = {}) =>
+        postJson('/api/library/health/delete-all', { filter, q }),
+
+    /** Aggregate library composition: totals + codec/resolution/status distributions. */
+    getInsights: () => getJson('/api/library/insights'),
 };
 
 

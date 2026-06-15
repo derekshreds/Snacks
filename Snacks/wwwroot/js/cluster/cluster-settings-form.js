@@ -100,8 +100,16 @@ export class ClusterSettingsForm {
             if (el('clusterSharedStorageEnabled')) el('clusterSharedStorageEnabled').checked = !!config.sharedStorageEnabled;
             if (el('clusterSharedInputPaths'))     el('clusterSharedInputPaths').value       = (config.sharedStorageInputPaths  || []).join('\n');
             if (el('clusterSharedOutputPaths'))    el('clusterSharedOutputPaths').value      = (config.sharedStorageOutputPaths || []).join('\n');
-            if (el('clusterSharedRewriteFrom'))    el('clusterSharedRewriteFrom').value      = config.sharedStoragePathRewriteFrom || '';
-            if (el('clusterSharedRewriteTo'))      el('clusterSharedRewriteTo').value        = config.sharedStoragePathRewriteTo   || '';
+            if (el('clusterSharedRewrites')) {
+                // List of {from,to} pairs, one "from => to" per line. A legacy
+                // single pair (older config) is shown as a line too; saving
+                // migrates it into the list.
+                const pairs = (config.sharedStoragePathRewrites || [])
+                    .map(r => `${r.from} => ${r.to}`);
+                if (pairs.length === 0 && config.sharedStoragePathRewriteFrom)
+                    pairs.push(`${config.sharedStoragePathRewriteFrom} => ${config.sharedStoragePathRewriteTo || ''}`);
+                el('clusterSharedRewrites').value = pairs.join('\n');
+            }
 
             this._updateRoleUI(config.role);
             this._updateSharedStorageWarning();
@@ -149,8 +157,25 @@ export class ClusterSettingsForm {
         config.sharedStorageEnabled         = !!el('clusterSharedStorageEnabled')?.checked;
         config.sharedStorageInputPaths      = (el('clusterSharedInputPaths')?.value  || '').split('\n').map(s => s.trim()).filter(Boolean);
         config.sharedStorageOutputPaths     = (el('clusterSharedOutputPaths')?.value || '').split('\n').map(s => s.trim()).filter(Boolean);
-        config.sharedStoragePathRewriteFrom = el('clusterSharedRewriteFrom')?.value  || '';
-        config.sharedStoragePathRewriteTo   = el('clusterSharedRewriteTo')?.value    || '';
+        // "from => to" per line → [{from, to}]. An empty right side is legal (the
+        // server accepts To="" — it strips the prefix), so only the FROM side is
+        // required. Lines without a "=>" separator are rejected loudly rather
+        // than silently dropped. The legacy single-pair fields are cleared on
+        // save so an old pair can't double-apply alongside the list.
+        const rewriteLines = (el('clusterSharedRewrites')?.value || '')
+            .split('\n').map(s => s.trim()).filter(Boolean);
+        const badLine = rewriteLines.find(line => !line.includes('=>') || !line.split('=>')[0].trim());
+        if (badLine !== undefined) {
+            showToast(`Path rewrite line "${badLine}" is not in "master-prefix => node-prefix" form.`, 'danger');
+            return;
+        }
+        config.sharedStoragePathRewrites = rewriteLines
+            .map(line => {
+                const idx = line.indexOf('=>');
+                return { from: line.slice(0, idx).trim(), to: line.slice(idx + 2).trim() };
+            });
+        config.sharedStoragePathRewriteFrom = '';
+        config.sharedStoragePathRewriteTo   = '';
 
         // Enabling cluster mode requires a shared secret; reject up-front.
         if (config.enabled

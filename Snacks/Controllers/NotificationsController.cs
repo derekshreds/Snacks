@@ -84,8 +84,10 @@ public sealed class NotificationsController : ControllerBase
     }
 
     /// <summary>
-    ///     Dispatches a one-shot test notification to a single destination. Temporarily
-    ///     swaps the active config to isolate the destination from the user's real setup.
+    ///     Dispatches a one-shot test notification to a single destination, without
+    ///     touching the active config. (The old implementation temporarily swapped
+    ///     and re-persisted the live config — real events firing during the test
+    ///     window were misrouted, and a crash mid-test wiped the user's config.)
     /// </summary>
     /// <param name="dest"> The destination to test. </param>
     [HttpPost("test")]
@@ -94,32 +96,24 @@ public sealed class NotificationsController : ControllerBase
         if (dest == null || string.IsNullOrWhiteSpace(dest.Url))
             return BadRequest("URL required");
 
-        var saved = _notifications.GetConfig();
         try
         {
-            _notifications.SaveConfig(new NotificationConfig
+            // The UI never echoes stored secrets back; reuse the saved secret for
+            // the matching destination so signed-webhook tests verify correctly.
+            if (string.IsNullOrEmpty(dest.Secret))
             {
-                Destinations = new List<NotificationDestination> { dest },
-                Events = new NotificationEventToggles
-                {
-                    EncodeStarted   = true,
-                    EncodeCompleted = true,
-                    EncodeFailed    = true,
-                    ScanCompleted   = true,
-                    NodeOffline     = true,
-                    NodeOnline      = true,
-                }
-            });
-            await _notifications.NotifyEncodeCompletedAsync("(test notification)", null);
+                var match = _notifications.GetConfig().Destinations
+                    .FirstOrDefault(e => string.Equals(e.Url, dest.Url, StringComparison.OrdinalIgnoreCase));
+                if (match != null && !string.IsNullOrEmpty(match.Secret))
+                    dest.Secret = match.Secret;
+            }
+
+            await _notifications.SendTestAsync(dest);
             return new JsonResult(new { success = true, message = "Test dispatched" });
         }
         catch (Exception ex)
         {
             return new JsonResult(new { success = false, error = ex.Message });
-        }
-        finally
-        {
-            _notifications.SaveConfig(saved);
         }
     }
 }

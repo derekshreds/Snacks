@@ -214,18 +214,19 @@ public sealed class SubtitleExtractionService
     {
         // mov_text cannot be transcoded to ASS; SRT is the safe default for any source codec.
         string codec = fmt == "ass" ? "ass" : "srt";
-        string args = $"-y -i \"{inputPath}\" -map 0:{streamIndex} -c:s {codec} \"{outPath}\"";
 
         await log($"Extracting subtitle stream {streamIndex} → {Path.GetFileName(outPath)}");
 
+        // ArgumentList so quotes in filenames can't split/inject arguments.
         var psi = new ProcessStartInfo(_ffmpegPath)
         {
-            Arguments              = args,
             UseShellExecute        = false,
             RedirectStandardOutput = true,
             RedirectStandardError  = true,
             CreateNoWindow         = true,
         };
+        foreach (var flag in new[] { "-y", "-i", inputPath, "-map", $"0:{streamIndex}", "-c:s", codec, outPath })
+            psi.ArgumentList.Add(flag);
         using var proc = new Process { StartInfo = psi };
         proc.Start();
         // Drain streams to avoid deadlock on large stderr output.
@@ -247,6 +248,10 @@ public sealed class SubtitleExtractionService
         }
         if (proc.ExitCode != 0)
         {
+            // Same cleanup as the cancel path: ffmpeg ran with -y straight to the
+            // final sidecar location, so a failed extraction otherwise leaves a
+            // truncated .srt/.ass next to the video for Plex/Jellyfin to pick up.
+            try { if (File.Exists(outPath)) File.Delete(outPath); } catch { }
             var err = await stdErrTask;
             var tail = string.Join("\n", err.Split('\n').TakeLast(10));
             throw new Exception($"ffmpeg exit {proc.ExitCode}: {tail}");

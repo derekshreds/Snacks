@@ -54,8 +54,11 @@ export class AnalyzeModal {
         /** @type {{dirPath: string, recursive: boolean, options: object, results: any[], filter: string} | null} */
         this._ctx = null;
 
-        /** AbortController for the in-flight analyze request; null when idle. */
-        this._abort = null;
+        /** Server-side job ID of the running analysis; null when idle. */
+        this._jobId = null;
+
+        /** Poll-loop generation counter — bumping it stops any in-flight loop. */
+        this._pollGen = 0;
     }
 
 
@@ -82,11 +85,13 @@ export class AnalyzeModal {
         }
     }
 
-    /** Aborts any in-flight analyze fetch and clears its controller. No-op when idle. */
+    /** Stops the poll loop and cancels the server-side job. No-op when idle. */
     _cancelInFlight() {
-        if (this._abort) {
-            this._abort.abort();
-            this._abort = null;
+        this._pollGen++;
+        if (this._jobId) {
+            // Fire-and-forget — the job service treats cancel of a finished job as a no-op.
+            libraryApi.analyzeCancel(this._jobId).catch(() => {});
+            this._jobId = null;
         }
     }
 
@@ -107,9 +112,8 @@ export class AnalyzeModal {
             return;
         }
 
-        // A previous run might still be in flight (user reopened before the first
-        // request finished) — abort it so its late-arriving response can't render
-        // into the modal we're about to reset.
+        // A previous run might still be going (user reopened before it finished) —
+        // cancel it so its poll loop can't render into the modal we're resetting.
         this._cancelInFlight();
 
         const options = getEncoderOptions('settings');
@@ -122,6 +126,9 @@ export class AnalyzeModal {
         document.getElementById('analyzeLoading').style.display = '';
         document.getElementById('analyzeContent').style.display = 'none';
         document.getElementById('analyzeError')  .style.display = 'none';
+        document.getElementById('analyzeProgressLabel').textContent = 'Scanning folder…';
+        document.getElementById('analyzeProgressWrap').style.display = 'none';
+        document.getElementById('analyzeProgressBar').style.width = '0%';
 
         // Reset Proceed to its initial state — otherwise it briefly shows the
         // count from the previous directory's results until the new fetch lands.
@@ -131,24 +138,83 @@ export class AnalyzeModal {
 
         openModal(MODAL_ID);
 
-        const controller = new AbortController();
-        this._abort = controller;
+        const gen = ++this._pollGen;
         try {
-            const data = await libraryApi.analyzeDirectory(dirPath, recursive, options, controller.signal);
-            // Late responses from a since-aborted request must not paint over a
-            // newer one — `_abort` is reassigned on each call, so identity check.
-            if (this._abort !== controller) return;
-            this._ctx.results = data.results || [];
-            this._renderResults();
+            const start = await libraryApi.analyzeDirectory(dirPath, recursive, options);
+            if (gen !== this._pollGen) {
+                // Modal was closed/reopened while the start call was in flight —
+                // this job has no owner anymore, kill it server-side.
+                libraryApi.analyzeCancel(start.jobId).catch(() => {});
+                return;
+            }
+            this._jobId = start.jobId;
+            await this._pollUntilDone(gen, start.jobId);
         } catch (err) {
-            if (err.name === 'AbortError') return; // user closed the modal — silent
-            document.getElementById('analyzeLoading').style.display = 'none';
-            const errEl = document.getElementById('analyzeError');
-            errEl.textContent  = 'Analysis failed: ' + err.message;
-            errEl.style.display = '';
-        } finally {
-            if (this._abort === controller) this._abort = null;
+            if (gen !== this._pollGen) return; // superseded — stay silent
+            this._showError(err.message);
         }
+    }
+
+    /**
+     * Polls job progress until it leaves the running state, then fetches and
+     * renders the results. The generation guard makes stale loops drop out the
+     * moment a newer open()/close() bumps `_pollGen`.
+     */
+    async _pollUntilDone(gen, jobId) {
+        // A whole-library analysis can run for many minutes (= thousands of
+        // polls); a single transient failure (proxy blip, server busy under
+        // encode load) must not kill the modal while the job runs on fine.
+        let consecutiveFailures = 0;
+
+        while (true) {
+            await new Promise(resolve => setTimeout(resolve, 750));
+            if (gen !== this._pollGen) return;
+
+            let status;
+            try {
+                status = await libraryApi.analyzeStatus(jobId);
+                consecutiveFailures = 0;
+            } catch (err) {
+                if (++consecutiveFailures < 8) continue;
+                throw err; // ~6s of consistent failure — surface it
+            }
+            if (gen !== this._pollGen) return;
+
+            if (status.state === 'running') {
+                if (status.total >= 0) {
+                    const pct = status.total > 0 ? Math.round((status.processed / status.total) * 100) : 100;
+                    document.getElementById('analyzeProgressWrap').style.display = '';
+                    document.getElementById('analyzeProgressBar').style.width = pct + '%';
+                    document.getElementById('analyzeProgressLabel').textContent =
+                        `Analyzing ${status.processed.toLocaleString()} of ${status.total.toLocaleString()} files…`;
+                }
+                continue;
+            }
+
+            if (status.state === 'cancelled') return;
+            if (status.state === 'failed') {
+                this._showError(status.error || 'Analysis failed on the server');
+                return;
+            }
+
+            const data = await libraryApi.analyzeResults(jobId);
+            if (gen !== this._pollGen) return;
+            this._jobId = null;
+            this._ctx.results      = data.results || [];
+            this._ctx.truncated    = !!data.truncated;
+            this._ctx.totalResults = data.totalResults || this._ctx.results.length;
+            this._ctx.summary      = data.summary || null;
+            this._renderResults();
+            return;
+        }
+    }
+
+    /** Swaps the loading pane for the error alert. */
+    _showError(message) {
+        document.getElementById('analyzeLoading').style.display = 'none';
+        const errEl = document.getElementById('analyzeError');
+        errEl.textContent  = 'Analysis failed: ' + message;
+        errEl.style.display = '';
     }
 
 
@@ -165,7 +231,9 @@ export class AnalyzeModal {
         document.getElementById('analyzeLoading').style.display = 'none';
         document.getElementById('analyzeContent').style.display = '';
 
-        // Bucket counts and rough byte totals for the summary cards.
+        // Bucket counts and rough byte totals for the summary cards. For very
+        // large runs the server ships a preview subset plus authoritative
+        // per-decision totals — use those so truncation never skews the cards.
         const counts = {
             all: ctx.results.length,
             Queue: 0, Shrink: 0, Copy: 0, Mux: 0, Skip: 0, Excluded: 0,
@@ -173,12 +241,34 @@ export class AnalyzeModal {
         };
         let encodeSize = 0, copySize = 0, muxSize = 0, skipSize = 0;
 
-        for (const r of ctx.results) {
-            counts[r.decision] = (counts[r.decision] || 0) + 1;
-            if      (ENCODE_SET.has(r.decision)) encodeSize += r.sizeBytes || 0;
-            else if (r.decision === 'Copy')      copySize   += r.sizeBytes || 0;
-            else if (r.decision === 'Mux')       muxSize    += r.sizeBytes || 0;
-            else if (r.decision === 'Skip')      skipSize   += r.sizeBytes || 0;
+        if (ctx.truncated && ctx.summary) {
+            counts.all = ctx.totalResults;
+            for (const s of ctx.summary) {
+                counts[s.decision] = s.count;
+                if      (ENCODE_SET.has(s.decision)) encodeSize += s.bytes || 0;
+                else if (s.decision === 'Copy')      copySize   += s.bytes || 0;
+                else if (s.decision === 'Mux')       muxSize    += s.bytes || 0;
+                else if (s.decision === 'Skip')      skipSize   += s.bytes || 0;
+            }
+        } else {
+            for (const r of ctx.results) {
+                counts[r.decision] = (counts[r.decision] || 0) + 1;
+                if      (ENCODE_SET.has(r.decision)) encodeSize += r.sizeBytes || 0;
+                else if (r.decision === 'Copy')      copySize   += r.sizeBytes || 0;
+                else if (r.decision === 'Mux')       muxSize    += r.sizeBytes || 0;
+                else if (r.decision === 'Skip')      skipSize   += r.sizeBytes || 0;
+            }
+        }
+
+        const truncNotice = document.getElementById('analyzeTruncatedNotice');
+        if (truncNotice) {
+            truncNotice.style.display = ctx.truncated ? '' : 'none';
+            if (ctx.truncated) {
+                truncNotice.textContent =
+                    `Large analysis — the table below previews the first ${ctx.results.length.toLocaleString()} of ` +
+                    `${ctx.totalResults.toLocaleString()} files. The totals above cover everything; ` +
+                    `analyze a subfolder for a full row-by-row view.`;
+            }
         }
 
         const encodeTotal  = counts.Queue + counts.Shrink;
@@ -188,7 +278,7 @@ export class AnalyzeModal {
         const skipPlusExcl = counts.Skip + counts.Excluded;
 
         document.getElementById('analyzeSummary').innerHTML = [
-            renderCard('fa-film',    'Total Files',  ctx.results.length, '',                                       '--border-color'),
+            renderCard('fa-film',    'Total Files',  counts.all,         '',                                       '--border-color'),
             renderCard('fa-cog',     'Will Encode',  encodeTotal,        encodeSize > 0 ? formatSize(encodeSize) : '', '--bs-primary'),
             renderCard('fa-random',  'Mux Pass',     counts.Mux,         muxSize    > 0 ? formatSize(muxSize)    : '', '--bs-info'),
             renderCard('fa-copy',    'Copy / Remux', counts.Copy,        copySize   > 0 ? formatSize(copySize)   : '', '--bs-info'),
@@ -249,8 +339,11 @@ export class AnalyzeModal {
 
         document.getElementById('analyzeTableBody').innerHTML = filtered.map(r => `
             <tr>
-                <td class="text-truncate" style="max-width: 460px;" title="${escapeHtml(r.filePath)}">
-                    <i class="fas fa-file-video me-2 text-primary"></i>${escapeHtml(r.fileName)}
+                <td class="dash-file" title="${escapeHtml(r.filePath)}">
+                    <div class="dash-file-inner">
+                        <span class="dash-fileicon"><i class="fas fa-file-video"></i></span>
+                        <div class="dash-filename">${escapeHtml(r.fileName)}</div>
+                    </div>
                 </td>
                 <td class="small text-muted" style="white-space: nowrap;">${renderSource(r)}</td>
                 <td>

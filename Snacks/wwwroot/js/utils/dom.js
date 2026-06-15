@@ -4,17 +4,23 @@
 
 
 /**
- * HTML-escapes `text` for safe insertion into `innerHTML`.
+ * HTML-escapes `text` for safe insertion into `innerHTML` — in BOTH element
+ * content and attribute positions.
  *
- * Delegates to the browser by round-tripping through a detached `<div>`'s
- * `textContent` / `innerHTML`, which handles every character the renderer
- * would otherwise interpret as markup.
+ * Quotes must be escaped here: call sites routinely interpolate this into
+ * double-quoted attributes (`title="..."`, `data-path="..."`, `value="..."`),
+ * and the previous textContent/innerHTML round-trip left `"` and `'` intact,
+ * letting a crafted filename break out of the attribute and inject an event
+ * handler (XSS reachable by anyone who can drop a file into a watched library).
  *
- * @param {unknown} text Value to escape (coerced to string by the DOM).
- * @returns {string}     Escaped HTML.
+ * @param {unknown} text Value to escape (coerced to string).
+ * @returns {string}     Escaped HTML, safe for content and attribute contexts.
  */
 export function escapeHtml(text) {
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
+    return String(text ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
 }

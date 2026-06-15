@@ -41,7 +41,7 @@ public sealed class ClusterDiscoveryService
     };
 
     /// <summary> Protocol version for cluster inter-node communication. </summary>
-    internal const string ClusterVersion = "2.13.1";
+    internal const string ClusterVersion = "2.14.0";
 
     private volatile ClusterConfig       _config;
     private UdpClient?                   _udpListener;
@@ -210,14 +210,20 @@ public sealed class ClusterDiscoveryService
         {
             try
             {
+                // secretToken (not secretHash): never broadcast a direct hash of
+                // the shared secret — see ComputeDiscoveryToken. Older peers that
+                // only understand secretHash won't verify this announcement, but
+                // newer nodes still accept THEIR legacy announcements, and the
+                // resulting handshake registers both sides, so mixed-version
+                // discovery still converges.
                 var announcement = new
                 {
-                    proto      = "snacks-v1",
-                    nodeId     = _config.NodeId,
-                    role       = _config.Role,
-                    port       = GetListeningPort(),
-                    version    = ClusterVersion,
-                    secretHash = HashSecret(_config.SharedSecret)
+                    proto       = "snacks-v1",
+                    nodeId      = _config.NodeId,
+                    role        = _config.Role,
+                    port        = GetListeningPort(),
+                    version     = ClusterVersion,
+                    secretToken = ComputeDiscoveryToken(_config.SharedSecret, _config.NodeId, CurrentDiscoveryBucket())
                 };
 
                 var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(announcement, _jsonOptions));
@@ -280,8 +286,23 @@ public sealed class ClusterDiscoveryService
                 if (nodeId == _config.NodeId)
                     continue;
 
-                var secretHash = announcement.GetProperty("secretHash").GetString();
-                if (secretHash != HashSecret(_config.SharedSecret))
+                // Prefer the HMAC token; fall back to the legacy bare-hash field so
+                // announcements from older nodes are still accepted during upgrades.
+                bool secretOk;
+                if (announcement.TryGetProperty("secretToken", out var tokenProp))
+                {
+                    secretOk = VerifyDiscoveryToken(tokenProp.GetString(), nodeId ?? "");
+                }
+                else if (announcement.TryGetProperty("secretHash", out var hashProp))
+                {
+                    secretOk = hashProp.GetString() == HashSecret(_config.SharedSecret);
+                }
+                else
+                {
+                    secretOk = false;
+                }
+
+                if (!secretOk)
                 {
                     Console.WriteLine($"ClusterDiscovery: Ignored announcement from {result.RemoteEndPoint} — secret mismatch");
                     continue;
@@ -397,13 +418,26 @@ public sealed class ClusterDiscoveryService
         {
             try
             {
-                await PerformHandshakeAsync(_config.MasterUrl!, ct);
-                if (!registered)
+                // PerformHandshakeAsync swallows network errors internally and
+                // reports success via its return value — keying off exceptions
+                // here would flip `registered` to true on the very first attempt
+                // even when the master is unreachable.
+                bool ok = await PerformHandshakeAsync(_config.MasterUrl!, ct);
+                if (ok && !registered)
                 {
                     registered = true;
                     Console.WriteLine("ClusterDiscovery: Registered with master — switching to periodic re-handshake");
                 }
-                await Task.Delay(TimeSpan.FromSeconds(30), ct);
+                else if (!ok && registered)
+                {
+                    Console.WriteLine("ClusterDiscovery: Lost contact with master — retrying at the fast cadence");
+                    registered = false;
+                }
+                await Task.Delay(TimeSpan.FromSeconds(registered ? 30 : 10), ct);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
             }
             catch (Exception ex)
             {
@@ -427,11 +461,14 @@ public sealed class ClusterDiscoveryService
 
     /// <summary>
     ///     Posts this node's info to the remote node's handshake endpoint and registers
-    ///     the remote node's response locally.
+    ///     the remote node's response locally. Returns <see langword="true"/> only when
+    ///     the handshake actually succeeded — network failures are logged and swallowed,
+    ///     so callers that need to know (e.g. the register-with-master loop) must check
+    ///     the return value rather than relying on the absence of an exception.
     /// </summary>
     /// <param name="baseUrl">Base URL of the remote node (e.g. <c>http://192.168.1.5:6767</c>).</param>
     /// <param name="ct">Cancelled when the cluster is stopping.</param>
-    public async Task PerformHandshakeAsync(string baseUrl, CancellationToken ct)
+    public async Task<bool> PerformHandshakeAsync(string baseUrl, CancellationToken ct)
     {
         var url = $"{baseUrl.TrimEnd('/')}/api/cluster/handshake";
         try
@@ -450,14 +487,14 @@ public sealed class ClusterDiscoveryService
                 var body = await response.Content.ReadAsStringAsync(ct);
                 Console.WriteLine($"ClusterDiscovery: Handshake rejected by {baseUrl} — {body}");
                 Console.WriteLine("ClusterDiscovery: Another master exists in the cluster. Reconfigure this node as 'node' or 'standalone'.");
-                return;
+                return false;
             }
 
             if (!response.IsSuccessStatusCode)
             {
                 var body = await response.Content.ReadAsStringAsync(ct);
                 Console.WriteLine($"ClusterDiscovery: Handshake with {baseUrl} failed — {response.StatusCode}: {body}");
-                return;
+                return false;
             }
 
             var responseBody = await response.Content.ReadAsStringAsync(ct);
@@ -487,11 +524,14 @@ public sealed class ClusterDiscoveryService
 
                 RegisterOrUpdateNode(remoteNode, fromHandshake: true);
                 Console.WriteLine($"ClusterDiscovery: Handshake with {remoteNode.Hostname} ({baseUrl}) successful");
+                return true;
             }
+            return false;
         }
         catch (Exception ex)
         {
             Console.WriteLine($"ClusterDiscovery: Handshake with {baseUrl} failed — {ex.Message}");
+            return false;
         }
     }
 
@@ -708,6 +748,46 @@ public sealed class ClusterDiscoveryService
         if (string.IsNullOrEmpty(secret)) return "";
         var hash = SHA256.HashData(Encoding.UTF8.GetBytes(secret));
         return Convert.ToHexString(hash).ToLower();
+    }
+
+    /// <summary>
+    ///     Length of the discovery-token time bucket, in minutes. Receivers accept
+    ///     the current bucket ±1 so modest clock skew between nodes is tolerated.
+    /// </summary>
+    private const long DiscoveryTokenBucketMinutes = 10;
+
+    /// <summary> The current discovery-token time bucket. </summary>
+    private static long CurrentDiscoveryBucket() =>
+        DateTimeOffset.UtcNow.ToUnixTimeSeconds() / (DiscoveryTokenBucketMinutes * 60);
+
+    /// <summary>
+    ///     Time-bucketed HMAC discovery token. Replaces broadcasting a bare
+    ///     SHA-256 of the shared secret: that gave any passive LAN listener a
+    ///     fast, unsalted hash to brute-force offline. An HMAC over a rotating,
+    ///     non-secret payload proves knowledge of the secret without exposing
+    ///     anything attackable, and a captured token expires within minutes.
+    /// </summary>
+    public static string ComputeDiscoveryToken(string secret, string nodeId, long bucket)
+    {
+        if (string.IsNullOrEmpty(secret)) return "";
+        using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(secret));
+        var payload = $"snacks-discovery|{nodeId}|{bucket}";
+        return Convert.ToHexString(hmac.ComputeHash(Encoding.UTF8.GetBytes(payload))).ToLower();
+    }
+
+    /// <summary> Verifies a received discovery token against the current bucket ±1 (clock-skew tolerance). </summary>
+    private bool VerifyDiscoveryToken(string? token, string nodeId)
+    {
+        if (string.IsNullOrEmpty(token) || string.IsNullOrEmpty(_config.SharedSecret)) return false;
+        var bucket = CurrentDiscoveryBucket();
+        for (long b = bucket - 1; b <= bucket + 1; b++)
+        {
+            var expected = ComputeDiscoveryToken(_config.SharedSecret, nodeId, b);
+            if (CryptographicOperations.FixedTimeEquals(
+                    Encoding.UTF8.GetBytes(expected), Encoding.UTF8.GetBytes(token)))
+                return true;
+        }
+        return false;
     }
 
     /// <summary>

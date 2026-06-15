@@ -69,6 +69,7 @@ public sealed class ClusterAdminController : ControllerBase
             config.SharedStorageOutputPaths,
             config.SharedStoragePathRewriteFrom,
             config.SharedStoragePathRewriteTo,
+            config.SharedStoragePathRewrites,
         });
     }
 

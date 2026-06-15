@@ -87,8 +87,8 @@ public sealed class NetworkingSettingsService
         if (v.MaxUploadMBpsPerNode             < 0) throw new ArgumentException("MaxUploadMBpsPerNode must be >= 0");
         if (v.MaxDownloadMBps                  < 0) throw new ArgumentException("MaxDownloadMBps must be >= 0");
         if (v.MaxDownloadMBpsPerNode           < 0) throw new ArgumentException("MaxDownloadMBpsPerNode must be >= 0");
-        if (v.ChunkSizeMB < 4 || v.ChunkSizeMB > 256)
-            throw new ArgumentException("ChunkSizeMB must be between 4 and 256");
+        if (v.ChunkSizeMB < Cluster.TransferLimits.MinChunkSizeMB || v.ChunkSizeMB > Cluster.TransferLimits.MaxChunkSizeMB)
+            throw new ArgumentException($"ChunkSizeMB must be between {Cluster.TransferLimits.MinChunkSizeMB} and {Cluster.TransferLimits.MaxChunkSizeMB}");
     }
 
     private NetworkingSettings LoadFromDisk()

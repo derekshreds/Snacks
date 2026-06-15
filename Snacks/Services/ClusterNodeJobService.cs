@@ -287,7 +287,11 @@ public sealed class ClusterNodeJobService
             if (kv.Value > cutoff)              continue;             // recent activity
             if (_receivingJobIds.TryRemove(kv.Key, out _))
             {
-                _receivingDeviceIds.TryRemove(kv.Key, out _);
+                // Full per-job teardown (lock + CTS too) — a master that crashed
+                // mid-upload never sends the cleanup DELETE, and each abandoned
+                // job otherwise leaks a SemaphoreSlim and an undisposed CTS for
+                // the worker's process lifetime.
+                RemoveReceiveLock(kv.Key);
                 Console.WriteLine($"Cluster: Cleared stale receiving state for job {kv.Key} (no activity for {timeout.TotalSeconds:0}s)");
             }
             // Master owns lifecycle messaging — no synthetic completion broadcast.
@@ -780,13 +784,21 @@ public sealed class ClusterNodeJobService
     /// </summary>
     private void ReleaseJobState(string jobId, DeviceSlotPool slotPool)
     {
-        if (_activeJobs.TryRemove(jobId, out var active))
+        bool wasActive = _activeJobs.TryRemove(jobId, out var active);
+        if (wasActive)
         {
-            try { active.Cts.Dispose(); } catch { }
+            try { active!.Cts.Dispose(); } catch { }
         }
         _transcodingService.SetProgressCallback(jobId, null);
         _transcodingService.SetLogCallback(jobId, null);
-        ReleaseSlot(slotPool);
+
+        // Release the device slot ONLY on the call that actually removed the
+        // job. ExecuteRemoteJobAsync calls this from both the failure path and
+        // the unconditional epilogue — an unconditional ReleaseSlot here would
+        // decrement the pool twice per failed encode, silently freeing a slot
+        // a CONCURRENT job still holds and letting the master over-dispatch.
+        if (wasActive)
+            ReleaseSlot(slotPool);
     }
 
     /******************************************************************

@@ -2,6 +2,12 @@
     string formPrefix = ViewData["FormPrefix"]?.ToString() ?? "";
 }
 
+<div class="alert alert-warning d-none" id="@(formPrefix)VideoMuxOnlyNotice">
+    <i class="fas fa-info-circle me-2"></i>
+    <strong>Mux Only mode is active</strong> (Encoding Mode above) — video is never re-encoded, so the
+    settings below have no effect until the encoding mode is changed.
+</div>
+
 <div class="row g-4">
     <div class="col-md-6">
         <div class="encoder-panel rounded">

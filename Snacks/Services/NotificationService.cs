@@ -108,6 +108,23 @@ public sealed class NotificationService
             $"Node online: {nodeName}",
             new { node = nodeName });
 
+    /// <summary>
+    ///     Sends a test notification directly to ONE destination without touching
+    ///     the live config. The controller's previous approach — temporarily
+    ///     SaveConfig'ing a single-destination config and restoring it after —
+    ///     raced real events into the test destination and could permanently
+    ///     replace the user's config if the process died mid-test.
+    /// </summary>
+    /// <param name="dest"> The destination to test (need not be saved). </param>
+    public async Task SendTestAsync(NotificationDestination dest)
+    {
+        var http     = _httpClientFactory.CreateClient();
+        http.Timeout = TimeSpan.FromSeconds(10);
+        await SendAsync(http, dest, "Test",
+            "Test notification from Snacks — your destination is configured correctly.",
+            new { test = true });
+    }
+
     /******************************************************************
      *  Internals
      ******************************************************************/
@@ -166,9 +183,15 @@ public sealed class NotificationService
                     break;
 
                 case "apprise":
-                    // Strip optional apprise:// prefix; remainder is the Apprise API endpoint.
+                    // Replace the apprise:// prefix with a real scheme — just stripping
+                    // it leaves a scheme-less relative URI, which HttpClient rejects on
+                    // every send (silently, because of the catch below), so apprise://
+                    // destinations never delivered anything.
                     var appriseUrl = url.StartsWith("apprise://", StringComparison.OrdinalIgnoreCase)
-                        ? url.Substring("apprise://".Length) : url;
+                        ? "http://" + url.Substring("apprise://".Length)
+                        : url.StartsWith("apprises://", StringComparison.OrdinalIgnoreCase)
+                            ? "https://" + url.Substring("apprises://".Length)
+                            : url;
                     var json = JsonSerializer.Serialize(new { body = message, title = "Snacks", type = "info" });
                     request = new HttpRequestMessage(HttpMethod.Post, appriseUrl)
                     {
@@ -241,7 +264,8 @@ public sealed class NotificationService
 
     private static string InferType(string url)
     {
-        if (url.StartsWith("apprise://", StringComparison.OrdinalIgnoreCase)) return "apprise";
+        if (url.StartsWith("apprise://", StringComparison.OrdinalIgnoreCase)
+            || url.StartsWith("apprises://", StringComparison.OrdinalIgnoreCase)) return "apprise";
         if (url.Contains("/ntfy.") || url.Contains("ntfy.sh")) return "ntfy";
         return "webhook";
     }

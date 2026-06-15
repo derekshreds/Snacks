@@ -1,0 +1,136 @@
+@{
+    ViewData["Title"] = "Library Health";
+    ViewData["Page"]  = "library-health";
+    Layout = "~/Views/Shared/_Layout.cshtml";
+}
+
+<div class="library-health-page">
+
+    <div class="d-flex align-items-center justify-content-between mb-3 flex-wrap gap-2">
+        <div>
+            <h3 class="mb-0"><i class="fas fa-heart-pulse me-2 text-primary"></i>Library Health</h3>
+            <small class="text-muted">File-level problems found during scans — missing audio, broken video, truncated files, failed encodes.</small>
+        </div>
+        <button id="healthRefreshBtn" class="btn btn-sm btn-outline-secondary">
+            <i class="fas fa-arrows-rotate me-1"></i>Refresh
+        </button>
+    </div>
+
+    <!-- Library composition: codec / resolution / progress distributions -->
+    <div class="card mb-3" id="libraryInsightsCard" style="display:none;">
+        <div class="card-header d-flex justify-content-between align-items-center">
+            <h6 class="mb-0"><i class="fas fa-chart-simple me-2"></i>Library Overview</h6>
+            <small class="text-muted" id="insightsTotals"></small>
+        </div>
+        <div class="card-body">
+            <div class="row g-3">
+                <div class="col-12 col-lg-4">
+                    <div class="small text-muted text-uppercase mb-2" style="letter-spacing:0.5px; font-size:0.7rem;">Codecs</div>
+                    <div id="insightsCodecs"></div>
+                </div>
+                <div class="col-12 col-lg-4">
+                    <div class="small text-muted text-uppercase mb-2" style="letter-spacing:0.5px; font-size:0.7rem;">Resolutions</div>
+                    <div id="insightsResolutions"></div>
+                </div>
+                <div class="col-12 col-lg-4">
+                    <div class="small text-muted text-uppercase mb-2" style="letter-spacing:0.5px; font-size:0.7rem;">Processing Status</div>
+                    <div id="insightsStatuses"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Summary cards double as filters -->
+    <div class="row g-2 mb-3" id="healthSummary">
+        <div class="col-6 col-md">
+            <button type="button" class="card w-100 text-start health-filter-card active" data-health-filter="all">
+                <div class="card-body p-2">
+                    <div class="small text-muted text-uppercase" style="letter-spacing:0.5px; font-size:0.7rem;">All Issues</div>
+                    <div class="h4 mb-0 mt-1" id="healthCountAll">—</div>
+                </div>
+            </button>
+        </div>
+        <div class="col-6 col-md">
+            <button type="button" class="card w-100 text-start health-filter-card" data-health-filter="no-audio" style="border-left:3px solid var(--bs-warning);">
+                <div class="card-body p-2">
+                    <div class="small text-muted text-uppercase" style="letter-spacing:0.5px; font-size:0.7rem;">No Audio</div>
+                    <div class="h4 mb-0 mt-1" id="healthCountNoAudio">—</div>
+                </div>
+            </button>
+        </div>
+        <div class="col-6 col-md">
+            <button type="button" class="card w-100 text-start health-filter-card" data-health-filter="no-video" style="border-left:3px solid var(--bs-danger);">
+                <div class="card-body p-2">
+                    <div class="small text-muted text-uppercase" style="letter-spacing:0.5px; font-size:0.7rem;">No Video</div>
+                    <div class="h4 mb-0 mt-1" id="healthCountNoVideo">—</div>
+                </div>
+            </button>
+        </div>
+        <div class="col-6 col-md">
+            <button type="button" class="card w-100 text-start health-filter-card" data-health-filter="no-duration" style="border-left:3px solid var(--bs-danger);">
+                <div class="card-body p-2">
+                    <div class="small text-muted text-uppercase" style="letter-spacing:0.5px; font-size:0.7rem;">No Duration</div>
+                    <div class="h4 mb-0 mt-1" id="healthCountNoDuration">—</div>
+                </div>
+            </button>
+        </div>
+        <div class="col-6 col-md">
+            <button type="button" class="card w-100 text-start health-filter-card" data-health-filter="failed" style="border-left:3px solid var(--bs-danger);">
+                <div class="card-body p-2">
+                    <div class="small text-muted text-uppercase" style="letter-spacing:0.5px; font-size:0.7rem;">Failed Encodes</div>
+                    <div class="h4 mb-0 mt-1" id="healthCountFailed">—</div>
+                </div>
+            </button>
+        </div>
+        <div class="col-6 col-md">
+            <button type="button" class="card w-100 text-start health-filter-card" data-health-filter="verify-failed" style="border-left:3px solid var(--bs-danger);">
+                <div class="card-body p-2">
+                    <div class="small text-muted text-uppercase" style="letter-spacing:0.5px; font-size:0.7rem;">Failed Verification</div>
+                    <div class="h4 mb-0 mt-1" id="healthCountVerifyFailed">—</div>
+                </div>
+            </button>
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+            <h6 class="mb-0"><i class="fas fa-stethoscope me-2"></i>Flagged Files <small class="text-muted ms-1" id="healthShownCount"></small></h6>
+            <div class="d-flex align-items-center gap-3 flex-wrap">
+                <small class="text-muted" id="healthVerifyCoverage" title="Rolling deep-verification coverage — enable in Settings → System → Rolling Verification"></small>
+                <input type="text" class="form-control form-control-sm" id="healthFilterText" placeholder="Search by name or path..." style="max-width: 280px;">
+                <button type="button" class="btn btn-sm btn-outline-danger" id="healthDeleteAllBtn" style="display:none;" title="Delete every flagged file in the current view from disk">
+                    <i class="fas fa-trash me-1"></i>Delete All
+                </button>
+            </div>
+        </div>
+        <div class="card-body p-0">
+            <div id="healthLoading" class="text-center text-muted py-5">
+                <div class="spinner-border text-info mb-2" role="status"><span class="visually-hidden">Loading…</span></div>
+                <div>Checking the library…</div>
+            </div>
+            <div id="healthEmpty" class="text-center text-muted py-5" style="display:none;">
+                <i class="fas fa-circle-check fa-2x mb-2 text-success"></i><br>
+                <span id="healthEmptyMsg">No file-level issues found. Your library looks healthy.</span>
+            </div>
+            <div class="dash-table-wrap" id="healthTableWrap" style="display:none; max-height: 65vh;">
+                <table class="dash-table">
+                    <thead>
+                        <tr>
+                            <th style="min-width: 280px;">File</th>
+                            <th style="white-space: nowrap;">Details</th>
+                            <th style="min-width: 200px;">Issues</th>
+                            <th style="white-space: nowrap; width: 1%;">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="healthTableBody"></tbody>
+                </table>
+            </div>
+        </div>
+        @* No d-flex class — its !important display:flex would defeat the JS show/hide toggle. *@
+        <div class="card-footer justify-content-center align-items-center gap-3 py-2" id="healthPager" style="display:none;">
+            <button type="button" class="btn btn-sm btn-outline-secondary" id="healthPagePrev"><i class="fas fa-chevron-left"></i></button>
+            <small class="text-muted" id="healthPageLabel"></small>
+            <button type="button" class="btn btn-sm btn-outline-secondary" id="healthPageNext"><i class="fas fa-chevron-right"></i></button>
+        </div>
+    </div>
+</div>

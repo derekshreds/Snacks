@@ -191,6 +191,9 @@ namespace Snacks.Data.Migrations
                     b.Property<long>("FileSize")
                         .HasColumnType("INTEGER");
 
+                    b.Property<bool>("ForceMux")
+                        .HasColumnType("INTEGER");
+
                     b.Property<int>("Height")
                         .HasColumnType("INTEGER");
 
@@ -212,12 +215,22 @@ namespace Snacks.Data.Migrations
                     b.Property<DateTime?>("LastScannedAt")
                         .HasColumnType("TEXT");
 
+                    b.Property<DateTime?>("LastVerifiedAt")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("LastVerifyResult")
+                        .HasMaxLength(2048)
+                        .HasColumnType("TEXT");
+
                     b.Property<string>("OriginalLanguage")
                         .HasColumnType("TEXT");
 
                     b.Property<string>("PixelFormat")
                         .HasMaxLength(32)
                         .HasColumnType("TEXT");
+
+                    b.Property<int>("Priority")
+                        .HasColumnType("INTEGER");
 
                     b.Property<int>("RemoteFailureCount")
                         .HasColumnType("INTEGER");
@@ -245,9 +258,14 @@ namespace Snacks.Data.Migrations
                     b.HasIndex("FilePath")
                         .IsUnique();
 
+                    b.HasIndex("LastVerifiedAt");
+
                     b.HasIndex("Status");
 
                     b.HasIndex("Directory", "BaseName");
+
+                    b.HasIndex("Status", "Priority", "Bitrate")
+                        .IsDescending(false, true, true);
 
                     b.ToTable("MediaFiles");
                 });

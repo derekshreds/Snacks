@@ -154,6 +154,9 @@ public sealed class ClusterService : IHostedService, IDisposable
     private Timer?                   _dispatchTimer;
     private Timer?                   _stuckWatchdogTimer;
     private CancellationTokenSource? _cts;
+
+    /// <summary> 1 while a heartbeat callback is in flight — Timer offers no overlap protection itself. </summary>
+    private int _heartbeatRunning;
     private TaskCompletionSource     _recoveryComplete = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly SemaphoreSlim   _dispatchLock = new(1, 1);
 
@@ -424,12 +427,19 @@ public sealed class ClusterService : IHostedService, IDisposable
         _nodeConsecutiveFailures.Clear();
         _activeDispatchTasks.Clear();
 
+        // Drop every slot reservation too — jobs in the Encoding phase have no
+        // in-flight transfer task whose cancellation would release them, so
+        // without this the devices stay booked (and the heartbeat reconcile
+        // resurrects phantom job chips from the stale rows) until restart.
+        _slotLedger.Clear();
+
         // Reset all worker node states
         foreach (var node in _nodes.Values.Where(n => n.Role == "node"))
         {
             node.ActiveWorkItemId = null;
             node.ActiveFileName   = null;
             node.ActiveProgress   = 0;
+            lock (node) { node.ActiveJobs.Clear(); }
             if (node.Status != NodeStatus.Unreachable && node.Status != NodeStatus.Offline)
                 node.Status = NodeStatus.Online;
             _ = _hubContext.Clients.All.SendAsync("WorkerUpdated", node);
@@ -780,6 +790,10 @@ public sealed class ClusterService : IHostedService, IDisposable
     public string? GetRemoteJobPhase(string jobId) =>
         _remoteJobs.TryGetValue(jobId, out var w) ? w.RemoteJobPhase : null;
 
+    /// <summary> Returns the NodeId the job was dispatched to, or <see langword="null" /> if not tracked. </summary>
+    public string? GetRemoteJobAssignedNodeId(string jobId) =>
+        _remoteJobs.TryGetValue(jobId, out var w) ? w.AssignedNodeId : null;
+
     /// <summary>
     ///     Checks if a file path is currently being handled as a remote job.
     ///     Uses the in-memory cache first, then the database as the authoritative source.
@@ -789,7 +803,7 @@ public sealed class ClusterService : IHostedService, IDisposable
         var normalized = Path.GetFullPath(filePath);
 
         if (_remoteJobs.Values.Any(w =>
-            Path.GetFullPath(w.Path).Equals(normalized, StringComparison.OrdinalIgnoreCase)))
+            w.NormalizedPath.Equals(normalized, StringComparison.OrdinalIgnoreCase)))
             return true;
 
         return await _mediaFileRepo.IsRemoteJobAsync(normalized);
@@ -847,11 +861,15 @@ public sealed class ClusterService : IHostedService, IDisposable
         _discovery.Config = _config;
         _nodeJobs.Config  = _config;
 
-        // UDP discovery
-        bool needsDiscovery = _config.AutoDiscovery ||
-            (_config.Role == "node" && string.IsNullOrEmpty(_config.MasterUrl));
-        if (needsDiscovery)
-            _discovery.Start(_cts.Token);
+        // Always start the discovery service — it gates its own sub-tasks
+        // internally: UDP broadcast only when auto-discovery is enabled (or a
+        // node has no master URL), master-URL registration for nodes, and
+        // manual-node connections when entries exist. Gating the whole call on
+        // the UDP condition here silently disabled node registration AND manual
+        // nodes for every autoDiscovery=false deployment (different subnets,
+        // Docker bridge networks) — the cluster looked configured but no worker
+        // ever joined.
+        _discovery.Start(_cts.Token);
 
         // Heartbeat with jitter
         var heartbeatInterval = TimeSpan.FromSeconds(_config.HeartbeatIntervalSeconds);
@@ -859,22 +877,35 @@ public sealed class ClusterService : IHostedService, IDisposable
         _heartbeatTimer = new Timer(async _ =>
         {
             if (_cts?.IsCancellationRequested == true) return;
-            try { await RunHeartbeatAsync(); }
-            catch (Exception ex) { Console.WriteLine($"Cluster: Heartbeat error: {ex.Message}"); }
 
-            // On nodes, clear stale receiving state and retry any pending completions
-            if (_config.Role == "node")
+            // Non-reentrant: Timer fires on schedule regardless of whether the
+            // previous async callback finished. A node that black-holes TCP can
+            // stall a probe for minutes — without this guard a new heartbeat
+            // run piles on every interval, all mutating node state concurrently.
+            if (Interlocked.CompareExchange(ref _heartbeatRunning, 1, 0) != 0) return;
+            try
             {
-                _nodeJobs.ExpireStaleReceiving(TimeSpan.FromSeconds(_config.StaleReceiveTimeoutSeconds));
-                try { await _nodeJobs.RetryPendingCompletionsAsync(); }
-                catch (Exception ex) { Console.WriteLine($"Cluster: Pending completion retry error: {ex.Message}"); }
+                try { await RunHeartbeatAsync(); }
+                catch (Exception ex) { Console.WriteLine($"Cluster: Heartbeat error: {ex.Message}"); }
 
-                // Refresh the cached master cluster view and rebroadcast
-                // deltas on this worker's SignalR hub so the worker's UI
-                // tracks the master's live state instead of going stale
-                // after the initial page load.
-                try { await RefreshMasterClusterStateAsync(); }
-                catch (Exception ex) { Console.WriteLine($"Cluster: Master state refresh error: {ex.Message}"); }
+                // On nodes, clear stale receiving state and retry any pending completions
+                if (_config.Role == "node")
+                {
+                    _nodeJobs.ExpireStaleReceiving(TimeSpan.FromSeconds(_config.StaleReceiveTimeoutSeconds));
+                    try { await _nodeJobs.RetryPendingCompletionsAsync(); }
+                    catch (Exception ex) { Console.WriteLine($"Cluster: Pending completion retry error: {ex.Message}"); }
+
+                    // Refresh the cached master cluster view and rebroadcast
+                    // deltas on this worker's SignalR hub so the worker's UI
+                    // tracks the master's live state instead of going stale
+                    // after the initial page load.
+                    try { await RefreshMasterClusterStateAsync(); }
+                    catch (Exception ex) { Console.WriteLine($"Cluster: Master state refresh error: {ex.Message}"); }
+                }
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _heartbeatRunning, 0);
             }
         }, null, jitter, heartbeatInterval);
 
@@ -931,7 +962,7 @@ public sealed class ClusterService : IHostedService, IDisposable
 
         var localIp = ClusterDiscoveryService.GetLocalIpAddress();
         var port    = _discovery.GetListeningPort();
-        Console.WriteLine($"Cluster started: role={_config.Role}, localIp={localIp}, port={port}, discovery={needsDiscovery}");
+        Console.WriteLine($"Cluster started: role={_config.Role}, localIp={localIp}, port={port}, autoDiscovery={_config.AutoDiscovery}");
     }
 
     /// <summary> Stops all timers and the discovery sub-service. </summary>
@@ -1054,12 +1085,16 @@ public sealed class ClusterService : IHostedService, IDisposable
                 continue;
             }
 
-            // Ping the node
+            // Ping the node — with a short per-probe timeout. The authenticated
+            // client's 30-minute timeout is sized for file transfers; a heartbeat
+            // probe against a black-holed node must fail in seconds, not stall
+            // the whole heartbeat loop.
             try
             {
                 var client   = _discovery.CreateAuthenticatedClient();
                 var baseUrl  = NodeBaseUrl(node);
-                var response = await client.GetAsync($"{baseUrl}/api/cluster/heartbeat");
+                using var probeCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                var response = await client.GetAsync($"{baseUrl}/api/cluster/heartbeat", probeCts.Token);
 
                 if (response.IsSuccessStatusCode)
                 {
@@ -1153,7 +1188,10 @@ public sealed class ClusterService : IHostedService, IDisposable
     private void ReleaseActiveSlot(ClusterNode node, string jobId,
         Snacks.Services.Slots.ReleaseReason reason = Snacks.Services.Slots.ReleaseReason.NodeFailed)
     {
-        node.ActiveJobs.RemoveAll(j => j.JobId == jobId);
+        // ActiveJobs is mutated from dispatch, heartbeat, and completion/failure
+        // threads — RemoveAll racing an Add corrupts the list. All mutators
+        // lock the node (cheap; the list is tiny).
+        lock (node) { node.ActiveJobs.RemoveAll(j => j.JobId == jobId); }
         if (node.ActiveWorkItemId == jobId) node.ActiveWorkItemId = null;
         _slotLedger.Release(jobId, reason);
     }
@@ -1218,7 +1256,7 @@ public sealed class ClusterService : IHostedService, IDisposable
         // dashboard chip renderer (which reads node.activeJobs[]) sees ledger
         // truth. This is the single point where the legacy field is touched.
         var snapshot = _slotLedger.Snapshot(node.NodeId);
-        node.ActiveJobs = snapshot;
+        lock (node) { node.ActiveJobs = snapshot; }
 
         node.Status = node.IsPaused
             ? NodeStatus.Paused
@@ -1453,6 +1491,12 @@ public sealed class ClusterService : IHostedService, IDisposable
                     if (hasMusicSlotFree && hasVideoSlotFree) break;
                 }
 
+                // The pending queue lives in the DB; the in-memory window the dequeue
+                // below reads from may have run dry (master paused/off-schedule means
+                // no local scheduler is refilling it). Top it up so workers keep
+                // pulling work straight through a 500k-row backlog.
+                await _transcodingService.EnsureQueueWindowAsync();
+
                 var workItem = _transcodingService.DequeueForRemoteProcessing(item =>
                 {
                     if (skipThisTick.Contains(item.Id)) return false;
@@ -1516,6 +1560,14 @@ public sealed class ClusterService : IHostedService, IDisposable
                 var nodeOverride = GetNodeSettings(bestNode.NodeId)?.EncodingOverrides;
                 var finalOptions = EncoderOptionsOverride.ApplyOverrides(globalOptions, folderOverride, nodeOverride);
 
+                // Force-mux items ("Process Item" / "Process Directory") dispatch as Hybrid even
+                // when the global mode is Transcode. The upgraded mode survives the pre-dispatch
+                // skip gate below and is cloned into the JobMetadata sent to the worker, so the
+                // worker mux-passes an at-target file (video copy, container normalized) instead
+                // of re-encoding or skipping it.
+                if (workItem.ForceMux && finalOptions.EncodingMode == EncodingMode.Transcode)
+                    finalOptions.EncodingMode = EncodingMode.Hybrid;
+
                 // Pre-dispatch skip gate (mirror of the local FinaliseForDispatchAsync).
                 // Resolves any missing OriginalLanguage live, persists it, merges it into
                 // finalOptions, and re-runs WouldSkipUnderOptions against those merged
@@ -1571,14 +1623,17 @@ public sealed class ClusterService : IHostedService, IDisposable
                 // broadcast between dispatch and the next heartbeat shows
                 // the new reservation. The heartbeat reconcile rebuilds this
                 // list from the ledger on every tick.
-                bestNode.ActiveJobs.Add(new ActiveJobInfo
+                lock (bestNode)
                 {
-                    JobId    = workItem.Id,
-                    DeviceId = deviceId,
-                    FileName = workItem.FileName,
-                    Progress = 0,
-                    Phase    = "Uploading",
-                });
+                    bestNode.ActiveJobs.Add(new ActiveJobInfo
+                    {
+                        JobId    = workItem.Id,
+                        DeviceId = deviceId,
+                        FileName = workItem.FileName,
+                        Progress = 0,
+                        Phase    = "Uploading",
+                    });
+                }
                 bestNode.Status = NodeStatus.Uploading;
 
                 // Stash the chosen device on the work item so the encode-history
@@ -1764,7 +1819,12 @@ public sealed class ClusterService : IHostedService, IDisposable
 
                 if (partialBytes > 0)
                 {
-                    // Node has partial data — reuse the ID for resume
+                    // Node has partial data — reuse the ID for resume.
+                    // EVERYTHING keyed by the old ID must be re-keyed: the slot
+                    // ledger reservation, the optimistic ActiveJobs chip, and the
+                    // dispatched-options snapshot. All later release/completion
+                    // paths key by the NEW ID — anything left under the old ID
+                    // would leak (the ledger row would hold the slot forever).
                     var oldId = workItem.Id;
                     workItem.Id = dbFile.RemoteWorkItemId;
                     _transcodingService.ReplaceWorkItemId(oldId, workItem.Id, workItem);
@@ -1772,6 +1832,14 @@ public sealed class ClusterService : IHostedService, IDisposable
                     _jobCts[workItem.Id] = jobCts;
                     _activeUploads.TryRemove(oldId, out _);
                     _activeUploads.TryAdd(workItem.Id, true);
+                    _slotLedger.Rekey(oldId, workItem.Id);
+                    if (_dispatchedOptions.TryRemove(oldId, out var dispatchedSnapshot))
+                        _dispatchedOptions[workItem.Id] = dispatchedSnapshot;
+                    lock (node)
+                    {
+                        foreach (var chip in node.ActiveJobs)
+                            if (chip.JobId == oldId) chip.JobId = workItem.Id;
+                    }
                     uploadId = workItem.Id;
                     Console.WriteLine($"Cluster: Reusing previous job ID {workItem.Id} for {workItem.FileName} (node has {partialBytes} bytes)");
                 }
@@ -4192,12 +4260,14 @@ public sealed class ClusterService : IHostedService, IDisposable
     /// <summary> Loads cluster configuration from disk. </summary>
     private void LoadConfig()
     {
+        bool loadedFromDisk = false;
         if (File.Exists(_configPath))
         {
             try
             {
                 var json = File.ReadAllText(_configPath);
                 _config = JsonSerializer.Deserialize<ClusterConfig>(json, _jsonOptions) ?? new ClusterConfig();
+                loadedFromDisk = true;
             }
             catch (Exception ex)
             {
@@ -4205,6 +4275,20 @@ public sealed class ClusterService : IHostedService, IDisposable
                 _config = new ClusterConfig();
             }
         }
+
+        // Persist the NodeId so this machine keeps a stable identity across restarts.
+        // ClusterConfig mints a fresh GUID by default; a standalone install never saves
+        // cluster.json through the settings UI, so without persisting here it would get a
+        // NEW NodeId every launch — and the dashboard's per-node throughput would show the
+        // same machine as a brand-new node after each restart. Save once on first run (or
+        // when an older config somehow has no NodeId) so the identity sticks.
+        bool needsPersist = !loadedFromDisk;
+        if (string.IsNullOrEmpty(_config.NodeId))
+        {
+            _config.NodeId = Guid.NewGuid().ToString();
+            needsPersist = true;
+        }
+        if (needsPersist) SaveConfig();
 
         _discovery.Config = _config;
         _nodeJobs.Config  = _config;

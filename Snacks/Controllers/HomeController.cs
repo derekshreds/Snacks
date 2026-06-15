@@ -22,12 +22,13 @@ public sealed class HomeController : Controller
      *  View Actions
      ******************************************************************/
 
-    /// <summary> Renders the main application view with the current work-item list. </summary>
-    public IActionResult Index()
-    {
-        var workItems = _transcodingService.GetAllWorkItems();
-        return View(workItems);
-    }
+    /// <summary>
+    ///     Renders the main application view. The queue itself is loaded by the
+    ///     frontend through the paginated <c>/api/queue/items</c> endpoint — the
+    ///     view doesn't declare a model, so materializing the full work-item list
+    ///     here was pure allocation (hundreds of MB per page load on big sweeps).
+    /// </summary>
+    public IActionResult Index() => View();
 
     /// <summary> Renders the error view. </summary>
     public IActionResult Error() => View();
@@ -42,7 +43,7 @@ public sealed class HomeController : Controller
     {
         status    = "healthy",
         timestamp = DateTime.UtcNow,
-        version   = "2.13.1",
+        version   = "2.14.0",
     });
 
     /// <summary>

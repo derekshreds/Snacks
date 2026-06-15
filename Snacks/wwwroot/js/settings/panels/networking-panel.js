@@ -20,12 +20,22 @@ const FIELDS = [
     ['ChunkSizeMB',                    'NetChunkSizeMB'],
 ];
 
-/** Reads a numeric input by id, defaulting to 0 on missing/invalid. */
+/**
+ * Reads a numeric input by id, defaulting to 0 on missing/invalid and
+ * clamping to the input's own min/max attributes. Without the clamp, a
+ * cleared chunk-size field saved 0 (below the documented 4 MB minimum and
+ * rejected server-side), and out-of-range typed values 400'd on save.
+ */
 function readNum(id) {
     const el = document.getElementById(id);
     if (!el) return 0;
-    const n = Number.parseInt(el.value, 10);
-    return Number.isFinite(n) ? n : 0;
+    let n = Number.parseInt(el.value, 10);
+    if (!Number.isFinite(n)) n = Number.parseInt(el.min, 10) || 0;
+    const min = Number.parseInt(el.min, 10);
+    const max = Number.parseInt(el.max, 10);
+    if (Number.isFinite(min)) n = Math.max(min, n);
+    if (Number.isFinite(max)) n = Math.min(max, n);
+    return n;
 }
 
 /** Writes a numeric value into an input. */

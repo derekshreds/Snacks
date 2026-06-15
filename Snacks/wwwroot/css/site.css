@@ -534,6 +534,15 @@ footer a.text-muted:hover {
     border: 1px solid rgba(14, 165, 233, 0.3);
 }
 
+/* No-savings: the encode ran but the output wasn't kept (didn't shrink). Not an
+   error and not a success — a neutral warm grey, distinct from the cool grey of
+   Cancelled and the green of Completed. */
+.status-nosavings {
+    background: rgba(120, 113, 108, 0.18);
+    color: #c8b6a6;
+    border: 1px solid rgba(120, 113, 108, 0.35);
+}
+
 /* ===========================
    Queue Filter Tabs
    =========================== */
@@ -1800,7 +1809,12 @@ footer a.text-muted:hover {
 }
 .dash-table tbody tr:hover { background: rgba(139, 92, 246, 0.04); }
 
-.dash-file { display: flex; align-items: center; gap: 0.5rem; max-width: 320px; }
+/* The file cell stays a normal table-cell so its width tracks the column model and
+   the sticky header stays aligned with the body. `display:flex` on the <td> itself
+   pulls it out of the table layout and drifts the header columns out of alignment —
+   so the flex row lives on an inner wrapper instead. */
+.dash-file { max-width: 320px; }
+.dash-file-inner { display: flex; align-items: center; gap: 0.5rem; min-width: 0; }
 .dash-fileicon {
     flex: 0 0 auto;
     width: 28px;
@@ -1933,4 +1947,58 @@ footer a.text-muted:hover {
     padding: 0.4rem 0.5rem;
     border-radius: 6px;
     background: rgba(0, 0, 0, 0.02);
+}
+
+/* ---------------------------------------------------------------------------
+   Library Health page — summary cards that double as issue filters
+   --------------------------------------------------------------------------- */
+
+.health-filter-card {
+    /* <button class="card"> — strip button chrome, keep card visuals */
+    appearance: none;
+    cursor: pointer;
+    transition: border-color 0.15s ease, transform 0.15s ease;
+}
+
+.health-filter-card:hover {
+    transform: translateY(-1px);
+}
+
+.health-filter-card.active {
+    border-color: var(--primary, #8b5cf6);
+    box-shadow: 0 0 0 1px var(--primary, #8b5cf6);
+}
+
+/* ---------------------------------------------------------------------------
+   Quality preset cards (settings → General)
+   --------------------------------------------------------------------------- */
+
+.preset-card {
+    appearance: none;
+    cursor: pointer;
+    transition: border-color 0.15s ease, transform 0.15s ease;
+}
+
+.preset-card:hover {
+    transform: translateY(-1px);
+    border-color: var(--primary, #8b5cf6);
+}
+
+.preset-card.active {
+    border-color: var(--primary, #8b5cf6);
+    box-shadow: 0 0 0 1px var(--primary, #8b5cf6);
+}
+
+/* ---------------------------------------------------------------------------
+   Settings — section titles inside merged tab panes (Video+Mode, Audio+Subs,
+   Cluster+Networking+Scheduling, Security+Advanced)
+   --------------------------------------------------------------------------- */
+
+.settings-section-title {
+    font-size: 0.95rem;
+    font-weight: 700;
+    color: var(--text-primary, #e5e7eb);
+    border-bottom: 1px solid var(--border-color, rgba(255, 255, 255, 0.1));
+    padding-bottom: 0.4rem;
+    margin-bottom: 1rem;
 }

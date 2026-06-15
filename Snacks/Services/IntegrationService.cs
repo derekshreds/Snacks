@@ -57,7 +57,11 @@ public sealed class IntegrationService
             {
                 _plexRootsCache.Clear();
                 _jellyfinRootsCache.Clear();
+                _arrLangCache.Clear();
             }
+            // The TVDB bearer token isn't keyed to the API key — a changed key would
+            // otherwise keep using the previous token until it expired or 401'd.
+            lock (_tvdbLock) _tvdbToken = null;
         }
     }
 

@@ -79,6 +79,11 @@ public sealed class AuthMiddleware
 
     private static bool IsAllowlisted(string path)
     {
+        // Prometheus scrape — aggregate counters only, no file paths or credentials;
+        // scrapers can't do cookie login. Exact match (not a prefix) so a future
+        // "/metrics/..." management route can't silently ship unauthenticated.
+        if (string.Equals(path, "/metrics", StringComparison.OrdinalIgnoreCase)) return true;
+
         foreach (var prefix in AllowlistPrefixes)
             if (path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) return true;
 

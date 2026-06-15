@@ -49,56 +49,118 @@ public sealed class QueueController : ControllerBase
     /// <param name="skip"> Number of non-active items to skip before returning. </param>
     /// <param name="status"> Optional status filter applied before pagination. </param>
     [HttpGet("items")]
-    public IActionResult GetItems(
+    public async Task<IActionResult> GetItems(
         [FromQuery] int? limit = null,
         [FromQuery] int skip = 0,
         [FromQuery] string? status = null)
     {
-        var allItems = _transcodingService.GetAllWorkItems();
+        var memoryItems = _transcodingService.GetAllWorkItems();
 
-        var processingItems = allItems.Where(w => w.Status is WorkItemStatus.Processing
+        var processingItems = memoryItems.Where(w => w.Status is WorkItemStatus.Processing
             or WorkItemStatus.Uploading or WorkItemStatus.Downloading).ToList();
 
-        var queueItems = allItems.Where(w => w.Status is not WorkItemStatus.Processing
-            and not WorkItemStatus.Uploading and not WorkItemStatus.Downloading).ToList();
+        // Remote dispatch briefly leaves the DB row Queued while the in-memory
+        // item is already Processing/Uploading — filter those rows out of the
+        // pending list so the same file never shows a pending tile AND a
+        // processing card at once.
+        var activePaths = new HashSet<string>(
+            processingItems.Select(w => w.NormalizedPath), StringComparer.OrdinalIgnoreCase);
 
-        if (!string.IsNullOrEmpty(status) && Enum.TryParse<WorkItemStatus>(status, true, out var filterStatus))
-            queueItems = queueItems.Where(w => w.Status == filterStatus).ToList();
+        // Pending comes from the DB — the authoritative queue. The in-memory
+        // registry only holds the hydrated window (whose rows are still Queued in
+        // the DB), so memory Pending items are deliberately excluded here to avoid
+        // double-listing. Everything terminal (recent history) stays memory-sourced.
+        var terminalItems = memoryItems.Where(w => w.Status is not WorkItemStatus.Processing
+            and not WorkItemStatus.Uploading and not WorkItemStatus.Downloading
+            and not WorkItemStatus.Pending).ToList();
 
-        queueItems.Sort((a, b) =>
+        terminalItems.Sort((a, b) =>
         {
             int StatusPriority(WorkItemStatus s) => s switch
             {
-                WorkItemStatus.Pending   => 0,
-                WorkItemStatus.Completed => 1,
-                WorkItemStatus.Failed    => 2,
-                WorkItemStatus.Cancelled => 3,
-                _                        => 4
+                WorkItemStatus.Completed => 0,
+                WorkItemStatus.Failed    => 1,
+                WorkItemStatus.Cancelled => 2,
+                _                        => 3
             };
             int cmp = StatusPriority(a.Status).CompareTo(StatusPriority(b.Status));
-            return cmp != 0 ? cmp : b.Bitrate.CompareTo(a.Bitrate);
+            return cmp != 0 ? cmp : TranscodingService.CompareQueueOrder(a, b);
         });
 
-        var total = queueItems.Count;
-        queueItems = queueItems.Skip(skip).ToList();
-        if (limit.HasValue) queueItems = queueItems.Take(limit.Value).ToList();
-        return new JsonResult(new { items = queueItems, total, processing = processingItems });
+        bool hasFilter = !string.IsNullOrEmpty(status)
+            && Enum.TryParse<WorkItemStatus>(status, true, out var filterStatus);
+
+        // Pending-only filter: page straight from the DB.
+        if (hasFilter && string.Equals(status, "Pending", StringComparison.OrdinalIgnoreCase))
+        {
+            var (rows, pendingTotal) = await _mediaFileRepo.GetQueuedPageAsync(skip, limit ?? int.MaxValue, _transcodingService.QueueNewestFirst);
+            return new JsonResult(new
+            {
+                items = rows.Where(r => !activePaths.Contains(r.FilePath)).Select(ToPendingDto).ToList(),
+                total = pendingTotal,
+                processing = processingItems,
+            });
+        }
+
+        // Other status filters: memory-sourced recent history, as before.
+        if (hasFilter)
+        {
+            Enum.TryParse<WorkItemStatus>(status, true, out var fs);
+            var filtered = terminalItems.Where(w => w.Status == fs).ToList();
+            var page = filtered.Skip(skip).Take(limit ?? int.MaxValue).Cast<object>().ToList();
+            return new JsonResult(new { items = page, total = filtered.Count, processing = processingItems });
+        }
+
+        // No filter: the page spans [DB pending..., memory terminal...] in order.
+        int dbPending = await _mediaFileRepo.CountQueuedLocalAsync();
+        int combinedTotal = dbPending + terminalItems.Count;
+        int take = limit ?? Math.Max(0, combinedTotal - skip);
+
+        var items = new List<object>();
+        if (skip < dbPending && take > 0)
+        {
+            var (rows, _) = await _mediaFileRepo.GetQueuedPageAsync(skip, Math.Min(take, dbPending - skip), _transcodingService.QueueNewestFirst);
+            items.AddRange(rows.Where(r => !activePaths.Contains(r.FilePath)).Select(ToPendingDto));
+        }
+        int remaining = take - items.Count;
+        if (remaining > 0)
+        {
+            int terminalSkip = Math.Max(0, skip - dbPending);
+            items.AddRange(terminalItems.Skip(terminalSkip).Take(remaining));
+        }
+
+        return new JsonResult(new { items, total = combinedTotal, processing = processingItems });
     }
+
+    /// <summary>
+    ///     Projects a pending DB row into the shape the queue cards render. The id is
+    ///     the row-addressed form (<c>mf-{rowId}</c>) — cancel/stop/prioritize accept
+    ///     it directly, reaching the hydrated window copy when one exists.
+    /// </summary>
+    private static object ToPendingDto(MediaFile row) => new
+    {
+        id        = $"mf-{row.Id}",
+        fileName  = row.FileName,
+        path      = row.FilePath,
+        size      = row.FileSize,
+        bitrate   = row.Bitrate,
+        length    = row.Duration,
+        status    = "Pending",
+        kind      = row.Kind.ToString(),
+        priority  = row.Priority,
+        createdAt = row.CreatedAt,
+    };
 
     /// <summary> Returns aggregate counts of work items by status. </summary>
     [HttpGet("stats")]
-    public IActionResult GetStats()
+    public async Task<IActionResult> GetStats()
     {
-        var workItems = _transcodingService.GetAllWorkItems();
-        return new JsonResult(new
-        {
-            pending    = workItems.Count(w => w.Status == WorkItemStatus.Pending),
-            processing = workItems.Count(w => w.Status is WorkItemStatus.Processing
-                                                  or WorkItemStatus.Uploading or WorkItemStatus.Downloading),
-            completed  = workItems.Count(w => w.Status == WorkItemStatus.Completed),
-            failed     = workItems.Count(w => w.Status == WorkItemStatus.Failed),
-            total      = workItems.Count
-        });
+        var (pending, processing, completed, failed, total) = await _transcodingService.GetWorkItemCountsAsync();
+        // knownFiles = every row the DB has ever recorded (any status). Lets the queue UI
+        // show its first-run onboarding hero only when nothing has ever been scanned, rather
+        // than every time the queue happens to be empty after a restart.
+        var knownFiles = await _transcodingService.GetKnownFileCountAsync();
+        return new JsonResult(new { pending, processing, completed, failed, total, knownFiles });
     }
 
     /// <summary> Returns a single work item by ID, or 404 if not found. </summary>
@@ -134,6 +196,19 @@ public sealed class QueueController : ControllerBase
             return BadRequest(ex.Message);
         }
     }
+
+    /// <summary>
+    ///     Moves a pending work item to the front of the queue. Accepts a hydrated
+    ///     work-item GUID or the queue UI's <c>mf-{rowId}</c> form. 404 when the item
+    ///     is unknown or no longer pending (it may have started processing between
+    ///     render and click — the UI just refreshes in that case).
+    /// </summary>
+    /// <param name="id"> The work item ID to prioritize. </param>
+    [HttpPost("prioritize/{id}")]
+    public async Task<IActionResult> Prioritize(string id)
+        => await _transcodingService.PrioritizeWorkItemAsync(id)
+            ? new JsonResult(new { success = true })
+            : NotFound("Item is not pending");
 
     /// <summary> Stops the active FFmpeg process for a work item without cancelling it. </summary>
     /// <param name="id"> The work item ID to stop. </param>

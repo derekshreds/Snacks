@@ -173,7 +173,11 @@ public sealed class EncoderOptions
      *  Video Pipeline
      ******************************************************************/
 
-    /// <summary> Downscale policy: "Never", "Always", or "IfLarger". </summary>
+    /// <summary>
+    ///     Downscale policy: "Never", "CapAtTarget", or "Always" (the values the UI writes).
+    ///     The legacy alias "IfLarger" is still accepted by the backend and mapped to
+    ///     "CapAtTarget" on settings restore.
+    /// </summary>
     public string DownscalePolicy { get; set; } = "Never";
 
     /// <summary> Target resolution for downscaling (e.g. "1080p", "720p"). </summary>
@@ -205,13 +209,31 @@ public sealed class EncoderOptions
     /// </summary>
     public int EncodingLogRetentionDays { get; set; } = 7;
 
+    /// <summary>
+    ///     Daily budget for the rolling deep-verifier (ffmpeg decode samples per file,
+    ///     oldest-verified first). <c>0</c> (default) disables it. Spread evenly across
+    ///     hourly ticks so the I/O cost is a trickle, not a nightly storm.
+    /// </summary>
+    public int VerifyFilesPerDay { get; set; } = 0;
+
+    /// <summary>
+    ///     When <see langword="true"/>, the pending-queue tiebreaker (after user/folder
+    ///     priority) is recency — newest files first — instead of bitrate descending.
+    ///     The right setting for "convert new downloads before the backlog".
+    /// </summary>
+    public bool QueueNewestFirst { get; set; } = false;
+
     /// <summary> Optional output directory override. When <see langword="null"/>, output is written beside the source. </summary>
     public string? OutputDirectory { get; set; }
 
     /// <summary> Optional intermediate encode directory. When <see langword="null"/>, the system temp directory is used. </summary>
     public string? EncodeDirectory { get; set; }
 
-    /// <summary> Hardware acceleration mode (e.g. "auto", "nvenc", "vaapi", "none"). </summary>
+    /// <summary>
+    ///     Hardware acceleration mode: "auto", "intel", "amd", "nvidia", "apple", or "none"
+    ///     (the values the UI writes). Legacy aliases ("nvenc", "vaapi", "qsv", "amf") are
+    ///     mapped to these on settings restore.
+    /// </summary>
     public string HardwareAcceleration { get; set; } = "auto";
 
     /// <summary>
@@ -281,6 +303,8 @@ public sealed class EncoderOptions
         RetryOnFail                = RetryOnFail,
         SkipPercentAboveTarget     = SkipPercentAboveTarget,
         EncodingLogRetentionDays   = EncodingLogRetentionDays,
+        VerifyFilesPerDay          = VerifyFilesPerDay,
+        QueueNewestFirst           = QueueNewestFirst,
         OutputDirectory            = OutputDirectory,
         EncodeDirectory            = EncodeDirectory,
         HardwareAcceleration       = HardwareAcceleration,

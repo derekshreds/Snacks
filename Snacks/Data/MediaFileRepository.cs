@@ -137,6 +137,16 @@ public class MediaFileRepository
                 // music slot.
                 existing.Kind = file.Kind;
                 existing.Status = file.Status;
+                // Non-zero only: AddFileAsync stamps the folder-override base priority
+                // (a feature that must reach pre-existing rows, not just first-ever
+                // inserts), but most callers construct rows with the default 0 — copying
+                // that unconditionally would erase a user's "move to front" bump.
+                if (file.Priority != 0) existing.Priority = file.Priority;
+                // Sticky-true: a manual "Process Item/Directory" sets ForceMux on the queued
+                // row, and a concurrent auto-scan re-upsert (which constructs rows with the
+                // default false) must not erase that intent before the item dispatches. The
+                // flag is cleared explicitly on terminal completion and on file reset.
+                if (file.ForceMux) existing.ForceMux = true;
                 existing.LastScannedAt = file.LastScannedAt;
                 existing.FileMtime = file.FileMtime;
                 // Only overwrite stream summaries when the caller actually has them — a
@@ -198,6 +208,9 @@ public class MediaFileRepository
             {
                 file.Status = status;
                 file.LastEncodedAt = lastEncodedAt;
+                // A force-mux request is satisfied once the encode reaches a terminal outcome —
+                // clear it so a future normal re-queue of this file isn't silently remuxed.
+                file.ForceMux = false;
                 if (status == MediaFileStatus.Completed)
                     file.CompletedAt = lastEncodedAt;
                 await SaveChangesWithRetryAsync(context);
@@ -223,6 +236,243 @@ public class MediaFileRepository
                 file.FailureReason = reason.Length > 2048 ? reason[..2048] : reason;
                 await SaveChangesWithRetryAsync(context);
             }
+        }
+
+        #endregion
+
+        #region DB-First Pending Queue
+
+        /*
+         * The pending queue lives HERE, not in memory: pending work = rows with
+         * Status == Queued and no remote assignment, ordered by Priority desc then
+         * the policy tiebreaker. The scheduler hydrates only the top of this order
+         * into its in-memory working window; the queue UI pages it directly. The
+         * (Status, Priority, Bitrate) index makes both O(log n) at 500k rows.
+         */
+
+        /// <summary> Local-pending queue rows: queued and not assigned to a cluster node. </summary>
+        private static IQueryable<MediaFile> QueuedLocal(SnacksDbContext context) =>
+            context.MediaFiles.Where(f => f.Status == MediaFileStatus.Queued && f.AssignedNodeId == null);
+
+        /// <summary> Applies the canonical queue order: user priority, then the policy tiebreaker. </summary>
+        private static IQueryable<MediaFile> InQueueOrder(IQueryable<MediaFile> q, bool newestFirst) =>
+            newestFirst
+                ? q.OrderByDescending(f => f.Priority).ThenByDescending(f => f.CreatedAt).ThenBy(f => f.Id)
+                : q.OrderByDescending(f => f.Priority).ThenByDescending(f => f.Bitrate).ThenBy(f => f.Id);
+
+        /// <summary>
+        ///     The top of the pending queue — what the scheduler's working window should
+        ///     contain. <paramref name="skip"/> is non-zero only during window rotation
+        ///     (the scheduler walking past a locally-unservable head of the queue).
+        ///     <paramref name="kind"/> narrows to one media kind — the window sync uses it
+        ///     to guarantee music representation when high-bitrate video would otherwise
+        ///     monopolize every window slot and starve the dedicated music lanes.
+        /// </summary>
+        public async Task<List<MediaFile>> GetQueueWindowAsync(int take, bool newestFirst = false, int skip = 0, MediaKind? kind = null)
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            var query = QueuedLocal(context);
+            if (kind != null) query = query.Where(f => f.Kind == kind);
+            return await InQueueOrder(query, newestFirst).Skip(skip).Take(take).ToListAsync();
+        }
+
+        /// <summary> One page of the pending queue for the UI, plus the total pending count. </summary>
+        public async Task<(List<MediaFile> Rows, int Total)> GetQueuedPageAsync(int skip, int take, bool newestFirst = false)
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            var total = await QueuedLocal(context).CountAsync();
+            var rows  = await InQueueOrder(QueuedLocal(context), newestFirst).Skip(skip).Take(take).ToListAsync();
+            return (rows, total);
+        }
+
+        /// <summary> Number of locally-pending queue rows. </summary>
+        public async Task<int> CountQueuedLocalAsync()
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            return await QueuedLocal(context).CountAsync();
+        }
+
+        /// <summary> Fetches a row by primary key. </summary>
+        public async Task<MediaFile?> GetByIdAsync(int id)
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            return await context.MediaFiles.FindAsync(id);
+        }
+
+        /// <summary>
+        ///     Moves a queued row to the front of the pending order by setting its
+        ///     priority above the current queued maximum. Returns the new priority,
+        ///     or null when the row is unknown or no longer queued.
+        /// </summary>
+        public async Task<int?> BumpPriorityToFrontAsync(int id)
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            var row = await context.MediaFiles.FindAsync(id);
+            if (row == null || row.Status != MediaFileStatus.Queued) return null;
+
+            var max = await context.MediaFiles
+                .Where(f => f.Status == MediaFileStatus.Queued)
+                .MaxAsync(f => (int?)f.Priority) ?? 0;
+            row.Priority = max + 1;
+            await context.SaveChangesAsync();
+            return row.Priority;
+        }
+
+        /// <summary>
+        ///     Flips a row's status by primary key (used by queue actions on rows that
+        ///     aren't hydrated into the scheduler's window). Guarded: only acts when the
+        ///     row is currently Queued, so a just-dispatched item can't be yanked back.
+        /// </summary>
+        public async Task<bool> SetQueuedRowStatusAsync(int id, MediaFileStatus status)
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            var row = await context.MediaFiles.FindAsync(id);
+            if (row == null || row.Status != MediaFileStatus.Queued) return false;
+            row.Status = status;
+            await context.SaveChangesAsync();
+            return true;
+        }
+
+        /// <summary>
+        ///     Walks every locally-pending queue row in id-ordered pages and flips the
+        ///     ones <paramref name="wouldSkipNow"/> says no longer need encoding to
+        ///     Skipped. Paged with a fresh context per page so a 500k-row backlog
+        ///     never materializes (or stays change-tracked) all at once. Rows without
+        ///     cached stream summaries are left alone — conservative, the next scan
+        ///     re-evaluates them.
+        /// </summary>
+        /// <returns> Number of rows flipped to Skipped. </returns>
+        public async Task<int> ReevaluateQueuedAsync(Func<MediaFile, bool> wouldSkipNow)
+        {
+            const int PageSize = 2000;
+            int flipped = 0, lastId = 0;
+
+            while (true)
+            {
+                using var context = await _contextFactory.CreateDbContextAsync();
+                var page = await QueuedLocal(context)
+                    .Where(f => f.Id > lastId)
+                    .OrderBy(f => f.Id)
+                    .Take(PageSize)
+                    .ToListAsync();
+                if (page.Count == 0) break;
+                lastId = page[^1].Id;
+
+                int pageFlipped = 0;
+                foreach (var mf in page)
+                {
+                    if (mf.AudioStreams == null && mf.SubtitleStreams == null) continue;
+                    if (!wouldSkipNow(mf)) continue;
+                    mf.Status = MediaFileStatus.Skipped;
+                    pageFlipped++;
+                }
+
+                if (pageFlipped > 0)
+                {
+                    await SaveChangesWithRetryAsync(context);
+                    flipped += pageFlipped;
+                }
+            }
+            return flipped;
+        }
+
+        /// <summary>
+        ///     Sets one status on a batch of paths in a single transaction. The sweep
+        ///     collects companion-validated "already completed" marks per chunk and
+        ///     flushes them through here — one commit instead of a write per file.
+        /// </summary>
+        /// <returns> Number of rows updated. </returns>
+        public async Task<int> SetStatusBatchAsync(IEnumerable<string> normalizedPaths, MediaFileStatus status)
+        {
+            var paths = normalizedPaths.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            if (paths.Count == 0) return 0;
+
+            using var context = await _contextFactory.CreateDbContextAsync();
+            int updated = 0;
+            // SQLite parameter limit is ~999 — chunk the IN list defensively.
+            foreach (var chunk in paths.Chunk(500))
+            {
+                updated += await context.MediaFiles
+                    .Where(f => chunk.Contains(f.FilePath))
+                    .ExecuteUpdateAsync(s => s.SetProperty(f => f.Status, status));
+            }
+            return updated;
+        }
+
+        /// <summary>
+        ///     Startup recovery: rows a crashed run left in Processing with no remote
+        ///     assignment go back to Queued so the scheduler's window picks them up.
+        ///     One bulk UPDATE — replaces the per-row restore loop.
+        /// </summary>
+        /// <returns> Number of rows requeued. </returns>
+        public async Task<int> RequeueOrphanedLocalProcessingAsync()
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            return await context.MediaFiles
+                .Where(f => f.Status == MediaFileStatus.Processing && f.AssignedNodeId == null)
+                .ExecuteUpdateAsync(s => s.SetProperty(f => f.Status, MediaFileStatus.Queued));
+        }
+
+        /// <summary>
+        ///     Bulk-resets every locally-pending queue row to Unseen and clears its
+        ///     priority. Backs "stop and clear queue" — the in-memory window only
+        ///     holds the top ~50 items, so clearing memory alone would leave the
+        ///     rest of a deep backlog re-hydrating right back into the window.
+        /// </summary>
+        /// <returns> Number of rows reset. </returns>
+        public async Task<int> ResetAllQueuedAsync()
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            return await QueuedLocal(context)
+                .ExecuteUpdateAsync(s => s
+                    .SetProperty(f => f.Status, MediaFileStatus.Unseen)
+                    .SetProperty(f => f.Priority, 0)
+                    .SetProperty(f => f.ForceMux, false));
+        }
+
+        #endregion
+
+        #region Rolling Verification
+
+        /// <summary>
+        ///     Next candidates for the rolling deep-verifier: scanned rows that aren't
+        ///     actively queued/processing, ordered never-verified first (SQLite sorts
+        ///     NULL first ascending) then oldest-verified — so the whole library is
+        ///     continuously re-checked in rotation.
+        /// </summary>
+        public async Task<List<MediaFile>> GetVerificationCandidatesAsync(int take)
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            return await context.MediaFiles
+                .Where(f => f.LastScannedAt != null
+                            && f.Status != MediaFileStatus.Queued
+                            && f.Status != MediaFileStatus.Processing)
+                .OrderBy(f => f.LastVerifiedAt)
+                .ThenBy(f => f.Id)
+                .Take(take)
+                .ToListAsync();
+        }
+
+        /// <summary> Records a deep-verification outcome ("ok" or the truncated issue summary). </summary>
+        public async Task SetVerifyResultAsync(string normalizedPath, string result)
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            await context.MediaFiles
+                .Where(f => f.FilePath == normalizedPath)
+                .ExecuteUpdateAsync(s => s
+                    .SetProperty(f => f.LastVerifiedAt, DateTime.UtcNow)
+                    .SetProperty(f => f.LastVerifyResult, result));
+        }
+
+        /// <summary> Verification coverage stats for the health page: verified count, failed count, oldest pass age. </summary>
+        public async Task<(int Verified, int FailedVerify, int Total)> GetVerificationStatsAsync()
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            var scanned = context.MediaFiles.Where(f => f.LastScannedAt != null);
+            return (
+                await scanned.CountAsync(f => f.LastVerifiedAt != null),
+                await scanned.CountAsync(f => f.LastVerifyResult != null && f.LastVerifyResult != "ok" && f.LastVerifyResult != "missing"),
+                await scanned.CountAsync());
         }
 
         #endregion
@@ -308,6 +558,18 @@ public class MediaFileRepository
         }
 
         /// <summary>
+        ///     Total number of media-file rows known to this install, regardless of status.
+        ///     Used to distinguish a genuine first run (the DB has never seen a file) from an
+        ///     established library that simply has nothing queued right now — so the queue's
+        ///     "Welcome to Snacks" onboarding hero only appears on a true first run.
+        /// </summary>
+        public async Task<int> CountAllAsync()
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            return await context.MediaFiles.CountAsync();
+        }
+
+        /// <summary>
         ///     Returns all failed files ordered by failure count descending,
         ///     so the most-problematic files surface first in the UI.
         /// </summary>
@@ -319,6 +581,154 @@ public class MediaFileRepository
                 .Where(f => f.Status == MediaFileStatus.Failed)
                 .OrderByDescending(f => f.FailureCount)
                 .ToListAsync();
+        }
+
+        /// <summary>
+        ///     Aggregate library composition for the insights panel: file/byte totals
+        ///     plus codec, resolution-bucket, and status distributions. All grouping
+        ///     happens in SQL — nothing row-shaped crosses into memory, so this stays
+        ///     cheap on 100k-row libraries.
+        /// </summary>
+        public async Task<LibraryInsights> GetLibraryInsightsAsync()
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            var files = context.MediaFiles.Where(f => f.LastScannedAt != null);
+
+            var codecs = await files
+                .Where(f => f.Codec != "")
+                .GroupBy(f => f.Codec)
+                .Select(g => new LibraryInsights.Slice(g.Key, g.Count(), g.Sum(f => f.FileSize)))
+                .ToListAsync();
+
+            // Width buckets follow the app's own 4K rule (Width > 1920).
+            var resolutions = new List<LibraryInsights.Slice>
+            {
+                new("4K",    await files.CountAsync(f => f.Kind == MediaKind.Video && f.Width > 1920), 0),
+                new("1080p", await files.CountAsync(f => f.Kind == MediaKind.Video && f.Width > 1280 && f.Width <= 1920), 0),
+                new("720p",  await files.CountAsync(f => f.Kind == MediaKind.Video && f.Width > 960  && f.Width <= 1280), 0),
+                new("SD",    await files.CountAsync(f => f.Kind == MediaKind.Video && f.Width > 0    && f.Width <= 960), 0),
+            };
+
+            var statuses = await files
+                .GroupBy(f => f.Status)
+                .Select(g => new { g.Key, Count = g.Count() })
+                .ToListAsync();
+
+            return new LibraryInsights
+            {
+                TotalFiles  = await files.CountAsync(),
+                TotalBytes  = await files.SumAsync(f => (long?)f.FileSize) ?? 0,
+                HdrFiles    = await files.CountAsync(f => f.IsHdr),
+                MusicFiles  = await files.CountAsync(f => f.Kind == MediaKind.Music),
+                Codecs      = codecs.OrderByDescending(c => c.Count).ToList(),
+                Resolutions = resolutions.Where(r => r.Count > 0).ToList(),
+                Statuses    = statuses.OrderByDescending(s => s.Count)
+                                      .Select(s => new LibraryInsights.Slice(s.Key.ToString(), s.Count, 0))
+                                      .ToList(),
+            };
+        }
+
+        /*
+         * Library-health predicates. A file can match several categories:
+         *  - no-audio:      video file whose stream summary records zero audio tracks
+         *                   ("[]" — explicitly empty; null means "scanned before
+         *                   summaries existed" and is NOT flagged)
+         *  - no-video:      probed video file (codec known) with zero dimensions
+         *  - no-duration:   probed file with zero/unknown duration (truncated container)
+         *  - failed:        encode permanently failed
+         *  - verify-failed: the rolling deep-verifier found decode problems
+         */
+
+        private static IQueryable<MediaFile> ApplyHealthCategory(IQueryable<MediaFile> scanned, string? category) => category switch
+        {
+            "no-audio"      => scanned.Where(f => f.Kind == MediaKind.Video && f.AudioStreams == "[]"),
+            "no-video"      => scanned.Where(f => f.Kind == MediaKind.Video && f.Codec != "" && (f.Width <= 0 || f.Height <= 0)),
+            "no-duration"   => scanned.Where(f => f.Codec != "" && f.Duration <= 0),
+            "failed"        => scanned.Where(f => f.Status == MediaFileStatus.Failed),
+            // "missing" is the rotation's skip marker (file unreachable at verify
+            // time, often a transient mount issue) — not a decode failure.
+            "verify-failed" => scanned.Where(f => f.LastVerifyResult != null && f.LastVerifyResult != "ok" && f.LastVerifyResult != "missing"),
+            _ => scanned.Where(f =>
+                   (f.Kind == MediaKind.Video && f.AudioStreams == "[]")
+                || (f.Kind == MediaKind.Video && f.Codec != "" && (f.Width <= 0 || f.Height <= 0))
+                || (f.Codec != "" && f.Duration <= 0)
+                || f.Status == MediaFileStatus.Failed
+                || (f.LastVerifyResult != null && f.LastVerifyResult != "ok" && f.LastVerifyResult != "missing")),
+        };
+
+        /// <summary>
+        ///     Authoritative per-category issue counts for the health page's summary
+        ///     cards — SQL COUNTs over the whole library, never derived from a capped
+        ///     item list (which would silently undercount on big libraries).
+        /// </summary>
+        public async Task<(int NoAudio, int NoVideo, int NoDuration, int Failed, int VerifyFailed, int Total)> GetHealthSummaryAsync()
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            var scanned = context.MediaFiles.Where(f => f.LastScannedAt != null);
+            return (
+                await ApplyHealthCategory(scanned, "no-audio").CountAsync(),
+                await ApplyHealthCategory(scanned, "no-video").CountAsync(),
+                await ApplyHealthCategory(scanned, "no-duration").CountAsync(),
+                await ApplyHealthCategory(scanned, "failed").CountAsync(),
+                await ApplyHealthCategory(scanned, "verify-failed").CountAsync(),
+                await ApplyHealthCategory(scanned, null).CountAsync());
+        }
+
+        /// <summary>
+        ///     One server-side page of flagged files for the health table, optionally
+        ///     narrowed to a category and a name/path search. Returns the page plus the
+        ///     total for the active filter so the UI can paginate honestly.
+        /// </summary>
+        public async Task<(List<MediaFile> Rows, int Total)> GetHealthPageAsync(
+            string? category, string? search, int skip, int take)
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            var query = ApplyHealthSearch(
+                ApplyHealthCategory(context.MediaFiles.Where(f => f.LastScannedAt != null), category),
+                search);
+
+            var total = await query.CountAsync();
+            var rows  = await query
+                .OrderByDescending(f => f.Status == MediaFileStatus.Failed)
+                .ThenBy(f => f.FilePath)
+                .Skip(skip)
+                .Take(take)
+                .ToListAsync();
+            return (rows, total);
+        }
+
+        /// <summary>
+        ///     File paths of every flagged file matching the given health category + search —
+        ///     the same set the health table shows, but the whole set (not one page), capped at
+        ///     <paramref name="cap"/>. Used by the "delete all" cleanup to act on every match
+        ///     across pages, not just what's currently on screen.
+        /// </summary>
+        public async Task<List<string>> GetHealthPathsAsync(string? category, string? search, int cap)
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            return await ApplyHealthSearch(
+                    ApplyHealthCategory(context.MediaFiles.Where(f => f.LastScannedAt != null), category),
+                    search)
+                .OrderByDescending(f => f.Status == MediaFileStatus.Failed)
+                .ThenBy(f => f.FilePath)
+                .Take(cap)
+                .Select(f => f.FilePath)
+                .ToListAsync();
+        }
+
+        /// <summary>
+        ///     Applies the optional name/path substring filter shared by the health page and
+        ///     the delete-all path query. LIKE metacharacters in the term ("%", "_") are
+        ///     escaped so they match literally — common in media filenames.
+        /// </summary>
+        private static IQueryable<MediaFile> ApplyHealthSearch(IQueryable<MediaFile> query, string? search)
+        {
+            if (string.IsNullOrWhiteSpace(search)) return query;
+            var term = search.Trim()
+                .Replace("\\", "\\\\")
+                .Replace("%", "\\%")
+                .Replace("_", "\\_");
+            return query.Where(f => EF.Functions.Like(f.FilePath, $"%{term}%", "\\"));
         }
 
         /// <summary>
@@ -495,6 +905,9 @@ public class MediaFileRepository
                 file.Status = MediaFileStatus.Unseen;
                 file.FailureCount = 0;
                 file.FailureReason = null;
+                // The file changed on disk — drop any prior force-mux intent so it's
+                // re-evaluated normally on the next scan.
+                file.ForceMux = false;
                 await SaveChangesWithRetryAsync(context);
             }
         }
