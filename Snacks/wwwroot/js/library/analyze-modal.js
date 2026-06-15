@@ -339,8 +339,11 @@ export class AnalyzeModal {
 
         document.getElementById('analyzeTableBody').innerHTML = filtered.map(r => `
             <tr>
-                <td class="text-truncate" style="max-width: 460px;" title="${escapeHtml(r.filePath)}">
-                    <i class="fas fa-file-video me-2 text-primary"></i>${escapeHtml(r.fileName)}
+                <td class="dash-file" title="${escapeHtml(r.filePath)}">
+                    <div class="dash-file-inner">
+                        <span class="dash-fileicon"><i class="fas fa-file-video"></i></span>
+                        <div class="dash-filename">${escapeHtml(r.fileName)}</div>
+                    </div>
                 </td>
                 <td class="small text-muted" style="white-space: nowrap;">${renderSource(r)}</td>
                 <td>

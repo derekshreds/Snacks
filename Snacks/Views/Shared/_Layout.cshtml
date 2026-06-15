@@ -1,3 +1,4 @@
+@inject Snacks.Services.ClusterService ClusterService
 <!DOCTYPE html>
 <html lang="en" data-bs-theme="dark">
 <head>
@@ -24,7 +25,12 @@
                     <li class="nav-item d-flex align-items-center py-2 py-sm-0">
                         <a class="btn btn-outline-secondary btn-sm me-2" href="/" data-spa-link title="Queue"><i class="fas fa-list-ul"></i><span class="d-none d-md-inline ms-1">Queue</span></a>
                         <a class="btn btn-outline-secondary btn-sm me-2" href="/dashboard" data-spa-link title="Dashboard"><i class="fas fa-chart-line"></i><span class="d-none d-md-inline ms-1">Dashboard</span></a>
-                        <a class="btn btn-outline-secondary btn-sm me-2" href="/library-health" data-spa-link title="Library Health"><i class="fas fa-heart-pulse"></i><span class="d-none d-md-inline ms-1">Health</span></a>
+                        @* Library Health tracks the master's catalog; a worker only has its own
+                           (near-empty) DB, so the page would be misleading there. Hide it on workers. *@
+                        @if (!ClusterService.IsNodeMode)
+                        {
+                            <a class="btn btn-outline-secondary btn-sm me-2" href="/library-health" data-spa-link title="Library Health"><i class="fas fa-heart-pulse"></i><span class="d-none d-md-inline ms-1">Health</span></a>
+                        }
                         <a class="btn btn-outline-secondary btn-sm me-2" href="/cluster-logs" data-spa-link title="Cluster Logs"><i class="fas fa-file-lines"></i><span class="d-none d-md-inline ms-1">Logs</span></a>
                         <button class="btn btn-outline-secondary btn-sm me-2" id="pauseResumeBtn" title="Pause/Resume Queue"><i class="fas fa-pause" id="pauseResumeIcon"></i></button>
                         <button class="btn btn-outline-secondary btn-sm me-2" id="openSettingsBtn"><i class="fas fa-cog"></i></button>
@@ -56,7 +62,7 @@
         <div class="container text-center">
             <span class="text-muted">
                 <img src="~/images/snacks.ico" alt="Snacks" style="height: 18px; width: 18px;" class="me-2">
-                <a href="https://snacksvideo.com" target="_blank" class="text-muted text-decoration-none"><strong>Snacks</strong></a> - v2.13.1 &copy; @DateTime.Now.Year - <a href="https://technobitch.com" target="_blank" class="text-muted text-decoration-none">Derek Morris</a>
+                <a href="https://snacksvideo.com" target="_blank" class="text-muted text-decoration-none"><strong>Snacks</strong></a> - v2.14.0 &copy; @DateTime.Now.Year - <a href="https://technobitch.com" target="_blank" class="text-muted text-decoration-none">Derek Morris</a>
             </span>
         </div>
     </footer>

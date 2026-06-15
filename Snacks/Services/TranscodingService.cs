@@ -561,8 +561,16 @@ public class TranscodingService
     /// <param name="filePath">Absolute path to the video file.</param>
     /// <param name="options">Encoder options for this job.</param>
     /// <param name="force">When <c>true</c>, bypasses DB status checks — used for explicit user selection.</param>
+    /// <param name="forceMux">
+    ///     When <c>true</c>, the file was queued by an explicit user action and is treated as
+    ///     <see cref="EncodingMode.Hybrid"/> regardless of the global mode: an at-target file
+    ///     gets a video-copy mux pass (audio/subs re-applied, container normalized to
+    ///     <see cref="EncoderOptions.Format"/>) instead of being skipped; above-target/wrong-codec
+    ///     files still re-encode. Only a file with genuinely nothing to do (at target, target codec,
+    ///     matching streams, matching container, no filters) is still skipped.
+    /// </param>
     /// <returns>The work item ID (may be a previously existing ID if the file was already tracked).</returns>
-    public async Task<string> AddFileAsync(string filePath, EncoderOptions options, bool force = false, CancellationToken cancellationToken = default)
+    public async Task<string> AddFileAsync(string filePath, EncoderOptions options, bool force = false, bool forceMux = false, CancellationToken cancellationToken = default)
     {
         // Don't queue something the encoder will only fail on. Scan-time callers
         // pass files they just enumerated so they exist by definition, but the
@@ -671,6 +679,7 @@ public class TranscodingService
                 IsHevc = isHevc,
                 Probe = probe,
                 Kind = MediaKind.Video,
+                ForceMux = forceMux,
             };
 
             // Don't add items that already meet the requirements.
@@ -680,7 +689,9 @@ public class TranscodingService
             // H.264 targets must match the actual source codec — "not HEVC" would
             // misclassify MPEG-2/VC-1/XviD/VP9 sources as already-H.264 and skip them.
             bool isH264 = sourceCodec is "h264" or "avc";
-            bool alreadyTargetCodec = targetIsAv1 ? isAv1 : (targetIsHevc ? isHevc : isH264);
+            // A source already in a codec at least as efficient as the target counts as
+            // "already at target" — so an AV1 source isn't shrunk into an HEVC target.
+            bool alreadyTargetCodec = SourceCodecMeetsTarget(isAv1, isHevc, isH264, targetIsHevc, targetIsAv1);
             bool isHighDef = probe.Streams.Any(s => s.CodecType == "video" && s.Width > 1920);
             workItem.Is4K = isHighDef;
 
@@ -747,15 +758,30 @@ public class TranscodingService
                 });
             }
 
+            // "Process Item" / "Process Directory" force-mux: evaluate this file as Hybrid
+            // even when the global mode is Transcode, so an at-target file gets a video-copy
+            // mux pass (audio/subs re-applied, container normalized) instead of being skipped.
+            // Above-target / wrong-codec files still re-encode through the normal ladder below.
+            // Cloned so the caller's options object isn't mutated.
+            if (forceMux && effectiveOptions.EncodingMode == EncodingMode.Transcode)
+            {
+                effectiveOptions = effectiveOptions.Clone();
+                effectiveOptions.EncodingMode = EncodingMode.Hybrid;
+            }
+
             // Bypass the skip gate only when a non-Transcode mode has actual work to do on
             // this file. A pointless remux of a file that already matches every audio/subtitle
-            // setting is never what the user wants.
-            bool hasMuxableWork = HasMuxableWork(effectiveOptions, probe);
-            bool bypassSkip     = effectiveOptions.EncodingMode != EncodingMode.Transcode && hasMuxableWork;
+            // setting is never what the user wants. For a force-mux item, a container change
+            // (source extension != the configured output Format) also counts as work.
+            bool hasMuxableWork       = HasMuxableWork(effectiveOptions, probe);
+            bool needsContainerChange = forceMux && NeedsContainerChange(effectiveOptions, filePath);
+            bool bypassSkip = (effectiveOptions.EncodingMode != EncodingMode.Transcode && hasMuxableWork)
+                              || needsContainerChange;
 
             // MuxOnly: video is never re-encoded, so a file with no muxable audio/sub work
-            // has nothing to do — skip it unconditionally, even if it's above the bitrate target.
-            if (effectiveOptions.EncodingMode == EncodingMode.MuxOnly && !hasMuxableWork)
+            // (and, for a force-mux item, no container change) has nothing to do — skip it
+            // unconditionally, even if it's above the bitrate target.
+            if (effectiveOptions.EncodingMode == EncodingMode.MuxOnly && !hasMuxableWork && !needsContainerChange)
             {
                 Console.WriteLine($"Skipping {workItem.FileName}: MuxOnly mode, no audio/subtitle work");
                 await MarkSkippedInDb();
@@ -769,11 +795,13 @@ public class TranscodingService
                 return workItem.Id;
             }
 
-            string targetCodecLabel = targetIsAv1 ? "AV1" : (isHevc ? "HEVC" : "H.264");
+            // Label the SOURCE codec (not the target) — a skip can fire because the source is
+            // already as efficient as the target (e.g. an AV1 source under an HEVC target).
+            string sourceCodecLabel = isAv1 ? "AV1" : isHevc ? "HEVC" : isH264 ? "H.264" : sourceCodec.ToUpperInvariant();
             double skipMultiplier = 1.0 + (Math.Clamp(effectiveOptions.SkipPercentAboveTarget, 0, 100) / 100.0);
             if (alreadyTargetCodec && bitrate > 0 && bitrate <= effectiveOptions.TargetBitrate * skipMultiplier && !isHighDef && !bypassSkip)
             {
-                Console.WriteLine($"Skipping {workItem.FileName}: already {targetCodecLabel} at {bitrate}kbps (target {effectiveOptions.TargetBitrate}kbps, skip threshold {skipMultiplier:P0})");
+                Console.WriteLine($"Skipping {workItem.FileName}: already {sourceCodecLabel} at {bitrate}kbps (target {effectiveOptions.TargetBitrate}kbps, skip threshold {skipMultiplier:P0})");
                 await MarkSkippedInDb();
                 return workItem.Id;
             }
@@ -782,7 +810,7 @@ public class TranscodingService
             int fourKTarget = effectiveOptions.TargetBitrate * fourKMultiplier;
             if (alreadyTargetCodec && isHighDef && bitrate > 0 && bitrate <= fourKTarget * skipMultiplier && !bypassSkip)
             {
-                Console.WriteLine($"Skipping {workItem.FileName}: already {targetCodecLabel} 4K at {bitrate}kbps (4K target {fourKTarget}kbps)");
+                Console.WriteLine($"Skipping {workItem.FileName}: already {sourceCodecLabel} 4K at {bitrate}kbps (4K target {fourKTarget}kbps)");
                 await MarkSkippedInDb();
                 return workItem.Id;
             }
@@ -878,6 +906,7 @@ public class TranscodingService
                 Is4K = isHighDef,
                 Status = MediaFileStatus.Queued,
                 Priority = ResolveFolderOverride(filePath)?.QueuePriority ?? 0,
+                ForceMux = forceMux,
                 LastScannedAt = DateTime.UtcNow,
                 FileMtime = fileInfo.LastWriteTimeUtc.Ticks,
                 AudioStreams    = MuxStreamSummary.Serialize(ProjectAudioSummaries(probe)),
@@ -1117,8 +1146,10 @@ public class TranscodingService
     /// <param name="directoryPath">The directory to scan for media files.</param>
     /// <param name="options">Encoder options to apply to all files.</param>
     /// <param name="recursive">When <c>true</c>, subdirectories are also scanned.</param>
+    /// <param name="force">When <c>true</c>, bypasses DB status checks — used for explicit user selection.</param>
+    /// <param name="forceMux">When <c>true</c>, files are queued as Hybrid mux passes (see <see cref="AddFileAsync"/>).</param>
     /// <returns>A summary message with the count of files added.</returns>
-    public async Task<string> AddDirectoryAsync(string directoryPath, EncoderOptions options, bool recursive = true)
+    public async Task<string> AddDirectoryAsync(string directoryPath, EncoderOptions options, bool recursive = true, bool force = false, bool forceMux = false)
     {
         List<string> directories;
         if (recursive)
@@ -1139,7 +1170,7 @@ public class TranscodingService
         {
             try
             {
-                await AddFileAsync(file, options);
+                await AddFileAsync(file, options, force, forceMux);
                 addedCount++;
             }
             catch (Exception ex) { Console.WriteLine($"Failed to add {file}: {ex.Message}"); }
@@ -1383,11 +1414,16 @@ public class TranscodingService
             // Match the actual source codec for H.264 targets — see AddFileAsync.
             bool isH264 = sourceCodec.Equals("h264", StringComparison.OrdinalIgnoreCase)
                        || sourceCodec.Equals("avc", StringComparison.OrdinalIgnoreCase);
-            bool alreadyTargetCodec = targetIsAv1 ? isAv1 : (targetIsHevc ? isHevc : isH264);
+            // A source already in a codec at least as efficient as the target counts as
+            // "already at target" — so an AV1 source isn't shrunk into an HEVC target.
+            bool alreadyTargetCodec = SourceCodecMeetsTarget(isAv1, isHevc, isH264, targetIsHevc, targetIsAv1);
             bool isHighDef = width > 1920;
             result.Is4K = isHighDef;
 
             string targetCodecLabel = targetIsAv1 ? "AV1" : (targetIsHevc ? "HEVC" : "H.264");
+            // Label the SOURCE codec in skip reasons — a skip can fire because the source is
+            // already as efficient as the target (e.g. "Already AV1" under an HEVC target).
+            string sourceCodecLabel = isAv1 ? "AV1" : isHevc ? "HEVC" : isH264 ? "H.264" : sourceCodec.ToUpperInvariant();
 
             // Borderline = real run's remeasured video-only bitrate could flip Queue/Skip.
             // Window: 30% above the applicable ceiling — wider flagged nearly every file.
@@ -1480,14 +1516,14 @@ public class TranscodingService
             if (alreadyTargetCodec && bitrate > 0 && bitrate <= skipCeilingHd && !isHighDef && !bypassSkip)
             {
                 result.Decision = "Skip";
-                result.Reason   = $"Already {targetCodecLabel} · {bitrate}kbps ≤ {skipCeilingHd}kbps{tolLabel}.";
+                result.Reason   = $"Already {sourceCodecLabel} · {bitrate}kbps ≤ {skipCeilingHd}kbps{tolLabel}.";
                 return result;
             }
 
             if (alreadyTargetCodec && isHighDef && bitrate > 0 && bitrate <= skipCeiling4K && !bypassSkip)
             {
                 result.Decision = "Skip";
-                result.Reason   = $"Already {targetCodecLabel} 4K · {bitrate}kbps ≤ {skipCeiling4K}kbps (4K target {fourKTarget}kbps).";
+                result.Reason   = $"Already {sourceCodecLabel} 4K · {bitrate}kbps ≤ {skipCeiling4K}kbps (4K target {fourKTarget}kbps).";
                 return result;
             }
 
@@ -1513,7 +1549,7 @@ public class TranscodingService
             if (!bypassSkip && WouldEncodeBeNoOp(options, bitrate, isHevc, sourceHeight, isHdr, audioStreams, subtitleStreams))
             {
                 result.Decision = "Skip";
-                result.Reason   = $"Already {targetCodecLabel} at {bitrate}kbps · no audio/subtitle changes · no filters — nothing to do.";
+                result.Reason   = $"Already {sourceCodecLabel} at {bitrate}kbps · no audio/subtitle changes · no filters — nothing to do.";
                 return result;
             }
 
@@ -1658,6 +1694,13 @@ public class TranscodingService
         int pending = await _mediaFileRepo.CountQueuedLocalAsync();
         return (pending, processing, completed, failed, pending + processing + completed + failed);
     }
+
+    /// <summary>
+    ///     Total media-file rows this install has ever recorded. The queue UI uses this to
+    ///     tell a genuine first run (nothing ever scanned) apart from an established library
+    ///     that just has an empty queue right now, so the onboarding hero only shows once.
+    /// </summary>
+    public Task<int> GetKnownFileCountAsync() => _mediaFileRepo.CountAllAsync();
 
     /// <summary>Removes a work item from the in-memory tracking dictionary (e.g. after remote job cleanup).</summary>
     public void RemoveWorkItem(string id) => UnregisterWorkItem(id);
@@ -1852,6 +1895,7 @@ public class TranscodingService
                     Is4K     = row.Is4K,
                     Kind     = row.Kind,
                     Priority = row.Priority,
+                    ForceMux = row.ForceMux,
                     QueuedAt = row.CreatedAt,
                     Probe    = null, // lazily probed when processing starts
                 };
@@ -2701,6 +2745,13 @@ public class TranscodingService
                 perJobOptions.HardwareAcceleration = deviceId == "cpu" ? "none" : deviceId;
                 perJobOptions.HardwareDevicePath   = deviceId == "cpu" ? null : GetDevicePathForDeviceId(deviceId);
 
+                // Force-mux items ("Process Item" / "Process Directory") dispatch as Hybrid even
+                // when the global mode is Transcode, so an at-target file is mux-passed instead of
+                // being dropped by the pre-dispatch skip gate below. The upgraded mode flows into
+                // the encode (ConvertVideoAsync), giving a video-copy remux to the target container.
+                if (workItem.ForceMux && perJobOptions.EncodingMode == EncodingMode.Transcode)
+                    perJobOptions.EncodingMode = EncodingMode.Hybrid;
+
                 // Pre-dispatch finalisation: resolve any missing OriginalLanguage live,
                 // merge it into the per-job keep lists, and re-run the skip ladder under
                 // the merged options. Keeps every "should this still encode?" decision in
@@ -3310,7 +3361,8 @@ public class TranscodingService
         //   MuxOnly — mux pass for every file with muxable work (files without work were
         //             already force-skipped upstream; video is never re-encoded).
         bool isMuxPass = options.EncodingMode != EncodingMode.Transcode &&
-            HasMuxableWork(options, workItem.Probe!) &&
+            (HasMuxableWork(options, workItem.Probe!)
+                || (workItem.ForceMux && NeedsContainerChange(options, workItem.Path))) &&
             (options.EncodingMode == EncodingMode.MuxOnly || MeetsBitrateTarget(workItem, options));
         bool doAudioWork    = !isMuxPass || options.MuxStreams is MuxStreams.Audio     or MuxStreams.Both;
         bool doSubtitleWork = !isMuxPass || options.MuxStreams is MuxStreams.Subtitles or MuxStreams.Both;
@@ -4091,6 +4143,23 @@ public class TranscodingService
         HasMuxableWork(options, ProjectAudioSummaries(probe), ProjectSubtitleSummaries(probe));
 
     /// <summary>
+    ///     Returns <see langword="true"/> when the source file's container differs from the
+    ///     configured output <see cref="EncoderOptions.Format"/> — i.e. a remux would change
+    ///     the container even if no stream re-encode is needed. Only consulted on the force-mux
+    ///     ("Process Item" / "Process Directory") path, where the user explicitly asked the file
+    ///     to be normalized to current settings. <c>mp4</c> and <c>m4v</c> are treated as the
+    ///     same container so an existing <c>.m4v</c> isn't needlessly rewritten under Format=mp4.
+    /// </summary>
+    internal static bool NeedsContainerChange(EncoderOptions options, string sourcePath)
+    {
+        var ext    = System.IO.Path.GetExtension(sourcePath).TrimStart('.').ToLowerInvariant();
+        var target = (options.Format ?? "").Trim().ToLowerInvariant();
+        if (string.IsNullOrEmpty(ext) || string.IsNullOrEmpty(target)) return false;
+        if (target == "mp4" && ext is "mp4" or "m4v") return false;
+        return ext != target;
+    }
+
+    /// <summary>
     ///     Overload that takes the compact summary shape directly — used by the settings-save
     ///     re-evaluation path to decide whether a previously-skipped file should be re-queued.
     /// </summary>
@@ -4350,7 +4419,7 @@ public class TranscodingService
         {
             skipMf = SyntheticMediaFile(workItem, originalLanguage);
         }
-        return !WouldSkipUnderOptions(skipMf, perJobOptions);
+        return !WouldSkipUnderOptions(skipMf, perJobOptions, workItem.ForceMux);
     }
 
     /// <summary>
@@ -4362,7 +4431,7 @@ public class TranscodingService
     ///     language preserved at encode time are evaluated against the same effective keep lists
     ///     instead of predicting drops that won't actually happen.
     /// </summary>
-    public static bool WouldSkipUnderOptions(MediaFile mf, EncoderOptions options)
+    public static bool WouldSkipUnderOptions(MediaFile mf, EncoderOptions options, bool forceMux = false)
     {
         // Music has its own skip ladder at enqueue time (AddMusicFileAsync) keyed
         // off the audio codec / bitrate against MusicEncoderOptions. Running it
@@ -4388,6 +4457,11 @@ public class TranscodingService
             MuxStreamSummary.DeserializeSubtitle(mf.SubtitleStreams));
         if (muxable) return false;
 
+        // Force-mux items ("Process Item" / "Process Directory") additionally treat a container
+        // change (source extension != configured output Format) as work, so an at-target file
+        // with matching streams but the wrong container is still remuxed rather than skipped.
+        if (forceMux && NeedsContainerChange(options, mf.FilePath)) return false;
+
         // MuxOnly guarantees video is never re-encoded, so a file with no muxable work
         // is skipped regardless of its bitrate / codec.
         if (options.EncodingMode == EncodingMode.MuxOnly) return true;
@@ -4398,9 +4472,8 @@ public class TranscodingService
         bool sourceIsAv1  = string.Equals(mf.Codec, "av1", StringComparison.OrdinalIgnoreCase);
         bool sourceIsH264 = string.Equals(mf.Codec, "h264", StringComparison.OrdinalIgnoreCase)
                          || string.Equals(mf.Codec, "avc", StringComparison.OrdinalIgnoreCase);
-        bool alreadyTargetCodec = targetIsAv1 ? sourceIsAv1
-                                : targetIsHevc ? mf.IsHevc
-                                : sourceIsH264;
+        // Source already at least as efficient as the target → no downgrade re-encode.
+        bool alreadyTargetCodec = SourceCodecMeetsTarget(sourceIsAv1, mf.IsHevc, sourceIsH264, targetIsHevc, targetIsAv1);
         if (!alreadyTargetCodec || mf.Bitrate <= 0) return false;
 
         double skipMultiplier = 1.0 + (Math.Clamp(options.SkipPercentAboveTarget, 0, 100) / 100.0);
@@ -4469,8 +4542,34 @@ public class TranscodingService
     internal static bool IsMuxPass(EncoderOptions options, WorkItem workItem) =>
         options.EncodingMode != EncodingMode.Transcode
         && workItem.Probe != null
-        && HasMuxableWork(options, workItem.Probe)
+        && (HasMuxableWork(options, workItem.Probe)
+            || (workItem.ForceMux && NeedsContainerChange(options, workItem.Path)))
         && (options.EncodingMode == EncodingMode.MuxOnly || MeetsBitrateTarget(workItem, options));
+
+    /// <summary>
+    ///     Relative space-efficiency of a video codec at equal quality: AV1 (3) beats HEVC
+    ///     (2) beats H.264 (1); everything older — MPEG-2, VC-1, VP9, XviD, … — is 0.
+    /// </summary>
+    private static int CodecRank(bool isAv1, bool isHevc, bool isH264) =>
+        isAv1 ? 3 : isHevc ? 2 : isH264 ? 1 : 0;
+
+    /// <summary>
+    ///     <see langword="true"/> when a source already in a codec at least as space-efficient
+    ///     as the configured target encoder. Re-encoding a more-efficient source down to a
+    ///     less-efficient target loses quality without saving meaningful space, so such a file
+    ///     is treated as "already at the target codec" — an AV1 source is never re-encoded to
+    ///     an HEVC target, and an HEVC source is never re-encoded to an H.264 target. This
+    ///     replaces the old exact-codec-match test (which treated AV1 as "not HEVC" and ran it
+    ///     through the H.264 shrink path). Legacy codecs (rank 0) sit below any modern target,
+    ///     so they still convert; an H.264 target still rejects MPEG-2/VC-1/VP9 sources because
+    ///     those are rank 0, not rank 1.
+    /// </summary>
+    internal static bool SourceCodecMeetsTarget(
+        bool sourceIsAv1, bool sourceIsHevc, bool sourceIsH264, bool targetIsHevc, bool targetIsAv1)
+    {
+        int targetRank = targetIsAv1 ? 3 : targetIsHevc ? 2 : 1;
+        return CodecRank(sourceIsAv1, sourceIsHevc, sourceIsH264) >= targetRank;
+    }
 
     /// <summary>
     ///     Mirrors the scan-phase skip-gate check: <see langword="true"/> when the source is
@@ -4488,9 +4587,8 @@ public class TranscodingService
         bool sourceIsAv1  = string.Equals(videoStream?.CodecName, "av1", StringComparison.OrdinalIgnoreCase);
         bool sourceIsH264 = string.Equals(videoStream?.CodecName, "h264", StringComparison.OrdinalIgnoreCase)
                          || string.Equals(videoStream?.CodecName, "avc", StringComparison.OrdinalIgnoreCase);
-        bool alreadyTargetCodec = targetIsAv1 ? sourceIsAv1
-                                : targetIsHevc ? workItem.IsHevc
-                                : sourceIsH264;
+        // Source already at least as efficient as the target → eligible for a video-copy pass.
+        bool alreadyTargetCodec = SourceCodecMeetsTarget(sourceIsAv1, workItem.IsHevc, sourceIsH264, targetIsHevc, targetIsAv1);
         if (!alreadyTargetCodec) return false;
 
         double skipMultiplier = 1.0 + (Math.Clamp(options.SkipPercentAboveTarget, 0, 100) / 100.0);

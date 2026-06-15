@@ -115,6 +115,19 @@ public sealed class MediaFile
     /// </summary>
     public string? LastVerifyResult { get; set; }
 
+    /// <summary>
+    ///     Set when the row was queued by an explicit user action ("Process Item" /
+    ///     "Process Directory"). A force-mux item is dispatched as
+    ///     <see cref="EncodingMode.Hybrid"/> even when the global mode is
+    ///     <see cref="EncodingMode.Transcode"/>: an at-target file gets a video-copy mux
+    ///     pass (audio/subs re-applied, container normalized to the configured output
+    ///     <see cref="EncoderOptions.Format"/>) rather than being skipped, while
+    ///     above-target/wrong-codec files still re-encode. Persisted so the intent
+    ///     survives the work item being evicted from the in-memory window or a restart.
+    ///     Sticky once set; cleared on terminal completion and on file reset.
+    /// </summary>
+    public bool ForceMux { get; set; }
+
     /// <summary> Number of local encoding failures for this file. </summary>
     public int FailureCount { get; set; }
 

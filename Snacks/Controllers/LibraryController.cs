@@ -227,7 +227,11 @@ public sealed class LibraryController : ControllerBase
         if (!_fileService.IsPathAllowed(request.DirectoryPath))
             return BadRequest("Directory is not within allowed library path");
 
-        var result = await _transcodingService.AddDirectoryAsync(request.DirectoryPath, request.Options, request.Recursive);
+        // Manual "Process Directory" is an explicit user action: force past DB status
+        // checks and treat every file as a Hybrid mux pass, so already-at-target files
+        // get remuxed (audio/subs re-applied, container normalized) instead of skipped.
+        var result = await _transcodingService.AddDirectoryAsync(
+            request.DirectoryPath, request.Options, request.Recursive, force: true, forceMux: true);
         return new JsonResult(new { success = true, message = result });
     }
 
@@ -327,7 +331,10 @@ public sealed class LibraryController : ControllerBase
         var folderOverride = _autoScanService.FindFolderOverride(request.FilePath);
         var fileOptions    = EncoderOptionsOverride.ApplyOverrides(request.Options, folderOverride, null);
 
-        var workItemId = await _transcodingService.AddFileAsync(request.FilePath, fileOptions, force: true);
+        // Manual "Process Item" is an explicit user action: force past DB status checks
+        // and treat it as a Hybrid mux pass so an at-target file gets remuxed (audio/subs
+        // re-applied, container normalized) instead of being skipped.
+        var workItemId = await _transcodingService.AddFileAsync(request.FilePath, fileOptions, force: true, forceMux: true);
         return new JsonResult(new { success = true, workItemId });
     }
 
@@ -428,5 +435,75 @@ public sealed class LibraryController : ControllerBase
 
         var result = await _fileHealth.VerifyAsync(request.FilePath, HttpContext.RequestAborted);
         return new JsonResult(new { ok = result.Ok, issues = result.Issues });
+    }
+
+    /// <summary>
+    ///     Deletes a single flagged file from disk and removes its database row. Lets users
+    ///     clean broken/unwanted files straight off the Library Health page. The DB row is
+    ///     dropped only after the file is confirmed gone, so a re-download is re-discovered as
+    ///     a fresh file on the next scan (and a failed delete leaves the row + flag intact).
+    /// </summary>
+    /// <param name="request"> The file to delete. </param>
+    [HttpPost("health/delete")]
+    public async Task<IActionResult> DeleteFlaggedFile([FromBody] ProcessFileRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        if (string.IsNullOrEmpty(request.FilePath)) return BadRequest("File path is required");
+        if (!_fileService.IsFilePathAllowed(request.FilePath))
+            return BadRequest("File is not within allowed library path");
+
+        return await TryDeleteFlaggedAsync(request.FilePath)
+            ? new JsonResult(new { success = true })
+            : StatusCode(500, new { success = false, error = "Could not delete the file (it may be in use or permission was denied)." });
+    }
+
+    /// <summary>
+    ///     Deletes every flagged file matching the given health category + search — the whole
+    ///     set the health table is showing, across all pages — from disk, and removes their DB
+    ///     rows. Capped per request so a runaway library can't hang the call; the response
+    ///     reports how many were deleted, how many failed, and whether the cap was hit.
+    /// </summary>
+    /// <param name="request"> The active health category + search to act on. </param>
+    [HttpPost("health/delete-all")]
+    public async Task<IActionResult> DeleteAllFlagged([FromBody] HealthDeleteAllRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
+        const int cap = 5000;
+        var paths  = await _mediaFileRepo.GetHealthPathsAsync(request.Filter, request.Q, cap + 1);
+        bool capped = paths.Count > cap;
+        if (capped) paths = paths.Take(cap).ToList();
+
+        int deleted = 0, failed = 0;
+        foreach (var path in paths)
+        {
+            if (await TryDeleteFlaggedAsync(path)) deleted++;
+            else failed++;
+        }
+
+        return new JsonResult(new { success = true, deleted, failed, capped });
+    }
+
+    /// <summary>
+    ///     Deletes one file from disk and drops its DB row, but only if the path is inside the
+    ///     allowed library root and the file is actually gone afterwards. Returns
+    ///     <see langword="false"/> (without touching the DB) when the path is disallowed or the
+    ///     delete didn't take, so the row — and its health flag — survive a failed attempt.
+    /// </summary>
+    private async Task<bool> TryDeleteFlaggedAsync(string filePath)
+    {
+        if (string.IsNullOrEmpty(filePath) || !_fileService.IsFilePathAllowed(filePath))
+            return false;
+        try
+        {
+            await _fileService.FileDeleteAsync(filePath);
+            if (System.IO.File.Exists(filePath)) return false;   // delete didn't take — keep the row
+            await _mediaFileRepo.RemoveByPathAsync(Path.GetFullPath(filePath));
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
     }
 }

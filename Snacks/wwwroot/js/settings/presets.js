@@ -148,6 +148,19 @@ function renderUserPresets() {
 // Actions
 // ---------------------------------------------------------------------------
 
+/**
+ * Confirms before applying — a preset overwrites the user's current encoder
+ * settings, so a stray click on a card shouldn't silently wipe a hand-tuned
+ * config. Proceeds to {@link applyPreset} only when the user accepts.
+ */
+async function confirmAndApplyPreset(options, label) {
+    const ok = await showConfirmModal(
+        'Apply Preset',
+        `Apply the "${label}" preset? This overwrites your current encoder settings.`,
+        'Apply');
+    if (ok) applyPreset(options, label);
+}
+
 /** Applies an options object to the form, persists, and re-runs the UI syncs. */
 function applyPreset(options, label) {
     applyEncoderOptionsToForm(PREFIX, options);
@@ -205,7 +218,7 @@ async function onUserPresetAction(group, action) {
     if (!preset) return;
 
     if (action === 'apply') {
-        applyPreset(preset.options, preset.name);
+        confirmAndApplyPreset(preset.options, preset.name);
     } else if (action === 'export') {
         const btn = group.querySelector('[data-preset-action="export"]');
         try { await streamDownload(presetsApi.exportUrl(name), btn, `${name}.snacks-preset.json`); }
@@ -246,7 +259,7 @@ export function initPresets() {
         // blocked (and the user's click silently lost) after a failed restore.
         retryRestoreEncoderOptionsIfNeeded(PREFIX);
         const preset = BUILTIN_PRESETS.find(p => p.key === card.dataset.presetKey);
-        if (preset) applyPreset(preset.options, preset.name);
+        if (preset) confirmAndApplyPreset(preset.options, preset.name);
     });
 
     document.getElementById('presetUserList')?.addEventListener('click', (e) => {
@@ -281,4 +294,11 @@ export function initPresets() {
         // Defer one tick so the change that triggered us has landed in the DOM.
         setTimeout(syncActivePresetCard, 0);
     });
+
+    // Re-evaluate once the form is populated from saved settings. The first
+    // sync in renderBuiltins() runs against the HTML defaults (which equal the
+    // "Balanced" preset), so without this a pre-existing library whose settings
+    // don't match any preset would keep Balanced highlighted after the restore
+    // quietly set non-matching values (programmatic value changes fire no event).
+    document.addEventListener('snacks:settings-restored', () => syncActivePresetCard());
 }

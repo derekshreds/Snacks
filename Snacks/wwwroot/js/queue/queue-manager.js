@@ -350,7 +350,12 @@ export class QueueManager {
             if (queueContainer.querySelector('.work-item')) return;
         }
 
-        if (stats.total > 0 || watchedDirs > 0) {
+        // Show the onboarding hero ONLY on a genuine first run. A queue can be empty for
+        // mundane reasons (everything already encoded, in-memory counters reset on restart),
+        // so `stats.total` alone isn't enough — `knownFiles` reflects every row the DB has
+        // ever recorded. If anything has been scanned/processed before, or a folder is being
+        // watched, fall back to the plain "No files in queue" message.
+        if (stats.total > 0 || watchedDirs > 0 || (stats.knownFiles || 0) > 0) {
             queueContainer.innerHTML = '<div class="text-muted text-center py-4"><i class="fas fa-inbox fa-2x mb-2"></i><br>No files in queue</div>';
             return;
         }

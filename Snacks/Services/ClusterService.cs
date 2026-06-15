@@ -1560,6 +1560,14 @@ public sealed class ClusterService : IHostedService, IDisposable
                 var nodeOverride = GetNodeSettings(bestNode.NodeId)?.EncodingOverrides;
                 var finalOptions = EncoderOptionsOverride.ApplyOverrides(globalOptions, folderOverride, nodeOverride);
 
+                // Force-mux items ("Process Item" / "Process Directory") dispatch as Hybrid even
+                // when the global mode is Transcode. The upgraded mode survives the pre-dispatch
+                // skip gate below and is cloned into the JobMetadata sent to the worker, so the
+                // worker mux-passes an at-target file (video copy, container normalized) instead
+                // of re-encoding or skipping it.
+                if (workItem.ForceMux && finalOptions.EncodingMode == EncodingMode.Transcode)
+                    finalOptions.EncodingMode = EncodingMode.Hybrid;
+
                 // Pre-dispatch skip gate (mirror of the local FinaliseForDispatchAsync).
                 // Resolves any missing OriginalLanguage live, persists it, merges it into
                 // finalOptions, and re-runs WouldSkipUnderOptions against those merged
@@ -4252,12 +4260,14 @@ public sealed class ClusterService : IHostedService, IDisposable
     /// <summary> Loads cluster configuration from disk. </summary>
     private void LoadConfig()
     {
+        bool loadedFromDisk = false;
         if (File.Exists(_configPath))
         {
             try
             {
                 var json = File.ReadAllText(_configPath);
                 _config = JsonSerializer.Deserialize<ClusterConfig>(json, _jsonOptions) ?? new ClusterConfig();
+                loadedFromDisk = true;
             }
             catch (Exception ex)
             {
@@ -4265,6 +4275,20 @@ public sealed class ClusterService : IHostedService, IDisposable
                 _config = new ClusterConfig();
             }
         }
+
+        // Persist the NodeId so this machine keeps a stable identity across restarts.
+        // ClusterConfig mints a fresh GUID by default; a standalone install never saves
+        // cluster.json through the settings UI, so without persisting here it would get a
+        // NEW NodeId every launch — and the dashboard's per-node throughput would show the
+        // same machine as a brand-new node after each restart. Save once on first run (or
+        // when an older config somehow has no NodeId) so the identity sticks.
+        bool needsPersist = !loadedFromDisk;
+        if (string.IsNullOrEmpty(_config.NodeId))
+        {
+            _config.NodeId = Guid.NewGuid().ToString();
+            needsPersist = true;
+        }
+        if (needsPersist) SaveConfig();
 
         _discovery.Config = _config;
         _nodeJobs.Config  = _config;

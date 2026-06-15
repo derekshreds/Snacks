@@ -252,6 +252,13 @@ export const libraryApi = {
     /** Deep-verifies one file with bounded ffmpeg decode samples. Resolves `{ ok, issues }`. */
     verifyFile: filePath => postJson('/api/library/health/verify', { filePath }),
 
+    /** Deletes one flagged file from disk and removes its DB row. */
+    deleteFlaggedFile: filePath => postJson('/api/library/health/delete', { filePath }),
+
+    /** Deletes every flagged file matching the active health filter + search. Resolves `{ deleted, failed, capped }`. */
+    deleteAllFlagged: ({ filter = null, q = null } = {}) =>
+        postJson('/api/library/health/delete-all', { filter, q }),
+
     /** Aggregate library composition: totals + codec/resolution/status distributions. */
     getInsights: () => getJson('/api/library/insights'),
 };

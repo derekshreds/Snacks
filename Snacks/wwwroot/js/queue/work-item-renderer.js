@@ -60,6 +60,21 @@ export function getStatusString(status) {
 }
 
 /**
+ * Friendly display text for a status badge. Single-word statuses (Pending,
+ * Completed, …) pass straight through — the badge CSS uppercases them. Compound
+ * enum names get a space inserted so they don't render as a run-on (e.g.
+ * "NoSavings" → "No Savings" instead of "NOSAVINGS"). The class still derives
+ * from the raw status, so color styling is unaffected.
+ *
+ * @param {number|string} status
+ * @returns {string}
+ */
+export function getStatusLabel(status) {
+    const s = getStatusString(status);
+    return s.replace(/([a-z0-9])([A-Z])/g, '$1 $2');
+}
+
+/**
  * Builds the size/bitrate/duration meta line shown under the filename.
  *
  * For completed items with a known output size we append the post-encode size
@@ -185,7 +200,7 @@ export function getWorkItemHtml(workItem, clusterEnabled) {
                         <i class="fas fa-file-video me-2 text-primary flex-shrink-0"></i>
                         <strong style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(workItem.fileName)}</strong>
                     </div>
-                    <span class="status-badge ${statusClass} flex-shrink-0">${workItem.status}</span>
+                    <span class="status-badge ${statusClass} flex-shrink-0">${getStatusLabel(workItem.status)}</span>
                     ${nodeBadge}
                 </div>
                 <small class="text-muted work-meta">
@@ -226,8 +241,9 @@ export function updateWorkItemDom(element, workItem, clusterEnabled) {
     const badge = element.querySelector('.status-badge');
     if (badge) {
         const newClass = `status-badge status-${statusString.toLowerCase()} flex-shrink-0`;
-        if (badge.className   !== newClass)      badge.className   = newClass;
-        if (badge.textContent !== statusString)  badge.textContent = statusString;
+        const label    = getStatusLabel(statusString);
+        if (badge.className   !== newClass)  badge.className   = newClass;
+        if (badge.textContent !== label)     badge.textContent = label;
     }
 
 

@@ -944,4 +944,146 @@ public sealed class AudioPlannerTests
 
         flags.Should().NotContain("-disposition:a");
     }
+
+
+    // ---------------------------------------------------------------------
+    //  Whole-file audio safeguard: when the language/commentary filter would
+    //  drop EVERY audio track, the planner keeps the source audio instead of
+    //  emitting a file with no audio at all.
+    // ---------------------------------------------------------------------
+
+    [Fact]
+    public void Safeguard_keeps_source_audio_when_no_language_matches()
+    {
+        // Japanese-only audio, keep-list ["en"] → pre-fix this produced NO audio.
+        var probe = new ProbeBuilder()
+            .Video()
+            .Audio(codec: "ac3", channels: 6, lang: "jpn")
+            .Build();
+
+        var (streams, warnings) = Plan(probe, preserve: true, outputs: null);
+
+        streams.Should().HaveCount(1);
+        streams[0].Codec.Should().Be("copy");
+        streams[0].SourceIndex.Should().Be(1);             // the Japanese track is mapped through
+        warnings.Should().Contain(w => w.Contains("without audio"));
+    }
+
+
+    [Fact]
+    public void Safeguard_keeps_source_audio_for_untagged_track()
+    {
+        // Untagged audio (no language tag) under the default ["en"] keep-list.
+        var probe = new ProbeBuilder()
+            .Video()
+            .Audio(codec: "ac3", channels: 6, lang: "")
+            .Build();
+
+        var (streams, warnings) = Plan(probe, preserve: true, outputs: null);
+
+        streams.Should().HaveCount(1);
+        streams[0].SourceIndex.Should().Be(1);
+        warnings.Should().Contain(w => w.Contains("without audio"));
+    }
+
+
+    [Fact]
+    public void Safeguard_keeps_source_audio_for_und_track()
+    {
+        var probe = new ProbeBuilder()
+            .Video()
+            .Audio(codec: "ac3", channels: 6, lang: "und")
+            .Build();
+
+        var (streams, _) = Plan(probe, preserve: true, outputs: null);
+
+        streams.Should().HaveCount(1);
+        streams[0].SourceIndex.Should().Be(1);
+    }
+
+
+    [Fact]
+    public void Safeguard_fires_even_when_preserve_is_off()
+    {
+        // Preserve=off would normally suppress source copies; the safeguard must still keep
+        // the source rather than produce an audio-less output.
+        var probe = new ProbeBuilder()
+            .Video()
+            .Audio(codec: "ac3", channels: 6, lang: "jpn")
+            .Build();
+
+        var (streams, warnings) = Plan(probe, preserve: false, outputs: null);
+
+        streams.Should().HaveCount(1);
+        streams[0].SourceIndex.Should().Be(1);
+        warnings.Should().Contain(w => w.Contains("without audio"));
+    }
+
+
+    [Fact]
+    public void Safeguard_re_encodes_kept_track_when_container_cannot_copy_it()
+    {
+        // Foreign TrueHD into MP4 — the safeguard keeps the track, but MP4 can't carry TrueHD
+        // as a copy, so the copy-emit path falls back to an AAC re-encode rather than failing.
+        var probe = new ProbeBuilder()
+            .Video()
+            .Audio(codec: "truehd", channels: 6, lang: "jpn")
+            .Build();
+
+        var (streams, warnings) = Plan(probe, preserve: true, outputs: null, container: "mp4");
+
+        streams.Should().HaveCount(1);
+        streams[0].SourceIndex.Should().Be(1);
+        streams[0].Codec.Should().Be("aac");               // container fallback, not "copy"
+        warnings.Should().Contain(w => w.Contains("without audio"));
+    }
+
+
+    [Fact]
+    public void Safeguard_keeps_commentary_when_source_is_commentary_only()
+    {
+        // The only audio is a commentary track. Commentary is normally dropped, but dropping
+        // the sole track would leave no audio — keep it.
+        var probe = new ProbeBuilder()
+            .Video()
+            .Audio(codec: "aac", channels: 2, lang: "eng", title: "Director's Commentary")
+            .Build();
+
+        var (streams, _) = Plan(probe, preserve: true, outputs: null);
+
+        streams.Should().HaveCount(1);
+        streams[0].SourceIndex.Should().Be(1);
+    }
+
+
+    [Fact]
+    public void Safeguard_does_not_fire_when_a_language_matches()
+    {
+        // EN + JA, keep ["en"] → English kept, Japanese dropped, NO safeguard warning.
+        // Confirms normal language filtering (and the foreign-track drop) is unchanged.
+        var probe = new ProbeBuilder()
+            .Video()
+            .Audio(codec: "ac3", channels: 6, lang: "eng")
+            .Audio(codec: "ac3", channels: 6, lang: "jpn")
+            .Build();
+
+        var (streams, warnings) = Plan(probe, preserve: true, outputs: null);
+
+        streams.Should().HaveCount(1);
+        streams[0].SourceIndex.Should().Be(1);             // English only
+        warnings.Should().NotContain(w => w.Contains("without audio"));
+    }
+
+
+    [Fact]
+    public void Source_with_no_audio_stays_audioless()
+    {
+        // A genuinely audio-less source must NOT gain a phantom track from the safeguard.
+        var probe = new ProbeBuilder().Video().Build();
+
+        var (streams, warnings) = Plan(probe, preserve: true, outputs: null);
+
+        streams.Should().BeEmpty();
+        warnings.Should().BeEmpty();
+    }
 }

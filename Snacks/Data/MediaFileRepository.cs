@@ -142,6 +142,11 @@ public class MediaFileRepository
                 // inserts), but most callers construct rows with the default 0 — copying
                 // that unconditionally would erase a user's "move to front" bump.
                 if (file.Priority != 0) existing.Priority = file.Priority;
+                // Sticky-true: a manual "Process Item/Directory" sets ForceMux on the queued
+                // row, and a concurrent auto-scan re-upsert (which constructs rows with the
+                // default false) must not erase that intent before the item dispatches. The
+                // flag is cleared explicitly on terminal completion and on file reset.
+                if (file.ForceMux) existing.ForceMux = true;
                 existing.LastScannedAt = file.LastScannedAt;
                 existing.FileMtime = file.FileMtime;
                 // Only overwrite stream summaries when the caller actually has them — a
@@ -203,6 +208,9 @@ public class MediaFileRepository
             {
                 file.Status = status;
                 file.LastEncodedAt = lastEncodedAt;
+                // A force-mux request is satisfied once the encode reaches a terminal outcome —
+                // clear it so a future normal re-queue of this file isn't silently remuxed.
+                file.ForceMux = false;
                 if (status == MediaFileStatus.Completed)
                     file.CompletedAt = lastEncodedAt;
                 await SaveChangesWithRetryAsync(context);
@@ -418,7 +426,8 @@ public class MediaFileRepository
             return await QueuedLocal(context)
                 .ExecuteUpdateAsync(s => s
                     .SetProperty(f => f.Status, MediaFileStatus.Unseen)
-                    .SetProperty(f => f.Priority, 0));
+                    .SetProperty(f => f.Priority, 0)
+                    .SetProperty(f => f.ForceMux, false));
         }
 
         #endregion
@@ -549,6 +558,18 @@ public class MediaFileRepository
         }
 
         /// <summary>
+        ///     Total number of media-file rows known to this install, regardless of status.
+        ///     Used to distinguish a genuine first run (the DB has never seen a file) from an
+        ///     established library that simply has nothing queued right now — so the queue's
+        ///     "Welcome to Snacks" onboarding hero only appears on a true first run.
+        /// </summary>
+        public async Task<int> CountAllAsync()
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            return await context.MediaFiles.CountAsync();
+        }
+
+        /// <summary>
         ///     Returns all failed files ordered by failure count descending,
         ///     so the most-problematic files surface first in the UI.
         /// </summary>
@@ -662,18 +683,9 @@ public class MediaFileRepository
             string? category, string? search, int skip, int take)
         {
             using var context = await _contextFactory.CreateDbContextAsync();
-            var query = ApplyHealthCategory(context.MediaFiles.Where(f => f.LastScannedAt != null), category);
-
-            if (!string.IsNullOrWhiteSpace(search))
-            {
-                // Escape LIKE metacharacters so a literal "%" or "_" in the search
-                // term (common in media filenames) matches literally.
-                var term = search.Trim()
-                    .Replace("\\", "\\\\")
-                    .Replace("%", "\\%")
-                    .Replace("_", "\\_");
-                query = query.Where(f => EF.Functions.Like(f.FilePath, $"%{term}%", "\\"));
-            }
+            var query = ApplyHealthSearch(
+                ApplyHealthCategory(context.MediaFiles.Where(f => f.LastScannedAt != null), category),
+                search);
 
             var total = await query.CountAsync();
             var rows  = await query
@@ -683,6 +695,40 @@ public class MediaFileRepository
                 .Take(take)
                 .ToListAsync();
             return (rows, total);
+        }
+
+        /// <summary>
+        ///     File paths of every flagged file matching the given health category + search —
+        ///     the same set the health table shows, but the whole set (not one page), capped at
+        ///     <paramref name="cap"/>. Used by the "delete all" cleanup to act on every match
+        ///     across pages, not just what's currently on screen.
+        /// </summary>
+        public async Task<List<string>> GetHealthPathsAsync(string? category, string? search, int cap)
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            return await ApplyHealthSearch(
+                    ApplyHealthCategory(context.MediaFiles.Where(f => f.LastScannedAt != null), category),
+                    search)
+                .OrderByDescending(f => f.Status == MediaFileStatus.Failed)
+                .ThenBy(f => f.FilePath)
+                .Take(cap)
+                .Select(f => f.FilePath)
+                .ToListAsync();
+        }
+
+        /// <summary>
+        ///     Applies the optional name/path substring filter shared by the health page and
+        ///     the delete-all path query. LIKE metacharacters in the term ("%", "_") are
+        ///     escaped so they match literally — common in media filenames.
+        /// </summary>
+        private static IQueryable<MediaFile> ApplyHealthSearch(IQueryable<MediaFile> query, string? search)
+        {
+            if (string.IsNullOrWhiteSpace(search)) return query;
+            var term = search.Trim()
+                .Replace("\\", "\\\\")
+                .Replace("%", "\\%")
+                .Replace("_", "\\_");
+            return query.Where(f => EF.Functions.Like(f.FilePath, $"%{term}%", "\\"));
         }
 
         /// <summary>
@@ -859,6 +905,9 @@ public class MediaFileRepository
                 file.Status = MediaFileStatus.Unseen;
                 file.FailureCount = 0;
                 file.FailureReason = null;
+                // The file changed on disk — drop any prior force-mux intent so it's
+                // re-evaluated normally on the next scan.
+                file.ForceMux = false;
                 await SaveChangesWithRetryAsync(context);
             }
         }

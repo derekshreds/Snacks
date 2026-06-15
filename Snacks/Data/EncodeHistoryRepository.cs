@@ -186,12 +186,17 @@ public class EncodeHistoryRepository
         var query = context.EncodeHistory.Where(e => e.CompletedAt >= cutoff);
         if (kind.HasValue) query = query.Where(e => e.Kind == kind.Value);
 
+        // Group by hostname, not NodeId. A machine's NodeId could change between runs
+        // (e.g. a config reset), which would split one physical node into several rows
+        // on the throughput chart — the same machine showing up as N "new" nodes. The
+        // hostname is the stable, human-meaningful identity for this view; NodeId is
+        // carried through only as a fallback label for rows with no hostname.
         return await query
-            .GroupBy(e => new { e.NodeId, e.NodeHostname })
+            .GroupBy(e => e.NodeHostname)
             .Select(g => new NodeAggregate
             {
-                NodeId         = g.Key.NodeId,
-                Hostname       = g.Key.NodeHostname,
+                NodeId         = g.Min(e => e.NodeId) ?? "",
+                Hostname       = g.Key,
                 Encodes        = g.Count(),
                 BytesSaved     = g.Sum(e => e.BytesSaved),
                 EncodeSeconds  = g.Sum(e => e.EncodeSeconds),

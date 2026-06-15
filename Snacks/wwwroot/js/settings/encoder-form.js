@@ -435,6 +435,7 @@ export async function restoreEncoderOptions(prefix = 'settings') {
             // Nothing saved yet (fresh install) — the HTML defaults ARE the
             // settings, so it's safe to arm auto-save.
             restoredPrefixes.add(prefix);
+            announceRestored(prefix);
             return;
         }
 
@@ -443,8 +444,19 @@ export async function restoreEncoderOptions(prefix = 'settings') {
         // Restore completed — the form now reflects the server's settings,
         // so auto-saves from this point write real data, not defaults.
         restoredPrefixes.add(prefix);
+        announceRestored(prefix);
 
     } catch { /* silent — restore is best-effort; auto-save stays disarmed */ }
+}
+
+/**
+ * Signals that the form now reflects the source of truth (saved settings, or
+ * the HTML defaults on a fresh install). Listeners that derive UI from the form
+ * — notably the preset system's active-card highlight — re-evaluate here, since
+ * programmatically setting input values doesn't fire `change` events.
+ */
+function announceRestored(prefix) {
+    document.dispatchEvent(new CustomEvent('snacks:settings-restored', { detail: { prefix } }));
 }
 
 /**

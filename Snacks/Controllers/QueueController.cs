@@ -156,7 +156,11 @@ public sealed class QueueController : ControllerBase
     public async Task<IActionResult> GetStats()
     {
         var (pending, processing, completed, failed, total) = await _transcodingService.GetWorkItemCountsAsync();
-        return new JsonResult(new { pending, processing, completed, failed, total });
+        // knownFiles = every row the DB has ever recorded (any status). Lets the queue UI
+        // show its first-run onboarding hero only when nothing has ever been scanned, rather
+        // than every time the queue happens to be empty after a restart.
+        var knownFiles = await _transcodingService.GetKnownFileCountAsync();
+        return new JsonResult(new { pending, processing, completed, failed, total, knownFiles });
     }
 
     /// <summary> Returns a single work item by ID, or 404 if not found. </summary>

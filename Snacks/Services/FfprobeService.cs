@@ -266,7 +266,25 @@ public class FfprobeService
             }
         }
 
-        if (buckets.Count == 0) return "";
+        // Whole-file audio safeguard: the language / commentary filtering matched nothing,
+        // but the source DOES have audio. Never silently produce a file with no audio — keep
+        // the source tracks instead. Prefer real tracks; if the source is commentary-only,
+        // keep those too (still better than an audio-less output). Forcing preserve here routes
+        // the fallback through the copy-emit path below, which also handles container-copy
+        // compatibility (e.g. a foreign DTS track into MP4 falls back to an AAC re-encode).
+        if (buckets.Count == 0)
+        {
+            var fallbackSources = audioStreams.Where(s => !IsCommentary(s)).ToList();
+            if (fallbackSources.Count == 0) fallbackSources = audioStreams;
+
+            var keepDesc = keepList is { Count: > 0 } ? string.Join(", ", keepList) : "(all)";
+            warnings.Add(
+                $"Audio: no source track matched the configured language(s) [{keepDesc}] — keeping " +
+                $"{fallbackSources.Count} source audio track(s) so the output isn't left without audio.");
+
+            buckets.Add(("und", fallbackSources));
+            preserveOriginalAudio = true;
+        }
 
         var profiles = (audioOutputs ?? Array.Empty<AudioOutputProfile>())
             .Where(p => !string.IsNullOrWhiteSpace(p.Codec))

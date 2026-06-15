@@ -76,6 +76,17 @@ public sealed class WorkItem
     public double Length { get; set; } = 0;
 
     /// <summary>
+    ///     Set when this item was enqueued by an explicit user action ("Process Item" /
+    ///     "Process Directory"). Such items are treated as <see cref="EncodingMode.Hybrid"/>
+    ///     at dispatch regardless of the global encoding mode — already-at-target files get a
+    ///     video-copy mux pass (audio/subs re-applied, container normalized to the configured
+    ///     <see cref="EncoderOptions.Format"/>) instead of being skipped, while above-target or
+    ///     wrong-codec files still re-encode. Hydrated from <see cref="MediaFile.ForceMux"/>
+    ///     so the intent survives the item falling out of the in-memory working window.
+    /// </summary>
+    public bool ForceMux { get; set; }
+
+    /// <summary>
     ///     Whether the source video is already encoded in HEVC/H.265.
     ///     Used to determine if re-encoding is necessary.
     /// </summary>

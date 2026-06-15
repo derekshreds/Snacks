@@ -10,9 +10,10 @@
  * so the page stays honest and fast on 500k-file libraries.
  */
 
-import { libraryApi }   from '../api.js';
-import { escapeHtml }   from '../utils/dom.js';
-import { registerPage } from '../core/navigation.js';
+import { libraryApi }       from '../api.js';
+import { escapeHtml }       from '../utils/dom.js';
+import { registerPage }     from '../core/navigation.js';
+import { showConfirmModal } from '../utils/modal-controller.js';
 
 
 /** Maps issue keys to badge labels + styles (status pills from site.css). */
@@ -97,9 +98,15 @@ async function loadInsights() {
         document.getElementById('insightsTotals').textContent = parts.join(' · ');
 
         const videoTotal = data.totalFiles - data.musicFiles;
+        // Status labels are raw enum names (e.g. "NoSavings"); space the compound
+        // ones so they read as "No Savings". Codec/resolution labels need no change.
+        const statuses = (data.statuses || []).map(s => ({
+            ...s,
+            label: s.label.replace(/([a-z0-9])([A-Z])/g, '$1 $2'),
+        }));
         renderSlices('insightsCodecs',      data.codecs,      data.totalFiles);
         renderSlices('insightsResolutions', data.resolutions, videoTotal);
-        renderSlices('insightsStatuses',    data.statuses,    data.totalFiles);
+        renderSlices('insightsStatuses',    statuses,         data.totalFiles);
     } catch (err) {
         console.error('Library insights failed', err);
     }
@@ -136,6 +143,14 @@ function renderTable() {
         ? `(${(page * PAGE_SIZE + 1).toLocaleString()}–${(page * PAGE_SIZE + shown).toLocaleString()} of ${totalItems.toLocaleString()})`
         : `(${totalItems.toLocaleString()})`;
 
+    // Delete-all acts on the whole active filter, not just this page — only offer it
+    // when something is actually flagged.
+    const delAll = document.getElementById('healthDeleteAllBtn');
+    if (delAll) {
+        delAll.style.display = totalItems > 0 ? '' : 'none';
+        delAll.innerHTML = `<i class="fas fa-trash me-1"></i>Delete All (${totalItems.toLocaleString()})`;
+    }
+
     renderPager();
 
     if (shown === 0) {
@@ -151,9 +166,14 @@ function renderTable() {
 
     document.getElementById('healthTableBody').innerHTML = items.map((r, idx) => `
         <tr data-health-row="${idx}">
-            <td class="text-truncate" style="max-width: 420px;" title="${escapeHtml(r.filePath)}">
-                <i class="fas ${r.kind === 'Music' ? 'fa-music' : 'fa-file-video'} me-2 text-primary"></i>${escapeHtml(r.fileName)}
-                <div class="small text-muted text-truncate">${escapeHtml(r.directory)}</div>
+            <td class="dash-file" style="max-width: 420px;" title="${escapeHtml(r.filePath)}">
+                <div class="dash-file-inner">
+                    <span class="dash-fileicon"><i class="fas ${r.kind === 'Music' ? 'fa-music' : 'fa-file-video'}"></i></span>
+                    <div style="min-width:0;">
+                        <div class="dash-filename">${escapeHtml(r.fileName)}</div>
+                        <div class="small text-muted text-truncate">${escapeHtml(r.directory)}</div>
+                    </div>
+                </div>
             </td>
             <td class="small text-muted" style="white-space: nowrap;">
                 ${[r.codec ? escapeHtml(r.codec) : '', r.width ? `${r.width}×${r.height}` : '', fmtDuration(r.duration), fmtSize(r.sizeBytes)].filter(Boolean).join(' · ')}
@@ -169,9 +189,14 @@ function renderTable() {
                 <div class="small mt-1" data-verify-result style="display:none;"></div>
             </td>
             <td style="white-space: nowrap;">
-                <button type="button" class="btn btn-sm btn-outline-info" data-verify-path="${escapeHtml(r.filePath)}" title="Run ffmpeg decode samples to confirm whether this file is damaged">
-                    <i class="fas fa-stethoscope me-1"></i>Verify
-                </button>
+                <div class="d-flex gap-1">
+                    <button type="button" class="btn btn-sm btn-outline-info" data-verify-path="${escapeHtml(r.filePath)}" title="Run ffmpeg decode samples to confirm whether this file is damaged">
+                        <i class="fas fa-stethoscope me-1"></i>Verify
+                    </button>
+                    <button type="button" class="btn btn-sm btn-outline-danger" data-delete-path="${escapeHtml(r.filePath)}" data-delete-name="${escapeHtml(r.fileName)}" title="Delete this file from disk and remove it from the library">
+                        <i class="fas fa-trash"></i>
+                    </button>
+                </div>
             </td>
         </tr>`).join('');
 }
@@ -227,6 +252,62 @@ async function onVerifyClick(btn) {
     } finally {
         btn.disabled  = false;
         btn.innerHTML = prev;
+    }
+}
+
+/** Deletes a single flagged file from disk (after confirmation), then refreshes. */
+async function onDeleteClick(btn) {
+    const path = btn.dataset.deletePath;
+    const name = btn.dataset.deleteName || path;
+    if (!path || btn.disabled) return;
+
+    const ok = await showConfirmModal(
+        'Delete File',
+        `Permanently delete <strong>${escapeHtml(name)}</strong> from disk? ` +
+        `This removes it from the library; it can't be undone. If you re-download it later, the next scan will pick it up fresh.`,
+        'Delete');
+    if (!ok) return;
+
+    btn.disabled  = true;
+    btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+    try {
+        await libraryApi.deleteFlaggedFile(path);
+        showToast(`Deleted "${name}"`, 'success');
+        refresh();
+    } catch (err) {
+        showToast('Delete failed: ' + err.message, 'danger');
+        btn.disabled  = false;
+        btn.innerHTML = '<i class="fas fa-trash"></i>';
+    }
+}
+
+/** Deletes every flagged file matching the active filter + search (after confirmation). */
+async function onDeleteAll() {
+    if (totalItems <= 0) return;
+    const scope = issueFilter === 'all' ? 'flagged' : `"${issueFilter}"`;
+    const ok = await showConfirmModal(
+        'Delete All Flagged Files',
+        `Permanently delete all <strong>${totalItems.toLocaleString()}</strong> ${escapeHtml(scope)} file(s) from disk? ` +
+        `This removes them from the library and <strong>cannot be undone</strong>. Re-downloaded files are picked up fresh on the next scan.`,
+        'Delete All');
+    if (!ok) return;
+
+    const btn = document.getElementById('healthDeleteAllBtn');
+    if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Deleting…'; }
+    try {
+        const res = await libraryApi.deleteAllFlagged({
+            filter: issueFilter === 'all' ? null : issueFilter,
+            q:      document.getElementById('healthFilterText')?.value || null,
+        });
+        let msg = `Deleted ${res.deleted.toLocaleString()} file(s)`;
+        if (res.failed)  msg += `, ${res.failed.toLocaleString()} could not be deleted`;
+        if (res.capped)  msg += ' (capped — run again to continue)';
+        showToast(msg, res.failed ? 'warning' : 'success');
+    } catch (err) {
+        showToast('Delete failed: ' + err.message, 'danger');
+    } finally {
+        page = 0;
+        refresh();
     }
 }
 
@@ -297,7 +378,10 @@ function onPageClick(e) {
     if (e.target.closest('#healthPagePrev')) { if (page > 0) { page--; refresh(); } return; }
     if (e.target.closest('#healthPageNext')) { page++; refresh(); return; }
     const verifyBtn = e.target.closest('[data-verify-path]');
-    if (verifyBtn) onVerifyClick(verifyBtn);
+    if (verifyBtn) { onVerifyClick(verifyBtn); return; }
+    const deleteBtn = e.target.closest('[data-delete-path]');
+    if (deleteBtn) { onDeleteClick(deleteBtn); return; }
+    if (e.target.closest('#healthDeleteAllBtn')) { onDeleteAll(); return; }
     if (e.target.closest('#healthRefreshBtn')) refresh();
 }
 

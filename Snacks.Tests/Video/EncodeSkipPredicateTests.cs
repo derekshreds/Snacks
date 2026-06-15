@@ -789,4 +789,305 @@ public sealed class EncodeSkipPredicateTests
 
         TranscodingService.WouldSkipUnderOptions(mf, opts).Should().BeTrue();
     }
+
+
+    // =====================================================================
+    //  NeedsContainerChange — source extension vs configured output Format.
+    //  Only consulted on the force-mux ("Process Item"/"Process Directory")
+    //  path; mp4 and m4v are treated as the same container.
+    // =====================================================================
+
+    /// <summary>Rows: (format, sourcePath, expected).</summary>
+    public static IEnumerable<object[]> ContainerChangeRows() => new[]
+    {
+        new object[] { "mp4",  "/x/movie.mkv",  true  },   // mkv → mp4
+        new object[] { "mkv",  "/x/movie.mkv",  false },   // already mkv
+        new object[] { "mp4",  "/x/movie.mp4",  false },   // already mp4
+        new object[] { "mp4",  "/x/movie.m4v",  false },   // m4v ≡ mp4
+        new object[] { "mkv",  "/x/movie.m4v",  true  },   // m4v → mkv
+        new object[] { "webm", "/x/movie.mkv",  true  },
+        new object[] { "MP4",  "/x/MOVIE.MKV",  true  },   // case-insensitive
+        new object[] { "mkv",  "/x/noext",      false },   // no extension → can't tell
+        new object[] { "",     "/x/movie.mkv",  false },   // no target → no change
+    };
+
+    [Theory]
+    [MemberData(nameof(ContainerChangeRows))]
+    public void NeedsContainerChange_compares_extension_to_format(string format, string sourcePath, bool expected)
+    {
+        var opts = new EncoderOptions { Format = format };
+        TranscodingService.NeedsContainerChange(opts, sourcePath).Should().Be(expected);
+    }
+
+
+    // =====================================================================
+    //  WouldSkipUnderOptions force-mux arm — a container change counts as
+    //  work for force-mux items (and only for them).
+    // =====================================================================
+
+    /// <summary>
+    ///     A force-mux item at the bitrate target with matching streams but the wrong
+    ///     container must NOT be skipped — it still gets a remux into the target container.
+    /// </summary>
+    [Fact]
+    public void WouldSkipUnderOptions_forceMux_container_change_unskips()
+    {
+        var opts = new EncoderOptions
+        {
+            Encoder                 = "libx265",
+            Format                  = "mp4",
+            TargetBitrate           = 3500,
+            SkipPercentAboveTarget  = 20,
+            EncodingMode            = EncodingMode.Hybrid,   // dispatch upgrades force-mux to Hybrid
+            PreserveOriginalAudio   = true,
+            AudioOutputs            = new(),
+            AudioLanguagesToKeep    = new(),
+            SubtitleLanguagesToKeep = new(),
+        };
+        var mf = MakeMediaFile(bitrate: 3000, isHevc: true, is4K: false);
+        mf.FilePath = "/lib/movie.mkv";   // mkv source, mp4 target → container change
+
+        TranscodingService.WouldSkipUnderOptions(mf, opts, forceMux: true).Should().BeFalse();
+    }
+
+
+    /// <summary>
+    ///     A force-mux item that's already in the target container with nothing else to do
+    ///     is still skipped — the action only processes files that need work.
+    /// </summary>
+    [Fact]
+    public void WouldSkipUnderOptions_forceMux_no_container_change_and_no_work_skips()
+    {
+        var opts = new EncoderOptions
+        {
+            Encoder                 = "libx265",
+            Format                  = "mkv",
+            TargetBitrate           = 3500,
+            SkipPercentAboveTarget  = 20,
+            EncodingMode            = EncodingMode.Hybrid,
+            PreserveOriginalAudio   = true,
+            AudioOutputs            = new(),
+            AudioLanguagesToKeep    = new(),
+            SubtitleLanguagesToKeep = new(),
+        };
+        var mf = MakeMediaFile(bitrate: 3000, isHevc: true, is4K: false);
+        mf.FilePath = "/lib/movie.mkv";   // mkv source, mkv target → no container change
+
+        TranscodingService.WouldSkipUnderOptions(mf, opts, forceMux: true).Should().BeTrue();
+    }
+
+
+    /// <summary>
+    ///     The container change is ignored on the normal (non-force-mux) path, so global
+    ///     behavior is unchanged: an at-target file in the "wrong" container still skips.
+    /// </summary>
+    [Fact]
+    public void WouldSkipUnderOptions_without_forceMux_ignores_container_change()
+    {
+        var opts = new EncoderOptions
+        {
+            Encoder                 = "libx265",
+            Format                  = "mp4",
+            TargetBitrate           = 3500,
+            SkipPercentAboveTarget  = 20,
+            EncodingMode            = EncodingMode.Transcode,
+            PreserveOriginalAudio   = true,
+            AudioOutputs            = new(),
+            AudioLanguagesToKeep    = new(),
+            SubtitleLanguagesToKeep = new(),
+        };
+        var mf = MakeMediaFile(bitrate: 3000, isHevc: true, is4K: false);
+        mf.FilePath = "/lib/movie.mkv";   // container differs, but forceMux defaults to false
+
+        TranscodingService.WouldSkipUnderOptions(mf, opts).Should().BeTrue();
+    }
+
+
+    // =====================================================================
+    //  IsMuxPass — a force-mux container change drives a video-copy mux pass
+    //  for an at-target file even with no audio/subtitle work.
+    // =====================================================================
+
+    private static WorkItem MakeMuxWorkItem(string sourcePath, long bitrate, bool isHevc, bool forceMux)
+    {
+        var probe = new ProbeResult
+        {
+            Streams = new[]
+            {
+                new Stream
+                {
+                    Index     = 0,
+                    CodecType = "video",
+                    CodecName = isHevc ? "hevc" : "h264",
+                    Width     = 1920,
+                    Height    = 1080,
+                },
+            },
+        };
+        return new WorkItem
+        {
+            Path     = sourcePath,
+            Bitrate  = bitrate,
+            IsHevc   = isHevc,
+            Is4K     = false,
+            ForceMux = forceMux,
+            Probe    = probe,
+        };
+    }
+
+    private static EncoderOptions MuxOpts(string format, EncodingMode mode = EncodingMode.Hybrid) => new()
+    {
+        Encoder                 = "libx265",
+        Format                  = format,
+        TargetBitrate           = 3500,
+        SkipPercentAboveTarget  = 20,
+        EncodingMode            = mode,
+        PreserveOriginalAudio   = true,
+        AudioOutputs            = new(),
+        AudioLanguagesToKeep    = new(),
+        SubtitleLanguagesToKeep = new(),
+    };
+
+    [Fact]
+    public void IsMuxPass_true_for_forceMux_at_target_with_container_change()
+    {
+        // HEVC at target, no audio/sub work, but mkv→mp4 container change + ForceMux → mux pass.
+        var item = MakeMuxWorkItem("/lib/movie.mkv", bitrate: 3000, isHevc: true, forceMux: true);
+        TranscodingService.IsMuxPass(MuxOpts("mp4"), item).Should().BeTrue();
+    }
+
+    [Fact]
+    public void IsMuxPass_false_without_forceMux_even_with_container_change()
+    {
+        var item = MakeMuxWorkItem("/lib/movie.mkv", bitrate: 3000, isHevc: true, forceMux: false);
+        TranscodingService.IsMuxPass(MuxOpts("mp4"), item).Should().BeFalse();
+    }
+
+    [Fact]
+    public void IsMuxPass_false_for_forceMux_when_container_already_matches()
+    {
+        var item = MakeMuxWorkItem("/lib/movie.mkv", bitrate: 3000, isHevc: true, forceMux: true);
+        TranscodingService.IsMuxPass(MuxOpts("mkv"), item).Should().BeFalse();
+    }
+
+    [Fact]
+    public void IsMuxPass_false_for_forceMux_container_change_when_not_at_target_codec()
+    {
+        // H.264 source against an HEVC target — not copy-eligible, so it re-encodes (not a mux
+        // pass) even with a container change. MeetsBitrateTarget gates the mux pass off.
+        var item = MakeMuxWorkItem("/lib/movie.mkv", bitrate: 3000, isHevc: false, forceMux: true);
+        TranscodingService.IsMuxPass(MuxOpts("mp4"), item).Should().BeFalse();
+    }
+
+
+    // =====================================================================
+    //  SourceCodecMeetsTarget — codec-efficiency hierarchy (AV1 > HEVC >
+    //  H.264 > legacy). A source already as efficient as the target is
+    //  "already at target" so it's never re-encoded into a worse codec.
+    // =====================================================================
+
+    /// <summary>Rows: (srcAv1, srcHevc, srcH264, targetHevc, targetAv1, expected).</summary>
+    [Theory]
+    // Target HEVC: AV1 + HEVC sources are already good; H.264 / legacy convert.
+    [InlineData(true,  false, false, true,  false, true)]   // AV1  → HEVC target  (the reported bug)
+    [InlineData(false, true,  false, true,  false, true)]   // HEVC → HEVC target
+    [InlineData(false, false, true,  true,  false, false)]  // H264 → HEVC target  → convert
+    [InlineData(false, false, false, true,  false, false)]  // legacy → HEVC target → convert
+    // Target AV1: only AV1 is already good.
+    [InlineData(true,  false, false, false, true,  true)]   // AV1  → AV1 target
+    [InlineData(false, true,  false, false, true,  false)]  // HEVC → AV1 target → convert
+    // Target H.264: AV1 / HEVC / H264 are all ≥ H.264; legacy still converts.
+    [InlineData(true,  false, false, false, false, true)]   // AV1  → H264 target → don't upsize
+    [InlineData(false, true,  false, false, false, true)]   // HEVC → H264 target → don't upsize
+    [InlineData(false, false, true,  false, false, true)]   // H264 → H264 target
+    [InlineData(false, false, false, false, false, false)]  // legacy → H264 target → convert
+    public void SourceCodecMeetsTarget_follows_efficiency_hierarchy(
+        bool srcAv1, bool srcHevc, bool srcH264, bool targetHevc, bool targetAv1, bool expected)
+    {
+        TranscodingService.SourceCodecMeetsTarget(srcAv1, srcHevc, srcH264, targetHevc, targetAv1)
+            .Should().Be(expected);
+    }
+
+
+    [Fact]
+    public void WouldSkipUnderOptions_av1_source_under_hevc_target_skips()
+    {
+        // The reported bug: an AV1 file well under the HEVC bitrate target was "shrunk" to
+        // HEVC (source × 0.7) instead of being left alone. AV1 ≥ HEVC, so it must skip.
+        var opts = new EncoderOptions
+        {
+            Encoder                 = "libx265",
+            TargetBitrate           = 3500,
+            SkipPercentAboveTarget  = 20,
+            EncodingMode            = EncodingMode.Transcode,
+            PreserveOriginalAudio   = true,
+            AudioOutputs            = new(),
+            AudioLanguagesToKeep    = new(),
+            SubtitleLanguagesToKeep = new(),
+        };
+        var mf = MakeMediaFile(bitrate: 97, isHevc: false, is4K: false, codec: "av1");
+
+        TranscodingService.WouldSkipUnderOptions(mf, opts).Should().BeTrue();
+    }
+
+
+    [Fact]
+    public void WouldSkipUnderOptions_hevc_source_under_h264_target_skips()
+    {
+        // Don't upsize: an HEVC source under an H.264 target is already more efficient.
+        var opts = new EncoderOptions
+        {
+            Encoder                 = "libx264",
+            TargetBitrate           = 3500,
+            SkipPercentAboveTarget  = 20,
+            EncodingMode            = EncodingMode.Transcode,
+            PreserveOriginalAudio   = true,
+            AudioOutputs            = new(),
+            AudioLanguagesToKeep    = new(),
+            SubtitleLanguagesToKeep = new(),
+        };
+        var mf = MakeMediaFile(bitrate: 2000, isHevc: true, is4K: false, codec: "hevc");
+
+        TranscodingService.WouldSkipUnderOptions(mf, opts).Should().BeTrue();
+    }
+
+
+    [Fact]
+    public void WouldSkipUnderOptions_h264_source_under_hevc_target_still_converts()
+    {
+        // H.264 is less efficient than the HEVC target → still re-encoded (not skipped).
+        var opts = new EncoderOptions
+        {
+            Encoder                 = "libx265",
+            TargetBitrate           = 3500,
+            SkipPercentAboveTarget  = 20,
+            EncodingMode            = EncodingMode.Transcode,
+            PreserveOriginalAudio   = true,
+            AudioOutputs            = new(),
+            AudioLanguagesToKeep    = new(),
+            SubtitleLanguagesToKeep = new(),
+        };
+        var mf = MakeMediaFile(bitrate: 2000, isHevc: false, is4K: false, codec: "h264");
+
+        TranscodingService.WouldSkipUnderOptions(mf, opts).Should().BeFalse();
+    }
+
+
+    [Fact]
+    public void MeetsBitrateTarget_av1_source_under_hevc_target_is_at_target()
+    {
+        // AV1 under the HEVC target counts as already-at-target, so a Hybrid pass would
+        // copy the AV1 video rather than re-encode it to HEVC.
+        var opts = new EncoderOptions { Encoder = "libx265", TargetBitrate = 3500, SkipPercentAboveTarget = 20 };
+        var probe = new ProbeResult
+        {
+            Streams = new[]
+            {
+                new Stream { Index = 0, CodecType = "video", CodecName = "av1", Width = 1920, Height = 1080 },
+            },
+        };
+        var item = new WorkItem { Bitrate = 97, IsHevc = false, Is4K = false, Probe = probe };
+
+        TranscodingService.MeetsBitrateTarget(item, opts).Should().BeTrue();
+    }
 }

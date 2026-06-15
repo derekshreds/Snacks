@@ -98,6 +98,9 @@
             <div class="d-flex align-items-center gap-3 flex-wrap">
                 <small class="text-muted" id="healthVerifyCoverage" title="Rolling deep-verification coverage — enable in Settings → System → Rolling Verification"></small>
                 <input type="text" class="form-control form-control-sm" id="healthFilterText" placeholder="Search by name or path..." style="max-width: 280px;">
+                <button type="button" class="btn btn-sm btn-outline-danger" id="healthDeleteAllBtn" style="display:none;" title="Delete every flagged file in the current view from disk">
+                    <i class="fas fa-trash me-1"></i>Delete All
+                </button>
             </div>
         </div>
         <div class="card-body p-0">
@@ -109,9 +112,9 @@
                 <i class="fas fa-circle-check fa-2x mb-2 text-success"></i><br>
                 <span id="healthEmptyMsg">No file-level issues found. Your library looks healthy.</span>
             </div>
-            <div class="table-responsive" id="healthTableWrap" style="display:none; max-height: 65vh; overflow-y: auto;">
-                <table class="table table-sm table-hover align-middle mb-0">
-                    <thead class="sticky-top" style="background: var(--bg-surface, #1a1a1e);">
+            <div class="dash-table-wrap" id="healthTableWrap" style="display:none; max-height: 65vh;">
+                <table class="dash-table">
+                    <thead>
                         <tr>
                             <th style="min-width: 280px;">File</th>
                             <th style="white-space: nowrap;">Details</th>

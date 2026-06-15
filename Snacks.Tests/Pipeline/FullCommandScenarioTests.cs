@@ -1027,6 +1027,62 @@ public sealed class FullCommandScenarioTests
     }
 
 
+    // =====================================================================
+    //  Scenario 18: Force-mux container change ("Process Item" on an at-target
+    //  file in the wrong container). The mux-pass decision (IsMuxPass) drives a
+    //  video copy, and the output lands in the configured container (mp4) —
+    //  i.e. a remux, not a re-encode.
+    // =====================================================================
+
+    [Fact]
+    public void Scenario_force_mux_container_change_copies_video_into_mp4()
+    {
+        var probe = new ProbeBuilder()
+            .Video(codec: "hevc", width: 1920, height: 1080)
+            .Audio(codec: "aac", channels: 2, lang: "eng")
+            .Build();
+
+        var opts = new EncoderOptions
+        {
+            Format                  = "mp4",
+            Encoder                 = "libx265",
+            HardwareAcceleration    = "none",
+            TargetBitrate           = 3500,
+            SkipPercentAboveTarget  = 20,
+            EncodingMode            = EncodingMode.Hybrid,   // dispatch upgrades a force-mux item to Hybrid
+            MuxStreams              = MuxStreams.Both,
+            PreserveOriginalAudio   = true,
+            AudioOutputs            = new(),
+            AudioLanguagesToKeep    = new() { "en" },
+            SubtitleLanguagesToKeep = new() { "en" },
+        };
+        // At-target HEVC, no audio/sub work — the only thing to do is the mkv→mp4 remux.
+        var item = new WorkItem
+        {
+            Path     = "/m/in.mkv",
+            Bitrate  = 3000,
+            IsHevc   = true,
+            ForceMux = true,
+            Probe    = probe,
+        };
+
+        // The production decision: IsMuxPass must elect a video copy purely on the container change.
+        bool videoCopy = TranscodingService.IsMuxPass(opts, item);
+        videoCopy.Should().BeTrue();
+
+        var cmd = BuildScenarioCommand(probe, opts, item,
+            inputPath: "/m/in.mkv", outputPath: "/m/out.mp4", videoCopy: videoCopy);
+
+        AssertWellFormed(cmd, "mp4", "/m/in.mkv", "/m/out.mp4");
+
+        // Remux: video stream copied (no encoder, no rate-control), output is mp4.
+        cmd.Should().Contain("-c:v copy");
+        cmd.Should().NotContain("-c:v libx265");
+        cmd.Should().NotContain("-b:v");
+        cmd.Should().Contain("-f mp4");
+    }
+
+
     [Fact]
     public void FormatExtension_maps_each_known_container()
     {
