@@ -74,6 +74,8 @@ xattr -d com.apple.quarantine electron-app/ffmpeg/ffmpeg  2>/dev/null || true
 xattr -d com.apple.quarantine electron-app/ffmpeg/ffprobe 2>/dev/null || true
 chmod +x electron-app/ffmpeg/ffmpeg electron-app/ffmpeg/ffprobe
 echo "FFmpeg found."
+echo "  bundling ffmpeg/ffprobe dylib deps (so end users don't need Homebrew)..."
+bash electron-app/scripts/bundle-ffmpeg-mac.sh electron-app/ffmpeg
 echo
 
 # ---------------------------------------------------------------------------
