@@ -78,12 +78,22 @@ public sealed class VideoJobRouter : IJobKindRouter
             d.DeviceId != "cpu"
             && ctx.IsDeviceEnabled(node, d.DeviceId)
             && d.SupportedCodecs.Any(c => c.Equals(codecKey, StringComparison.OrdinalIgnoreCase))) == true;
+        // For an explicit vendor pick, is that vendor's device present, enabled, and
+        // codec-capable on this node? When it isn't (absent, or present-but-incapable
+        // like AV1 on a pre-RDNA3 Radeon) CPU is allowed as a software fallback so the
+        // job isn't stranded forever. Mirrors TryReserveLocalDeviceSlot's
+        // selectedVendorCanEncode on the local path.
+        bool selectedVendorUsable = caps.Devices?.Any(d =>
+            d.DeviceId != "cpu"
+            && string.Equals(d.DeviceId, hw, StringComparison.OrdinalIgnoreCase)
+            && ctx.IsDeviceEnabled(node, d.DeviceId)
+            && d.SupportedCodecs.Any(c => c.Equals(codecKey, StringComparison.OrdinalIgnoreCase))) == true;
 
-        if (hw == "none" && !isCpu) return -50;                             // software-only ⇒ CPU only
-        if (hw != "none" && hw != "auto" && isCpu) return -50;              // specific vendor ⇒ never CPU
-        if (hw == "auto" && isCpu && nodeHasUsableHardware) return -50;     // auto + usable HW ⇒ never CPU
+        if (hw == "none" && !isCpu) return -50;                                          // software-only ⇒ CPU only
+        if (hw != "none" && hw != "auto" && isCpu && selectedVendorUsable) return -50;   // specific vendor (usable) ⇒ never CPU; otherwise CPU is the software fallback
+        if (hw == "auto" && isCpu && nodeHasUsableHardware) return -50;                  // auto + usable HW ⇒ never CPU
         if (hw != "none" && !isCpu && !string.Equals(device.DeviceId, hw, StringComparison.OrdinalIgnoreCase)
-            && hw != "auto") return -50;                                    // specific vendor ⇒ wrong family
+            && hw != "auto") return -50;                                                 // specific vendor ⇒ wrong family
 
         int score = 1;
         if (hw == "none")                                                                  score += 6;

@@ -2861,10 +2861,18 @@ public class TranscodingService
         var hwPref = (options.HardwareAcceleration ?? "auto").ToLowerInvariant();
         bool hasHardwareThatCanEncode = devices.Any(d =>
             d.DeviceId != "cpu" && DeviceCanEncode(d.DeviceId, workItem, options));
+        // For an explicit vendor pick, can *that* vendor's device actually encode this
+        // codec? False when the vendor isn't detected (e.g. AMD on Linux that failed to
+        // register) or is present but lacks the codec (e.g. AV1 on a pre-RDNA3 Radeon) —
+        // either way CPU becomes an eligible software fallback below.
+        bool selectedVendorCanEncode = devices.Any(d =>
+            d.DeviceId != "cpu"
+            && string.Equals(d.DeviceId, hwPref, StringComparison.OrdinalIgnoreCase)
+            && DeviceCanEncode(d.DeviceId, workItem, options));
 
         foreach (var device in devices)
         {
-            if (!IsDeviceEligibleUnderHwPref(device.DeviceId, hwPref, hasHardwareThatCanEncode)) continue;
+            if (!IsDeviceEligibleUnderHwPref(device.DeviceId, hwPref, hasHardwareThatCanEncode, selectedVendorCanEncode)) continue;
 
             // Skip devices that can't encode this item's target codec —
             // the ledger only cares about capacity, not codec compatibility.
@@ -2875,19 +2883,37 @@ public class TranscodingService
             // or disabled (resolver returns 0).
             if (_slotLedger.TryReserve(_localNodeId, device.DeviceId, workItem.Id, workItem.FileName))
             {
-                // Surface a one-time per-codec log when Auto lands on CPU because
-                // no hardware device can encode the codec. Otherwise the user sees
-                // jobs run slowly (or, before this fix, not at all) with no signal
-                // — the GitHub issue that motivated the fix called out "no errors
-                // reported to help track down the cause".
-                if (device.DeviceId == "cpu" && hwPref == "auto")
+                // Surface a warning when a job lands on CPU because the selected (or
+                // auto) hardware can't encode the codec — under "auto" no detected device
+                // does the codec, under an explicit vendor that vendor can't (absent, or
+                // present-but-incapable, e.g. AV1 on a pre-RDNA3 Radeon). Without this the
+                // user just sees jobs run slowly (or, before the broader fix, not at all
+                // under an explicit vendor) with no signal — the GitHub issue that
+                // motivated the original auto-fallback called out "no errors reported to
+                // help track down the cause", and that report came in via stdout only,
+                // which Serilog never captured. Route it through the structured logger so
+                // it lands in the log file the user actually reads, and emit a per-item
+                // TranscodingLog line so the reason shows on that item in the UI.
+                if (device.DeviceId == "cpu" && hwPref != "none")
                 {
                     var codec = (options.Codec ?? "").ToLowerInvariant();
-                    if (_loggedAutoCpuFallback.Add(codec))
-                        Console.WriteLine(
-                            $"No hardware encoder for '{codec}' on any detected device — " +
-                            $"using software fallback ({GetSoftwareFallbackEncoder(options)}). " +
-                            "Encodes will be significantly slower.");
+                    var fallbackEncoder = GetSoftwareFallbackEncoder(options);
+                    var message = hwPref == "auto"
+                        ? $"No hardware encoder for '{codec}' on any detected device — " +
+                          $"using software fallback ({fallbackEncoder}). Encodes will be significantly slower."
+                        : $"Hardware acceleration '{hwPref}' can't encode '{codec}' on this machine " +
+                          $"(device not detected, or no hardware {codec} encoder) — using software fallback " +
+                          $"({fallbackEncoder}). Encodes will be significantly slower.";
+
+                    // Dedupe the global log line per (vendor, codec) so a long queue of
+                    // identical fallbacks doesn't spam the log file every dispatch.
+                    if (_loggedAutoCpuFallback.Add($"{hwPref}:{codec}"))
+                    {
+                        Console.WriteLine(message);
+                        _log?.LogWarning("{Message}", message);
+                    }
+                    // Per-item line (not deduped) so each affected item explains itself.
+                    _ = LogAsync(workItem.Id, message);
                 }
                 return device.DeviceId;
             }
@@ -2899,19 +2925,34 @@ public class TranscodingService
     ///     Pure hw-vs-CPU gating predicate, extracted from
     ///     <see cref="TryReserveLocalDeviceSlot"/> so it can be exercised by unit
     ///     tests without standing up a slot ledger or detected-device list. Encodes
-    ///     the four-rule eligibility ladder used by both the local-master dispatcher
-    ///     and (in spirit) <c>VideoJobRouter.ScoreSlot</c> for cluster routing.
+    ///     the eligibility ladder used by both the local-master dispatcher and
+    ///     (in spirit) <c>VideoJobRouter.ScoreSlot</c> for cluster routing.
+    ///
+    ///     <para><paramref name="selectedVendorCanEncode"/> only matters for an explicit
+    ///     vendor preference: it is <see langword="true"/> when the chosen vendor's device
+    ///     is present, enabled, and able to encode the requested codec. When it is
+    ///     <see langword="false"/> — the vendor isn't detected at all (e.g. an AMD GPU on
+    ///     Linux that didn't register), or is present but can't do the codec (e.g. AV1 on
+    ///     a pre-RDNA3 Radeon) — CPU becomes an eligible software fallback so the queue
+    ///     keeps moving instead of stalling forever. The caller surfaces a warning when
+    ///     this happens. A vendor device that <em>can</em> do the codec but is merely busy
+    ///     keeps <paramref name="selectedVendorCanEncode"/> <see langword="true"/>, so the
+    ///     job still queues for the GPU rather than silently spilling onto a slow software
+    ///     encode.</para>
     /// </summary>
     internal static bool IsDeviceEligibleUnderHwPref(
         string deviceId,
         string hwPref,
-        bool hasHardwareThatCanEncode)
+        bool hasHardwareThatCanEncode,
+        bool selectedVendorCanEncode)
     {
         bool isCpu = deviceId == "cpu";
+        bool specificVendor = hwPref != "none" && hwPref != "auto";
+
         if (hwPref == "none" && !isCpu) return false;                              // Software ⇒ CPU only
-        if (hwPref != "none" && hwPref != "auto" && isCpu) return false;           // Specific vendor ⇒ never CPU
+        if (specificVendor && isCpu) return !selectedVendorCanEncode;              // Specific vendor ⇒ CPU only as a fallback when that vendor can't serve the codec
         if (hwPref == "auto" && isCpu && hasHardwareThatCanEncode) return false;   // Auto with usable HW ⇒ never CPU
-        if (hwPref != "auto" && hwPref != "none"
+        if (specificVendor && !isCpu
             && !string.Equals(hwPref, deviceId, StringComparison.OrdinalIgnoreCase)) return false; // Specific vendor must match
         return true;
     }
@@ -4999,9 +5040,64 @@ public class TranscodingService
             {
                 foreach (var nodePath in renderNodes)
                 {
-                    // QSV first. oneVPL on Linux needs the iHD driver — i965 doesn't
-                    // expose QSV — so pin it before probing instead of leaving it to
-                    // the host's default.
+                    var nodeVendor = ReadRenderNodeVendor(nodePath);
+
+                    // NVIDIA nodes don't expose VAAPI/QSV encode — the dedicated NVENC
+                    // probe below handles them. Skip so we don't waste probes or mislabel
+                    // a CUDA card as a VAAPI device.
+                    if (nodeVendor == "nvidia")
+                    {
+                        Console.WriteLine($"Auto-detect: {nodePath} is NVIDIA — handled by the NVENC probe, skipping VAAPI/QSV");
+                        continue;
+                    }
+
+                    // AMD Radeon: VAAPI via Mesa's radeonsi driver (QSV is Intel-only, so
+                    // don't probe it). Crucially this registers DeviceId="amd" so an explicit
+                    // "AMD" hardware-acceleration preference can match — the historical code
+                    // labelled every Linux VAAPI GPU "intel", which stranded AMD users with
+                    // jobs stuck Pending. Encoder names are the vendor-agnostic *_vaapi set,
+                    // identical to the Intel-VAAPI path; only the family id and driver differ.
+                    if (nodeVendor == "amd")
+                    {
+                        bool amdMatched = false;
+                        // radeonsi is the Mesa VAAPI driver for Radeon; fall back to libva's
+                        // own auto-detection ("" → unset) if the explicit driver doesn't take.
+                        foreach (var driver in new[] { "radeonsi", "" })
+                        {
+                            Environment.SetEnvironmentVariable("LIBVA_DRIVER_NAME", string.IsNullOrEmpty(driver) ? null : driver);
+                            var label = string.IsNullOrEmpty(driver) ? "auto" : driver;
+                            Console.WriteLine($"Auto-detect: Trying AMD VAAPI on {nodePath} with {label} driver...");
+
+                            var amdInit = $"-init_hw_device vaapi=hw:{nodePath} -filter_hw_device hw";
+                            bool hevcOk = await TestEncoderAsync(amdInit, "hevc_vaapi");
+                            bool h264Ok = await TestEncoderAsync(amdInit, "h264_vaapi");
+                            bool av1Ok  = await TestEncoderAsync(amdInit, "av1_vaapi");
+
+                            if (hevcOk || h264Ok || av1Ok)
+                            {
+                                Console.WriteLine($"Auto-detect: AMD VAAPI available on {nodePath} with {label} driver (hevc={hevcOk}, h264={h264Ok}, av1={av1Ok})");
+                                devices.Add(new HardwareDevice
+                                {
+                                    DeviceId           = "amd",
+                                    DisplayName        = "AMD VAAPI",
+                                    SupportedCodecs    = BuildSupportedCodecs(hevcOk, h264Ok, av1Ok),
+                                    Encoders           = BuildAmdEncoders(hevcOk, h264Ok, av1Ok, amf: false),
+                                    DefaultConcurrency = DefaultConcurrencyFor("amd"),
+                                    IsHardware         = true,
+                                    DevicePath         = nodePath,
+                                });
+                                amdMatched = true;
+                                break;
+                            }
+                        }
+                        if (amdMatched) break;
+                        continue; // AMD node that didn't probe — move on to the next render node
+                    }
+
+                    // Intel iGPU/dGPU (or an unknown vendor — fall back to the historical
+                    // Intel probe path). QSV first. oneVPL on Linux needs the iHD driver —
+                    // i965 doesn't expose QSV — so pin it before probing instead of leaving
+                    // it to the host's default.
                     Console.WriteLine($"Auto-detect: Trying Intel QSV (Linux) on {nodePath}...");
                     Environment.SetEnvironmentVariable("LIBVA_DRIVER_NAME", "iHD");
 
@@ -5175,6 +5271,37 @@ public class TranscodingService
     }
 
     /// <summary>
+    ///     Maps a <c>/dev/dri/renderD*</c> node to a Snacks device family by reading its
+    ///     PCI vendor id from sysfs (<c>/sys/class/drm/{node}/device/vendor</c>):
+    ///     <c>0x1002</c>→<c>"amd"</c>, <c>0x8086</c>→<c>"intel"</c>, <c>0x10de</c>→<c>"nvidia"</c>.
+    ///     Returns <see langword="null"/> when the file is missing or the id is unrecognised —
+    ///     callers treat that as "probe the historical Intel/VAAPI path". This is what lets
+    ///     Linux detection register an AMD Radeon as <c>DeviceId="amd"</c> instead of
+    ///     mislabelling every VAAPI GPU as <c>"intel"</c> (which stranded AMD users with an
+    ///     explicit "AMD" preference — jobs stuck Pending forever).
+    /// </summary>
+    internal static string? ReadRenderNodeVendor(string nodePath)
+    {
+        try
+        {
+            var name = Path.GetFileName(nodePath);
+            var vendorFile = $"/sys/class/drm/{name}/device/vendor";
+            if (!File.Exists(vendorFile)) return null;
+            return File.ReadAllText(vendorFile).Trim().ToLowerInvariant() switch
+            {
+                "0x1002" => "amd",
+                "0x8086" => "intel",
+                "0x10de" => "nvidia",
+                _        => null,
+            };
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
     ///     Logs VAAPI diagnostic info (vainfo output) for troubleshooting. On hybrid
     ///     systems with multiple render nodes, vainfo runs against the first node — the
     ///     detection probe loop covers the rest.
@@ -5213,7 +5340,11 @@ public class TranscodingService
                 RedirectStandardError = true,
                 CreateNoWindow = true
             };
-            psi.Environment["LIBVA_DRIVER_NAME"] = Environment.GetEnvironmentVariable("LIBVA_DRIVER_NAME") ?? "iHD";
+            // Pick the VAAPI driver by the node's actual vendor so vainfo reports something
+            // useful on AMD too — forcing iHD (Intel) on a Radeon prints a driver-load error
+            // instead of the codec table. Honour an explicit host override first.
+            var defaultDriver = ReadRenderNodeVendor(firstNode) == "amd" ? "radeonsi" : "iHD";
+            psi.Environment["LIBVA_DRIVER_NAME"] = Environment.GetEnvironmentVariable("LIBVA_DRIVER_NAME") ?? defaultDriver;
 
             using var process = new Process { StartInfo = psi };
             process.Start();
@@ -6547,7 +6678,12 @@ public class TranscodingService
     {
         _lastOptions = options;
         SetQueueOrderNewestFirst(options.QueueNewestFirst);
-        WakeScheduler();
+        // A settings change (e.g. flipping hardware acceleration) can make rows the
+        // scheduler had rotated past as "locally unservable" servable again. Mark the
+        // window dirty rather than just waking the loop so the rotation offset resets and
+        // the window snaps back to the head — otherwise newly-servable items can keep
+        // getting skipped until some other queue mutation clears the offset.
+        MarkQueueWindowDirty();
     }
 
     /// <summary> Current queue-order policy, exposed so the queue API pages the DB in the same order the scheduler dispatches. </summary>

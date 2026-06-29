@@ -13,18 +13,27 @@ namespace Snacks.Tests.Video;
 ///     The two compose to determine whether a detected device is a valid landing spot for a
 ///     work item under the current hardware-acceleration preference.
 ///
-///     <para>The regression these guard against: AV1 + Auto on a machine with hardware encoders
-///     that lack AV1 support (e.g. Intel UHD 630) used to lock out the CPU fallback because the
-///     "has hardware" check was codec-blind. Jobs queued forever instead of falling back to
-///     software libsvtav1. The predicate pair must now leave CPU eligible in that scenario while
-///     preserving every other branch (specific-vendor still queues forever on impossible codec,
-///     none/auto/specific behaviour for working codecs is unchanged).</para>
+///     <para>The regressions these guard against: (1) AV1 + Auto on a machine with hardware
+///     encoders that lack AV1 support (e.g. Intel UHD 630) used to lock out the CPU fallback
+///     because the "has hardware" check was codec-blind; (2) an explicit vendor pick (e.g. AMD)
+///     for a codec that vendor can't encode (AV1 on a pre-RDNA3 Radeon) — or a vendor that
+///     isn't detected at all on Linux — used to leave the job stuck Pending forever. Both now
+///     fall back to software (CPU) with a caller-emitted warning, via the
+///     <c>selectedVendorCanEncode</c> arm of the ladder. A vendor device that <em>can</em> do
+///     the codec but is merely busy still keeps CPU excluded (the job queues for the GPU);
+///     none/auto/specific behaviour for working codecs is otherwise unchanged.</para>
 /// </summary>
 public sealed class DeviceSlotSelectionTests
 {
     private static HardwareDevice IntelNoAv1() => new()
     {
         DeviceId = "intel",
+        SupportedCodecs = new List<string> { "h264", "h265" },
+    };
+
+    private static HardwareDevice AmdNoAv1() => new()
+    {
+        DeviceId = "amd",
         SupportedCodecs = new List<string> { "h264", "h265" },
     };
 
@@ -50,10 +59,14 @@ public sealed class DeviceSlotSelectionTests
         bool hasHardwareThatCanEncode = devices.Any(d =>
             d.DeviceId != "cpu"
             && TranscodingService.CanDeviceEncodeCodec(d, d.DeviceId, codec));
+        bool selectedVendorCanEncode = devices.Any(d =>
+            d.DeviceId != "cpu"
+            && string.Equals(d.DeviceId, hwPref, StringComparison.OrdinalIgnoreCase)
+            && TranscodingService.CanDeviceEncodeCodec(d, d.DeviceId, codec));
 
         foreach (var device in devices)
         {
-            if (!TranscodingService.IsDeviceEligibleUnderHwPref(device.DeviceId, hwPref, hasHardwareThatCanEncode))
+            if (!TranscodingService.IsDeviceEligibleUnderHwPref(device.DeviceId, hwPref, hasHardwareThatCanEncode, selectedVendorCanEncode))
                 continue;
             if (!TranscodingService.CanDeviceEncodeCodec(device, device.DeviceId, codec))
                 continue;
@@ -68,41 +81,42 @@ public sealed class DeviceSlotSelectionTests
     // ------------------------------------------------------------------ //
 
     /// <summary>
-    ///     Rows: (deviceId, hwPref, hasHardwareThatCanEncode, expectedEligible).
-    ///     Encodes every branch of the four-rule ladder. The
-    ///     <c>("cpu", "auto", false, true)</c> row is the regression case the fix
-    ///     introduces — CPU must be eligible under Auto when no HW device can do
-    ///     the requested codec.
+    ///     Rows: (deviceId, hwPref, hasHardwareThatCanEncode, selectedVendorCanEncode, expectedEligible).
+    ///     Encodes every branch of the ladder. The <c>("cpu", "auto", false, …, true)</c> row is the
+    ///     original Auto fallback; the <c>("cpu", "intel", …, false, true)</c> row is the new
+    ///     specific-vendor fallback — CPU becomes eligible when the chosen vendor can't serve the codec.
     /// </summary>
     public static IEnumerable<object[]> EligibilityRows() => new[]
     {
-        // none → CPU only
-        new object[] { "cpu",    "none",   true,  true  },
-        new object[] { "cpu",    "none",   false, true  },
-        new object[] { "intel",  "none",   true,  false },
-        new object[] { "nvidia", "none",   false, false },
+        // none → CPU only (selectedVendorCanEncode irrelevant)
+        new object[] { "cpu",    "none",   true,  false, true  },
+        new object[] { "cpu",    "none",   false, false, true  },
+        new object[] { "intel",  "none",   true,  false, false },
+        new object[] { "nvidia", "none",   false, false, false },
 
-        // specific vendor → CPU excluded, must match family
-        new object[] { "cpu",    "intel",  true,  false },
-        new object[] { "cpu",    "intel",  false, false },
-        new object[] { "intel",  "intel",  true,  true  },
-        new object[] { "intel",  "nvidia", true,  false },
-        new object[] { "nvidia", "nvidia", false, true  },
+        // specific vendor → matching HW family eligible; CPU eligible ONLY as a software
+        // fallback when the chosen vendor can't serve the codec (selectedVendorCanEncode=false)
+        new object[] { "cpu",    "intel",  true,  true,  false },  // intel can do it ⇒ no CPU fallback
+        new object[] { "cpu",    "intel",  false, false, true  },  // intel can't do it ⇒ CPU is the fallback
+        new object[] { "cpu",    "amd",    false, false, true  },  // amd absent/incapable ⇒ CPU is the fallback
+        new object[] { "intel",  "intel",  true,  true,  true  },
+        new object[] { "intel",  "nvidia", true,  true,  false },  // wrong family
+        new object[] { "nvidia", "nvidia", false, true,  true  },
 
         // auto → HW always eligible, CPU eligible only when no HW can do the codec
-        new object[] { "intel",  "auto",   true,  true  },
-        new object[] { "intel",  "auto",   false, true  },   // codec check rejects this later
-        new object[] { "nvidia", "auto",   true,  true  },
-        new object[] { "cpu",    "auto",   true,  false },   // HW can do it ⇒ CPU excluded
-        new object[] { "cpu",    "auto",   false, true  },   // regression: HW can't do it ⇒ CPU is fallback
+        new object[] { "intel",  "auto",   true,  false, true  },
+        new object[] { "intel",  "auto",   false, false, true  },  // codec check rejects this later
+        new object[] { "nvidia", "auto",   true,  false, true  },
+        new object[] { "cpu",    "auto",   true,  false, false },  // HW can do it ⇒ CPU excluded
+        new object[] { "cpu",    "auto",   false, false, true  },  // HW can't do it ⇒ CPU is fallback
     };
 
     [Theory]
     [MemberData(nameof(EligibilityRows))]
     public void IsDeviceEligibleUnderHwPref_encodes_gating_ladder(
-        string deviceId, string hwPref, bool hasHardwareThatCanEncode, bool expected)
+        string deviceId, string hwPref, bool hasHardwareThatCanEncode, bool selectedVendorCanEncode, bool expected)
     {
-        TranscodingService.IsDeviceEligibleUnderHwPref(deviceId, hwPref, hasHardwareThatCanEncode)
+        TranscodingService.IsDeviceEligibleUnderHwPref(deviceId, hwPref, hasHardwareThatCanEncode, selectedVendorCanEncode)
             .Should().Be(expected);
     }
 
@@ -211,16 +225,90 @@ public sealed class DeviceSlotSelectionTests
     }
 
     /// <summary>
-    ///     Explicit-vendor + impossible-codec is the "queue forever" case the fix
-    ///     deliberately leaves unchanged. The user picked Intel specifically — falling back
-    ///     to CPU silently would be doing something other than what they asked for. Better
-    ///     to surface the misconfiguration by leaving the job pending.
+    ///     Explicit-vendor + impossible-codec now falls back to software instead of queueing
+    ///     forever. Previously this returned null ("surface the misconfiguration by leaving the
+    ///     job pending"), but a job stuck Pending with no signal was the actual reported bug —
+    ///     the chosen behaviour is now fall-back-to-software with a one-time warning emitted by
+    ///     the caller (TryReserveLocalDeviceSlot).
     /// </summary>
     [Fact]
-    public void Specific_intel_with_av1_returns_null_when_intel_lacks_av1()
+    public void Specific_intel_with_av1_falls_back_to_cpu_when_intel_lacks_av1()
     {
         var devices = new List<HardwareDevice> { IntelNoAv1(), Cpu() };
-        PickDevice(devices, "intel", "av1").Should().BeNull();
+        PickDevice(devices, "intel", "av1").Should().Be("cpu");
+    }
+
+    /// <summary>
+    ///     The reporter's exact case: AMD (RDNA1) selected explicitly, AV1 output. The AMD VAAPI
+    ///     device has no AV1 encoder, so the job falls back to software (CPU) instead of stalling
+    ///     in Pending forever.
+    /// </summary>
+    [Fact]
+    public void Specific_amd_with_av1_falls_back_to_cpu_when_amd_lacks_av1()
+    {
+        var devices = new List<HardwareDevice> { AmdNoAv1(), Cpu() };
+        PickDevice(devices, "amd", "av1").Should().Be("cpu");
+    }
+
+    /// <summary>
+    ///     With the AMD device present and capable of the codec (HEVC), an explicit AMD
+    ///     preference lands on the GPU — CPU stays excluded so a job the hardware can actually
+    ///     do isn't downgraded to software.
+    /// </summary>
+    [Fact]
+    public void Specific_amd_with_hevc_picks_amd_when_capable()
+    {
+        var devices = new List<HardwareDevice> { AmdNoAv1(), Cpu() };
+        PickDevice(devices, "amd", "hevc").Should().Be("amd");
+    }
+
+    /// <summary>
+    ///     Explicit AMD on a machine where AMD wasn't detected at all (only CPU present) — e.g. a
+    ///     host without the render node, or before the Linux vendor-labelling fix. Falls back to
+    ///     software rather than stranding the job.
+    /// </summary>
+    [Fact]
+    public void Specific_amd_with_no_amd_device_falls_back_to_cpu()
+    {
+        var devices = new List<HardwareDevice> { Cpu() };
+        PickDevice(devices, "amd", "av1").Should().Be("cpu");
+    }
+
+    /// <summary>
+    ///     Busy-but-capable is NOT a fallback trigger: when the chosen vendor CAN do the codec,
+    ///     the ladder keeps CPU excluded (the job queues for the GPU rather than spilling onto a
+    ///     slow software encode). Pinned directly on the predicate since PickDevice models no
+    ///     capacity.
+    /// </summary>
+    [Fact]
+    public void Specific_amd_capable_keeps_cpu_excluded()
+    {
+        TranscodingService.IsDeviceEligibleUnderHwPref("cpu", "amd",
+            hasHardwareThatCanEncode: true, selectedVendorCanEncode: true).Should().BeFalse();
+    }
+
+    /// <summary>
+    ///     Vendor isolation: an explicit AMD pick for AV1 falls back to <em>software</em>, never
+    ///     to a different vendor's hardware — even when an AV1-capable NVIDIA card is present.
+    ///     The user asked for AMD specifically; silently using NVIDIA would be doing something
+    ///     other than what they asked, so CPU is the only fallback.
+    /// </summary>
+    [Fact]
+    public void Specific_amd_with_av1_falls_back_to_cpu_not_to_other_vendor_hw()
+    {
+        var devices = new List<HardwareDevice> { AmdNoAv1(), NvidiaFull(), Cpu() };
+        PickDevice(devices, "amd", "av1").Should().Be("cpu");
+    }
+
+    /// <summary>
+    ///     Explicit NVIDIA on a machine with no NVIDIA device falls back to software too — the
+    ///     fix isn't AMD-specific, it covers every vendor that can't service the job.
+    /// </summary>
+    [Fact]
+    public void Specific_nvidia_with_no_nvidia_device_falls_back_to_cpu()
+    {
+        var devices = new List<HardwareDevice> { AmdNoAv1(), Cpu() };
+        PickDevice(devices, "nvidia", "h264").Should().Be("cpu");
     }
 
     /// <summary>
