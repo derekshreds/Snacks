@@ -422,4 +422,18 @@ public sealed class HardwareEncoderTests
     {
         TranscodingService.GetNvidiaInputDecoder(sourceCodec).Should().Be(expected);
     }
+
+
+    /// <summary>
+    ///     The render-node vendor probe must never throw and must return null for a node
+    ///     whose sysfs vendor file is absent (Windows/macOS, a container without GPU
+    ///     passthrough, or a bogus path) — callers fall back to the historical Intel/VAAPI
+    ///     probe on null. The 0x1002→amd / 0x8086→intel / 0x10de→nvidia mapping needs real
+    ///     sysfs files so it's exercised by the live detection path, not here.
+    /// </summary>
+    [Fact]
+    public void ReadRenderNodeVendor_missing_node_returns_null()
+    {
+        TranscodingService.ReadRenderNodeVendor("/dev/dri/renderD_does_not_exist_zzz").Should().BeNull();
+    }
 }
