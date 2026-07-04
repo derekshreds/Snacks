@@ -345,4 +345,35 @@ public sealed class RateControlAndScaleTests
         FfprobeService.ContainerCanCopySource("opus",      "mkv").Should().BeTrue();
         FfprobeService.ContainerCanCopySource("pcm_s16le", "mkv").Should().BeTrue();
     }
+
+
+    // =====================================================================
+    //  ComputeFixedFrameFilter — builds the scale+pad+format chain for
+    //  device-specific presets (e.g. iPod Classic 640×480).
+    // =====================================================================
+
+    [Fact]
+    public void ComputeFixedFrameFilter_returns_null_when_unset()
+    {
+        var opts = new EncoderOptions();
+        TranscodingService.ComputeFixedFrameFilter(opts).Should().BeNull();
+    }
+
+    [Fact]
+    public void ComputeFixedFrameFilter_returns_null_for_garbage()
+    {
+        var opts = new EncoderOptions { FixedFrameSize = "not-a-size" };
+        TranscodingService.ComputeFixedFrameFilter(opts).Should().BeNull();
+    }
+
+    [Fact]
+    public void ComputeFixedFrameFilter_builds_scale_pad_format_chain()
+    {
+        var opts = new EncoderOptions { FixedFrameSize = "640x480" };
+        var filter = TranscodingService.ComputeFixedFrameFilter(opts);
+        filter.Should().NotBeNull();
+        filter.Should().Contain("scale=min(iw\\,640):min(ih\\,480):force_original_aspect_ratio=decrease");
+        filter.Should().Contain("pad=640:480:(ow-iw)/2:(oh-ih)/2");
+        filter.Should().Contain("format=yuv420p");
+    }
 }

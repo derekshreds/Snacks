@@ -3509,7 +3509,8 @@ public class TranscodingService
             var detected = await GetCropParametersAsync(workItem, options, workItem.Path);
             if (!string.IsNullOrEmpty(detected)) cropExpr = detected;
         }
-        string? scaleExpr = isMuxPass ? null : ComputeScaleExpr(workItem, options);
+        string? scaleExpr = isMuxPass ? null
+            : ComputeFixedFrameFilter(options) ?? ComputeScaleExpr(workItem, options);
         bool tonemap = options.TonemapHdrToSdr && !isMuxPass && FfprobeService.IsHdr(workItem.Probe!);
         bool hasFilter = cropExpr != null || scaleExpr != null || tonemap;
 
@@ -3579,9 +3580,20 @@ public class TranscodingService
             : isSvtAv1 ? $"-preset {MapSvtAv1Preset(options.FfmpegQualityPreset)} "
             : isAmf    ? $"-quality {MapAmfPreset(options.FfmpegQualityPreset)} "
                         : $"-preset {options.FfmpegQualityPreset} ";
+        // H.264/H.265 profile + level — only for software encoders (libx264/libx265).
+        // Hardware encoders (NVENC/VAAPI/QSV/AMF) accept different profile value sets,
+        // so we gate to the lib* path to avoid passing incompatible values.
+        string profileLevel = "";
+        if (!videoCopy && encoder.StartsWith("lib"))
+        {
+            if (!string.IsNullOrWhiteSpace(options.VideoProfile))
+                profileLevel += $"-profile:v {options.VideoProfile} ";
+            if (!string.IsNullOrWhiteSpace(options.VideoLevel))
+                profileLevel += $"-level {options.VideoLevel} ";
+        }
         string videoFlags = videoCopy ?
             $"{_ffprobeService.MapVideo(workItem.Probe!)} -c:v copy " :
-            $"{_ffprobeService.MapVideo(workItem.Probe!)} -c:v {encoder} {presetFlag}{vfFlag}";
+            $"{_ffprobeService.MapVideo(workItem.Probe!)} -c:v {encoder} {presetFlag}{profileLevel}{vfFlag}";
 
         // On a mux pass that excludes audio (MuxStreams.Subtitles), keep every audio track as-is:
         // empty language list = keep all, preserve-only profile = no re-encode.
@@ -4803,6 +4815,7 @@ public class TranscodingService
         "1080p" => 1080,
         "720p"  => 720,
         "480p"  => 480,
+        "240p"  => 240,
         _       => 1080,
     };
 
@@ -4830,6 +4843,33 @@ public class TranscodingService
 
         // -2 preserves aspect ratio and rounds to an even width (required by most encoders).
         return $"scale=w=-2:h={targetH}:flags=lanczos";
+    }
+
+    /// <summary>
+    ///     When <see cref="EncoderOptions.FixedFrameSize"/> is set (e.g. "640x480"),
+    ///     builds a scale+pad+format filter chain that fits the video inside the
+    ///     target frame with letterboxing and forces <c>yuv420p</c>. This is required
+    ///     by device-specific presets like iPod Classic, which demand an exact frame
+    ///     size. Returns <c>null</c> when <see cref="EncoderOptions.FixedFrameSize"/>
+    ///     is unset or unparseable, so the caller falls back to <see cref="ComputeScaleExpr"/>.
+    /// </summary>
+    internal static string? ComputeFixedFrameFilter(EncoderOptions options)
+    {
+        if (string.IsNullOrWhiteSpace(options.FixedFrameSize)) return null;
+
+        // Parse "WxH" (case-insensitive).
+        var parts = options.FixedFrameSize.ToLowerInvariant().Split('x');
+        if (parts.Length != 2
+            || !int.TryParse(parts[0], out int w)
+            || !int.TryParse(parts[1], out int h)
+            || w <= 0 || h <= 0) return null;
+
+        // Scale to fit inside w×h preserving aspect ratio, then pad to exact w×h
+        // with letterboxing, then force yuv420p (required by Baseline profile and
+        // most hardware players). The commas inside min() are escaped as \, so
+        // ffmpeg treats them as part of the expression, not filter-chain separators.
+        return $"scale=min(iw\\,{w}):min(ih\\,{h}):force_original_aspect_ratio=decrease," +
+               $"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,format=yuv420p";
     }
 
     /// <summary>

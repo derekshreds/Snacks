@@ -69,6 +69,29 @@ export const BUILTIN_PRESETS = [
         spec: 'H.264 · MP4 · 4500 kbps · medium',
         options: { Format: 'mp4', Codec: 'h264', TargetBitrate: 4500, FourKBitrateMultiplier: 4, FfmpegQualityPreset: 'medium' },
     },
+    {
+        key:  'ipod-classic',
+        name: 'iPod Classic',
+        icon: 'fa-music',
+        desc: '640×480 H.264 Baseline for older iPods (Classic, 5th Gen, Nano). AAC stereo at 48 kHz.',
+        spec: 'H.264 Baseline L3.0 · MP4 · 640×480 · 1500 kbps · AAC 160k',
+        options: {
+            Format: 'mp4',
+            Codec: 'h264',
+            TargetBitrate: 1500,
+            StrictBitrate: true,
+            FourKBitrateMultiplier: 1,
+            FfmpegQualityPreset: 'medium',
+            FixedFrameSize: '640x480',
+            VideoProfile: 'baseline',
+            VideoLevel: '3.0',
+            TonemapHdrToSdr: true,
+            PreserveOriginalAudio: false,
+            AudioOutputs: [
+                { Codec: 'aac', Layout: 'Stereo', BitrateKbps: 160, SampleRateHz: 48000 },
+            ],
+        },
+    },
 ];
 
 let userPresets = [];
@@ -85,10 +108,37 @@ function formValue(key) {
     return node.type === 'checkbox' ? node.checked : node.value;
 }
 
+/** Reads the audio-outputs editor rows as an array of {Codec,Layout,BitrateKbps,SampleRateHz}. */
+function formAudioOutputs() {
+    const root = document.getElementById(`${PREFIX}AudioOutputs`);
+    if (!root) return [];
+    return Array.from(root.querySelectorAll('[data-audio-output-row]')).map(row => ({
+        Codec:       row.querySelector('[data-field="Codec"]')?.value       ?? 'aac',
+        Layout:      row.querySelector('[data-field="Layout"]')?.value      ?? 'Source',
+        BitrateKbps: parseInt(row.querySelector('[data-field="BitrateKbps"]')?.value, 10) || 0,
+        SampleRateHz: parseInt(row.querySelector('[data-field="SampleRateHz"]')?.value, 10) || 0,
+    }));
+}
+
+/** Deep-equals two AudioOutputs arrays (order-sensitive, like the preset definition). */
+function audioOutputsMatch(a, b) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    return a.every((row, i) =>
+        String(row.Codec ?? 'aac')        === String(b[i].Codec ?? 'aac') &&
+        String(row.Layout ?? 'Source')    === String(b[i].Layout ?? 'Source') &&
+        Number(row.BitrateKbps ?? 0)      === Number(b[i].BitrateKbps ?? 0) &&
+        Number(row.SampleRateHz ?? 0)     === Number(b[i].SampleRateHz ?? 0));
+}
+
 /** True when every field the preset takes a position on matches the form. */
 function presetMatchesForm(preset) {
-    return Object.entries(preset.options).every(([key, val]) =>
-        String(formValue(key)) === String(val));
+    return Object.entries(preset.options).every(([key, val]) => {
+        if (key === 'AudioOutputs') return audioOutputsMatch(formAudioOutputs(), val);
+        const fv = formValue(key);
+        // Normalize null/empty-string so a preset specifying null matches a blank text input.
+        if (val === null) return fv === '' || fv === null || fv === undefined;
+        return String(fv) === String(val);
+    });
 }
 
 /** Re-highlights whichever built-in card (if any) matches the current form. */

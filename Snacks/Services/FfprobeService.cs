@@ -302,7 +302,7 @@ public class FfprobeService
             // phase writes copies before re-encodes so output stream order matches user
             // expectation ("the original is the default").
             var copySourceIndices = new HashSet<int>();
-            var reencodes         = new List<(int srcIndex, string codec, int channels, int bitrateKbps)>();
+            var reencodes         = new List<(int srcIndex, string codec, int channels, int bitrateKbps, int sampleRateHz)>();
 
             foreach (var profile in profiles)
             {
@@ -341,7 +341,7 @@ public class FfprobeService
 
                 int encodeCh = targetCh ?? candidate.Channels;
                 var resolved = ResolveAudioCodec(profile.Codec, encodeCh, container, warnings);
-                reencodes.Add((candidate.Index, resolved.codec, resolved.channels, profile.BitrateKbps));
+                reencodes.Add((candidate.Index, resolved.codec, resolved.channels, profile.BitrateKbps, profile.SampleRateHz));
             }
 
             // PreserveOriginal: every kept source not already covered by a dedup is copied.
@@ -371,7 +371,7 @@ public class FfprobeService
                         $"Audio: source track #{src.Index} ({src.CodecName}) cannot be copied to {container.ToUpperInvariant()} — re-encoding to {reencTarget.ToUpperInvariant()}.");
                     var fallback = ResolveAudioCodec(reencTarget, src.Channels, container, warnings);
                     maps.Append($"-map 0:{src.Index} ");
-                    codecArgs.Append(BuildAudioCodecArgs(fallback.codec, fallback.channels, 0, outIndex)).Append(' ');
+                    codecArgs.Append(BuildAudioCodecArgs(fallback.codec, fallback.channels, 0, 0, outIndex)).Append(' ');
                     AppendAudioMeta(meta, outIndex, bucket, fallback.codec, fallback.channels);
                 }
                 else
@@ -389,7 +389,7 @@ public class FfprobeService
             foreach (var re in reencodes)
             {
                 maps.Append($"-map 0:{re.srcIndex} ");
-                codecArgs.Append(BuildAudioCodecArgs(re.codec, re.channels, re.bitrateKbps, outIndex)).Append(' ');
+                codecArgs.Append(BuildAudioCodecArgs(re.codec, re.channels, re.bitrateKbps, re.sampleRateHz, outIndex)).Append(' ');
                 AppendAudioMeta(meta, outIndex, bucket, re.codec, re.channels);
                 outIndex++;
             }
@@ -508,7 +508,7 @@ public class FfprobeService
     ///     The output-stream index is baked into <c>-c:a:N</c>, <c>-b:a:N</c>, etc., so
     ///     callers can interleave many audio outputs in a single command.
     /// </summary>
-    private static string BuildAudioCodecArgs(string codec, int channels, int bitrateKbps, int outIndex)
+    private static string BuildAudioCodecArgs(string codec, int channels, int bitrateKbps, int sampleRateHz, int outIndex)
     {
         if (!_codecSpecs.TryGetValue(codec, out var spec)) spec = _codecSpecs["aac"];
 
@@ -529,6 +529,7 @@ public class FfprobeService
         }
 
         if (channels > 0) sb.Append($" -ac:a:{outIndex} {channels}");
+        if (sampleRateHz > 0) sb.Append($" -ar:a:{outIndex} {sampleRateHz}");
         return sb.ToString();
     }
 

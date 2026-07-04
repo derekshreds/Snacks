@@ -377,6 +377,7 @@ public sealed class HardwareEncoderTests
         new object[] { "1080p",   1080 },
         new object[] { "720p",    720  },
         new object[] { "480p",    480  },
+        new object[] { "240p",    240  },
         new object[] { "garbage", 1080 },
     };
 

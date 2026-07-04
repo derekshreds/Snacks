@@ -140,6 +140,7 @@ function readAudioOutputs(prefix) {
         Codec:       row.querySelector('[data-field="Codec"]')?.value       ?? 'aac',
         Layout:      row.querySelector('[data-field="Layout"]')?.value      ?? 'Source',
         BitrateKbps: parseInt(row.querySelector('[data-field="BitrateKbps"]')?.value, 10) || 0,
+        SampleRateHz: parseInt(row.querySelector('[data-field="SampleRateHz"]')?.value, 10) || 0,
     }));
 }
 
@@ -166,9 +167,11 @@ function appendAudioOutputRow(prefix, profile = {}) {
     const codecSel  = row.querySelector('[data-field="Codec"]');
     const layoutSel = row.querySelector('[data-field="Layout"]');
     const bitrateIn = row.querySelector('[data-field="BitrateKbps"]');
+    const sampleRateSel = row.querySelector('[data-field="SampleRateHz"]');
 
     if (profile.Codec)  codecSel.value  = profile.Codec;
     if (profile.Layout) layoutSel.value = profile.Layout;
+    if (profile.SampleRateHz != null) sampleRateSel.value = String(profile.SampleRateHz);
 
     bitrateIn.value = (profile.BitrateKbps && profile.BitrateKbps > 0)
         ? profile.BitrateKbps
@@ -216,6 +219,7 @@ function setAudioOutputs(prefix, profiles) {
             Codec:       p.Codec       ?? p.codec,
             Layout:      p.Layout      ?? p.layout,
             BitrateKbps: p.BitrateKbps ?? p.bitrateKbps ?? 0,
+            SampleRateHz: p.SampleRateHz ?? p.sampleRateHz ?? 0,
         });
     }
 }
@@ -348,8 +352,11 @@ export function getEncoderOptions(prefix = 'settings') {
         // Video.
         DownscalePolicy:     sel('DownscalePolicy', 'Never'),
         DownscaleTarget:     sel('DownscaleTarget', '1080p'),
+        FixedFrameSize:      str('FixedFrameSize', '') || null,
         TonemapHdrToSdr:     bool('TonemapHdrToSdr'),
         FfmpegQualityPreset: sel('FfmpegQualityPreset', 'medium'),
+        VideoProfile:        sel('VideoProfile', '') || null,
+        VideoLevel:          sel('VideoLevel', '') || null,
 
         // Music — nested object on EncoderOptions, codec is derived from the format selector.
         Music: {
@@ -569,8 +576,11 @@ export function applyEncoderOptionsToForm(prefix, saved) {
         // Video.
         set('DownscalePolicy',     or(pick('DownscalePolicy'),     'Never'));
         set('DownscaleTarget',     or(pick('DownscaleTarget'),     '1080p'));
+        set('FixedFrameSize',      or(pick('FixedFrameSize'),      ''));
         set('TonemapHdrToSdr',     pick('TonemapHdrToSdr'));
         set('FfmpegQualityPreset', or(pick('FfmpegQualityPreset'), 'medium'));
+        set('VideoProfile',        or(pick('VideoProfile'),        ''));
+        set('VideoLevel',          or(pick('VideoLevel'),          ''));
 
         // Chip inputs — only when the key is present; null falls back to a sane default.
         const audioLangs = pick('AudioLanguagesToKeep');

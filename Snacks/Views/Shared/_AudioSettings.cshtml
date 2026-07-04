@@ -85,6 +85,15 @@
                 <option value="7.1">7.1 surround</option>
             </select>
         </div>
+        <div class="flex-fill">
+            <label class="form-label form-label-sm mb-1">Sample Rate</label>
+            <select class="form-select form-select-sm" data-field="SampleRateHz">
+                <option value="0" selected>Source</option>
+                <option value="44100">44.1 kHz</option>
+                <option value="48000">48 kHz</option>
+                <option value="96000">96 kHz</option>
+            </select>
+        </div>
         <div style="width: 7rem;">
             <label class="form-label form-label-sm mb-1">Bitrate (kbps)</label>
             <input type="number" class="form-control form-control-sm" data-field="BitrateKbps" min="0" max="1536" step="16" value="192">

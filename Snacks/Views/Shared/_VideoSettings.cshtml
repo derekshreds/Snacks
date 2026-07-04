@@ -30,8 +30,16 @@
                     <option value="1440p">1440p</option>
                     <option value="1080p" selected>1080p</option>
                     <option value="720p">720p</option>
+                    <option value="480p">480p</option>
+                    <option value="240p">240p</option>
                 </select>
                 <div class="form-text">Maximum output resolution for the downscale policy above.</div>
+            </div>
+
+            <div class="mb-3">
+                <label for="@(formPrefix)FixedFrameSize" class="form-label">Fixed Frame Size</label>
+                <input type="text" class="form-control" id="@(formPrefix)FixedFrameSize" name="FixedFrameSize" placeholder="e.g. 640x480 (blank = off)">
+                <div class="form-text">When set, scales and pads to this exact frame size with letterboxing and forces yuv420p. Overrides the downscale policy above. Used by device-specific presets (e.g. iPod Classic).</div>
             </div>
         </div>
     </div>
@@ -56,6 +64,34 @@
                     <option value="veryslow">veryslow</option>
                 </select>
                 <div class="form-text">Slower presets yield smaller files at the same quality.</div>
+            </div>
+
+            <div class="row g-2">
+                <div class="col-md-6">
+                    <label for="@(formPrefix)VideoProfile" class="form-label">H.264/H.265 Profile</label>
+                    <select class="form-select" id="@(formPrefix)VideoProfile" name="VideoProfile">
+                        <option value="" selected>Default (encoder choice)</option>
+                        <option value="baseline">Baseline</option>
+                        <option value="main">Main</option>
+                        <option value="high">High</option>
+                    </select>
+                    <div class="form-text">Baseline is required by older devices (e.g. iPod Classic). Software encoders only.</div>
+                </div>
+                <div class="col-md-6">
+                    <label for="@(formPrefix)VideoLevel" class="form-label">H.264/H.265 Level</label>
+                    <select class="form-select" id="@(formPrefix)VideoLevel" name="VideoLevel">
+                        <option value="" selected>Default (encoder choice)</option>
+                        <option value="1.3">1.3</option>
+                        <option value="2.0">2.0</option>
+                        <option value="2.1">2.1</option>
+                        <option value="3.0">3.0</option>
+                        <option value="3.1">3.1</option>
+                        <option value="4.0">4.0</option>
+                        <option value="4.1">4.1</option>
+                        <option value="5.0">5.0</option>
+                    </select>
+                    <div class="form-text">Limits max resolution/framerate. iPod Classic needs 3.0.</div>
+                </div>
             </div>
 
             <div class="form-check mb-2">

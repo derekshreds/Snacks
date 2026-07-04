@@ -48,7 +48,10 @@ const FOLDER_OVERRIDE_FIELDS = Object.freeze({
     // Video pipeline
     DownscalePolicy:            'select',
     DownscaleTarget:            'select',
+    FixedFrameSize:             'text',
     FfmpegQualityPreset:        'select',
+    VideoProfile:               'select',
+    VideoLevel:                 'select',
     TonemapHdrToSdr:            'bool',
     RemoveBlackBorders:         'bool',
 
@@ -89,7 +92,10 @@ const NODE_OVERRIDE_FIELDS = Object.freeze({
     // Video pipeline
     DownscalePolicy:            'select',
     DownscaleTarget:            'select',
+    FixedFrameSize:             'text',
     FfmpegQualityPreset:        'select',
+    VideoProfile:               'select',
+    VideoLevel:                 'select',
     TonemapHdrToSdr:            'bool',
     RemoveBlackBorders:         'bool',
 
@@ -145,9 +151,11 @@ function ovrAppendAudioRow(profile = {}) {
     const codecSel  = row.querySelector('[data-field="Codec"]');
     const layoutSel = row.querySelector('[data-field="Layout"]');
     const bitrateIn = row.querySelector('[data-field="BitrateKbps"]');
+    const sampleRateSel = row.querySelector('[data-field="SampleRateHz"]');
 
     if (profile.Codec)  codecSel.value  = profile.Codec;
     if (profile.Layout) layoutSel.value = profile.Layout;
+    if (profile.SampleRateHz != null) sampleRateSel.value = String(profile.SampleRateHz);
     bitrateIn.value = (profile.BitrateKbps && profile.BitrateKbps > 0)
         ? profile.BitrateKbps
         : defaultBitrateForCodec(codecSel.value);
@@ -177,6 +185,7 @@ function ovrSetAudioOutputs(profiles) {
             Codec:       p.Codec       ?? p.codec,
             Layout:      p.Layout      ?? p.layout,
             BitrateKbps: p.BitrateKbps ?? p.bitrateKbps ?? 0,
+            SampleRateHz: p.SampleRateHz ?? p.sampleRateHz ?? 0,
         });
     }
 }
@@ -188,6 +197,7 @@ function ovrReadAudioOutputs() {
         Codec:       row.querySelector('[data-field="Codec"]')?.value       ?? 'aac',
         Layout:      row.querySelector('[data-field="Layout"]')?.value      ?? 'Source',
         BitrateKbps: parseInt(row.querySelector('[data-field="BitrateKbps"]')?.value, 10) || 0,
+        SampleRateHz: parseInt(row.querySelector('[data-field="SampleRateHz"]')?.value, 10) || 0,
     }));
 }
 

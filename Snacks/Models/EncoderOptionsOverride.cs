@@ -41,6 +41,12 @@ public sealed class EncoderOptionsOverride
     /// <summary> Overrides <see cref="EncoderOptions.FfmpegQualityPreset"/> when non-<see langword="null"/>. </summary>
     public string? FfmpegQualityPreset { get; set; }
 
+    /// <summary> Overrides <see cref="EncoderOptions.VideoProfile"/> when non-<see langword="null"/>. </summary>
+    public string? VideoProfile { get; set; }
+
+    /// <summary> Overrides <see cref="EncoderOptions.VideoLevel"/> when non-<see langword="null"/>. </summary>
+    public string? VideoLevel { get; set; }
+
     /******************************************************************
      *  Audio
      ******************************************************************/
@@ -110,6 +116,9 @@ public sealed class EncoderOptionsOverride
 
     /// <summary> Overrides <see cref="EncoderOptions.DownscaleTarget"/> when non-<see langword="null"/>. </summary>
     public string? DownscaleTarget { get; set; }
+
+    /// <summary> Overrides <see cref="EncoderOptions.FixedFrameSize"/> when non-<see langword="null"/>. </summary>
+    public string? FixedFrameSize { get; set; }
 
     /// <summary> Overrides <see cref="EncoderOptions.TonemapHdrToSdr"/> when non-<see langword="null"/>. </summary>
     public bool? TonemapHdrToSdr { get; set; }
@@ -236,8 +245,11 @@ public sealed class EncoderOptionsOverride
         if (over.PassThroughImageSubtitlesMkv.HasValue) target.PassThroughImageSubtitlesMkv = over.PassThroughImageSubtitlesMkv.Value;
         if (over.DownscalePolicy != null)             target.DownscalePolicy            = over.DownscalePolicy;
         if (over.DownscaleTarget != null)             target.DownscaleTarget            = over.DownscaleTarget;
+        if (over.FixedFrameSize != null)             target.FixedFrameSize             = over.FixedFrameSize;
         if (over.TonemapHdrToSdr.HasValue)            target.TonemapHdrToSdr            = over.TonemapHdrToSdr.Value;
         if (over.FfmpegQualityPreset != null)         target.FfmpegQualityPreset        = over.FfmpegQualityPreset;
+        if (over.VideoProfile != null)               target.VideoProfile               = over.VideoProfile;
+        if (over.VideoLevel != null)                 target.VideoLevel                 = over.VideoLevel;
         over.MusicOverride?.ApplyTo(target.Music);
     }
 }

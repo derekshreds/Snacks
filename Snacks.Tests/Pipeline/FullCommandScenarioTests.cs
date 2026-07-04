@@ -101,7 +101,8 @@ public sealed class FullCommandScenarioTests
         // VAAPI's init flags depend on whether SW decode is forced — production lowers it
         // when filters are active. Mirror that here so scenarios with filters get the right init.
         bool isHdr     = FfprobeService.IsHdr(probe);
-        var  scaleExpr = videoCopy ? null : TranscodingService.ComputeScaleExpr(workItem, options);
+        var  scaleExpr = videoCopy ? null
+            : TranscodingService.ComputeFixedFrameFilter(options) ?? TranscodingService.ComputeScaleExpr(workItem, options);
         bool tonemap   = !videoCopy && options.TonemapHdrToSdr && isHdr;
         bool hasFilter = cropExpr != null || scaleExpr != null || tonemap;
 
@@ -138,9 +139,19 @@ public sealed class FullCommandScenarioTests
                   canHwDecode: useVaapi && !hasFilter,   // SW-decode when filters are active
                   vaapiFormat: tonemap ? "nv12" : "nv12");
 
+        // H.264/H.265 profile + level — software encoders only (mirrors production code).
+        string profileLevel = "";
+        if (!videoCopy && encoder.StartsWith("lib"))
+        {
+            if (!string.IsNullOrWhiteSpace(options.VideoProfile))
+                profileLevel += $"-profile:v {options.VideoProfile} ";
+            if (!string.IsNullOrWhiteSpace(options.VideoLevel))
+                profileLevel += $"-level {options.VideoLevel} ";
+        }
+
         string videoFlags = videoCopy
             ? $"{videoMap} -c:v copy "
-            : $"{videoMap} -c:v {encoder} {presetFlag}{vfFlag}";
+            : $"{videoMap} -c:v {encoder} {presetFlag}{profileLevel}{vfFlag}";
         string compressionFlags = videoCopy
             ? ""
             : TranscodingService.GetForcedReencodeCompressionFlags(
@@ -1100,5 +1111,79 @@ public sealed class FullCommandScenarioTests
         TranscodingService.FormatMuxer("mkv") .Should().Be("matroska");
         TranscodingService.FormatMuxer("mp4") .Should().Be("mp4");
         TranscodingService.FormatMuxer("webm").Should().Be("webm");
+    }
+
+
+    // =====================================================================
+    //  Scenario: iPod Classic preset — 1080p source → 640×480 H.264
+    //  Baseline L3.0 in MP4, AAC stereo 48 kHz 160k, strict 1500 kbps.
+    //  Verifies profile/level flags, fixed-frame scale+pad+format filter,
+    //  and audio sample-rate flag all surface in the assembled command.
+    // =====================================================================
+
+    [Fact]
+    public void Scenario_iPod_Classic_1080p_to_640x480_baseline()
+    {
+        var probe = new ProbeBuilder()
+            .Video(codec: "h264", width: 1920, height: 1080)
+            .Audio(codec: "ac3", channels: 6, lang: "eng")
+            .Build();
+
+        var opts = new EncoderOptions
+        {
+            Format                = "mp4",
+            Codec                 = "h264",
+            Encoder               = "libx264",
+            FfmpegQualityPreset   = "medium",
+            TargetBitrate         = 1500,
+            StrictBitrate         = true,
+            FourKBitrateMultiplier = 1,
+            HardwareAcceleration  = "none",
+            FixedFrameSize        = "640x480",
+            VideoProfile          = "baseline",
+            VideoLevel            = "3.0",
+            TonemapHdrToSdr       = true,
+            PreserveOriginalAudio = false,
+            AudioOutputs          = new()
+            {
+                new AudioOutputProfile
+                {
+                    Codec        = "aac",
+                    Layout       = "Stereo",
+                    BitrateKbps  = 160,
+                    SampleRateHz = 48000,
+                },
+            },
+            AudioLanguagesToKeep    = new() { "en" },
+            SubtitleLanguagesToKeep = new() { "en" },
+        };
+        var item = new WorkItem { Bitrate = 8000, IsHevc = false, Probe = probe };
+
+        var cmd = BuildScenarioCommand(probe, opts, item,
+            inputPath: "/src/movie.mkv", outputPath: "/out/movie.mp4");
+
+        AssertWellFormed(cmd, "mp4", "/src/movie.mkv", "/out/movie.mp4");
+
+        // Video: software H.264 with Baseline profile + Level 3.0.
+        cmd.Should().Contain("-c:v libx264");
+        cmd.Should().Contain("-profile:v baseline");
+        cmd.Should().Contain("-level 3.0");
+        cmd.Should().Contain("-preset medium");
+
+        // Fixed-frame filter: scale to fit 640×480, pad to exact size, force yuv420p.
+        cmd.Should().Contain("scale=min(iw\\,640):min(ih\\,480):force_original_aspect_ratio=decrease");
+        cmd.Should().Contain("pad=640:480:(ow-iw)/2:(oh-ih)/2");
+        cmd.Should().Contain("format=yuv420p");
+
+        // Strict bitrate: target = min = max = 1500k.
+        cmd.Should().Contain("-b:v 1500k");
+        cmd.Should().Contain("-minrate 1500k");
+        cmd.Should().Contain("-maxrate 1500k");
+
+        // Audio: AAC stereo, 160k, 48 kHz sample rate.
+        cmd.Should().Contain("-c:a:0 aac");
+        cmd.Should().Contain("-b:a:0 160k");
+        cmd.Should().Contain("-ac:a:0 2");
+        cmd.Should().Contain("-ar:a:0 48000");
     }
 }
