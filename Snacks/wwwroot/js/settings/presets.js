@@ -78,6 +78,11 @@ export const BUILTIN_PRESETS = [
         options: {
             Format: 'mp4',
             Codec: 'h264',
+            // Force software (libx264): the Baseline profile + Level 3.0 flags below are
+            // only emitted for lib* encoders, and HW encoders (VideoToolbox/VAAPI/NVENC)
+            // produce a High-profile stream the older iPods can't decode. See
+            // TranscodingService profile/level gate.
+            HardwareAcceleration: 'none',
             TargetBitrate: 1500,
             StrictBitrate: true,
             FourKBitrateMultiplier: 1,
@@ -85,6 +90,9 @@ export const BUILTIN_PRESETS = [
             FixedFrameSize: '640x480',
             VideoProfile: 'baseline',
             VideoLevel: '3.0',
+            // Level 3.0 at 640×480 tops out at ~33 fps; cap so 50/60 fps sources stay
+            // conformant (24/25/30 fps sources are left untouched).
+            MaxFrameRate: 30,
             TonemapHdrToSdr: true,
             PreserveOriginalAudio: false,
             AudioOutputs: [
@@ -93,6 +101,39 @@ export const BUILTIN_PRESETS = [
         },
     },
 ];
+
+/**
+ * Reset floor layered UNDER a preset's own options on every apply (built-in AND user).
+ *
+ * The writer in applyEncoderOptionsToForm only touches fields the incoming object
+ * actually carries; a field that's absent is left at whatever the form currently shows.
+ * That's the leak: applying a preset that doesn't mention a "sticky" field lets a value
+ * from a previously applied profile linger. It bites two ways —
+ *   1. Built-in presets are partial by design (they list only a handful of fields), so
+ *      switching from the iPod Classic device profile to Balanced would otherwise keep
+ *      640×480 / Baseline / fps-cap / forced-software stuck on.
+ *   2. A USER preset saved before a field existed won't carry that key, so flipping to
+ *      iPod Classic and back to that old custom preset hits the exact same bug.
+ * Layering these defaults underneath fixes both: the preset's own values always win
+ * (spread last), so a modern full snapshot is unaffected — only genuinely-absent keys
+ * fall back to their default.
+ *
+ * Listed here = every field that (a) changes encode behavior/mode and (b) isn't set by
+ * ALL built-in presets. Fields every preset sets (Format/Codec/bitrate/…) never leak;
+ * fields no preset touches (subtitles, languages, paths) are intentionally left alone.
+ * When adding a new "sticky" encoder field in the future, add its default here too.
+ */
+const PRESET_BASELINE = Object.freeze({
+    HardwareAcceleration:  'auto',
+    StrictBitrate:         false,
+    FixedFrameSize:        null,
+    VideoProfile:          null,
+    VideoLevel:            null,
+    MaxFrameRate:          0,
+    TonemapHdrToSdr:       false,
+    PreserveOriginalAudio: true,
+    AudioOutputs:          [],
+});
 
 let userPresets = [];
 
@@ -213,7 +254,10 @@ async function confirmAndApplyPreset(options, label) {
 
 /** Applies an options object to the form, persists, and re-runs the UI syncs. */
 function applyPreset(options, label) {
-    applyEncoderOptionsToForm(PREFIX, options);
+    // Layer over the reset floor so any "sticky" field the preset doesn't carry —
+    // a built-in's unlisted fields, or a field newer than a saved user preset — falls
+    // back to its default instead of lingering from a previously applied profile.
+    applyEncoderOptionsToForm(PREFIX, { ...PRESET_BASELINE, ...options });
 
     // Persist via the normal auto-save path, then let main.js's sync handlers
     // (WebM codec lockout, MuxOnly banner) react to the new values.

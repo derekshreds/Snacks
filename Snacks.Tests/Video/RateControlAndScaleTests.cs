@@ -376,4 +376,73 @@ public sealed class RateControlAndScaleTests
         filter.Should().Contain("pad=640:480:(ow-iw)/2:(oh-ih)/2");
         filter.Should().Contain("format=yuv420p");
     }
+
+
+    // =====================================================================
+    //  ComputeFpsCapExpr — caps output frame rate for level-conformant
+    //  device presets (e.g. iPod Classic H.264 Level 3.0 ≤ 30 fps).
+    // =====================================================================
+
+    private static WorkItem MakeWorkItemFps(string? frameRate) => new()
+    {
+        Probe = new ProbeResult
+        {
+            Streams = new[]
+            {
+                new Stream
+                {
+                    Index = 0, CodecType = "video", CodecName = "h264",
+                    Width = 1920, Height = 1080,
+                    AvgFrameRate = frameRate, RFrameRate = frameRate,
+                },
+            },
+        },
+    };
+
+    [Fact]
+    public void ComputeFpsCapExpr_returns_null_when_cap_disabled()
+    {
+        var opts = new EncoderOptions { MaxFrameRate = 0 };
+        TranscodingService.ComputeFpsCapExpr(MakeWorkItemFps("60/1"), opts).Should().BeNull();
+    }
+
+    [Fact]
+    public void ComputeFpsCapExpr_caps_when_source_exceeds_cap()
+    {
+        var opts = new EncoderOptions { MaxFrameRate = 30 };
+        TranscodingService.ComputeFpsCapExpr(MakeWorkItemFps("60/1"), opts).Should().Be("fps=30");
+    }
+
+    [Fact]
+    public void ComputeFpsCapExpr_returns_null_when_source_at_or_below_cap()
+    {
+        var opts = new EncoderOptions { MaxFrameRate = 30 };
+        // 24000/1001 ≈ 23.976 fps and exact 25/30 are all under the cap → untouched.
+        TranscodingService.ComputeFpsCapExpr(MakeWorkItemFps("24000/1001"), opts).Should().BeNull();
+        TranscodingService.ComputeFpsCapExpr(MakeWorkItemFps("25/1"), opts).Should().BeNull();
+        TranscodingService.ComputeFpsCapExpr(MakeWorkItemFps("30/1"), opts).Should().BeNull();
+    }
+
+    [Fact]
+    public void ComputeFpsCapExpr_caps_defensively_when_source_rate_unknown()
+    {
+        var opts = new EncoderOptions { MaxFrameRate = 30 };
+        TranscodingService.ComputeFpsCapExpr(MakeWorkItemFps(null), opts).Should().Be("fps=30");
+        TranscodingService.ComputeFpsCapExpr(MakeWorkItemFps("0/0"), opts).Should().Be("fps=30");
+    }
+
+    [Theory]
+    [InlineData("30/1",      30.0)]
+    [InlineData("24000/1001", 23.976)]
+    [InlineData("60",        60.0)]
+    [InlineData(null,        null)]
+    [InlineData("",          null)]
+    [InlineData("0/0",       null)]
+    [InlineData("garbage",   null)]
+    public void ParseFrameRate_handles_fraction_whole_and_junk(string? input, double? expected)
+    {
+        var actual = TranscodingService.ParseFrameRate(input);
+        if (expected is null) actual.Should().BeNull();
+        else actual.Should().BeApproximately(expected.Value, 0.001);
+    }
 }

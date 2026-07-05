@@ -58,6 +58,26 @@ public sealed class HardwareEncoderTests
 
 
     /// <summary>
+    ///     The iPod Classic preset pins <c>HardwareAcceleration = "none"</c> precisely so
+    ///     H.264 resolves to <c>libx264</c> — the only encoder path that emits the
+    ///     <c>-profile:v baseline -level 3.0</c> flags the old devices require. Left on a
+    ///     HW setting (e.g. Apple VideoToolbox), the same request resolves to a hardware
+    ///     encoder whose default High profile the devices can't decode; this test guards
+    ///     that the pin is what makes the preset work.
+    /// </summary>
+    [Fact]
+    public void GetEncoder_ipod_preset_pins_libx264_for_baseline_support()
+    {
+        var pinned = new EncoderOptions { HardwareAcceleration = "none", Encoder = "libx264" };
+        TranscodingService.GetEncoder(pinned, isWindows: false, linuxIntelQsv: false).Should().Be("libx264");
+
+        // Contrast: without the pin, an Apple host would drop to a HW encoder (no baseline).
+        var unpinned = new EncoderOptions { HardwareAcceleration = "apple", Encoder = "libx264" };
+        TranscodingService.GetEncoder(unpinned, isWindows: false, linuxIntelQsv: false).Should().Be("h264_videotoolbox");
+    }
+
+
+    /// <summary>
     ///     Linux Intel with the QSV preference set picks QSV encoders instead of VAAPI.
     ///     Uses the pure overload so this runs on any host — VAAPI vs QSV here depends
     ///     on detection, not the test process's OS.

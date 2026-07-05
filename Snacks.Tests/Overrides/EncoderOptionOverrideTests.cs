@@ -236,6 +236,7 @@ public sealed class EncoderOptionOverrideTests
         new object[] { "DownscalePolicy",       "Always"  },
         new object[] { "DownscaleTarget",       "720p"    },
         new object[] { "FixedFrameSize",        "640x480" },
+        new object[] { "MaxFrameRate",          30        },
         new object[] { "VideoProfile",          "baseline" },
         new object[] { "VideoLevel",            "3.0"    },
         new object[] { "TonemapHdrToSdr",       true      },

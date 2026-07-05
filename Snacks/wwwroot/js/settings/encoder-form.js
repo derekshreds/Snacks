@@ -353,6 +353,7 @@ export function getEncoderOptions(prefix = 'settings') {
         DownscalePolicy:     sel('DownscalePolicy', 'Never'),
         DownscaleTarget:     sel('DownscaleTarget', '1080p'),
         FixedFrameSize:      str('FixedFrameSize', '') || null,
+        MaxFrameRate:        Math.max(0, num('MaxFrameRate', 0)),
         TonemapHdrToSdr:     bool('TonemapHdrToSdr'),
         FfmpegQualityPreset: sel('FfmpegQualityPreset', 'medium'),
         VideoProfile:        sel('VideoProfile', '') || null,
@@ -577,6 +578,7 @@ export function applyEncoderOptionsToForm(prefix, saved) {
         set('DownscalePolicy',     or(pick('DownscalePolicy'),     'Never'));
         set('DownscaleTarget',     or(pick('DownscaleTarget'),     '1080p'));
         set('FixedFrameSize',      or(pick('FixedFrameSize'),      ''));
+        set('MaxFrameRate',        or(pick('MaxFrameRate'),        0));
         set('TonemapHdrToSdr',     pick('TonemapHdrToSdr'));
         set('FfmpegQualityPreset', or(pick('FfmpegQualityPreset'), 'medium'));
         set('VideoProfile',        or(pick('VideoProfile'),        ''));

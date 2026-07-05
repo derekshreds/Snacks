@@ -3511,8 +3511,9 @@ public class TranscodingService
         }
         string? scaleExpr = isMuxPass ? null
             : ComputeFixedFrameFilter(options) ?? ComputeScaleExpr(workItem, options);
+        string? fpsExpr = isMuxPass ? null : ComputeFpsCapExpr(workItem, options);
         bool tonemap = options.TonemapHdrToSdr && !isMuxPass && FfprobeService.IsHdr(workItem.Probe!);
-        bool hasFilter = cropExpr != null || scaleExpr != null || tonemap;
+        bool hasFilter = cropExpr != null || scaleExpr != null || fpsExpr != null || tonemap;
 
         // Any active filter forces a re-encode even if bitrate logic chose videoCopy.
         if (videoCopy && hasFilter)
@@ -3571,7 +3572,7 @@ public class TranscodingService
         // After tonemap the frame is 8-bit SDR; p010 would waste bandwidth on the hwupload.
         string vaapiFormat = (is10Bit && !tonemap) ? "p010" : "nv12";
         string vfFlag = VideoFilterBuilder.Emit(
-            cropExpr: cropExpr, tonemap: tonemap, scaleExpr: scaleExpr,
+            cropExpr: cropExpr, fpsExpr: fpsExpr, tonemap: tonemap, scaleExpr: scaleExpr,
             useVaapi: useVaapi, canHwDecode: canHwDecode, vaapiFormat: vaapiFormat);
         bool isSvtAv1 = encoder == "libsvtav1";
         bool isAmf    = encoder.Contains("amf");
@@ -4870,6 +4871,47 @@ public class TranscodingService
         // ffmpeg treats them as part of the expression, not filter-chain separators.
         return $"scale=min(iw\\,{w}):min(ih\\,{h}):force_original_aspect_ratio=decrease," +
                $"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,format=yuv420p";
+    }
+
+    /// <summary>
+    ///     When <see cref="EncoderOptions.MaxFrameRate"/> is set (&gt; 0) and the source
+    ///     runs faster than the cap, returns an <c>fps=</c> filter that drops frames to
+    ///     the cap; otherwise returns <c>null</c>. Sources at or below the cap are left
+    ///     untouched (no filter) so a 24/25/30 fps source is never resampled. Required by
+    ///     device presets like iPod Classic, whose H.264 Level 3.0 tops out near 33 fps at
+    ///     640×480 — a 50/60 fps source must be capped to stay level-conformant.
+    /// </summary>
+    internal static string? ComputeFpsCapExpr(WorkItem workItem, EncoderOptions options)
+    {
+        int cap = options.MaxFrameRate;
+        if (cap <= 0) return null;
+
+        var v = workItem.Probe?.Streams?.FirstOrDefault(s => s.CodecType == "video");
+        double sourceFps = ParseFrameRate(v?.AvgFrameRate) ?? ParseFrameRate(v?.RFrameRate) ?? 0;
+
+        // Unknown source rate → apply the cap defensively (an over-cap source is the risk;
+        // an fps filter that matches the true rate is a harmless no-op).
+        if (sourceFps > 0 && sourceFps <= cap) return null;
+        return $"fps={cap}";
+    }
+
+    /// <summary>
+    ///     Parses an ffprobe frame-rate string ("num/den", e.g. "24000/1001" or "30/1")
+    ///     into fps. Returns <c>null</c> for null/empty/unparseable input or a zero
+    ///     denominator/numerator ("0/0" is ffprobe's "unknown").
+    /// </summary>
+    internal static double? ParseFrameRate(string? rate)
+    {
+        if (string.IsNullOrWhiteSpace(rate)) return null;
+        var parts = rate.Split('/');
+        if (parts.Length == 1 && double.TryParse(parts[0], out double whole))
+            return whole > 0 ? whole : null;
+        if (parts.Length == 2
+            && double.TryParse(parts[0], out double num)
+            && double.TryParse(parts[1], out double den)
+            && num > 0 && den > 0)
+            return num / den;
+        return null;
     }
 
     /// <summary>

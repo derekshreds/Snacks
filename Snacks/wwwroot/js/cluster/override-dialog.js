@@ -49,6 +49,7 @@ const FOLDER_OVERRIDE_FIELDS = Object.freeze({
     DownscalePolicy:            'select',
     DownscaleTarget:            'select',
     FixedFrameSize:             'text',
+    MaxFrameRate:               'number',
     FfmpegQualityPreset:        'select',
     VideoProfile:               'select',
     VideoLevel:                 'select',
@@ -93,6 +94,7 @@ const NODE_OVERRIDE_FIELDS = Object.freeze({
     DownscalePolicy:            'select',
     DownscaleTarget:            'select',
     FixedFrameSize:             'text',
+    MaxFrameRate:               'number',
     FfmpegQualityPreset:        'select',
     VideoProfile:               'select',
     VideoLevel:                 'select',
@@ -124,6 +126,7 @@ const NUMBER_DEFAULTS = Object.freeze({
     FourKBitrateMultiplier: '4',
     SkipPercentAboveTarget: '20',
     QueuePriority:          '0',
+    MaxFrameRate:           '0',
 });
 
 

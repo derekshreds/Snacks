@@ -120,6 +120,9 @@ public sealed class EncoderOptionsOverride
     /// <summary> Overrides <see cref="EncoderOptions.FixedFrameSize"/> when non-<see langword="null"/>. </summary>
     public string? FixedFrameSize { get; set; }
 
+    /// <summary> Overrides <see cref="EncoderOptions.MaxFrameRate"/> when non-<see langword="null"/>. </summary>
+    public int? MaxFrameRate { get; set; }
+
     /// <summary> Overrides <see cref="EncoderOptions.TonemapHdrToSdr"/> when non-<see langword="null"/>. </summary>
     public bool? TonemapHdrToSdr { get; set; }
 
@@ -246,6 +249,7 @@ public sealed class EncoderOptionsOverride
         if (over.DownscalePolicy != null)             target.DownscalePolicy            = over.DownscalePolicy;
         if (over.DownscaleTarget != null)             target.DownscaleTarget            = over.DownscaleTarget;
         if (over.FixedFrameSize != null)             target.FixedFrameSize             = over.FixedFrameSize;
+        if (over.MaxFrameRate.HasValue)              target.MaxFrameRate               = over.MaxFrameRate.Value;
         if (over.TonemapHdrToSdr.HasValue)            target.TonemapHdrToSdr            = over.TonemapHdrToSdr.Value;
         if (over.FfmpegQualityPreset != null)         target.FfmpegQualityPreset        = over.FfmpegQualityPreset;
         if (over.VideoProfile != null)               target.VideoProfile               = over.VideoProfile;

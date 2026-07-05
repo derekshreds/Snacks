@@ -41,6 +41,12 @@
                 <input type="text" class="form-control" id="@(formPrefix)FixedFrameSize" name="FixedFrameSize" placeholder="e.g. 640x480 (blank = off)">
                 <div class="form-text">When set, scales and pads to this exact frame size with letterboxing and forces yuv420p. Overrides the downscale policy above. Used by device-specific presets (e.g. iPod Classic).</div>
             </div>
+
+            <div class="mb-3">
+                <label for="@(formPrefix)MaxFrameRate" class="form-label">Max Frame Rate (fps)</label>
+                <input type="number" class="form-control" id="@(formPrefix)MaxFrameRate" name="MaxFrameRate" min="0" max="120" step="1" placeholder="0 = no cap">
+                <div class="form-text">Caps output frame rate; faster sources are dropped to this rate, slower ones are left untouched. 0 disables. iPod Classic (H.264 Level 3.0) needs 30.</div>
+            </div>
         </div>
     </div>
 

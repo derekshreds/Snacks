@@ -103,8 +103,9 @@ public sealed class FullCommandScenarioTests
         bool isHdr     = FfprobeService.IsHdr(probe);
         var  scaleExpr = videoCopy ? null
             : TranscodingService.ComputeFixedFrameFilter(options) ?? TranscodingService.ComputeScaleExpr(workItem, options);
+        var  fpsExpr   = videoCopy ? null : TranscodingService.ComputeFpsCapExpr(workItem, options);
         bool tonemap   = !videoCopy && options.TonemapHdrToSdr && isHdr;
-        bool hasFilter = cropExpr != null || scaleExpr != null || tonemap;
+        bool hasFilter = cropExpr != null || scaleExpr != null || fpsExpr != null || tonemap;
 
         string init = useVaapi && hasFilter
             ? TranscodingService.GetInitFlags(options.HardwareAcceleration, options.HardwareDevicePath, hwDecode: false)
@@ -133,6 +134,7 @@ public sealed class FullCommandScenarioTests
             ? ""
             : VideoFilterBuilder.Emit(
                   cropExpr:    cropExpr,
+                  fpsExpr:     fpsExpr,
                   tonemap:     tonemap,
                   scaleExpr:   scaleExpr,
                   useVaapi:    useVaapi,
@@ -1125,7 +1127,7 @@ public sealed class FullCommandScenarioTests
     public void Scenario_iPod_Classic_1080p_to_640x480_baseline()
     {
         var probe = new ProbeBuilder()
-            .Video(codec: "h264", width: 1920, height: 1080)
+            .Video(codec: "h264", width: 1920, height: 1080, frameRate: "60/1")
             .Audio(codec: "ac3", channels: 6, lang: "eng")
             .Build();
 
@@ -1142,6 +1144,7 @@ public sealed class FullCommandScenarioTests
             FixedFrameSize        = "640x480",
             VideoProfile          = "baseline",
             VideoLevel            = "3.0",
+            MaxFrameRate          = 30,
             TonemapHdrToSdr       = true,
             PreserveOriginalAudio = false,
             AudioOutputs          = new()
@@ -1174,6 +1177,9 @@ public sealed class FullCommandScenarioTests
         cmd.Should().Contain("scale=min(iw\\,640):min(ih\\,480):force_original_aspect_ratio=decrease");
         cmd.Should().Contain("pad=640:480:(ow-iw)/2:(oh-ih)/2");
         cmd.Should().Contain("format=yuv420p");
+
+        // Frame-rate cap: 60 fps source dropped to 30 for H.264 Level 3.0 conformance.
+        cmd.Should().Contain("fps=30");
 
         // Strict bitrate: target = min = max = 1500k.
         cmd.Should().Contain("-b:v 1500k");

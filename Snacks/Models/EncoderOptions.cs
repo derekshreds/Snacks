@@ -204,6 +204,14 @@ public sealed class EncoderOptions
     /// </summary>
     public string? FixedFrameSize { get; set; }
 
+    /// <summary>
+    ///     Maximum output frame rate in fps. <c>0</c> (default) means "no cap" — the
+    ///     source rate is preserved. When set, sources faster than this are dropped to
+    ///     the cap via an <c>fps=</c> filter; slower sources are left untouched. Used by
+    ///     device-specific presets (e.g. iPod Classic requires ≤30 fps for H.264 Level 3.0).
+    /// </summary>
+    public int MaxFrameRate { get; set; } = 0;
+
     /// <summary> When <see langword="true"/>, HDR content is tone-mapped to SDR before encoding. </summary>
     public bool TonemapHdrToSdr { get; set; } = false;
 
@@ -321,6 +329,7 @@ public sealed class EncoderOptions
         DownscalePolicy            = DownscalePolicy,
         DownscaleTarget            = DownscaleTarget,
         FixedFrameSize             = FixedFrameSize,
+        MaxFrameRate               = MaxFrameRate,
         TonemapHdrToSdr            = TonemapHdrToSdr,
         RemoveBlackBorders         = RemoveBlackBorders,
         DeleteOriginalFile         = DeleteOriginalFile,
