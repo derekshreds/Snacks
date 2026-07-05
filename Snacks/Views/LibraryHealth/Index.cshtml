@@ -93,11 +93,17 @@
     </div>
 
     <div class="card">
-        <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+        @* Title + coverage + search are left-anchored (stable); the action buttons are pushed to
+           the far right with ms-auto and only its right edge is pinned — so toggling the buttons
+           (or their count labels changing) never shifts the search box. *@
+        <div class="card-header d-flex align-items-center flex-wrap gap-2">
             <h6 class="mb-0"><i class="fas fa-stethoscope me-2"></i>Flagged Files <small class="text-muted ms-1" id="healthShownCount"></small></h6>
-            <div class="d-flex align-items-center gap-3 flex-wrap">
-                <small class="text-muted" id="healthVerifyCoverage" title="Rolling deep-verification coverage — enable in Settings → System → Rolling Verification"></small>
-                <input type="text" class="form-control form-control-sm" id="healthFilterText" placeholder="Search by name or path..." style="max-width: 280px;">
+            <small class="text-muted" id="healthVerifyCoverage" title="Rolling deep-verification coverage — enable in Settings → System → Rolling Verification"></small>
+            <input type="text" class="form-control form-control-sm" id="healthFilterText" placeholder="Search by name or path..." style="max-width: 280px;">
+            <div class="d-flex align-items-center gap-2 ms-auto">
+                <button type="button" class="btn btn-sm btn-outline-warning" id="healthResetVerifyBtn" style="display:none;" title="Clear the failed-verification flag on all deep-verify failures (no deletion) so rolling verification re-checks them — use for stale or false failures">
+                    <i class="fas fa-rotate-left me-1"></i>Reset Verify Failures
+                </button>
                 <button type="button" class="btn btn-sm btn-outline-danger" id="healthDeleteAllBtn" style="display:none;" title="Delete every flagged file in the current view from disk">
                     <i class="fas fa-trash me-1"></i>Delete All
                 </button>

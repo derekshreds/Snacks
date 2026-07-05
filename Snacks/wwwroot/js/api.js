@@ -259,6 +259,13 @@ export const libraryApi = {
     deleteAllFlagged: ({ filter = null, q = null } = {}) =>
         postJson('/api/library/health/delete-all', { filter, q }),
 
+    /** Clears the deep-verification flag on every file matching the active filter + search (no deletion). Resolves `{ reset }`. */
+    resetVerifyFlagged: ({ filter = null, q = null } = {}) =>
+        postJson('/api/library/health/reset-verify', { filter, q }),
+
+    /** Clears the failed-verification flag on a single file (no deletion). Resolves `{ success }`. */
+    resetVerifyFile: filePath => postJson('/api/library/health/reset-verify-file', { filePath }),
+
     /** Aggregate library composition: totals + codec/resolution/status distributions. */
     getInsights: () => getJson('/api/library/insights'),
 };

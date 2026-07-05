@@ -717,6 +717,44 @@ public class MediaFileRepository
         }
 
         /// <summary>
+        ///     Clears the stored deep-verification state (result + timestamp) for every file
+        ///     matching the given health category + search — the same set the health table shows.
+        ///     A file with no stored result drops off the failed-verification list immediately,
+        ///     and its null verify timestamp sorts it to the FRONT of the rolling-verification
+        ///     rotation (<see cref="GetVerificationCandidatesAsync"/> orders nulls first), so the
+        ///     corrected verifier re-adjudicates it soon rather than months later. Only rows that
+        ///     actually carry a stored result are touched.
+        /// </summary>
+        /// <returns>The number of rows reset.</returns>
+        public async Task<int> ResetVerifyForHealthAsync(string? category, string? search)
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            return await ApplyHealthSearch(
+                    ApplyHealthCategory(context.MediaFiles.Where(f => f.LastScannedAt != null), category),
+                    search)
+                .Where(f => f.LastVerifyResult != null)
+                .ExecuteUpdateAsync(s => s
+                    .SetProperty(f => f.LastVerifyResult, (string?)null)
+                    .SetProperty(f => f.LastVerifiedAt, (DateTime?)null));
+        }
+
+        /// <summary>
+        ///     Clears the stored deep-verification state for a single file by path — the per-row
+        ///     "reset" on the health page. Same effect as <see cref="ResetVerifyForHealthAsync"/>,
+        ///     scoped to one row. Returns <see langword="false"/> when no row matched the path.
+        /// </summary>
+        public async Task<bool> ResetVerifyForPathAsync(string normalizedPath)
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            var updated = await context.MediaFiles
+                .Where(f => f.FilePath == normalizedPath)
+                .ExecuteUpdateAsync(s => s
+                    .SetProperty(f => f.LastVerifyResult, (string?)null)
+                    .SetProperty(f => f.LastVerifiedAt, (DateTime?)null));
+            return updated > 0;
+        }
+
+        /// <summary>
         ///     Applies the optional name/path substring filter shared by the health page and
         ///     the delete-all path query. LIKE metacharacters in the term ("%", "_") are
         ///     escaped so they match literally — common in media filenames.

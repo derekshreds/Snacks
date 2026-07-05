@@ -434,6 +434,15 @@ public sealed class LibraryController : ControllerBase
             return BadRequest("File is not within allowed library path");
 
         var result = await _fileHealth.VerifyAsync(request.FilePath, HttpContext.RequestAborted);
+
+        // Persist the fresh outcome (same format the rolling verifier stores) so a manual
+        // re-verify actually updates the health list: a pass clears the file from the failed
+        // queue, a fail refreshes its summary. Without this the button showed a result but
+        // never wrote it back, so files that now decode cleanly stayed stuck as "failed".
+        var summary = result.Ok ? "ok" : string.Join(" | ", result.Issues.Take(5));
+        if (summary.Length > 2000) summary = summary[..2000];
+        await _mediaFileRepo.SetVerifyResultAsync(request.FilePath, summary);
+
         return new JsonResult(new { ok = result.Ok, issues = result.Issues });
     }
 
@@ -482,6 +491,37 @@ public sealed class LibraryController : ControllerBase
         }
 
         return new JsonResult(new { success = true, deleted, failed, capped });
+    }
+
+    /// <summary>
+    ///     Clears the deep-verification flag on every file matching the given health category +
+    ///     search, dropping them off the failed-verification list without deleting anything.
+    ///     Their verify timestamp is nulled too, so rolling verification re-checks them first
+    ///     (front of the rotation) and any genuinely broken file re-surfaces. This is the safe
+    ///     "these flags are stale/false — re-adjudicate them" cleanup, as opposed to delete-all.
+    /// </summary>
+    /// <param name="request"> The active health category + search to act on. </param>
+    [HttpPost("health/reset-verify")]
+    public async Task<IActionResult> ResetVerifyFlagged([FromBody] HealthDeleteAllRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        var reset = await _mediaFileRepo.ResetVerifyForHealthAsync(request.Filter, request.Q);
+        return new JsonResult(new { success = true, reset });
+    }
+
+    /// <summary>
+    ///     Clears the failed-verification flag on a single file (no deletion) — the per-row
+    ///     "reset" action on the health page. DB-only (it just nulls the stored verify state),
+    ///     so unlike delete it needs no on-disk path check.
+    /// </summary>
+    /// <param name="request"> The file to reset. </param>
+    [HttpPost("health/reset-verify-file")]
+    public async Task<IActionResult> ResetVerifyFile([FromBody] ProcessFileRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        if (string.IsNullOrEmpty(request.FilePath)) return BadRequest("File path is required");
+        var reset = await _mediaFileRepo.ResetVerifyForPathAsync(request.FilePath);
+        return new JsonResult(new { success = reset });
     }
 
     /// <summary>
