@@ -29,6 +29,7 @@ const PAGE_SIZE = 100;
 
 let items = [];           // current page of report rows
 let totalItems = 0;       // total rows for the active filter
+let verifyFailedCount = 0;// whole-library verify-failed count (drives the Reset button on any tab)
 let issueFilter = 'all';  // active summary-card filter
 let page = 0;
 let searchTimer = null;
@@ -124,6 +125,7 @@ function renderSummary(summary) {
     document.getElementById('healthCountNoDuration').textContent   = summary.noDuration.toLocaleString();
     document.getElementById('healthCountFailed').textContent       = summary.failed.toLocaleString();
     document.getElementById('healthCountVerifyFailed').textContent = (summary.verifyFailed ?? 0).toLocaleString();
+    verifyFailedCount = summary.verifyFailed ?? 0;
 
     // Rolling-verify coverage line: "12,400 of 515,000 files deep-verified".
     const coverage = document.getElementById('healthVerifyCoverage');
@@ -149,6 +151,17 @@ function renderTable() {
     if (delAll) {
         delAll.style.display = totalItems > 0 ? '' : 'none';
         delAll.innerHTML = `<i class="fas fa-trash me-1"></i>Delete All (${totalItems.toLocaleString()})`;
+    }
+
+    // "Reset Verify Failures" clears the verify flag rather than deleting, and always acts on the
+    // whole verify-failed set. Show it on the All tab (so it's discoverable) and the Verify-failed
+    // tab (its natural home) — but not on unrelated tabs (no-audio, etc.) where it'd be confusing.
+    const resetBtn = document.getElementById('healthResetVerifyBtn');
+    if (resetBtn) {
+        const showReset = (issueFilter === 'all' || issueFilter === 'verify-failed') && verifyFailedCount > 0;
+        resetBtn.style.display = showReset ? '' : 'none';
+        if (showReset)
+            resetBtn.innerHTML = `<i class="fas fa-rotate-left me-1"></i>Reset Verify Failures (${verifyFailedCount.toLocaleString()})`;
     }
 
     renderPager();
@@ -193,6 +206,11 @@ function renderTable() {
                     <button type="button" class="btn btn-sm btn-outline-info" data-verify-path="${escapeHtml(r.filePath)}" title="Run ffmpeg decode samples to confirm whether this file is damaged">
                         <i class="fas fa-stethoscope me-1"></i>Verify
                     </button>
+                    ${r.verifyResult && r.verifyResult !== 'ok'
+                        ? `<button type="button" class="btn btn-sm btn-outline-warning" data-reset-path="${escapeHtml(r.filePath)}" title="Clear this file's failed-verification flag (no deletion) so rolling verification re-checks it">
+                        <i class="fas fa-rotate-left"></i>
+                    </button>`
+                        : ''}
                     <button type="button" class="btn btn-sm btn-outline-danger" data-delete-path="${escapeHtml(r.filePath)}" data-delete-name="${escapeHtml(r.fileName)}" title="Delete this file from disk and remove it from the library">
                         <i class="fas fa-trash"></i>
                     </button>
@@ -287,7 +305,7 @@ async function onDeleteAll() {
     const scope = issueFilter === 'all' ? 'flagged' : `"${issueFilter}"`;
     const ok = await showConfirmModal(
         'Delete All Flagged Files',
-        `Permanently delete all <strong>${totalItems.toLocaleString()}</strong> ${escapeHtml(scope)} file(s) from disk? ` +
+        `Permanently delete all <strong>${totalItems.toLocaleString()}</strong> ${escapeHtml(scope)} file(s) from disk? <br /><br />` +
         `This removes them from the library and <strong>cannot be undone</strong>. Re-downloaded files are picked up fresh on the next scan.`,
         'Delete All');
     if (!ok) return;
@@ -308,6 +326,55 @@ async function onDeleteAll() {
     } finally {
         page = 0;
         refresh();
+    }
+}
+
+/** Clears the failed-verification flag on the whole verify-failed set (after confirmation), from any tab. */
+async function onResetVerify() {
+    if (verifyFailedCount <= 0) return;
+    const ok = await showConfirmModal(
+        'Reset Verify Failures',
+        `Clear the failed-verification flag on all <strong>${verifyFailedCount.toLocaleString()}</strong> file(s)? <br /><br />` +
+        `Nothing is deleted — the files are marked unverified and moved to the front of the rolling-verification queue, ` +
+        `so any genuinely broken file will re-appear here after it's re-checked (rolling verification must be enabled in Settings). <br /><br />` +
+        `Use this to clear stale or false failures.`,
+        'Reset');
+    if (!ok) return;
+
+    const btn = document.getElementById('healthResetVerifyBtn');
+    if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Resetting…'; }
+    try {
+        // Always the verify-failed set, regardless of the active tab; a search term still narrows it.
+        const res = await libraryApi.resetVerifyFlagged({
+            filter: 'verify-failed',
+            q:      document.getElementById('healthFilterText')?.value || null,
+        });
+        showToast(`Reset ${res.reset.toLocaleString()} file(s) for re-verification`, 'success');
+    } catch (err) {
+        showToast('Reset failed: ' + err.message, 'danger');
+    } finally {
+        page = 0;
+        refresh();
+    }
+}
+
+/** Clears the failed-verification flag on a single file, then refreshes. */
+async function onResetRowClick(btn) {
+    const path = btn.dataset.resetPath;
+    if (!path || btn.disabled) return;
+
+    btn.disabled  = true;
+    const prev    = btn.innerHTML;
+    btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+    try {
+        const res = await libraryApi.resetVerifyFile(path);
+        if (!res.success) throw new Error('no matching file');
+        showToast('Verification flag cleared', 'success');
+        refresh();
+    } catch (err) {
+        showToast('Reset failed: ' + err.message, 'danger');
+        btn.disabled  = false;
+        btn.innerHTML = prev;
     }
 }
 
@@ -379,8 +446,11 @@ function onPageClick(e) {
     if (e.target.closest('#healthPageNext')) { page++; refresh(); return; }
     const verifyBtn = e.target.closest('[data-verify-path]');
     if (verifyBtn) { onVerifyClick(verifyBtn); return; }
+    const resetRowBtn = e.target.closest('[data-reset-path]');
+    if (resetRowBtn) { onResetRowClick(resetRowBtn); return; }
     const deleteBtn = e.target.closest('[data-delete-path]');
     if (deleteBtn) { onDeleteClick(deleteBtn); return; }
+    if (e.target.closest('#healthResetVerifyBtn')) { onResetVerify(); return; }
     if (e.target.closest('#healthDeleteAllBtn')) { onDeleteAll(); return; }
     if (e.target.closest('#healthRefreshBtn')) refresh();
 }
