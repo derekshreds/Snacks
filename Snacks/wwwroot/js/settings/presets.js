@@ -69,7 +69,71 @@ export const BUILTIN_PRESETS = [
         spec: 'H.264 · MP4 · 4500 kbps · medium',
         options: { Format: 'mp4', Codec: 'h264', TargetBitrate: 4500, FourKBitrateMultiplier: 4, FfmpegQualityPreset: 'medium' },
     },
+    {
+        key:  'ipod-classic',
+        name: 'iPod Classic',
+        icon: 'fa-music',
+        desc: '640×480 H.264 Baseline for older iPods (Classic, 5th Gen, Nano). AAC stereo at 48 kHz.',
+        spec: 'H.264 Baseline L3.0 · MP4 · 640×480 · 1500 kbps · AAC 160k',
+        options: {
+            Format: 'mp4',
+            Codec: 'h264',
+            // Force software (libx264): the Baseline profile + Level 3.0 flags below are
+            // only emitted for lib* encoders, and HW encoders (VideoToolbox/VAAPI/NVENC)
+            // produce a High-profile stream the older iPods can't decode. See
+            // TranscodingService profile/level gate.
+            HardwareAcceleration: 'none',
+            TargetBitrate: 1500,
+            StrictBitrate: true,
+            FourKBitrateMultiplier: 1,
+            FfmpegQualityPreset: 'medium',
+            FixedFrameSize: '640x480',
+            VideoProfile: 'baseline',
+            VideoLevel: '3.0',
+            // Level 3.0 at 640×480 tops out at ~33 fps; cap so 50/60 fps sources stay
+            // conformant (24/25/30 fps sources are left untouched).
+            MaxFrameRate: 30,
+            TonemapHdrToSdr: true,
+            PreserveOriginalAudio: false,
+            AudioOutputs: [
+                { Codec: 'aac', Layout: 'Stereo', BitrateKbps: 160, SampleRateHz: 48000 },
+            ],
+        },
+    },
 ];
+
+/**
+ * Reset floor layered UNDER a preset's own options on every apply (built-in AND user).
+ *
+ * The writer in applyEncoderOptionsToForm only touches fields the incoming object
+ * actually carries; a field that's absent is left at whatever the form currently shows.
+ * That's the leak: applying a preset that doesn't mention a "sticky" field lets a value
+ * from a previously applied profile linger. It bites two ways —
+ *   1. Built-in presets are partial by design (they list only a handful of fields), so
+ *      switching from the iPod Classic device profile to Balanced would otherwise keep
+ *      640×480 / Baseline / fps-cap / forced-software stuck on.
+ *   2. A USER preset saved before a field existed won't carry that key, so flipping to
+ *      iPod Classic and back to that old custom preset hits the exact same bug.
+ * Layering these defaults underneath fixes both: the preset's own values always win
+ * (spread last), so a modern full snapshot is unaffected — only genuinely-absent keys
+ * fall back to their default.
+ *
+ * Listed here = every field that (a) changes encode behavior/mode and (b) isn't set by
+ * ALL built-in presets. Fields every preset sets (Format/Codec/bitrate/…) never leak;
+ * fields no preset touches (subtitles, languages, paths) are intentionally left alone.
+ * When adding a new "sticky" encoder field in the future, add its default here too.
+ */
+const PRESET_BASELINE = Object.freeze({
+    HardwareAcceleration:  'auto',
+    StrictBitrate:         false,
+    FixedFrameSize:        null,
+    VideoProfile:          null,
+    VideoLevel:            null,
+    MaxFrameRate:          0,
+    TonemapHdrToSdr:       false,
+    PreserveOriginalAudio: true,
+    AudioOutputs:          [],
+});
 
 let userPresets = [];
 
@@ -85,10 +149,37 @@ function formValue(key) {
     return node.type === 'checkbox' ? node.checked : node.value;
 }
 
+/** Reads the audio-outputs editor rows as an array of {Codec,Layout,BitrateKbps,SampleRateHz}. */
+function formAudioOutputs() {
+    const root = document.getElementById(`${PREFIX}AudioOutputs`);
+    if (!root) return [];
+    return Array.from(root.querySelectorAll('[data-audio-output-row]')).map(row => ({
+        Codec:       row.querySelector('[data-field="Codec"]')?.value       ?? 'aac',
+        Layout:      row.querySelector('[data-field="Layout"]')?.value      ?? 'Source',
+        BitrateKbps: parseInt(row.querySelector('[data-field="BitrateKbps"]')?.value, 10) || 0,
+        SampleRateHz: parseInt(row.querySelector('[data-field="SampleRateHz"]')?.value, 10) || 0,
+    }));
+}
+
+/** Deep-equals two AudioOutputs arrays (order-sensitive, like the preset definition). */
+function audioOutputsMatch(a, b) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    return a.every((row, i) =>
+        String(row.Codec ?? 'aac')        === String(b[i].Codec ?? 'aac') &&
+        String(row.Layout ?? 'Source')    === String(b[i].Layout ?? 'Source') &&
+        Number(row.BitrateKbps ?? 0)      === Number(b[i].BitrateKbps ?? 0) &&
+        Number(row.SampleRateHz ?? 0)     === Number(b[i].SampleRateHz ?? 0));
+}
+
 /** True when every field the preset takes a position on matches the form. */
 function presetMatchesForm(preset) {
-    return Object.entries(preset.options).every(([key, val]) =>
-        String(formValue(key)) === String(val));
+    return Object.entries(preset.options).every(([key, val]) => {
+        if (key === 'AudioOutputs') return audioOutputsMatch(formAudioOutputs(), val);
+        const fv = formValue(key);
+        // Normalize null/empty-string so a preset specifying null matches a blank text input.
+        if (val === null) return fv === '' || fv === null || fv === undefined;
+        return String(fv) === String(val);
+    });
 }
 
 /** Re-highlights whichever built-in card (if any) matches the current form. */
@@ -163,7 +254,10 @@ async function confirmAndApplyPreset(options, label) {
 
 /** Applies an options object to the form, persists, and re-runs the UI syncs. */
 function applyPreset(options, label) {
-    applyEncoderOptionsToForm(PREFIX, options);
+    // Layer over the reset floor so any "sticky" field the preset doesn't carry —
+    // a built-in's unlisted fields, or a field newer than a saved user preset — falls
+    // back to its default instead of lingering from a previously applied profile.
+    applyEncoderOptionsToForm(PREFIX, { ...PRESET_BASELINE, ...options });
 
     // Persist via the normal auto-save path, then let main.js's sync handlers
     // (WebM codec lockout, MuxOnly banner) react to the new values.

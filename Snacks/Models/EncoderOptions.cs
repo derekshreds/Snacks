@@ -67,6 +67,19 @@ public sealed class EncoderOptions
     /// <summary> FFmpeg quality preset string (e.g. "medium", "slow"). </summary>
     public string FfmpegQualityPreset { get; set; } = "medium";
 
+    /// <summary>
+    ///     H.264/H.265 profile (e.g. "baseline", "main", "high"). Empty/whitespace
+    ///     uses the encoder's default. Only emitted for software encoders (libx264/libx265)
+    ///     since hardware encoders have varying profile value sets.
+    /// </summary>
+    public string? VideoProfile { get; set; }
+
+    /// <summary>
+    ///     H.264/H.265 level as a decimal string (e.g. "1.3", "3.0", "4.0").
+    ///     Empty/whitespace uses the encoder's default.
+    /// </summary>
+    public string? VideoLevel { get; set; }
+
     /******************************************************************
      *  Audio
      ******************************************************************/
@@ -183,6 +196,22 @@ public sealed class EncoderOptions
     /// <summary> Target resolution for downscaling (e.g. "1080p", "720p"). </summary>
     public string DownscaleTarget { get; set; } = "1080p";
 
+    /// <summary>
+    ///     When set (e.g. "640x480"), scales and pads to this exact frame size with
+    ///     letterboxing and forces <c>yuv420p</c> pixel format. Overrides the normal
+    ///     downscale policy/target. Used by device-specific presets (e.g. iPod Classic
+    ///     requires a strict 640×480 frame).
+    /// </summary>
+    public string? FixedFrameSize { get; set; }
+
+    /// <summary>
+    ///     Maximum output frame rate in fps. <c>0</c> (default) means "no cap" — the
+    ///     source rate is preserved. When set, sources faster than this are dropped to
+    ///     the cap via an <c>fps=</c> filter; slower sources are left untouched. Used by
+    ///     device-specific presets (e.g. iPod Classic requires ≤30 fps for H.264 Level 3.0).
+    /// </summary>
+    public int MaxFrameRate { get; set; } = 0;
+
     /// <summary> When <see langword="true"/>, HDR content is tone-mapped to SDR before encoding. </summary>
     public bool TonemapHdrToSdr { get; set; } = false;
 
@@ -278,6 +307,8 @@ public sealed class EncoderOptions
         FourKBitrateMultiplier     = FourKBitrateMultiplier,
         Skip4K                     = Skip4K,
         FfmpegQualityPreset        = FfmpegQualityPreset,
+        VideoProfile               = VideoProfile,
+        VideoLevel                 = VideoLevel,
         TwoChannelAudio            = TwoChannelAudio,
         AudioLanguagesToKeep       = new List<string>(AudioLanguagesToKeep),
         KeepOriginalLanguage       = KeepOriginalLanguage,
@@ -297,6 +328,8 @@ public sealed class EncoderOptions
         AutoSetDefaultTrack        = AutoSetDefaultTrack,
         DownscalePolicy            = DownscalePolicy,
         DownscaleTarget            = DownscaleTarget,
+        FixedFrameSize             = FixedFrameSize,
+        MaxFrameRate               = MaxFrameRate,
         TonemapHdrToSdr            = TonemapHdrToSdr,
         RemoveBlackBorders         = RemoveBlackBorders,
         DeleteOriginalFile         = DeleteOriginalFile,

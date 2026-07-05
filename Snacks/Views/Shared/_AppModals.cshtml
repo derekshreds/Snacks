@@ -269,6 +269,14 @@
                             <option value="h265">H.265/HEVC</option><option value="h264">H.264/AVC</option><option value="av1">AV1</option>
                         </select>
                     </div>
+                    <div class="form-check mb-2" data-context="folder">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_HardwareAcceleration" data-field="HardwareAcceleration">
+                        <label class="form-check-label" for="ovr_HardwareAcceleration">Hardware Acceleration</label>
+                        <select class="form-select form-select-sm mt-1" id="ovrHardwareAcceleration" disabled>
+                            <option value="auto">Auto Detect</option><option value="intel">Intel Quick Sync (QSV)</option><option value="amd">AMD AMF</option><option value="nvidia">NVIDIA NVENC</option><option value="apple">Apple VideoToolbox</option><option value="none">Software Only</option>
+                        </select>
+                        <div class="form-text">Force software (Software Only) for device profiles that need Baseline/level flags, e.g. iPod Classic.</div>
+                    </div>
                     <div class="form-check mb-2" data-context="folder,node">
                         <input class="form-check-input override-toggle" type="checkbox" id="ovr_TargetBitrate" data-field="TargetBitrate">
                         <label class="form-check-label" for="ovr_TargetBitrate">Target Bitrate (kbps)</label>
@@ -283,7 +291,7 @@
                         <input class="form-check-input override-toggle" type="checkbox" id="ovr_FourKBitrateMultiplier" data-field="FourKBitrateMultiplier">
                         <label class="form-check-label" for="ovr_FourKBitrateMultiplier">4K Bitrate Multiplier</label>
                         <select class="form-select form-select-sm mt-1" id="ovrFourKBitrateMultiplier" disabled>
-                            <option value="2">2x</option><option value="3">3x</option><option value="4">4x</option><option value="5">5x</option><option value="6">6x</option><option value="8">8x</option>
+                            <option value="1">1x</option><option value="2">2x</option><option value="3">3x</option><option value="4">4x</option><option value="5">5x</option><option value="6">6x</option><option value="8">8x</option>
                         </select>
                     </div>
                 </div>
@@ -334,14 +342,38 @@
                         <input class="form-check-input override-toggle" type="checkbox" id="ovr_DownscaleTarget" data-field="DownscaleTarget">
                         <label class="form-check-label" for="ovr_DownscaleTarget">Downscale Target</label>
                         <select class="form-select form-select-sm mt-1" id="ovrDownscaleTarget" disabled>
-                            <option value="4K">4K (2160p)</option><option value="1440p">1440p</option><option value="1080p">1080p</option><option value="720p">720p</option>
+                            <option value="4K">4K (2160p)</option><option value="1440p">1440p</option><option value="1080p">1080p</option><option value="720p">720p</option><option value="480p">480p</option><option value="240p">240p</option>
                         </select>
+                    </div>
+                    <div class="form-check mb-2" data-context="folder,node">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_FixedFrameSize" data-field="FixedFrameSize">
+                        <label class="form-check-label" for="ovr_FixedFrameSize">Fixed Frame Size</label>
+                        <input type="text" class="form-control form-control-sm mt-1" id="ovrFixedFrameSize" placeholder="e.g. 640x480" disabled>
+                    </div>
+                    <div class="form-check mb-2" data-context="folder,node">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_MaxFrameRate" data-field="MaxFrameRate">
+                        <label class="form-check-label" for="ovr_MaxFrameRate">Max Frame Rate (fps)</label>
+                        <input type="number" class="form-control form-control-sm mt-1" id="ovrMaxFrameRate" min="0" max="120" step="1" placeholder="0 = no cap" disabled>
                     </div>
                     <div class="form-check mb-2" data-context="folder,node">
                         <input class="form-check-input override-toggle" type="checkbox" id="ovr_FfmpegQualityPreset" data-field="FfmpegQualityPreset">
                         <label class="form-check-label" for="ovr_FfmpegQualityPreset">FFmpeg Preset</label>
                         <select class="form-select form-select-sm mt-1" id="ovrFfmpegQualityPreset" disabled>
                             <option value="veryfast">veryfast</option><option value="fast">fast</option><option value="medium">medium</option><option value="slow">slow</option><option value="veryslow">veryslow</option>
+                        </select>
+                    </div>
+                    <div class="form-check mb-2" data-context="folder,node">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_VideoProfile" data-field="VideoProfile">
+                        <label class="form-check-label" for="ovr_VideoProfile">Video Profile</label>
+                        <select class="form-select form-select-sm mt-1" id="ovrVideoProfile" disabled>
+                            <option value="">Default</option><option value="baseline">Baseline</option><option value="main">Main</option><option value="high">High</option>
+                        </select>
+                    </div>
+                    <div class="form-check mb-2" data-context="folder,node">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_VideoLevel" data-field="VideoLevel">
+                        <label class="form-check-label" for="ovr_VideoLevel">Video Level</label>
+                        <select class="form-select form-select-sm mt-1" id="ovrVideoLevel" disabled>
+                            <option value="">Default</option><option value="1.3">1.3</option><option value="2.0">2.0</option><option value="2.1">2.1</option><option value="3.0">3.0</option><option value="3.1">3.1</option><option value="4.0">4.0</option><option value="4.1">4.1</option><option value="5.0">5.0</option>
                         </select>
                     </div>
                 </div>
@@ -426,6 +458,15 @@
                             <option value="Stereo">Stereo (2.0)</option>
                             <option value="5.1">5.1 surround</option>
                             <option value="7.1">7.1 surround</option>
+                        </select>
+                    </div>
+                    <div class="flex-fill">
+                        <label class="form-label form-label-sm mb-1">Sample Rate</label>
+                        <select class="form-select form-select-sm" data-field="SampleRateHz">
+                            <option value="0" selected>Source</option>
+                            <option value="44100">44.1 kHz</option>
+                            <option value="48000">48 kHz</option>
+                            <option value="96000">96 kHz</option>
                         </select>
                     </div>
                     <div style="width: 7rem;">

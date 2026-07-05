@@ -28,10 +28,18 @@ public sealed class AudioOutputProfile
     /// </summary>
     public int BitrateKbps { get; set; } = 0;
 
+    /// <summary>
+    ///     Target sample rate in Hz (e.g. 48000, 44100). <c>0</c> means "use the
+    ///     source rate" — no <c>-ar</c> flag is emitted. Some devices (e.g. older
+    ///     iPods) require a specific sample rate for playback.
+    /// </summary>
+    public int SampleRateHz { get; set; } = 0;
+
     public AudioOutputProfile Clone() => new()
     {
-        Codec       = Codec,
-        Layout      = Layout,
-        BitrateKbps = BitrateKbps,
+        Codec        = Codec,
+        Layout       = Layout,
+        BitrateKbps  = BitrateKbps,
+        SampleRateHz = SampleRateHz,
     };
 }

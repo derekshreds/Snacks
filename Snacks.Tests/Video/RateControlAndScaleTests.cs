@@ -345,4 +345,148 @@ public sealed class RateControlAndScaleTests
         FfprobeService.ContainerCanCopySource("opus",      "mkv").Should().BeTrue();
         FfprobeService.ContainerCanCopySource("pcm_s16le", "mkv").Should().BeTrue();
     }
+
+
+    // =====================================================================
+    //  ComputeFixedFrameFilter — builds the scale+pad+format chain for
+    //  device-specific presets (e.g. iPod Classic 640×480).
+    // =====================================================================
+
+    [Fact]
+    public void ComputeFixedFrameFilter_returns_null_when_unset()
+    {
+        var opts = new EncoderOptions();
+        TranscodingService.ComputeFixedFrameFilter(opts).Should().BeNull();
+    }
+
+    [Fact]
+    public void ComputeFixedFrameFilter_returns_null_for_garbage()
+    {
+        var opts = new EncoderOptions { FixedFrameSize = "not-a-size" };
+        TranscodingService.ComputeFixedFrameFilter(opts).Should().BeNull();
+    }
+
+    [Fact]
+    public void ComputeFixedFrameFilter_builds_scale_pad_format_chain()
+    {
+        var opts = new EncoderOptions { FixedFrameSize = "640x480" };
+        var filter = TranscodingService.ComputeFixedFrameFilter(opts);
+        filter.Should().NotBeNull();
+        filter.Should().Contain("scale=min(iw\\,640):min(ih\\,480):force_original_aspect_ratio=decrease");
+        filter.Should().Contain("pad=640:480:(ow-iw)/2:(oh-ih)/2");
+        filter.Should().Contain("format=yuv420p");
+    }
+
+    [Fact]
+    public void ComputeFixedFrameFilter_rounds_odd_dimensions_down_to_even()
+    {
+        // yuv420p needs even dims — an odd hand-entered size must not produce a filter
+        // ffmpeg rejects. 641x481 → 640x480.
+        var opts = new EncoderOptions { FixedFrameSize = "641x481" };
+        var filter = TranscodingService.ComputeFixedFrameFilter(opts);
+        filter.Should().NotBeNull();
+        filter.Should().Contain("min(iw\\,640):min(ih\\,480)");
+        filter.Should().Contain("pad=640:480:");
+    }
+
+    [Fact]
+    public void ComputeFixedFrameFilter_returns_null_when_a_dimension_rounds_to_zero()
+    {
+        // "1" rounds down to 0 — treat as unparseable rather than emit a 0-size pad.
+        TranscodingService.ComputeFixedFrameFilter(new EncoderOptions { FixedFrameSize = "1x480" }).Should().BeNull();
+    }
+
+
+    // =====================================================================
+    //  IsVideoProfileValidForEncoder — drops H.264-only profiles on HEVC
+    //  (and any H.26x profile on AV1) so the command can't hard-fail.
+    // =====================================================================
+
+    [Theory]
+    [InlineData("libx264", "baseline", true)]
+    [InlineData("libx264", "high",     true)]
+    [InlineData("libx264", "main",     true)]
+    [InlineData("libx265", "main",     true)]
+    [InlineData("libx265", "main10",   true)]
+    [InlineData("libx265", "baseline", false)]  // H.264-only — would crash libx265
+    [InlineData("libx265", "high",     false)]
+    [InlineData("hevc_nvenc", "baseline", false)]
+    [InlineData("libsvtav1", "main",   false)]  // AV1 takes no H.26x profile
+    [InlineData("libx264", "",         true)]   // empty = nothing emitted = valid
+    [InlineData("libx264", null,       true)]
+    public void IsVideoProfileValidForEncoder_matches_codec(string encoder, string? profile, bool expected)
+    {
+        TranscodingService.IsVideoProfileValidForEncoder(encoder, profile).Should().Be(expected);
+    }
+
+
+    // =====================================================================
+    //  ComputeFpsCapExpr — caps output frame rate for level-conformant
+    //  device presets (e.g. iPod Classic H.264 Level 3.0 ≤ 30 fps).
+    // =====================================================================
+
+    private static WorkItem MakeWorkItemFps(string? frameRate) => new()
+    {
+        Probe = new ProbeResult
+        {
+            Streams = new[]
+            {
+                new Stream
+                {
+                    Index = 0, CodecType = "video", CodecName = "h264",
+                    Width = 1920, Height = 1080,
+                    AvgFrameRate = frameRate, RFrameRate = frameRate,
+                },
+            },
+        },
+    };
+
+    [Fact]
+    public void ComputeFpsCapExpr_returns_null_when_cap_disabled()
+    {
+        var opts = new EncoderOptions { MaxFrameRate = 0 };
+        TranscodingService.ComputeFpsCapExpr(MakeWorkItemFps("60/1"), opts).Should().BeNull();
+    }
+
+    [Fact]
+    public void ComputeFpsCapExpr_caps_when_source_exceeds_cap()
+    {
+        var opts = new EncoderOptions { MaxFrameRate = 30 };
+        TranscodingService.ComputeFpsCapExpr(MakeWorkItemFps("60/1"), opts).Should().Be("fps=30");
+    }
+
+    [Fact]
+    public void ComputeFpsCapExpr_returns_null_when_source_at_or_below_cap()
+    {
+        var opts = new EncoderOptions { MaxFrameRate = 30 };
+        // 24000/1001 ≈ 23.976 fps and exact 25/30 are all under the cap → untouched.
+        TranscodingService.ComputeFpsCapExpr(MakeWorkItemFps("24000/1001"), opts).Should().BeNull();
+        TranscodingService.ComputeFpsCapExpr(MakeWorkItemFps("25/1"), opts).Should().BeNull();
+        TranscodingService.ComputeFpsCapExpr(MakeWorkItemFps("30/1"), opts).Should().BeNull();
+    }
+
+    [Fact]
+    public void ComputeFpsCapExpr_leaves_source_untouched_when_rate_unknown()
+    {
+        // `fps=N` would UPSAMPLE (duplicate frames) a slower source, so an unknown rate
+        // must NOT be capped — leaving it is safer than risking a 24→30 fps inflation.
+        var opts = new EncoderOptions { MaxFrameRate = 30 };
+        TranscodingService.ComputeFpsCapExpr(MakeWorkItemFps(null), opts).Should().BeNull();
+        TranscodingService.ComputeFpsCapExpr(MakeWorkItemFps("0/0"), opts).Should().BeNull();
+    }
+
+    [Theory]
+    [InlineData("30/1",      30.0)]
+    [InlineData("24000/1001", 23.976)]
+    [InlineData("60",        60.0)]
+    [InlineData(null,        null)]
+    [InlineData("",          null)]
+    [InlineData("0/0",       null)]
+    [InlineData("garbage",   null)]
+    public void ParseFrameRate_handles_fraction_whole_and_junk(string? input, double? expected)
+    {
+        var actual = TranscodingService.ParseFrameRate(input);
+        if (expected is null) actual.Should().BeNull();
+        else actual.Should().BeApproximately(expected.Value, 0.001);
+    }
 }

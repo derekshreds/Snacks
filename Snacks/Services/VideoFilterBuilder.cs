@@ -23,8 +23,9 @@ namespace Snacks.Services;
 ///             followed by <c>format=…|vaapi,hwupload</c> when VAAPI is the target.
 ///         </item>
 ///         <item>
-///             Filter order: crop → tonemap → scale → hwupload-terminator. Cropping
-///             first reduces pixels through the rest of the chain.
+///             Filter order: crop → fps → tonemap → scale → hwupload-terminator.
+///             Cropping and dropping frames first reduces the pixels/frames the
+///             rest of the chain has to process.
 ///         </item>
 ///     </list>
 /// </remarks>
@@ -32,6 +33,7 @@ public static class VideoFilterBuilder
 {
     /// <summary> Builds the <c>-vf …</c> fragment (including trailing space) or returns <c>""</c>. </summary>
     /// <param name="cropExpr">    Crop filter expression without the <c>-vf </c> prefix (e.g. <c>"crop=1920:800:0:140"</c>), or <c>null</c>. </param>
+    /// <param name="fpsExpr">     Frame-rate cap expression (e.g. <c>"fps=30"</c>), or <c>null</c>. Placed right after crop so downstream filters process fewer frames. </param>
     /// <param name="tonemap">     When <c>true</c>, inserts the zscale/tonemap chain (for HDR→SDR). </param>
     /// <param name="scaleExpr">   Scale filter expression (e.g. <c>"scale=w=-2:h=1080:flags=lanczos"</c>), or <c>null</c>. </param>
     /// <param name="useVaapi">    When <c>true</c>, the encoder is VAAPI and the chain ends with <c>format=…|vaapi,hwupload</c>. </param>
@@ -43,9 +45,11 @@ public static class VideoFilterBuilder
         string? scaleExpr,
         bool    useVaapi,
         bool    canHwDecode,
-        string  vaapiFormat)
+        string  vaapiFormat,
+        string? fpsExpr = null)
     {
-        bool hasFilter = !string.IsNullOrEmpty(cropExpr) || tonemap || !string.IsNullOrEmpty(scaleExpr);
+        bool hasFilter = !string.IsNullOrEmpty(cropExpr) || !string.IsNullOrEmpty(fpsExpr)
+                      || tonemap || !string.IsNullOrEmpty(scaleExpr);
 
         // No user-requested filters — preserve pre-refactor behavior byte-for-byte.
         if (!hasFilter)
@@ -54,8 +58,9 @@ public static class VideoFilterBuilder
             return $"-vf format={vaapiFormat}|vaapi,hwupload ";
         }
 
-        var parts = new List<string>(4);
+        var parts = new List<string>(5);
         if (!string.IsNullOrEmpty(cropExpr))  parts.Add(cropExpr);
+        if (!string.IsNullOrEmpty(fpsExpr))   parts.Add(fpsExpr);
         if (tonemap)                          parts.Add(TonemapSwChain);
         if (!string.IsNullOrEmpty(scaleExpr)) parts.Add(scaleExpr);
         if (useVaapi)                         parts.Add($"format={vaapiFormat}|vaapi,hwupload");

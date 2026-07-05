@@ -29,13 +29,17 @@ import { initChipInput, getChipValues, setChipValues } from '../settings/chip-in
 const MODAL_ID = 'overrideDialog';
 
 /**
- * Folder-context fields. Mirrors what the main settings tabs expose, minus
- * HardwareAcceleration (each node auto-detects its own hardware).
+ * Folder-context fields. Mirrors what the main settings tabs expose. Nodes normally
+ * auto-detect their own hardware, but HardwareAcceleration is overridable so a folder
+ * can force software encoding — required for device profiles (e.g. iPod Classic), whose
+ * Baseline/level flags only apply on software encoders. A vendor mismatch on a given
+ * node falls back to software automatically (GetSoftwareFallbackEncoder).
  */
 const FOLDER_OVERRIDE_FIELDS = Object.freeze({
     // General
     Format:                     'select',
     Codec:                      'select',
+    HardwareAcceleration:       'select',
     TargetBitrate:              'number',
     StrictBitrate:              'bool',
     FourKBitrateMultiplier:     'select',
@@ -48,7 +52,11 @@ const FOLDER_OVERRIDE_FIELDS = Object.freeze({
     // Video pipeline
     DownscalePolicy:            'select',
     DownscaleTarget:            'select',
+    FixedFrameSize:             'text',
+    MaxFrameRate:               'number',
     FfmpegQualityPreset:        'select',
+    VideoProfile:               'select',
+    VideoLevel:                 'select',
     TonemapHdrToSdr:            'bool',
     RemoveBlackBorders:         'bool',
 
@@ -89,7 +97,11 @@ const NODE_OVERRIDE_FIELDS = Object.freeze({
     // Video pipeline
     DownscalePolicy:            'select',
     DownscaleTarget:            'select',
+    FixedFrameSize:             'text',
+    MaxFrameRate:               'number',
     FfmpegQualityPreset:        'select',
+    VideoProfile:               'select',
+    VideoLevel:                 'select',
     TonemapHdrToSdr:            'bool',
     RemoveBlackBorders:         'bool',
 
@@ -118,6 +130,7 @@ const NUMBER_DEFAULTS = Object.freeze({
     FourKBitrateMultiplier: '4',
     SkipPercentAboveTarget: '20',
     QueuePriority:          '0',
+    MaxFrameRate:           '0',
 });
 
 
@@ -145,9 +158,11 @@ function ovrAppendAudioRow(profile = {}) {
     const codecSel  = row.querySelector('[data-field="Codec"]');
     const layoutSel = row.querySelector('[data-field="Layout"]');
     const bitrateIn = row.querySelector('[data-field="BitrateKbps"]');
+    const sampleRateSel = row.querySelector('[data-field="SampleRateHz"]');
 
     if (profile.Codec)  codecSel.value  = profile.Codec;
     if (profile.Layout) layoutSel.value = profile.Layout;
+    if (profile.SampleRateHz != null) sampleRateSel.value = String(profile.SampleRateHz);
     bitrateIn.value = (profile.BitrateKbps && profile.BitrateKbps > 0)
         ? profile.BitrateKbps
         : defaultBitrateForCodec(codecSel.value);
@@ -177,6 +192,7 @@ function ovrSetAudioOutputs(profiles) {
             Codec:       p.Codec       ?? p.codec,
             Layout:      p.Layout      ?? p.layout,
             BitrateKbps: p.BitrateKbps ?? p.bitrateKbps ?? 0,
+            SampleRateHz: p.SampleRateHz ?? p.sampleRateHz ?? 0,
         });
     }
 }
@@ -188,6 +204,7 @@ function ovrReadAudioOutputs() {
         Codec:       row.querySelector('[data-field="Codec"]')?.value       ?? 'aac',
         Layout:      row.querySelector('[data-field="Layout"]')?.value      ?? 'Source',
         BitrateKbps: parseInt(row.querySelector('[data-field="BitrateKbps"]')?.value, 10) || 0,
+        SampleRateHz: parseInt(row.querySelector('[data-field="SampleRateHz"]')?.value, 10) || 0,
     }));
 }
 
