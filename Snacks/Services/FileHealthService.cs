@@ -38,6 +38,27 @@ public sealed class FileHealthService
     public sealed record VerifyResult(bool Ok, IReadOnlyList<string> Issues);
 
     /// <summary>
+    ///     stderr fragments that are artifacts of the sampling method, not real defects.
+    ///     We input-seek (<c>-ss</c> before <c>-i</c>) into the middle/end of the file and
+    ///     feed decoded frames to the null muxer; seeking into an open-GOP HEVC stream
+    ///     hands the muxer a few frames whose DTS aren't strictly increasing, so ffmpeg
+    ///     prints "non monotonically increasing dts to muxer". The frames DID decode —
+    ///     which is exactly what this check verifies — so it's a muxer timestamp complaint,
+    ///     not a corruption signal. Files that trip it play back fine; counting it as a
+    ///     failure produced false "VERIFY FAILED" reports across healthy HEVC libraries.
+    ///     Genuine corruption surfaces as distinct lines ("Invalid data found", "error
+    ///     while decoding", "corrupt", …) which are NOT matched here.
+    /// </summary>
+    private static readonly string[] _benignVerifyNoise =
+    {
+        "non monotonically increasing dts to muxer",
+    };
+
+    /// <summary> True when a stderr line is sampling-method noise rather than a decode defect. </summary>
+    internal static bool IsBenignVerifyNoise(string line) =>
+        _benignVerifyNoise.Any(p => line.Contains(p, StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>
     ///     Decodes short samples at three offsets and collects every decoder error.
     ///     A clean file returns <c>Ok = true</c> with no issues; a damaged one returns
     ///     the (deduplicated, truncated) ffmpeg error lines so the user can see what's
@@ -125,6 +146,9 @@ public sealed class FileHealthService
             lock (errors)
             {
                 // Keep lines compact and deduplicated — decoder errors repeat per frame.
+                // Benign muxer-timestamp noise is collected here (so the exit-code fallback
+                // can tell "printed nothing" from "printed only noise") and filtered out of
+                // the returned issues below.
                 var line = e.Data.Length > 300 ? e.Data[..300] + "…" : e.Data;
                 if (errors.Count < 50 && !errors.Contains(line)) errors.Add(line);
             }
@@ -149,17 +173,22 @@ public sealed class FileHealthService
             // enumerates the list without taking the lock.
             lock (errors)
             {
-                errors.Add($"Decode sample timed out after {SampleTimeout.TotalSeconds:0}s — likely a hang-inducing corruption.");
-                return new List<string>(errors);
+                var timedOut = errors.Where(l => !IsBenignVerifyNoise(l)).ToList();
+                timedOut.Add($"Decode sample timed out after {SampleTimeout.TotalSeconds:0}s — likely a hang-inducing corruption.");
+                return timedOut;
             }
         }
         process.WaitForExit(); // drain async stderr events
 
         lock (errors)
         {
+            // Drop benign muxer-timestamp noise; a sample whose ONLY output was that noise
+            // is a healthy decode. Gate the exit-code fallback on the RAW output so a
+            // non-zero exit accompanied only by benign noise doesn't resurface as a failure.
+            var genuine = errors.Where(l => !IsBenignVerifyNoise(l)).ToList();
             if (process.ExitCode != 0 && errors.Count == 0)
-                errors.Add($"ffmpeg exited with code {process.ExitCode} but printed no error.");
-            return new List<string>(errors);
+                genuine.Add($"ffmpeg exited with code {process.ExitCode} but printed no error.");
+            return genuine;
         }
     }
 }
