@@ -4899,27 +4899,6 @@ public class TranscodingService
     ///     whose H.264 Level 3.0 tops out near 33 fps at 640×480 — a 50/60 fps source must
     ///     be capped to stay level-conformant.
     /// </summary>
-    private static readonly HashSet<string> _h264Profiles =
-        new(StringComparer.OrdinalIgnoreCase) { "baseline", "main", "high", "high10", "high422", "high444" };
-    private static readonly HashSet<string> _h265Profiles =
-        new(StringComparer.OrdinalIgnoreCase) { "main", "main10", "main12", "mainstillpicture", "msp" };
-
-    /// <summary>
-    ///     True when <paramref name="profile"/> is a valid <c>-profile:v</c> value for the
-    ///     given software encoder. H.264 (libx264) and HEVC (libx265) accept disjoint sets
-    ///     — e.g. "baseline"/"high" are H.264-only and make libx265 error out — and other
-    ///     encoders (libsvtav1) take no H.26x profile at all. An empty profile is "valid"
-    ///     (nothing is emitted). Used to drop an incompatible codec+profile pairing rather
-    ///     than assemble a command ffmpeg refuses to run.
-    /// </summary>
-    internal static bool IsVideoProfileValidForEncoder(string encoder, string? profile)
-    {
-        if (string.IsNullOrWhiteSpace(profile)) return true;
-        if (encoder.Contains("264")) return _h264Profiles.Contains(profile);
-        if (encoder.Contains("265") || encoder.Contains("hevc")) return _h265Profiles.Contains(profile);
-        return false;
-    }
-
     internal static string? ComputeFpsCapExpr(WorkItem workItem, EncoderOptions options)
     {
         int cap = options.MaxFrameRate;
@@ -4953,6 +4932,27 @@ public class TranscodingService
             && num > 0 && den > 0)
             return num / den;
         return null;
+    }
+
+    private static readonly HashSet<string> _h264Profiles =
+        new(StringComparer.OrdinalIgnoreCase) { "baseline", "main", "high", "high10", "high422", "high444" };
+    private static readonly HashSet<string> _h265Profiles =
+        new(StringComparer.OrdinalIgnoreCase) { "main", "main10", "main12", "mainstillpicture", "msp" };
+
+    /// <summary>
+    ///     True when <paramref name="profile"/> is a valid <c>-profile:v</c> value for the
+    ///     given software encoder. H.264 (libx264) and HEVC (libx265) accept disjoint sets
+    ///     — e.g. "baseline"/"high" are H.264-only and make libx265 error out — and other
+    ///     encoders (libsvtav1) take no H.26x profile at all. An empty profile is "valid"
+    ///     (nothing is emitted). Used to drop an incompatible codec+profile pairing rather
+    ///     than assemble a command ffmpeg refuses to run.
+    /// </summary>
+    internal static bool IsVideoProfileValidForEncoder(string encoder, string? profile)
+    {
+        if (string.IsNullOrWhiteSpace(profile)) return true;
+        if (encoder.Contains("264")) return _h264Profiles.Contains(profile);
+        if (encoder.Contains("265") || encoder.Contains("hevc")) return _h265Profiles.Contains(profile);
+        return false;
     }
 
     /// <summary>
