@@ -377,6 +377,48 @@ public sealed class RateControlAndScaleTests
         filter.Should().Contain("format=yuv420p");
     }
 
+    [Fact]
+    public void ComputeFixedFrameFilter_rounds_odd_dimensions_down_to_even()
+    {
+        // yuv420p needs even dims — an odd hand-entered size must not produce a filter
+        // ffmpeg rejects. 641x481 → 640x480.
+        var opts = new EncoderOptions { FixedFrameSize = "641x481" };
+        var filter = TranscodingService.ComputeFixedFrameFilter(opts);
+        filter.Should().NotBeNull();
+        filter.Should().Contain("min(iw\\,640):min(ih\\,480)");
+        filter.Should().Contain("pad=640:480:");
+    }
+
+    [Fact]
+    public void ComputeFixedFrameFilter_returns_null_when_a_dimension_rounds_to_zero()
+    {
+        // "1" rounds down to 0 — treat as unparseable rather than emit a 0-size pad.
+        TranscodingService.ComputeFixedFrameFilter(new EncoderOptions { FixedFrameSize = "1x480" }).Should().BeNull();
+    }
+
+
+    // =====================================================================
+    //  IsVideoProfileValidForEncoder — drops H.264-only profiles on HEVC
+    //  (and any H.26x profile on AV1) so the command can't hard-fail.
+    // =====================================================================
+
+    [Theory]
+    [InlineData("libx264", "baseline", true)]
+    [InlineData("libx264", "high",     true)]
+    [InlineData("libx264", "main",     true)]
+    [InlineData("libx265", "main",     true)]
+    [InlineData("libx265", "main10",   true)]
+    [InlineData("libx265", "baseline", false)]  // H.264-only — would crash libx265
+    [InlineData("libx265", "high",     false)]
+    [InlineData("hevc_nvenc", "baseline", false)]
+    [InlineData("libsvtav1", "main",   false)]  // AV1 takes no H.26x profile
+    [InlineData("libx264", "",         true)]   // empty = nothing emitted = valid
+    [InlineData("libx264", null,       true)]
+    public void IsVideoProfileValidForEncoder_matches_codec(string encoder, string? profile, bool expected)
+    {
+        TranscodingService.IsVideoProfileValidForEncoder(encoder, profile).Should().Be(expected);
+    }
+
 
     // =====================================================================
     //  ComputeFpsCapExpr — caps output frame rate for level-conformant
@@ -424,11 +466,13 @@ public sealed class RateControlAndScaleTests
     }
 
     [Fact]
-    public void ComputeFpsCapExpr_caps_defensively_when_source_rate_unknown()
+    public void ComputeFpsCapExpr_leaves_source_untouched_when_rate_unknown()
     {
+        // `fps=N` would UPSAMPLE (duplicate frames) a slower source, so an unknown rate
+        // must NOT be capped — leaving it is safer than risking a 24→30 fps inflation.
         var opts = new EncoderOptions { MaxFrameRate = 30 };
-        TranscodingService.ComputeFpsCapExpr(MakeWorkItemFps(null), opts).Should().Be("fps=30");
-        TranscodingService.ComputeFpsCapExpr(MakeWorkItemFps("0/0"), opts).Should().Be("fps=30");
+        TranscodingService.ComputeFpsCapExpr(MakeWorkItemFps(null), opts).Should().BeNull();
+        TranscodingService.ComputeFpsCapExpr(MakeWorkItemFps("0/0"), opts).Should().BeNull();
     }
 
     [Theory]

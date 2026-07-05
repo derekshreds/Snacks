@@ -3588,7 +3588,17 @@ public class TranscodingService
         if (!videoCopy && encoder.StartsWith("lib"))
         {
             if (!string.IsNullOrWhiteSpace(options.VideoProfile))
-                profileLevel += $"-profile:v {options.VideoProfile} ";
+            {
+                // Profile names differ by codec — H.264 has baseline/main/high, HEVC has
+                // main/main10/…. Passing an H.264 profile to libx265 makes it hard-fail, so
+                // drop an incompatible pairing (encoder default) instead of emitting a
+                // command that can't run.
+                if (IsVideoProfileValidForEncoder(encoder, options.VideoProfile))
+                    profileLevel += $"-profile:v {options.VideoProfile} ";
+                else
+                    await LogAsync(workItem.Id,
+                        $"Ignoring video profile '{options.VideoProfile}' — not valid for {encoder}.");
+            }
             if (!string.IsNullOrWhiteSpace(options.VideoLevel))
                 profileLevel += $"-level {options.VideoLevel} ";
         }
@@ -4865,6 +4875,13 @@ public class TranscodingService
             || !int.TryParse(parts[1], out int h)
             || w <= 0 || h <= 0) return null;
 
+        // yuv420p (and the pad target) require even dimensions — round a hand-entered odd
+        // size down to the nearest even so ffmpeg can't reject the frame at runtime. A
+        // value that rounds to 0 (someone typed "1") is treated as unparseable.
+        w -= w % 2;
+        h -= h % 2;
+        if (w <= 0 || h <= 0) return null;
+
         // Scale to fit inside w×h preserving aspect ratio, then pad to exact w×h
         // with letterboxing, then force yuv420p (required by Baseline profile and
         // most hardware players). The commas inside min() are escaped as \, so
@@ -4874,24 +4891,48 @@ public class TranscodingService
     }
 
     /// <summary>
-    ///     When <see cref="EncoderOptions.MaxFrameRate"/> is set (&gt; 0) and the source
-    ///     runs faster than the cap, returns an <c>fps=</c> filter that drops frames to
-    ///     the cap; otherwise returns <c>null</c>. Sources at or below the cap are left
-    ///     untouched (no filter) so a 24/25/30 fps source is never resampled. Required by
-    ///     device presets like iPod Classic, whose H.264 Level 3.0 tops out near 33 fps at
-    ///     640×480 — a 50/60 fps source must be capped to stay level-conformant.
+    ///     When <see cref="EncoderOptions.MaxFrameRate"/> is set (&gt; 0) and the source is
+    ///     KNOWN to run faster than the cap, returns an <c>fps=</c> filter that drops frames
+    ///     to the cap; otherwise returns <c>null</c>. Sources at/below the cap — or whose
+    ///     rate can't be determined — are left untouched so a 24/25/30 fps source is never
+    ///     resampled (and never upsampled). Required by device presets like iPod Classic,
+    ///     whose H.264 Level 3.0 tops out near 33 fps at 640×480 — a 50/60 fps source must
+    ///     be capped to stay level-conformant.
     /// </summary>
+    private static readonly HashSet<string> _h264Profiles =
+        new(StringComparer.OrdinalIgnoreCase) { "baseline", "main", "high", "high10", "high422", "high444" };
+    private static readonly HashSet<string> _h265Profiles =
+        new(StringComparer.OrdinalIgnoreCase) { "main", "main10", "main12", "mainstillpicture", "msp" };
+
+    /// <summary>
+    ///     True when <paramref name="profile"/> is a valid <c>-profile:v</c> value for the
+    ///     given software encoder. H.264 (libx264) and HEVC (libx265) accept disjoint sets
+    ///     — e.g. "baseline"/"high" are H.264-only and make libx265 error out — and other
+    ///     encoders (libsvtav1) take no H.26x profile at all. An empty profile is "valid"
+    ///     (nothing is emitted). Used to drop an incompatible codec+profile pairing rather
+    ///     than assemble a command ffmpeg refuses to run.
+    /// </summary>
+    internal static bool IsVideoProfileValidForEncoder(string encoder, string? profile)
+    {
+        if (string.IsNullOrWhiteSpace(profile)) return true;
+        if (encoder.Contains("264")) return _h264Profiles.Contains(profile);
+        if (encoder.Contains("265") || encoder.Contains("hevc")) return _h265Profiles.Contains(profile);
+        return false;
+    }
+
     internal static string? ComputeFpsCapExpr(WorkItem workItem, EncoderOptions options)
     {
         int cap = options.MaxFrameRate;
         if (cap <= 0) return null;
 
         var v = workItem.Probe?.Streams?.FirstOrDefault(s => s.CodecType == "video");
-        double sourceFps = ParseFrameRate(v?.AvgFrameRate) ?? ParseFrameRate(v?.RFrameRate) ?? 0;
+        double? sourceFps = ParseFrameRate(v?.AvgFrameRate) ?? ParseFrameRate(v?.RFrameRate);
 
-        // Unknown source rate → apply the cap defensively (an over-cap source is the risk;
-        // an fps filter that matches the true rate is a harmless no-op).
-        if (sourceFps > 0 && sourceFps <= cap) return null;
+        // Only cap when we KNOW the source exceeds it. `fps=N` duplicates frames to reach
+        // N on a slower source, so capping an unknown (or at/below-cap) rate risks silently
+        // upsampling a 24 fps file to 30 — worse than leaving it. An unknown rate is rare
+        // (ffprobe populates it for real media) and the bitrate math already trusts the probe.
+        if (sourceFps is null || sourceFps <= cap) return null;
         return $"fps={cap}";
     }
 

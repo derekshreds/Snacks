@@ -29,13 +29,17 @@ import { initChipInput, getChipValues, setChipValues } from '../settings/chip-in
 const MODAL_ID = 'overrideDialog';
 
 /**
- * Folder-context fields. Mirrors what the main settings tabs expose, minus
- * HardwareAcceleration (each node auto-detects its own hardware).
+ * Folder-context fields. Mirrors what the main settings tabs expose. Nodes normally
+ * auto-detect their own hardware, but HardwareAcceleration is overridable so a folder
+ * can force software encoding — required for device profiles (e.g. iPod Classic), whose
+ * Baseline/level flags only apply on software encoders. A vendor mismatch on a given
+ * node falls back to software automatically (GetSoftwareFallbackEncoder).
  */
 const FOLDER_OVERRIDE_FIELDS = Object.freeze({
     // General
     Format:                     'select',
     Codec:                      'select',
+    HardwareAcceleration:       'select',
     TargetBitrate:              'number',
     StrictBitrate:              'bool',
     FourKBitrateMultiplier:     'select',

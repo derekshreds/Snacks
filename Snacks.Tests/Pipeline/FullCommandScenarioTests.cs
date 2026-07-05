@@ -141,11 +141,13 @@ public sealed class FullCommandScenarioTests
                   canHwDecode: useVaapi && !hasFilter,   // SW-decode when filters are active
                   vaapiFormat: tonemap ? "nv12" : "nv12");
 
-        // H.264/H.265 profile + level — software encoders only (mirrors production code).
+        // H.264/H.265 profile + level — software encoders only (mirrors production code,
+        // including the codec/profile validity gate).
         string profileLevel = "";
         if (!videoCopy && encoder.StartsWith("lib"))
         {
-            if (!string.IsNullOrWhiteSpace(options.VideoProfile))
+            if (!string.IsNullOrWhiteSpace(options.VideoProfile)
+                && TranscodingService.IsVideoProfileValidForEncoder(encoder, options.VideoProfile))
                 profileLevel += $"-profile:v {options.VideoProfile} ";
             if (!string.IsNullOrWhiteSpace(options.VideoLevel))
                 profileLevel += $"-level {options.VideoLevel} ";

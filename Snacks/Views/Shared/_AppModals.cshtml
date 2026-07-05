@@ -269,6 +269,14 @@
                             <option value="h265">H.265/HEVC</option><option value="h264">H.264/AVC</option><option value="av1">AV1</option>
                         </select>
                     </div>
+                    <div class="form-check mb-2" data-context="folder">
+                        <input class="form-check-input override-toggle" type="checkbox" id="ovr_HardwareAcceleration" data-field="HardwareAcceleration">
+                        <label class="form-check-label" for="ovr_HardwareAcceleration">Hardware Acceleration</label>
+                        <select class="form-select form-select-sm mt-1" id="ovrHardwareAcceleration" disabled>
+                            <option value="auto">Auto Detect</option><option value="intel">Intel Quick Sync (QSV)</option><option value="amd">AMD AMF</option><option value="nvidia">NVIDIA NVENC</option><option value="apple">Apple VideoToolbox</option><option value="none">Software Only</option>
+                        </select>
+                        <div class="form-text">Force software (Software Only) for device profiles that need Baseline/level flags, e.g. iPod Classic.</div>
+                    </div>
                     <div class="form-check mb-2" data-context="folder,node">
                         <input class="form-check-input override-toggle" type="checkbox" id="ovr_TargetBitrate" data-field="TargetBitrate">
                         <label class="form-check-label" for="ovr_TargetBitrate">Target Bitrate (kbps)</label>
