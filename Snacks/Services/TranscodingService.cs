@@ -5564,24 +5564,59 @@ public class TranscodingService
 
     /// <summary>
     ///     Tests whether a hardware encoder is functional by running a minimal encode.
+    ///     Tries each probe variant from <see cref="BuildEncoderProbeAttempts"/> in order;
+    ///     a pass on any variant means the encoder is usable (the real encode negotiates
+    ///     its own mode — see <see cref="CalibrateVaapiQualityAsync"/>).
     /// </summary>
     private async Task<bool> TestEncoderAsync(string hwFlags, string encoder)
     {
+        foreach (var (args, lowPower) in BuildEncoderProbeAttempts(hwFlags, encoder))
+        {
+            if (await RunEncoderProbeAsync(args, lowPower ? $"{encoder} (low_power)" : encoder))
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    ///     Builds the ordered ffmpeg argument sets used to probe an encoder. Non-VAAPI
+    ///     encoders get a single bare attempt. VAAPI encoders are probed with the CQP
+    ///     flags real encodes use — twice: plain first, then with <c>-low_power 1</c>.
+    ///
+    ///     <para>Neither attempt alone covers the VAAPI hardware matrix. AMD (Mesa
+    ///     radeonsi) only exposes the normal entrypoint (VAEntrypointEncSlice) and
+    ///     rejects <c>-low_power</c> with EINVAL; LP-only Intel parts (Jasper Lake,
+    ///     Elkhart Lake, and the ADL-N/Twin Lake N-series — N95/N100/N305/N355) only
+    ///     expose VAEntrypointEncSliceLP and reject plain CQP. Probing only one mode
+    ///     has shipped a regression in each direction already — LP-only dropped every
+    ///     AMD encode to software, plain-only dropped LP-only Intel to software. Plain
+    ///     goes first so healthy AMD and full-featured Intel never pay a second probe.</para>
+    /// </summary>
+    internal static (string args, bool lowPower)[] BuildEncoderProbeAttempts(string hwFlags, string encoder)
+    {
+        string Args(string vf, string extra) =>
+            $"-y {hwFlags} -f lavfi -i color=c=black:s=256x256:d=0.1 {vf} -c:v {encoder} {extra} -frames:v 1 -f null -";
+
+        if (!encoder.Contains("vaapi"))
+            return [(Args("", ""), false)];
+
+        const string vf = "-vf format=nv12|vaapi,hwupload";
+        string cqp = $"-rc_mode CQP -global_quality:v {VaapiQualityScale.For(encoder).FixedCqp}";
+        return
+        [
+            (Args(vf, cqp), false),
+            (Args(vf, $"-low_power 1 {cqp}"), true),
+        ];
+    }
+
+    /// <summary>
+    ///     Runs a single encoder probe attempt. <paramref name="label"/> is the encoder
+    ///     name plus the probe variant, used only for log output.
+    /// </summary>
+    private async Task<bool> RunEncoderProbeAsync(string args, string label)
+    {
         try
         {
-            // Test with the same flags used in actual encoding: CQP mode with low-power for VAAPI
-            string vf, extra;
-            if (encoder.Contains("vaapi"))
-            {
-                vf = "-vf format=nv12|vaapi,hwupload";
-                extra = $"-rc_mode CQP -global_quality:v {VaapiQualityScale.For(encoder).FixedCqp}";
-            }
-            else
-            {
-                vf = "";
-                extra = "";
-            }
-            var args = $"-y {hwFlags} -f lavfi -i color=c=black:s=256x256:d=0.1 {vf} -c:v {encoder} {extra} -frames:v 1 -f null -";
             var psi = new ProcessStartInfo(_ffmpegPath)
             {
                 Arguments = args,
@@ -5606,17 +5641,17 @@ public class TranscodingService
             if (!process.HasExited)
             {
                 try { process.Kill(entireProcessTree: true); } catch { }
-                Console.WriteLine($"Auto-detect: {encoder} test timed out");
+                Console.WriteLine($"Auto-detect: {label} test timed out");
                 return false;
             }
             var stderr = await stderrTask;
 
-            Console.WriteLine($"Auto-detect: {encoder} test exit={process.ExitCode}");
+            Console.WriteLine($"Auto-detect: {label} test exit={process.ExitCode}");
             if (process.ExitCode != 0)
             {
                 // Get last 500 chars of stderr (actual error is at the end, not the build config at the start)
                 var errTail = stderr.Length > 500 ? stderr.Substring(stderr.Length - 500) : stderr;
-                Console.WriteLine($"Auto-detect: {encoder} stderr (tail): {errTail}");
+                Console.WriteLine($"Auto-detect: {label} stderr (tail): {errTail}");
             }
 
             return process.ExitCode == 0;
