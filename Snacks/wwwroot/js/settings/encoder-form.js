@@ -86,7 +86,10 @@ const LEGACY_SELECT_VALUES = {
     HardwareAcceleration: {
         nvenc: 'nvidia',
         cuda:  'nvidia',
-        vaapi: 'intel',
+        // 'vaapi' is vendor-ambiguous (Intel AND AMD use VAAPI on Linux) — mapping
+        // it to 'intel' stranded AMD hosts on an unmatched device. 'auto' lets the
+        // backend's hardware detection resolve the actual vendor.
+        vaapi: 'auto',
         qsv:   'intel',
         amf:   'amd',
     },

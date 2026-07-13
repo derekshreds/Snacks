@@ -820,9 +820,10 @@ public class TranscodingService
             bool isVaapiMode = IsVaapiAcceleration(effectiveOptions.HardwareAcceleration) ||
                 (effectiveOptions.HardwareAcceleration.Equals("auto", StringComparison.OrdinalIgnoreCase) &&
                     _detectedHardware != null && IsVaapiAcceleration(_detectedHardware));
-            if (isVaapiMode && !isHevc && targetIsHevc && bitrate > 0 && bitrate <= effectiveOptions.TargetBitrate && !isHighDef && !bypassSkip)
+            if (isVaapiMode && ((targetIsHevc && !isHevc) || (targetIsAv1 && !isAv1))
+                && bitrate > 0 && bitrate <= effectiveOptions.TargetBitrate && !isHighDef && !bypassSkip)
             {
-                Console.WriteLine($"Skipping {workItem.FileName}: VAAPI can't compress {bitrate}kbps H.264 below target");
+                Console.WriteLine($"Skipping {workItem.FileName}: VAAPI can't compress {bitrate}kbps {sourceCodecLabel} below target");
                 await MarkSkippedInDb();
                 return workItem.Id;
             }
@@ -1530,10 +1531,11 @@ public class TranscodingService
             bool isVaapiMode = IsVaapiAcceleration(options.HardwareAcceleration) ||
                 (options.HardwareAcceleration.Equals("auto", StringComparison.OrdinalIgnoreCase) &&
                  _detectedHardware != null && IsVaapiAcceleration(_detectedHardware));
-            if (isVaapiMode && !isHevc && targetIsHevc && bitrate > 0 && bitrate <= options.TargetBitrate && !isHighDef && !bypassSkip)
+            if (isVaapiMode && ((targetIsHevc && !isHevc) || (targetIsAv1 && !isAv1))
+                && bitrate > 0 && bitrate <= options.TargetBitrate && !isHighDef && !bypassSkip)
             {
                 result.Decision = "Skip";
-                result.Reason   = $"VAAPI can't compress {bitrate}kbps H.264 below {options.TargetBitrate}kbps target.";
+                result.Reason   = $"VAAPI can't compress {bitrate}kbps {sourceCodecLabel} below {options.TargetBitrate}kbps target.";
                 return result;
             }
 
@@ -3435,6 +3437,7 @@ public class TranscodingService
         // Do a 30-second test encode to measure actual output, then adjust QP to hit target.
         string compressionFlags;
         bool useLowPower = true;
+        int gop = ComputeGop(workItem);
         if (videoCopy)
             compressionFlags = "";
         else if (useVaapi)
@@ -3451,7 +3454,7 @@ public class TranscodingService
             }
             else
             {
-                compressionFlags = $"-g 25 -rc_mode CQP -global_quality:v {quality} ";
+                compressionFlags = $"-g {gop} -rc_mode CQP -global_quality:v {quality} ";
             }
         }
         else if (encoder == "libsvtav1")
@@ -3472,29 +3475,38 @@ public class TranscodingService
             // ("Temporal AQ not supported" → encoder fails to open on Pascal and earlier).
             int maxBitrateVal = int.Parse(maxBitrate.TrimEnd('k'));
             string aqFlags = useConservativeHwFlags ? "-spatial_aq 1" : "-spatial_aq 1 -temporal_aq 1";
-            compressionFlags = $"-g 25 -rc vbr -rc-lookahead 32 {aqFlags} -b:v {targetBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
+            compressionFlags = $"-g {gop} -rc vbr -rc-lookahead 32 {aqFlags} -b:v {targetBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
         }
         else if (encoder.Contains("amf"))
         {
             // AMF ignores -maxrate in generic VBR mode (confirmed bug in FFmpeg >= 7.1).
             // Use vbr_peak (peak-constrained VBR) with enforce_hrd to enforce the ceiling.
             int maxBitrateVal = int.Parse(maxBitrate.TrimEnd('k'));
-            compressionFlags = $"-g 25 -rc vbr_peak -enforce_hrd 1 -b:v {targetBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
+            compressionFlags = $"-g {gop} -rc vbr_peak -enforce_hrd 1 -b:v {targetBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
         }
         else if (encoder.Contains("qsv"))
         {
             // QSV needs lookahead and extbrc for reliable maxrate enforcement.
             // Conservative mode drops both — iGPUs that don't implement oneVPL lookahead
             // fail surface handoff at frame 0 ("Invalid FrameType:0" on Tiger Lake).
+            // (-look_ahead is h264_qsv-only and ignored elsewhere; extbrc and
+            // look_ahead_depth are valid on h264/hevc/av1 QSV.)
             int maxBitrateVal = int.Parse(maxBitrate.TrimEnd('k'));
             string laFlags = useConservativeHwFlags ? "" : "-extbrc 1 -look_ahead 1 -look_ahead_depth 40 ";
-            compressionFlags = $"-g 25 {laFlags}-b:v {targetBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
+            compressionFlags = $"-g {gop} {laFlags}-b:v {targetBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
+        }
+        else if (encoder.Contains("videotoolbox"))
+        {
+            // VideoToolbox honors -b:v/-maxrate but not -minrate; keep the GOP in
+            // line with the rest of the library.
+            int maxBitrateVal = int.Parse(maxBitrate.TrimEnd('k'));
+            compressionFlags = $"-g {gop} -b:v {targetBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
         }
         else
         {
             // Software encoders (libx264, libx265) — standard VBR with maxrate enforcement.
             int maxBitrateVal = int.Parse(maxBitrate.TrimEnd('k'));
-            compressionFlags = $"-g 25 -b:v {targetBitrate} -minrate {minBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
+            compressionFlags = $"-g {gop} -b:v {targetBitrate} -minrate {minBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
         }
 
         // Detect 10-bit content — VAAPI needs p010 format instead of nv12 for 10-bit
@@ -3534,23 +3546,32 @@ public class TranscodingService
                 }
             }
             useVaapi = encoder.Contains("vaapi");
+            // Calibration didn't run on this path (videoCopy skipped it), so useLowPower
+            // still holds its initial value. LP entrypoints are Intel-only
+            // (VAEntrypointEncSliceLP); AMD Mesa exposes only VAEntrypointEncSlice and
+            // the encoder fails to open with -low_power 1.
+            useLowPower = useVaapi && hwAccel.Equals("intel", StringComparison.OrdinalIgnoreCase);
             compressionFlags = GetForcedReencodeCompressionFlags(
                 encoder, useVaapi, encoder == "libsvtav1",
-                targetBitrate, minBitrate, maxBitrate, useConservativeHwFlags);
+                targetBitrate, minBitrate, maxBitrate, useConservativeHwFlags, gop);
         }
 
-        // forceSwDecode: external retry path when VAAPI hwaccel fails mid-stream.
+        // forceSwDecode: external retry path when VAAPI/QSV hwaccel fails mid-stream.
         // User's chosen strategy is "SW filters + hwupload", so any active filter on a
-        // VAAPI path also forces SW decode — SW filter ops can't run on GPU frames.
+        // VAAPI/QSV path also forces SW decode — SW filter ops can't run on GPU frames.
+        // QSV must thread hwDecode through like VAAPI does: otherwise the sw-decode
+        // init arm in GetInitFlags is unreachable and the forceSwDecode retry re-runs
+        // the exact command that just failed.
+        bool useQsv = !videoCopy && encoder.Contains("qsv");
         bool canHwDecode = !forceSwDecode && CanVaapiDecode(workItem.Probe);
-        if (useVaapi && hasFilter) canHwDecode = false;
-        if (useVaapi && !canHwDecode && (forceSwDecode || hasFilter))
+        if ((useVaapi || useQsv) && hasFilter) canHwDecode = false;
+        if ((useVaapi || useQsv) && !canHwDecode && (forceSwDecode || hasFilter))
         {
             await LogAsync(workItem.Id,
-                "Using software decode + VAAPI encode (hwaccel decode disabled)");
+                $"Using software decode + {(useQsv ? "QSV" : "VAAPI")} encode (hwaccel decode disabled)");
         }
 
-        string initFlags = useVaapi
+        string initFlags = useVaapi || useQsv
             ? GetInitFlags(hwAccel, options.HardwareDevicePath, canHwDecode)
             : GetInitFlags(hwAccel, options.HardwareDevicePath);
 
@@ -3562,7 +3583,11 @@ public class TranscodingService
         // disabled HW decode for retry. If the source codec has no cuvid mapping or NVDEC
         // refuses the profile, the retry path drops the explicit decoder.
         bool isNvidia = hwAccel.Equals("nvidia", StringComparison.OrdinalIgnoreCase);
-        if (isNvidia && !videoCopy && !forceSwDecode && !encoder.StartsWith("lib"))
+        // hasFilter: crop/downscale/tonemap run as software -vf chains with no
+        // hwdownload, so NVDEC surfaces can't feed them ("Impossible to convert
+        // between the formats") — decode in software when a filter is active,
+        // mirroring the VAAPI/QSV gate above.
+        if (isNvidia && !videoCopy && !forceSwDecode && !hasFilter && !encoder.StartsWith("lib"))
         {
             var srcCodec = workItem.Probe?.Streams?.FirstOrDefault(s => s.CodecType == "video")?.CodecName;
             string cuvid = GetNvidiaInputDecoder(srcCodec);
@@ -3576,10 +3601,17 @@ public class TranscodingService
             useVaapi: useVaapi, canHwDecode: canHwDecode, vaapiFormat: vaapiFormat);
         bool isSvtAv1 = encoder == "libsvtav1";
         bool isAmf    = encoder.Contains("amf");
+        bool isVideoToolbox = encoder.Contains("videotoolbox");
+        bool isNvenc  = encoder.Contains("nvenc");
         string presetFlag = useVaapi
             ? (useLowPower ? "-low_power 1 " : "")
+            // VideoToolbox has no -preset option at all — passing one fails the encode
+            // before the encoder opens (masked by TestEncoderAsync, which never sends
+            // a preset, so detection reports VT as working).
+            : isVideoToolbox ? ""
             : isSvtAv1 ? $"-preset {MapSvtAv1Preset(options.FfmpegQualityPreset)} "
             : isAmf    ? $"-quality {MapAmfPreset(options.FfmpegQualityPreset)} "
+            : isNvenc  ? $"-preset {MapNvencPreset(options.FfmpegQualityPreset)} "
                         : $"-preset {options.FfmpegQualityPreset} ";
         // H.264/H.265 profile + level — only for software encoders (libx264/libx265).
         // Hardware encoders (NVENC/VAAPI/QSV/AMF) accept different profile value sets,
@@ -3713,10 +3745,12 @@ public class TranscodingService
         else if (ocrMuxSrts.Count > 0)
         {
             // Mux mode — build the subtitle args ourselves so we can interleave source text
-            // subs (passed through as-is via per-stream -c:s:N copy) with the OCR'd SRTs
-            // (encoded to the container's native text codec). When MKV pass-through is on,
-            // bitmap streams are also kept here so the output has both PGS + OCR'd SRT.
-            string ocrCodec = FfprobeService.IsMatroska(options.Format) ? "srt" : "mov_text";
+            // subs with the OCR'd SRTs (encoded to the container's native text codec).
+            // When MKV pass-through is on, bitmap streams are also kept here so the
+            // output has both PGS + OCR'd SRT.
+            string ocrCodec = FfprobeService.IsMatroska(options.Format) ? "srt"
+                : options.Format.Equals("webm", StringComparison.OrdinalIgnoreCase) ? "webvtt"
+                : "mov_text";
 
             bool passBitmaps = FfprobeService.IsMatroska(options.Format)
                             && options.PassThroughImageSubtitlesMkv
@@ -3752,7 +3786,13 @@ public class TranscodingService
             foreach (var s in sourceSubs)
             {
                 maps   += $"-map 0:{s.StreamIndex} ";
-                codecs += $"-c:s:{outSubIndex} copy ";
+                // -c:s copy is only valid into Matroska. MP4/WebM can't stream-copy
+                // subrip/ass — ffmpeg aborts with "could not find tag" — so source text
+                // subs are transcoded to the container's native text codec instead.
+                // (Bitmap subs only reach this loop on the Matroska pass-through path.)
+                codecs += FfprobeService.IsMatroska(options.Format)
+                    ? $"-c:s:{outSubIndex} copy "
+                    : $"-c:s:{outSubIndex} {ocrCodec} ";
                 // Matroska's language element and Plex/Jellyfin auto-select both key on
                 // ISO 639-2/B. Map the 2-letter tag if we can, otherwise pass through.
                 var tag = LanguageMatcher.ToThreeLetterB(s.Lang) ?? s.Lang;
@@ -4772,7 +4812,7 @@ public class TranscodingService
             else
             {
                 targetBitrate = $"{hdBitrate}k";
-                minBitrate = $"{hdBitrate - 200}k";
+                minBitrate = $"{Math.Max(hdBitrate - 200, 0)}k";
                 maxBitrate = $"{hdBitrate + 500}k";
             }
         }
@@ -4793,8 +4833,10 @@ public class TranscodingService
             maxBitrate = $"{effectiveTarget + 500}k";
         }
 
-        // If bitrate is already below target and using HEVC, copy instead
-        if (workItem.Bitrate < options.TargetBitrate + 700 && workItem.IsHevc && !options.RemoveBlackBorders)
+        // If bitrate is already below target and using HEVC, copy instead. Bitrate 0
+        // means ffprobe couldn't measure it — don't copy a possibly-huge file on an
+        // unknown bitrate (mirrors the > 0 guards above).
+        if (workItem.Bitrate > 0 && workItem.Bitrate < options.TargetBitrate + 700 && workItem.IsHevc && !options.RemoveBlackBorders)
         {
             videoCopy = true;
         }
@@ -4934,6 +4976,22 @@ public class TranscodingService
         return null;
     }
 
+    /// <summary>
+    ///     Keyframe interval: ~2 seconds of frames (the streaming-standard GOP),
+    ///     from the probed source rate. The old fixed <c>-g 25</c> was ~1s at film
+    ///     rates and only ~0.4s at 60fps — short GOPs cost real compression
+    ///     efficiency, most acutely for AV1 where keyframes are disproportionately
+    ///     expensive. Falls back to 48 (2s at 24fps) when the rate is unknown.
+    /// </summary>
+    internal static int ComputeGop(WorkItem workItem)
+    {
+        var v = workItem.Probe?.Streams?.FirstOrDefault(s => s.CodecType == "video");
+        return ComputeGop(ParseFrameRate(v?.AvgFrameRate) ?? ParseFrameRate(v?.RFrameRate));
+    }
+
+    internal static int ComputeGop(double? fps) =>
+        fps is > 0 and <= 480 ? Math.Max(24, (int)Math.Round(fps.Value * 2)) : 48;
+
     private static readonly HashSet<string> _h264Profiles =
         new(StringComparer.OrdinalIgnoreCase) { "baseline", "main", "high", "high10", "high422", "high444" };
     private static readonly HashSet<string> _h265Profiles =
@@ -4962,11 +5020,11 @@ public class TranscodingService
     ///     already implies bitrate guesswork is acceptable for an exceptional case.
     /// </summary>
     internal static string GetForcedReencodeCompressionFlags(string encoder, bool useVaapi, bool isSvtAv1,
-        string targetBitrate, string minBitrate, string maxBitrate, bool useConservativeHwFlags)
+        string targetBitrate, string minBitrate, string maxBitrate, bool useConservativeHwFlags, int gop = 48)
     {
         int maxBitrateVal = int.Parse(maxBitrate.TrimEnd('k'));
         if (useVaapi)
-            return $"-g 25 -rc_mode CQP -global_quality:v 25 ";
+            return $"-g {gop} -rc_mode CQP -global_quality:v {VaapiQualityScale.For(encoder).FixedCqp} ";
         if (isSvtAv1)
         {
             long tbr = long.Parse(targetBitrate.TrimEnd('k'));
@@ -4975,18 +5033,18 @@ public class TranscodingService
         if (encoder.Contains("nvenc"))
         {
             string aqFlags = useConservativeHwFlags ? "-spatial_aq 1" : "-spatial_aq 1 -temporal_aq 1";
-            return $"-g 25 -rc vbr -rc-lookahead 32 {aqFlags} -b:v {targetBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
+            return $"-g {gop} -rc vbr -rc-lookahead 32 {aqFlags} -b:v {targetBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
         }
         if (encoder.Contains("amf"))
-            return $"-g 25 -rc vbr_peak -enforce_hrd 1 -b:v {targetBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
+            return $"-g {gop} -rc vbr_peak -enforce_hrd 1 -b:v {targetBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
         if (encoder.Contains("qsv"))
         {
             string laFlags = useConservativeHwFlags ? "" : "-extbrc 1 -look_ahead 1 -look_ahead_depth 40 ";
-            return $"-g 25 {laFlags}-b:v {targetBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
+            return $"-g {gop} {laFlags}-b:v {targetBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
         }
         if (encoder.Contains("videotoolbox"))
-            return $"-b:v {targetBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
-        return $"-g 25 -b:v {targetBitrate} -minrate {minBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
+            return $"-g {gop} -b:v {targetBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
+        return $"-g {gop} -b:v {targetBitrate} -minrate {minBitrate} -maxrate {maxBitrate} -bufsize {maxBitrateVal * 2}k ";
     }
 
     private string? _detectedHardware = null;
@@ -5487,6 +5545,16 @@ public class TranscodingService
 
             var output = !string.IsNullOrEmpty(stdout) ? stdout : stderr;
             Console.WriteLine($"Auto-detect vainfo ({firstNode}) output:\n{output.Substring(0, Math.Min(output.Length, 1000))}");
+
+            // Record the node's actual decode profiles so CanVaapiDecode reflects this
+            // GPU instead of the static Elkhart Lake baseline (which under-reports AV1
+            // decode on AMD RDNA2+/Intel DG2 and over-reports VP8 on radeonsi).
+            var decodeCodecs = ParseVaapiDecodeCodecs(output);
+            if (decodeCodecs.Count > 0)
+            {
+                _vaapiDecodeCodecs = decodeCodecs;
+                Console.WriteLine($"Auto-detect: VAAPI decode support: {string.Join(", ", decodeCodecs.OrderBy(c => c))}");
+            }
         }
         catch (Exception ex)
         {
@@ -5506,7 +5574,7 @@ public class TranscodingService
             if (encoder.Contains("vaapi"))
             {
                 vf = "-vf format=nv12|vaapi,hwupload";
-                extra = "-rc_mode CQP -global_quality:v 25";
+                extra = $"-rc_mode CQP -global_quality:v {VaapiQualityScale.For(encoder).FixedCqp}";
             }
             else
             {
@@ -5526,11 +5594,13 @@ public class TranscodingService
             using var process = new Process { StartInfo = psi };
             process.Start();
 
-            // Start the read but DON'T await it before the timeout wait —
+            // Start the reads but DON'T await them before the timeout wait —
             // ReadToEndAsync only completes when ffmpeg exits, so awaiting it
             // first made the 10s hang-protection unreachable. A hung driver
-            // probe would wedge hardware detection forever.
+            // probe would wedge hardware detection forever. Drain stdout too:
+            // a redirected-but-unread pipe can fill and deadlock the process.
             var stderrTask = process.StandardError.ReadToEndAsync();
+            _ = process.StandardOutput.ReadToEndAsync();
 
             await Task.WhenAny(process.WaitForExitAsync(), Task.Delay(10000));
             if (!process.HasExited)
@@ -5597,14 +5667,62 @@ public class TranscodingService
     }
 
     /// <summary>
-    ///     Returns <c>true</c> if the source video codec is supported by VAAPI hardware decoding
-    ///     on Elkhart Lake (J6412) hardware (h264, hevc, mpeg2, vp8, vp9, mjpeg).
+    ///     VAAPI decode profiles parsed from vainfo during hardware detection.
+    ///     Null until (and unless) detection has run — e.g. vainfo missing or an
+    ///     explicitly configured vendor that skipped auto-detect.
     /// </summary>
-    internal static bool CanVaapiDecode(ProbeResult? probe)
+    private static volatile HashSet<string>? _vaapiDecodeCodecs;
+
+    /// <summary>
+    ///     Returns <c>true</c> if the source video codec is supported by VAAPI hardware
+    ///     decoding. Uses the decode profiles parsed from vainfo when detection captured
+    ///     them; otherwise falls back to the Elkhart Lake (J6412) baseline
+    ///     (h264, hevc, mpeg2, vp8, vp9, mjpeg).
+    /// </summary>
+    internal static bool CanVaapiDecode(ProbeResult? probe) => CanVaapiDecode(probe, _vaapiDecodeCodecs);
+
+    internal static bool CanVaapiDecode(ProbeResult? probe, HashSet<string>? detectedDecodeCodecs)
     {
         var codec = probe?.Streams?.FirstOrDefault(s => s.CodecType == "video")?.CodecName;
+        if (codec is null) return false;
+        if (detectedDecodeCodecs != null) return detectedDecodeCodecs.Contains(codec);
         // J6412 (Elkhart Lake) VAAPI decode: h264, hevc, mpeg2, vp8, vp9, jpeg
         return codec is "h264" or "hevc" or "mpeg2video" or "vp8" or "vp9" or "mjpeg";
+    }
+
+    /// <summary>
+    ///     Extracts ffmpeg codec names with a decode (VLD) entrypoint from vainfo output.
+    ///     Profile lines look like <c>"VAProfileHEVCMain10 : VAEntrypointVLD"</c>; encode
+    ///     entrypoints (EncSlice/EncSliceLP) on the same profile are ignored here.
+    /// </summary>
+    internal static HashSet<string> ParseVaapiDecodeCodecs(string vainfoOutput)
+    {
+        (string prefix, string codec)[] profileMap =
+        [
+            ("VAProfileH264", "h264"),
+            ("VAProfileHEVC", "hevc"),
+            ("VAProfileAV1", "av1"),
+            ("VAProfileVP9", "vp9"),
+            ("VAProfileVP8", "vp8"),
+            ("VAProfileMPEG2", "mpeg2video"),
+            ("VAProfileJPEG", "mjpeg"),
+            ("VAProfileVC1", "vc1"),
+        ];
+        var result = new HashSet<string>();
+        foreach (var raw in vainfoOutput.Split('\n'))
+        {
+            var line = raw.Trim();
+            if (!line.Contains("VAEntrypointVLD")) continue;
+            foreach (var (prefix, codec) in profileMap)
+            {
+                if (line.StartsWith(prefix, StringComparison.Ordinal))
+                {
+                    result.Add(codec);
+                    break;
+                }
+            }
+        }
+        return result;
     }
 
     /// <summary>
@@ -5653,6 +5771,8 @@ public class TranscodingService
         var node = string.IsNullOrEmpty(devicePath) ? "/dev/dri/renderD128" : devicePath;
         return hardwareAcceleration.ToLower() switch
         {
+            // Software decode + QSV encode: init the device but don't force hwaccel decode
+            "intel" when isWindows && !hwDecode => "-y -init_hw_device qsv=hw -filter_hw_device hw",
             "intel" when isWindows => "-y -hwaccel qsv -hwaccel_output_format qsv -qsv_device auto",
             "amd" when isWindows => "-y -hwaccel auto",
             // Linux Intel QSV: derive a QSV device from VAAPI on the same render node
@@ -5766,6 +5886,26 @@ public class TranscodingService
     }
 
     /// <summary>
+    ///     Quality bounds for VAAPI CQP encoding. <c>-global_quality</c> is codec-scale
+    ///     dependent: h264_vaapi/hevc_vaapi take a 0–51 QP, but av1_vaapi maps it to the
+    ///     AV1 quantizer index (1–255, ~5x coarser). Using the H.264 scale for AV1 pins
+    ///     the encoder at near-lossless quality, so calibration can never reach the
+    ///     bitrate target and every conversion ends in "no savings".
+    /// </summary>
+    internal readonly record struct VaapiQualityScale(int Start, int Min, int Max, int MaxStep, int FixedCqp)
+    {
+        /// <summary>Log-bitrate slope per quality unit assumed before two passes exist (0.72x per +2 units on the 51 scale).</summary>
+        internal double DefaultLogSlope => Math.Log(0.72) / 2.0 * 51.0 / Max;
+
+        /// <summary>Fitted slopes shallower than this are treated as measurement noise.</summary>
+        internal double MinUsableLogSlope => -0.05 * 51.0 / Max;
+
+        internal static VaapiQualityScale For(string encoder) => encoder.Contains("av1")
+            ? new VaapiQualityScale(Start: 120, Min: 90, Max: 255, MaxStep: 20, FixedCqp: 125)
+            : new VaapiQualityScale(Start: 24, Min: 18, Max: 51, MaxStep: 4, FixedCqp: 25);
+    }
+
+    /// <summary>
     ///     SVT-AV1 takes a numeric preset (0 = slowest/best, 13 = fastest/worst) instead
     ///     of the libx264/libx265 preset names. Maps the shared UI preset string into
     ///     SVT-AV1's range so a user who picks "slow" in the UI actually gets slower
@@ -5779,6 +5919,20 @@ public class TranscodingService
         "fast"     => 8,
         "veryfast" => 10,
         _          => 6,
+    };
+
+    /// <summary>
+    ///     NVENC accepts slow/medium/fast (plus p1–p7 and legacy hp/hq) but NOT the
+    ///     libx264-style "veryslow"/"veryfast" the UI offers — those fail with
+    ///     "Error setting option preset" before the encoder opens. Map the two
+    ///     unsupported extremes onto NVENC's nearest named preset.
+    /// </summary>
+    internal static string MapNvencPreset(string preset) => (preset ?? "").ToLowerInvariant() switch
+    {
+        "veryslow" => "slow",
+        "veryfast" => "fast",
+        ""         => "medium",
+        var p      => p,
     };
 
     /// <summary>
@@ -5873,6 +6027,8 @@ public class TranscodingService
         bool canHwDecode = CanVaapiDecode(workItem.Probe);
         string initFlags = GetInitFlags(options.HardwareAcceleration, options.HardwareDevicePath, canHwDecode);
         string encoder = GetEncoder(options);
+        var scale = VaapiQualityScale.For(encoder);
+        int gop = ComputeGop(workItem);
         // Use p010 for 10-bit content, nv12 for 8-bit
         bool is10Bit = workItem.Probe?.Streams?.Any(s =>
             s.CodecType == "video" && (s.PixFmt?.Contains("10") == true || s.Profile?.Contains("10") == true)) == true;
@@ -5887,7 +6043,7 @@ public class TranscodingService
         {
             string lpFlag = lowPower ? "-low_power 1 " : "";
             string modeLabel = lowPower ? "LP mode" : "normal mode";
-            int currentQp = 24;
+            int currentQp = scale.Start;
             // QP -> peak kbps from prior passes in this mode; used to detect oscillation
             // and bisect between a bracketing pair rather than re-testing the same QP.
             var tested = new Dictionary<int, long>();
@@ -5902,7 +6058,7 @@ public class TranscodingService
                 bool sampleFailed = false;
                 foreach (var (seekTime, duration) in samples)
                 {
-                    long kbps = await RunTestEncodeAsync(inputPath, initFlags, encoder, hwFilter, lpFlag, currentQp, seekTime, duration);
+                    long kbps = await RunTestEncodeAsync(inputPath, initFlags, encoder, hwFilter, lpFlag, currentQp, seekTime, duration, gop);
                     if (kbps <= 0)
                     {
                         sampleFailed = true;
@@ -5946,88 +6102,22 @@ public class TranscodingService
                 }
 
                 // Already below target and at minimum QP — can't increase quality further
-                if (peakKbps <= targetKbps && currentQp <= 18)
+                if (peakKbps <= targetKbps && currentQp <= scale.Min)
                 {
                     await LogAsync(workItem.Id,
                         $"QP {currentQp} already at minimum and below target. Using QP {currentQp} ({modeLabel}).");
                     return (currentQp, lowPower);
                 }
 
-                // Pick next QP. If we already bracket the target, bisect within the
-                // bracket — converges in ~log2(range) passes and is immune to the
-                // encoder's nonlinear QP→bitrate curve. Only extrapolate when no
-                // bracket exists yet.
-                int? lowQp  = tested.Where(kv => kv.Value >  targetKbps).Select(kv => (int?)kv.Key).DefaultIfEmpty(null).Max(); // higher bitrate = lower QP
-                int? highQp = tested.Where(kv => kv.Value <= targetKbps).Select(kv => (int?)kv.Key).DefaultIfEmpty(null).Min(); // lower bitrate = higher QP
-
-                int nextQp;
-                if (lowQp.HasValue && highQp.HasValue)
+                var (nextQp, convergedReason) = PlanNextCalibrationQp(tested, currentQp, peakKbps, targetKbps, scale);
+                if (nextQp is null)
                 {
-                    if (highQp.Value - lowQp.Value <= 1)
-                    {
-                        await LogAsync(workItem.Id,
-                            $"Calibration converged — adjacent QPs {lowQp}/{highQp} bracket target. Selecting best observed.");
-                        break;
-                    }
-
-                    nextQp = (lowQp.Value + highQp.Value) / 2;
-                    if (tested.ContainsKey(nextQp))
-                        nextQp = (lowQp.Value + highQp.Value + 1) / 2;
-                    if (tested.ContainsKey(nextQp))
-                    {
-                        await LogAsync(workItem.Id,
-                            $"Calibration converged — bracket {lowQp}–{highQp} exhausted. Selecting best observed.");
-                        break;
-                    }
-                }
-                else
-                {
-                    // No bracket — extrapolate. Fit the slope from prior samples when we
-                    // have ≥2; the default 0.72x-per-+2QP heuristic is wrong for many
-                    // VAAPI encoders (real slope is often ~0.5x per +2QP), so a fixed
-                    // model overshoots and skips past the bracket on each pass.
-                    double logSlopePerQp;
-                    if (tested.Count >= 2)
-                    {
-                        var sorted = tested.OrderBy(kv => kv.Key).ToList();
-                        var firstSample = sorted.First();
-                        var lastSample  = sorted.Last();
-                        double s = Math.Log((double)lastSample.Value / firstSample.Value) / (lastSample.Key - firstSample.Key);
-                        // Reject positive/near-zero slopes (measurement noise) — fall back to default
-                        logSlopePerQp = s < -0.05 ? s : Math.Log(0.72) / 2.0;
-                    }
-                    else
-                    {
-                        logSlopePerQp = Math.Log(0.72) / 2.0;
-                    }
-
-                    double qpDelta = Math.Log((double)targetKbps / peakKbps) / logSlopePerQp;
-                    int adjustment = (int)Math.Round(qpDelta);
-                    if (adjustment == 0) adjustment = peakKbps > targetKbps ? 1 : -1;
-                    // Cap step to keep extrapolation sane — the QP→bitrate curve gets
-                    // steeper at higher QP, so a long extrapolation often overshoots.
-                    adjustment = Math.Clamp(adjustment, -4, 4);
-
-                    nextQp = Math.Clamp(currentQp + adjustment, 18, 51);
-                    if (tested.ContainsKey(nextQp))
-                    {
-                        // Predictor wants a duplicate — step further in the same direction
-                        // to find a novel QP and establish the bracket.
-                        int direction = peakKbps > targetKbps ? 1 : -1;
-                        int candidate = nextQp + direction;
-                        while (candidate >= 18 && candidate <= 51 && tested.ContainsKey(candidate))
-                            candidate += direction;
-                        if (candidate < 18 || candidate > 51)
-                        {
-                            await LogAsync(workItem.Id,
-                                $"Calibration exhausted on {modeLabel} — no novel QP available. Selecting best observed.");
-                            break;
-                        }
-                        nextQp = candidate;
-                    }
+                    await LogAsync(workItem.Id,
+                        $"Calibration converged on {modeLabel} — {convergedReason}. Selecting best observed.");
+                    break;
                 }
 
-                currentQp = nextQp;
+                currentQp = nextQp.Value;
             }
 
             // Pick the best tested QP: prefer highest-quality (lowest QP) whose peak
@@ -6065,6 +6155,77 @@ public class TranscodingService
 
         // Both LP and normal mode failed
         return (-1, false);
+    }
+
+    /// <summary>
+    ///     Picks the next QP for a calibration pass, or null when the search has
+    ///     converged and the best tested QP should be selected. If prior passes
+    ///     bracket the target, bisect within the bracket — converges in ~log2(range)
+    ///     passes and is immune to the encoder's nonlinear QP→bitrate curve. Only
+    ///     extrapolates along the measured (or default) log-linear slope when no
+    ///     bracket exists yet. All bounds and steps come from <paramref name="scale"/>
+    ///     so AV1's 1–255 qindex and H.264/HEVC's 0–51 QP both search their full range.
+    /// </summary>
+    internal static (int? nextQp, string? convergedReason) PlanNextCalibrationQp(
+        IReadOnlyDictionary<int, long> tested, int currentQp, long peakKbps, long targetKbps, VaapiQualityScale scale)
+    {
+        int? lowQp  = tested.Where(kv => kv.Value >  targetKbps).Select(kv => (int?)kv.Key).DefaultIfEmpty(null).Max(); // higher bitrate = lower QP
+        int? highQp = tested.Where(kv => kv.Value <= targetKbps).Select(kv => (int?)kv.Key).DefaultIfEmpty(null).Min(); // lower bitrate = higher QP
+
+        if (lowQp.HasValue && highQp.HasValue)
+        {
+            if (highQp.Value - lowQp.Value <= 1)
+                return (null, $"adjacent QPs {lowQp}/{highQp} bracket target");
+
+            int nextQp = (lowQp.Value + highQp.Value) / 2;
+            if (tested.ContainsKey(nextQp))
+                nextQp = (lowQp.Value + highQp.Value + 1) / 2;
+            if (tested.ContainsKey(nextQp))
+                return (null, $"bracket {lowQp}–{highQp} exhausted");
+            return (nextQp, null);
+        }
+
+        // No bracket — extrapolate. Fit the slope from prior samples when we
+        // have ≥2; the default heuristic is wrong for many VAAPI encoders
+        // (real slope is often steeper), so a fixed model overshoots and
+        // skips past the bracket on each pass.
+        double logSlopePerQp;
+        if (tested.Count >= 2)
+        {
+            var sorted = tested.OrderBy(kv => kv.Key).ToList();
+            var firstSample = sorted.First();
+            var lastSample  = sorted.Last();
+            double s = Math.Log((double)lastSample.Value / firstSample.Value) / (lastSample.Key - firstSample.Key);
+            // Reject positive/near-zero slopes (measurement noise) — fall back to default
+            logSlopePerQp = s < scale.MinUsableLogSlope ? s : scale.DefaultLogSlope;
+        }
+        else
+        {
+            logSlopePerQp = scale.DefaultLogSlope;
+        }
+
+        double qpDelta = Math.Log((double)targetKbps / peakKbps) / logSlopePerQp;
+        int adjustment = (int)Math.Round(qpDelta);
+        if (adjustment == 0) adjustment = peakKbps > targetKbps ? 1 : -1;
+        // Cap step to keep extrapolation sane — the QP→bitrate curve gets
+        // steeper at higher QP, so a long extrapolation often overshoots.
+        adjustment = Math.Clamp(adjustment, -scale.MaxStep, scale.MaxStep);
+
+        int planned = Math.Clamp(currentQp + adjustment, scale.Min, scale.Max);
+        if (tested.ContainsKey(planned))
+        {
+            // Predictor wants a duplicate — step further in the same direction
+            // to find a novel QP and establish the bracket.
+            int direction = peakKbps > targetKbps ? 1 : -1;
+            int candidate = planned + direction;
+            while (candidate >= scale.Min && candidate <= scale.Max && tested.ContainsKey(candidate))
+                candidate += direction;
+            if (candidate < scale.Min || candidate > scale.Max)
+                return (null, "no novel QP available");
+            planned = candidate;
+        }
+
+        return (planned, null);
     }
 
     /// <summary>
@@ -6141,135 +6302,14 @@ public class TranscodingService
     }
 
     /// <summary>
-    ///     Calibrates the -b:v value for SVT-AV1 VBR mode by running iterative 30s
-    ///     test encodes at two positions and adjusting until the output straddles
-    ///     the target. SVT-AV1's VBR consistently undershoots by ~20-25%, so we
-    ///     inflate -b:v until the measured output matches the desired bitrate.
-    /// </summary>
-    private async Task<long> CalibrateSvtAv1BitrateAsync(WorkItem workItem, EncoderOptions options, string inputPath, long targetKbps)
-    {
-        const int sampleDuration = 30;
-        const int maxIterations = 6;
-
-        // Two sample points at ~25% and ~60% of the file, with short-file fallback
-        var samples = new List<(string seekTime, int duration)>();
-        if (workItem.Length >= 90)
-        {
-            samples.Add((FormatSeekTime((int)(workItem.Length * 0.25)), sampleDuration));
-            samples.Add((FormatSeekTime((int)(workItem.Length * 0.60)), sampleDuration));
-        }
-        else
-        {
-            int dur = Math.Max(5, (int)(workItem.Length * 0.4));
-            int seekSec = Math.Max(0, (int)(workItem.Length * 0.30));
-            if (seekSec + dur > (int)workItem.Length)
-                seekSec = Math.Max(0, (int)workItem.Length - dur);
-            samples.Add((FormatSeekTime(seekSec), dur));
-        }
-
-        string initFlags = GetInitFlags(options.HardwareAcceleration, options.HardwareDevicePath);
-        long currentBv = targetKbps;
-
-        for (int iter = 1; iter <= maxIterations; iter++)
-        {
-            await LogAsync(workItem.Id,
-                $"SVT-AV1 calibration pass {iter}/{maxIterations} — testing b:v {currentBv}k...");
-
-            var sampleBitrates = new List<long>();
-            foreach (var (seekTime, dur) in samples)
-            {
-                long measured = await RunSvtAv1TestEncodeAsync(inputPath, initFlags, currentBv, seekTime, dur);
-                if (measured > 0)
-                    sampleBitrates.Add(measured);
-            }
-
-            if (sampleBitrates.Count == 0)
-            {
-                await LogAsync(workItem.Id, "SVT-AV1 calibration failed — using target bitrate as-is");
-                return targetKbps;
-            }
-
-            long lo = sampleBitrates.Min();
-            long hi = sampleBitrates.Max();
-            long avg = sampleBitrates.Sum() / sampleBitrates.Count;
-
-            await LogAsync(workItem.Id,
-                $"Pass {iter}: b:v {currentBv}k → lo={lo}k hi={hi}k avg={avg}k (target {targetKbps}k)");
-
-            // Done when the average is within 5% of target — individual samples
-            // can vary more due to content complexity, the average is what matters
-            double avgError = Math.Abs((double)(avg - targetKbps) / targetKbps);
-            if (avgError <= 0.05)
-                break;
-
-            // Scale currentBv by the ratio of target to measured average
-            double correctionRatio = (double)targetKbps / avg;
-            currentBv = (long)(currentBv * correctionRatio);
-            currentBv = Math.Clamp(currentBv, targetKbps, targetKbps * 4);
-        }
-
-        await LogAsync(workItem.Id, $"SVT-AV1 calibration complete — using b:v {currentBv}k for target {targetKbps}k");
-        return currentBv;
-    }
-
-    /// <summary>
-    ///     Runs a short SVT-AV1 VBR test encode and returns the measured bitrate in kbps.
-    ///     Returns 0 if the encode produced no measurable output.
-    /// </summary>
-    private async Task<long> RunSvtAv1TestEncodeAsync(string inputPath, string initFlags, long bitrateKbps, string seekTime, int duration)
-    {
-        string command = $"{initFlags} -ss {seekTime} -i \"{inputPath}\" -t {duration} " +
-            $"-c:v libsvtav1 -preset 6 -svtav1-params rc=1 -b:v {bitrateKbps}k " +
-            $"-an -sn -f null -";
-
-        Console.WriteLine($"SVT-AV1 calibration command: ffmpeg {command}");
-
-        try
-        {
-            var psi = new ProcessStartInfo(_ffmpegPath)
-            {
-                Arguments = command,
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true
-            };
-
-            using var process = new Process { StartInfo = psi };
-            process.Start();
-
-            var stderrTask = process.StandardError.ReadToEndAsync();
-            var stdoutTask = process.StandardOutput.ReadToEndAsync();
-
-            // Async wait — calibration runs can pin threadpool threads for minutes.
-            await Task.WhenAny(process.WaitForExitAsync(), Task.Delay(180000));
-            if (!process.HasExited)
-            {
-                try { process.Kill(entireProcessTree: true); } catch { }
-                return 0;
-            }
-
-            var outputText = await stderrTask;
-            var sizeMatch = Regex.Match(outputText, @"video:\s*(\d+)\s*(?:kB|KiB)");
-            if (sizeMatch.Success)
-            {
-                long outputKb = long.Parse(sizeMatch.Groups[1].Value);
-                return outputKb * 8 / duration;
-            }
-        }
-        catch (Exception ex) { Console.WriteLine($"SVT-AV1 calibration test exception: {ex.Message}"); }
-
-        return 0;
-    }
-
-    /// <summary>
     ///     Runs a short test encode to measure the actual output bitrate for a given VAAPI QP value.
     ///     Returns the measured bitrate in kbps, or 0 if the encode produced no output.
     /// </summary>
-    private async Task<long> RunTestEncodeAsync(string inputPath, string initFlags, string encoder, string hwFilter, string lpFlag, int qp, string seekTime, int duration)
+    private async Task<long> RunTestEncodeAsync(string inputPath, string initFlags, string encoder, string hwFilter, string lpFlag, int qp, string seekTime, int duration, int gop)
     {
+        // Same -g as the real encode — GOP length changes the measured bitrate.
         string command = $"{initFlags} -ss {seekTime} -i \"{inputPath}\" -t {duration} " +
-            $"-c:v {encoder} {lpFlag}{hwFilter} -g 25 -rc_mode CQP -global_quality:v {qp} " +
+            $"-c:v {encoder} {lpFlag}{hwFilter} -g {gop} -rc_mode CQP -global_quality:v {qp} " +
             $"-an -sn -f null -";
 
         Console.WriteLine($"Calibration command: ffmpeg {command}");
@@ -6461,6 +6501,9 @@ public class TranscodingService
                                 lineBuilder.Clear();
 
                                 errorOutput.Enqueue(line);
+                                // Only the tail is ever read (TakeLast on failure); without a
+                                // cap a multi-hour encode accumulates every progress line.
+                                while (errorOutput.Count > 100) errorOutput.TryDequeue(out _);
                                 lastActivity = DateTime.UtcNow;
 
                                 try
@@ -6644,7 +6687,51 @@ public class TranscodingService
             return;
         }
 
-        // Retry 2a: Drop image-based subs only — keeps OCR'd SRTs and text-based (srt/ass)
+        // Retry 2: Software decode + HW encode for hwaccel filter graph / decoder errors.
+        // VAAPI/QSV: drops -hwaccel and routes SW frames into the encoder.
+        // NVIDIA: drops the explicit -c:v <src>_cuvid (cuvid decoder rejected the profile,
+        // or nvcuvid isn't loaded on this driver/setup); -hwaccel cuda's auto-attach + native
+        // decoder still runs, so NVENC keeps the GPU encode path.
+        // This tier runs BEFORE the subtitle tiers: a decode/filter format error has
+        // nothing to do with sub streams, and stripping subs first meant the eventual
+        // sw-decode success shipped without subtitles for no reason.
+        bool isHwaccelError = reason.Contains("hwaccel", StringComparison.OrdinalIgnoreCase)
+            || reason.Contains("filter graph", StringComparison.OrdinalIgnoreCase)
+            || reason.Contains("Impossible to convert", StringComparison.OrdinalIgnoreCase)
+            || reason.Contains("hwupload", StringComparison.OrdinalIgnoreCase)
+            || reason.Contains("Reconfiguring filter", StringComparison.OrdinalIgnoreCase)
+            || reason.Contains("cuvid", StringComparison.OrdinalIgnoreCase)
+            || reason.Contains("nvcuvid", StringComparison.OrdinalIgnoreCase)
+            || reason.Contains("ffnvcodec", StringComparison.OrdinalIgnoreCase)
+            || reason.Contains("Failed to get HW config", StringComparison.OrdinalIgnoreCase);
+
+        bool isVaapi = IsVaapiAcceleration(options.HardwareAcceleration);
+        bool isNvidia = options.HardwareAcceleration.Equals("nvidia", StringComparison.OrdinalIgnoreCase);
+        // Windows QSV isn't a VAAPI mode but has its own sw-decode init arm.
+        bool isWindowsQsv = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+            && options.HardwareAcceleration.Equals("intel", StringComparison.OrdinalIgnoreCase);
+
+        if (isHwaccelError && (isVaapi || isNvidia || isWindowsQsv) && !swDecodeWasForced)
+        {
+            await LogAsync(workItem.Id,
+                isNvidia
+                    ? "Retrying without explicit NVDEC decoder (falling back to -hwaccel cuda auto-attach)..."
+                    : "Retrying with software decode + hardware encode...");
+            workItem.Progress = 0;
+            await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
+            await ConvertVideoAsync(workItem, options,
+                stripSubtitles: subtitlesWereStripped,
+                forceSwDecode: true,
+                useConservativeHwFlags: conservativeHwFlagsTried,
+                cachedOcrSrts: cachedOcrSrts,
+                cachedOcrMuxTmpDir: cachedOcrMuxTmpDir,
+                dropImageSubtitlesOnly: imageSubtitlesAlreadyDropped,
+                skipPlacement: skipPlacement,
+                cancellationToken: cancellationToken);
+            return;
+        }
+
+        // Retry 3a: Drop image-based subs only — keeps OCR'd SRTs and text-based (srt/ass)
         // streams. Bitmap streams (PGS/VOBSUB/DVB) are the most common cause of subtitle
         // failures; many failures clear once they're removed without sacrificing the rest
         // of the user's subtitles. Only relevant when the user opted into MKV pass-through.
@@ -6665,7 +6752,7 @@ public class TranscodingService
             return;
         }
 
-        // Retry 2b: Strip all subtitles (covers broken streams that survived 2a).
+        // Retry 3b: Strip all subtitles (covers broken streams that survived 3a).
         if (!subtitlesWereStripped)
         {
             await LogAsync(workItem.Id, "Retrying without subtitles...");
@@ -6681,45 +6768,7 @@ public class TranscodingService
             return;
         }
 
-        // Retry 3: Software decode + HW encode for hwaccel filter graph / decoder errors.
-        // VAAPI: drops -hwaccel vaapi and routes SW frames into the encoder via hwupload.
-        // NVIDIA: drops the explicit -c:v <src>_cuvid (cuvid decoder rejected the profile,
-        // or nvcuvid isn't loaded on this driver/setup); -hwaccel cuda's auto-attach + native
-        // decoder still runs, so NVENC keeps the GPU encode path.
-        bool isHwaccelError = reason.Contains("hwaccel", StringComparison.OrdinalIgnoreCase)
-            || reason.Contains("filter graph", StringComparison.OrdinalIgnoreCase)
-            || reason.Contains("Impossible to convert", StringComparison.OrdinalIgnoreCase)
-            || reason.Contains("hwupload", StringComparison.OrdinalIgnoreCase)
-            || reason.Contains("Reconfiguring filter", StringComparison.OrdinalIgnoreCase)
-            || reason.Contains("cuvid", StringComparison.OrdinalIgnoreCase)
-            || reason.Contains("nvcuvid", StringComparison.OrdinalIgnoreCase)
-            || reason.Contains("ffnvcodec", StringComparison.OrdinalIgnoreCase)
-            || reason.Contains("Failed to get HW config", StringComparison.OrdinalIgnoreCase);
-
-        bool isVaapi = IsVaapiAcceleration(options.HardwareAcceleration);
-        bool isNvidia = options.HardwareAcceleration.Equals("nvidia", StringComparison.OrdinalIgnoreCase);
-
-        if (isHwaccelError && (isVaapi || isNvidia) && !swDecodeWasForced)
-        {
-            await LogAsync(workItem.Id,
-                isNvidia
-                    ? "Retrying without explicit NVDEC decoder (falling back to -hwaccel cuda auto-attach)..."
-                    : "Retrying with software decode + VAAPI encode...");
-            workItem.Progress = 0;
-            await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
-            await ConvertVideoAsync(workItem, options,
-                stripSubtitles: subtitlesWereStripped,
-                forceSwDecode: true,
-                useConservativeHwFlags: conservativeHwFlagsTried,
-                cachedOcrSrts: cachedOcrSrts,
-                cachedOcrMuxTmpDir: cachedOcrMuxTmpDir,
-                dropImageSubtitlesOnly: imageSubtitlesAlreadyDropped,
-                skipPlacement: skipPlacement,
-                cancellationToken: cancellationToken);
-            return;
-        }
-
-        // Retry 3: Fall back to software encoding (resets subtitle stripping to try subs first on software)
+        // Retry 4: Fall back to software encoding (resets subtitle stripping to try subs first on software)
         // Check the actual resolved encoder, not options.Encoder (which is the user's base preference
         // like "libsvtav1" that GetEncoder() maps to hardware variants like "av1_nvenc")
         bool isAlreadySoftware = options.HardwareAcceleration.Equals("none", StringComparison.OrdinalIgnoreCase);
@@ -7578,19 +7627,12 @@ public class TranscodingService
 
                 if (options.DeleteOriginalFile)
                 {
-                    // Replace original: delete it, then move encoded file back to original location
+                    // Replace original: move the encode into place first, delete after
                     await LogAsync(workItem.Id, "Replacing original file");
-                    await LogAsync(workItem.Id, $"Deleting original: {workItem.Path}");
-                    await _fileService.FileDeleteAsync(workItem.Path, log);
-
-                    // Move back to the original's directory with a clean name (no [snacks] tag)
                     string originalDir = _fileService.GetDirectory(workItem.Path);
                     string cleanName = Path.GetFileNameWithoutExtension(outputPath).Replace(" [snacks]", "") + Path.GetExtension(outputPath);
                     string finalPath = Path.Combine(originalDir, cleanName);
-                    await LogAsync(workItem.Id, $"Moving encoded output: {outputPath} -> {finalPath}");
-                    await _fileService.FileMoveAsync(outputPath, finalPath, log);
-                    await MoveSidecarsAlongsideAsync(outputPath, finalPath, workItem);
-                    await LogAsync(workItem.Id, $"Final output: {finalPath}");
+                    await ReplaceOriginalAsync(outputPath, finalPath, workItem, log);
                 }
                 else
                 {
@@ -7610,17 +7652,11 @@ public class TranscodingService
 
                 if (options.DeleteOriginalFile)
                 {
-                    // Replace original: delete it and rename transcoded file to take its place
+                    // Replace original: move the encode into place first, delete after
                     await LogAsync(workItem.Id, "Replacing original with transcoded version");
-                    await LogAsync(workItem.Id, $"Deleting original: {workItem.Path}");
-                    await _fileService.FileDeleteAsync(workItem.Path, log);
-
                     string cleanName = Path.GetFileNameWithoutExtension(outputPath).Replace(" [snacks]", "") + Path.GetExtension(outputPath);
                     string finalPath = Path.Combine(originalDir, cleanName);
-                    await LogAsync(workItem.Id, $"Moving encoded output: {outputPath} -> {finalPath}");
-                    await _fileService.FileMoveAsync(outputPath, finalPath, log);
-                    await MoveSidecarsAlongsideAsync(outputPath, finalPath, workItem);
-                    await LogAsync(workItem.Id, $"Final output: {finalPath}");
+                    await ReplaceOriginalAsync(outputPath, finalPath, workItem, log);
                 }
                 else
                 {
@@ -7653,6 +7689,41 @@ public class TranscodingService
             await LogAsync(workItem.Id, $"Error handling output placement [{ex.GetType().Name}]: {ex.Message}{suffix}");
             throw;
         }
+    }
+
+    /// <summary>
+    ///     Replaces the original file with the staged encode, ordered so the original
+    ///     survives any failure: rename the original to a .bak name in the same
+    ///     directory (cheap), move the encode into place, then delete the .bak.
+    ///     The old delete-then-move order had a data-loss window — a failed move
+    ///     (disk full, cross-volume copy, AV lock) after the delete left no original
+    ///     and no correctly-placed encode.
+    /// </summary>
+    private async Task ReplaceOriginalAsync(string outputPath, string finalPath, WorkItem workItem, Func<string, Task> log)
+    {
+        string backupPath = workItem.Path + ".snacks.bak";
+        // A stale .bak from a previous crashed run would block the park rename.
+        if (File.Exists(backupPath))
+            await _fileService.FileDeleteAsync(backupPath, log);
+
+        await LogAsync(workItem.Id, $"Parking original: {workItem.Path} -> {backupPath}");
+        await _fileService.FileMoveAsync(workItem.Path, backupPath, log);
+        try
+        {
+            await LogAsync(workItem.Id, $"Moving encoded output: {outputPath} -> {finalPath}");
+            await _fileService.FileMoveAsync(outputPath, finalPath, log);
+        }
+        catch
+        {
+            await LogAsync(workItem.Id, $"Move failed — restoring original from {backupPath}");
+            try { await _fileService.FileMoveAsync(backupPath, workItem.Path, log); }
+            catch (Exception restoreEx) { await LogAsync(workItem.Id, $"Restore failed: {restoreEx.Message}"); }
+            throw;
+        }
+        await LogAsync(workItem.Id, $"Deleting original: {backupPath}");
+        await _fileService.FileDeleteAsync(backupPath, log);
+        await MoveSidecarsAlongsideAsync(outputPath, finalPath, workItem);
+        await LogAsync(workItem.Id, $"Final output: {finalPath}");
     }
 
     /// <summary>

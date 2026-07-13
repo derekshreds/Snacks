@@ -83,11 +83,15 @@ public sealed class RateControlAndScaleTests
     }
 
 
-    [Fact]
-    public void Amf_path_uses_vbr_peak_with_hrd_enforcement()
+    [Theory]
+    [InlineData("hevc_amf")]
+    // av1_amf accepts the same RC surface as h264/hevc AMF (verified against
+    // FFmpeg 7.1 amfenc_av1.c: both enforce_hrd and rc=vbr_peak are defined).
+    [InlineData("av1_amf")]
+    public void Amf_path_uses_vbr_peak_with_hrd_enforcement(string encoder)
     {
         var flags = TranscodingService.GetForcedReencodeCompressionFlags(
-            encoder: "hevc_amf", useVaapi: false, isSvtAv1: false,
+            encoder: encoder, useVaapi: false, isSvtAv1: false,
             targetBitrate: "3500k", minBitrate: "3300k", maxBitrate: "4000k",
             useConservativeHwFlags: false);
 
@@ -98,11 +102,17 @@ public sealed class RateControlAndScaleTests
     }
 
 
-    [Fact]
-    public void Qsv_path_emits_lookahead_when_not_conservative()
+    [Theory]
+    [InlineData("h264_qsv")]
+    // extbrc + look_ahead_depth are valid on hevc/av1 QSV too (verified against
+    // FFmpeg 7.1 qsvenc_hevc.c/qsvenc_av1.c); the plain look_ahead flag is
+    // h264-only and harmlessly ignored elsewhere.
+    [InlineData("hevc_qsv")]
+    [InlineData("av1_qsv")]
+    public void Qsv_path_emits_lookahead_when_not_conservative(string encoder)
     {
         var flags = TranscodingService.GetForcedReencodeCompressionFlags(
-            encoder: "hevc_qsv", useVaapi: false, isSvtAv1: false,
+            encoder: encoder, useVaapi: false, isSvtAv1: false,
             targetBitrate: "3500k", minBitrate: "3300k", maxBitrate: "4000k",
             useConservativeHwFlags: false);
 
@@ -268,6 +278,77 @@ public sealed class RateControlAndScaleTests
     {
         var probe = new ProbeResult { Streams = Array.Empty<Stream>() };
         TranscodingService.CanVaapiDecode(probe).Should().BeFalse();
+    }
+
+
+    // =====================================================================
+    //  CanVaapiDecode with vainfo-detected capabilities — the parsed profile
+    //  list overrides the Elkhart Lake baseline (e.g. AV1 decode on RDNA2+,
+    //  no VP8 decode on radeonsi).
+    // =====================================================================
+
+    [Theory]
+    [InlineData("av1",  true)]   // in detected set, not in baseline
+    [InlineData("vp8",  false)]  // in baseline, not in detected set
+    [InlineData("h264", true)]
+    public void CanVaapiDecode_prefers_detected_capabilities(string codec, bool expected)
+    {
+        var amdRdna3 = new HashSet<string> { "h264", "hevc", "av1", "vp9", "mpeg2video", "mjpeg" };
+        var probe = new ProbeResult
+        {
+            Streams = new[] { new Stream { Index = 0, CodecType = "video", CodecName = codec } },
+        };
+        TranscodingService.CanVaapiDecode(probe, amdRdna3).Should().Be(expected);
+    }
+
+
+    [Fact]
+    public void ParseVaapiDecodeCodecs_reads_vld_entrypoints_only()
+    {
+        // Trimmed vainfo output shaped like radeonsi on RDNA3: AV1 has decode,
+        // VP9 profile exists with decode, H264 has both decode and encode,
+        // HEVC line with only EncSlice must NOT count as decodable.
+        const string vainfo = """
+            libva info: VA-API version 1.20.0
+            vainfo: Supported profile and entrypoints
+                  VAProfileH264Main               : VAEntrypointVLD
+                  VAProfileH264Main               : VAEntrypointEncSlice
+                  VAProfileHEVCMain               : VAEntrypointEncSlice
+                  VAProfileAV1Profile0            : VAEntrypointVLD
+                  VAProfileVP9Profile2            : VAEntrypointVLD
+                  VAProfileJPEGBaseline           : VAEntrypointVLD
+                  VAProfileNone                   : VAEntrypointVideoProc
+            """;
+
+        var codecs = TranscodingService.ParseVaapiDecodeCodecs(vainfo);
+
+        codecs.Should().BeEquivalentTo(new[] { "h264", "av1", "vp9", "mjpeg" });
+    }
+
+
+    [Fact]
+    public void ParseVaapiDecodeCodecs_returns_empty_for_error_output()
+    {
+        TranscodingService.ParseVaapiDecodeCodecs("libva error: failed to initialize display")
+            .Should().BeEmpty();
+    }
+
+
+    // =====================================================================
+    //  ComputeGop — ~2s keyframe interval from the probed frame rate.
+    // =====================================================================
+
+    [Theory]
+    [InlineData(23.976, 48)]
+    [InlineData(25.0,   50)]
+    [InlineData(29.97,  60)]
+    [InlineData(60.0,  120)]
+    [InlineData(0.0,    48)]   // unknown rate → 24fps default
+    [InlineData(5.0,    24)]   // implausibly low → floor of 24 frames
+    [InlineData(1000.0, 48)]   // implausibly high → treated as unknown
+    public void ComputeGop_targets_two_seconds(double fps, int expected)
+    {
+        TranscodingService.ComputeGop(fps > 0 ? fps : null).Should().Be(expected);
     }
 
 
