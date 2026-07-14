@@ -14,6 +14,7 @@
 
 import { settingsApi }                    from '../api.js';
 import { setChipValues, getChipValues }   from './chip-input.js';
+import { applyEnvLocks }                  from './env-locks.js';
 
 
 // ---------------------------------------------------------------------------
@@ -86,7 +87,10 @@ const LEGACY_SELECT_VALUES = {
     HardwareAcceleration: {
         nvenc: 'nvidia',
         cuda:  'nvidia',
-        vaapi: 'intel',
+        // 'vaapi' is vendor-ambiguous (Intel AND AMD use VAAPI on Linux) — mapping
+        // it to 'intel' stranded AMD hosts on an unmatched device. 'auto' lets the
+        // backend's hardware detection resolve the actual vendor.
+        vaapi: 'auto',
         qsv:   'intel',
         amf:   'amd',
     },
@@ -448,6 +452,7 @@ export async function restoreEncoderOptions(prefix = 'settings') {
         }
 
         applyEncoderOptionsToForm(prefix, saved);
+        applyEncoderEnvLocks(prefix, saved._envLocked);
 
         // Restore completed — the form now reflects the server's settings,
         // so auto-saves from this point write real data, not defaults.
@@ -455,6 +460,41 @@ export async function restoreEncoderOptions(prefix = 'settings') {
         announceRestored(prefix);
 
     } catch { /* silent — restore is best-effort; auto-save stays disarmed */ }
+}
+
+/**
+ * Music form inputs whose ids diverge from the property name, keyed by the
+ * `_envLocked` path the server reports.
+ */
+const ENV_LOCK_MUSIC_IDS = {
+    'music.format':                  'MusicFormat',
+    'music.bitrateKbps':             'MusicBitrate',
+    'music.sampleRatePolicy':        'MusicSampleRate',
+    'music.channelPolicy':           'MusicChannels',
+    'music.skipIfAlreadyTargetCodec': 'MusicSkipIfTarget',
+    'music.bitrateMatchTolerancePct': 'MusicTolerance',
+    'music.copyMetadataAndArt':      'MusicCopyMetadata',
+    'music.deleteOriginalFile':      'MusicDeleteOriginal',
+    'music.masterMusicConcurrency':  'MusicConcurrency',
+    'music.dispatchToCluster':       'MusicCluster',
+};
+
+/**
+ * Renders SNACKS_SET_* env locks onto the encoder form. Top-level paths map to
+ * `${prefix}${PascalCase}` ids; Music fields go through {@link ENV_LOCK_MUSIC_IDS};
+ * chip inputs and the audio-outputs row editor lock as whole containers.
+ * Paths with no rendered control (e.g. `music.vbrQuality`) resolve to null and
+ * are simply not shown — the server enforces the lock either way.
+ */
+function applyEncoderEnvLocks(prefix, lockedPaths) {
+    applyEnvLocks(lockedPaths, (path) => {
+        if (ENV_LOCK_MUSIC_IDS[path])          return el(prefix, ENV_LOCK_MUSIC_IDS[path]);
+        if (path === 'audioLanguagesToKeep')    return el(prefix, 'AudioLanguagesToKeepChips');
+        if (path === 'subtitleLanguagesToKeep') return el(prefix, 'SubtitleLanguagesToKeepChips');
+        if (path === 'audioOutputs')            return [el(prefix, 'AudioOutputs'), el(prefix, 'AudioOutputsAdd')];
+        if (path.includes('.'))                 return null;
+        return el(prefix, path.charAt(0).toUpperCase() + path.slice(1));
+    });
 }
 
 /**

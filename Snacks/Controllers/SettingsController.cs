@@ -66,7 +66,7 @@ public sealed class SettingsController : ControllerBase
                 if (parsed == null) continue;
 
                 MigrateLegacyAudioIfNeeded(parsed, json);
-                return new JsonResult(parsed);
+                return SettingsResponse(parsed);
             }
             catch
             {
@@ -75,8 +75,29 @@ public sealed class SettingsController : ControllerBase
         }
 
         // Fresh install / no saved file — defaults are already in the new shape, no migration.
-        return new JsonResult(new EncoderOptions());
+        return SettingsResponse(new EncoderOptions());
     }
+
+    /// <summary>
+    ///     Applies env-var overrides and returns the options with an <c>_envLocked</c>
+    ///     metadata array (camelCase dotted paths) so the settings form can render
+    ///     env-driven fields read-only. Self-serialized camelCase — MVC's naming
+    ///     policy does not rename <see cref="System.Text.Json.Nodes.JsonNode"/> keys.
+    /// </summary>
+    private static IActionResult SettingsResponse(EncoderOptions options)
+    {
+        EnvConfigOverrides.Apply(options, EnvConfigOverrides.SettingsPrefix);
+        var node = JsonSerializer.SerializeToNode(options, _responseJsonOptions)!.AsObject();
+        node["_envLocked"] = new System.Text.Json.Nodes.JsonArray(
+            EnvConfigOverrides.LockedPaths(EnvConfigOverrides.SettingsPrefix, typeof(EncoderOptions))
+                .Select(p => (System.Text.Json.Nodes.JsonNode)p).ToArray());
+        return new JsonResult(node);
+    }
+
+    private static readonly JsonSerializerOptions _responseJsonOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+    };
 
     /// <summary>
     ///     Runs <see cref="EncoderOptions.ApplyLegacyAudioMigration"/> only when the on-disk
@@ -156,6 +177,9 @@ public sealed class SettingsController : ControllerBase
                 if (parsed != null)
                 {
                     MigrateLegacyAudioIfNeeded(parsed, json);
+                    // Env overrides beat whatever was just persisted — the in-memory
+                    // options must always reflect the env-effective configuration.
+                    EnvConfigOverrides.Apply(parsed, EnvConfigOverrides.SettingsPrefix);
                     _transcodingService.UpdateOptions(parsed);
                 }
             }
@@ -178,13 +202,19 @@ public sealed class SettingsController : ControllerBase
     ///     payload are preserved). Falls back to the incoming payload verbatim when
     ///     the existing file is missing or unparsable.
     /// </summary>
-    internal string MergeWithExistingSettings(string path, JsonElement settings)
+    internal static string MergeWithExistingSettings(string path, JsonElement settings)
     {
         var incomingJson = JsonSerializer.Serialize(settings, _jsonOptions);
         try
         {
             if (System.Text.Json.Nodes.JsonNode.Parse(incomingJson) is not System.Text.Json.Nodes.JsonObject incoming)
                 return incomingJson;
+
+            // Keys currently driven by SNACKS_SET_* env vars never reach the file —
+            // the file keeps the last non-env value so unsetting the var reverts cleanly.
+            EnvConfigOverrides.StripLockedPaths(incoming, EnvConfigOverrides.SettingsPrefix, typeof(EncoderOptions));
+            incomingJson = incoming.ToJsonString(_jsonOptions);
+
             if (!System.IO.File.Exists(path))
                 return incomingJson;
             if (System.Text.Json.Nodes.JsonNode.Parse(System.IO.File.ReadAllText(path)) is not System.Text.Json.Nodes.JsonObject existing)
@@ -336,7 +366,7 @@ public sealed class SettingsController : ControllerBase
                 var parsed = JsonSerializer.Deserialize<EncoderOptions>(json, _jsonOptions);
                 if (parsed == null) continue;
                 MigrateLegacyAudioIfNeeded(parsed, json);
-                return parsed;
+                return EnvConfigOverrides.Apply(parsed, EnvConfigOverrides.SettingsPrefix);
             }
             catch { /* fall through to backup or default */ }
         }

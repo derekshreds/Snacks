@@ -153,17 +153,20 @@ public sealed class CalculateBitratesTests
 
 
     [Fact]
-    public void Zero_source_bitrate_on_hevc_uses_user_target_and_copies()
+    public void Zero_source_bitrate_on_hevc_reencodes_at_user_target()
     {
-        // HEVC + unknown bitrate: above-target branch emits the user target, and
-        // the videoCopy gate fires (Bitrate < target+700 is satisfied at 0 < 4200).
+        // HEVC + unknown bitrate: emit the user target and re-encode. The videoCopy
+        // gate must NOT fire on bitrate 0 — "couldn't measure" is not "already small",
+        // and copying skipped compression for arbitrarily large files whose bitrate
+        // ffprobe failed to report. A pointless re-encode of an actually-small file
+        // is discarded by the no-savings check; a wrongly-copied huge remux is not.
         var opts = new EncoderOptions { Encoder = "libx265", TargetBitrate = 3500 };
         var item = MakeWorkItem(bitrate: 0, isHevc: true);
 
         var (target, _, _, copy) = TranscodingService.CalculateBitrates(item, opts);
 
         target.Should().Be("3500k");
-        copy.Should().BeTrue();
+        copy.Should().BeFalse();
     }
 
 

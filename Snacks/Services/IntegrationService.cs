@@ -31,7 +31,9 @@ public sealed class IntegrationService
         ArgumentNullException.ThrowIfNull(httpClientFactory);
         _configFileService = configFileService;
         _httpClientFactory = httpClientFactory;
-        _config            = _configFileService.Load<IntegrationConfig>("integrations.json");
+        _config            = EnvConfigOverrides.Apply(
+            _configFileService.Load<IntegrationConfig>("integrations.json"),
+            EnvConfigOverrides.IntegrationsPrefix);
     }
 
     /******************************************************************
@@ -50,8 +52,12 @@ public sealed class IntegrationService
     {
         lock (_lock)
         {
-            _config = config;
+            // Fields driven by SNACKS_INTEG_* env vars keep their on-disk values in the
+            // file (unsetting a var reverts cleanly); the live config gets env re-applied.
+            var fileState = _configFileService.Load<IntegrationConfig>("integrations.json");
+            EnvConfigOverrides.RestoreLockedValues(config, fileState, EnvConfigOverrides.IntegrationsPrefix);
             _configFileService.Save("integrations.json", config);
+            _config = EnvConfigOverrides.Apply(config, EnvConfigOverrides.IntegrationsPrefix);
             // Credentials or base URL may have changed — drop the library-root caches.
             lock (_rootsLock)
             {

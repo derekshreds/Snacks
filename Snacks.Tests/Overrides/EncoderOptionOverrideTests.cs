@@ -48,6 +48,39 @@ public sealed class EncoderOptionOverrideTests
     }
 
 
+    [Theory]
+    [InlineData("av1",  "libsvtav1")]
+    [InlineData("AV1",  "libsvtav1")]
+    [InlineData("h264", "libx264")]
+    [InlineData("h265", "libx265")]
+    public void Codec_override_rederives_encoder(string codec, string expectedEncoder)
+    {
+        // The override dialog only writes Codec; the pipeline branches on Encoder.
+        // Without re-derivation a folder's "AV1" override still encoded with the
+        // global libx265.
+        var baseOpts = BaseOptions();
+        baseOpts.Codec   = "h265";
+        baseOpts.Encoder = "libx265";
+
+        var result = EncoderOptionsOverride.ApplyOverrides(
+            baseOpts, new EncoderOptionsOverride { Codec = codec }, null);
+
+        result.Encoder.Should().Be(expectedEncoder);
+    }
+
+
+    [Fact]
+    public void Explicit_encoder_override_wins_over_codec_derivation()
+    {
+        var baseOpts = BaseOptions();
+        var folder = new EncoderOptionsOverride { Codec = "av1", Encoder = "custom_encoder" };
+
+        var result = EncoderOptionsOverride.ApplyOverrides(baseOpts, folder, null);
+
+        result.Encoder.Should().Be("custom_encoder");
+    }
+
+
     [Fact]
     public void Apply_does_not_mutate_base_options()
     {
