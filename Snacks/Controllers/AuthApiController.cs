@@ -61,4 +61,27 @@ public sealed class AuthApiController : ControllerBase
             return new JsonResult(new { success = false, error = ex.Message });
         }
     }
+
+    /******************************************************************
+     *  API Key
+     ******************************************************************/
+
+    /// <summary>
+    ///     Returns the stored API key for the Security panel's reveal button.
+    ///     A key set via the SNACKS_API_KEY env var is never exposed here.
+    /// </summary>
+    [HttpGet("apikey")]
+    public IActionResult GetApiKey() => new JsonResult(new { apiKey = _auth.GetStoredApiKey() });
+
+    /// <summary> Generates and persists a new stored API key, replacing any previous one. </summary>
+    [HttpPost("apikey/generate")]
+    public IActionResult GenerateApiKey() => new JsonResult(new { success = true, apiKey = _auth.GenerateApiKey() });
+
+    /// <summary> Removes the stored API key. A key set via SNACKS_API_KEY stays valid. </summary>
+    [HttpDelete("apikey")]
+    public IActionResult DeleteApiKey()
+    {
+        _auth.ClearApiKey();
+        return new JsonResult(new { success = true });
+    }
 }

@@ -3990,6 +3990,8 @@ public sealed class ClusterService : IHostedService, IDisposable
             }
             catch { }
             options ??= new EncoderOptions();
+            // Disk fallback only — GetLastOptions() already carries env-applied values.
+            EnvConfigOverrides.Apply(options, EnvConfigOverrides.SettingsPrefix);
         }
         return options;
     }

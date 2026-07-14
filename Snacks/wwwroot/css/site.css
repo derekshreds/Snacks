@@ -2002,3 +2002,26 @@ footer a.text-muted:hover {
     padding-bottom: 0.4rem;
     margin-bottom: 1rem;
 }
+
+/* ---------------------------------------------------------------------------
+   Settings — env-locked controls (values driven by SNACKS_* environment
+   variables; the server re-applies them on load and strips them from saves)
+   --------------------------------------------------------------------------- */
+
+.env-locked {
+    opacity: 0.65;
+    cursor: not-allowed;
+}
+
+.env-locked-container {
+    opacity: 0.65;
+    pointer-events: none;
+}
+
+.env-locked-badge {
+    cursor: help;
+}
+
+.env-locked-note {
+    color: var(--text-secondary, #9ca3af);
+}

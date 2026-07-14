@@ -282,6 +282,78 @@ Click the terminal icon on any item to view detailed FFmpeg logs -- logs are per
 - **Process Selected override** -- explicitly selecting a file in the browser always queues it, regardless of its database status (failed, cancelled, completed).
 - **Pause/Resume** -- pause state is saved across restarts. If the queue was paused when the container stopped, it stays paused.
 
+### API Access & Automation
+
+Everything the pause button and scan trigger do is also available over HTTP, so orchestrators
+(Komodo, cron, CI, Home Assistant, ...) can drive Snacks — e.g. pause encoding while backups run.
+
+If sign-in is enabled, authenticate with an API key sent as an `X-Api-Key` header or an
+`Authorization: Bearer` token. Generate a key under **Settings → Security → API Access**, or
+supply one via the `SNACKS_API_KEY` environment variable (both work at the same time; the env
+key is never shown in the UI). With sign-in disabled, no key is needed.
+
+```bash
+# Pause the queue (the current encode finishes, nothing new starts)
+curl -H "X-Api-Key: $SNACKS_API_KEY" -X POST http://nas:6767/api/queue/paused \
+     -H 'Content-Type: application/json' -d '{"paused":true}'
+
+# Resume
+curl -H "X-Api-Key: $SNACKS_API_KEY" -X POST http://nas:6767/api/queue/paused \
+     -H 'Content-Type: application/json' -d '{"paused":false}'
+
+# Current pause state
+curl -H "X-Api-Key: $SNACKS_API_KEY" http://nas:6767/api/queue/paused
+
+# Trigger a library scan immediately
+curl -H "X-Api-Key: $SNACKS_API_KEY" -X POST http://nas:6767/api/auto-scan/trigger
+
+# Queue stats
+curl -H "X-Api-Key: $SNACKS_API_KEY" http://nas:6767/api/queue/stats
+```
+
+Pause state persists across restarts, so a paused container comes back up paused.
+
+### Configuration via Environment Variables
+
+Any encoder, auto-scan, or integration setting can be pinned from your compose file instead of
+the GUI — handy for version-controlling config and recreating nodes. Env-pinned settings show a
+lock icon in the GUI and always win: they are applied on every load, never written into the
+config files, and removing the variable reverts to whatever is in the file.
+
+| Prefix | Targets | Example |
+|---|---|---|
+| `SNACKS_SET_<Property>` | Encoder settings (`settings.json`), nested fields via `__` | `SNACKS_SET_Codec=av1`, `SNACKS_SET_Music__BitrateKbps=256` |
+| `SNACKS_SCAN_<Property>` | Auto-scan (`autoscan.json`) | `SNACKS_SCAN_Enabled=true`, `SNACKS_SCAN_IntervalMinutes=30` |
+| `SNACKS_INTEG_<Section>__<Property>` | Integrations (`integrations.json`) | `SNACKS_INTEG_Plex__Token=abc` |
+
+Property names match the JSON keys in the config files, case-insensitively. Values parse by type:
+
+- **Booleans**: `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`
+- **Numbers / enums**: plain values (`2500`, `MuxOnly`)
+- **String lists**: comma-separated (`en,ja`) or a JSON array (`["en","ja"]`)
+- **Complex values**: JSON (`SNACKS_SET_AudioOutputs=[{"Codec":"aac","Layout":"Stereo","BitrateKbps":192}]`,
+  `SNACKS_SCAN_Directories=["/media/tv","/media/movies"]`)
+
+Invalid names or values are logged as warnings and skipped — a typo never prevents startup.
+The queue pause state and other runtime fields (`QueuePaused`, `LastScanTime`) can't be pinned;
+use the API above for pausing. On cluster nodes, per-job settings shipped from the master are
+authoritative — node-local `SNACKS_SET_*` only affects encodes the node queues itself.
+
+```yaml
+environment:
+  - SNACKS_API_KEY=change-me
+  - SNACKS_SET_Codec=av1
+  - SNACKS_SET_TargetBitrate=2500
+  - SNACKS_SET_Music__BitrateKbps=256
+  - SNACKS_SET_AudioLanguagesToKeep=en,ja
+  - SNACKS_SCAN_Enabled=true
+  - SNACKS_SCAN_IntervalMinutes=30
+  - SNACKS_INTEG_Plex__BaseUrl=http://plex:32400
+  - SNACKS_INTEG_Plex__Token=xxxx
+  - SNACKS_INTEG_Plex__RescanOnComplete=true
+  - SNACKS_INTEG_Plex__Enabled=true
+```
+
 ### Logs
 
 - Every encode writes a log file to the `logs` directory (e.g., `The Matrix (1999)_a3f2b1c4.log`)

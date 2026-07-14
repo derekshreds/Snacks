@@ -60,6 +60,16 @@ public sealed class AuthMiddleware
             return;
         }
 
+        // API key (X-Api-Key header or Bearer token) — the automation path for
+        // orchestrators that can't do cookie login. API routes only; browser
+        // navigation still goes through the login form.
+        if (path.StartsWith("/api/", StringComparison.OrdinalIgnoreCase)
+            && auth.ValidateApiKey(ExtractApiKey(ctx)))
+        {
+            await _next(ctx);
+            return;
+        }
+
         // API calls get 401; browser navigation gets redirected to login.
         if (path.StartsWith("/api/", StringComparison.OrdinalIgnoreCase)
             || ctx.Request.Headers["X-Requested-With"] == "XMLHttpRequest"
@@ -76,6 +86,18 @@ public sealed class AuthMiddleware
     /******************************************************************
      *  Helpers
      ******************************************************************/
+
+    private static string? ExtractApiKey(HttpContext ctx)
+    {
+        var headerKey = ctx.Request.Headers["X-Api-Key"].FirstOrDefault();
+        if (!string.IsNullOrEmpty(headerKey)) return headerKey;
+
+        var authorization = ctx.Request.Headers.Authorization.FirstOrDefault();
+        const string bearer = "Bearer ";
+        return authorization?.StartsWith(bearer, StringComparison.OrdinalIgnoreCase) == true
+            ? authorization[bearer.Length..]
+            : null;
+    }
 
     private static bool IsAllowlisted(string path)
     {

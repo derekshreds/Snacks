@@ -28,6 +28,12 @@ services:
       - FFPROBE_PATH=/usr/lib/jellyfin-ffmpeg/ffprobe
       ## VAAPI driver — auto-detection tries iHD then i965. Override here if needed:
       #- LIBVA_DRIVER_NAME=iHD
+      ## API key for automation (pause/resume queue, trigger scans) when sign-in is enabled.
+      #- SNACKS_API_KEY=change-me
+      ## Pin settings from compose (lock shown in GUI) — see README
+      ## "Configuration via Environment Variables".
+      #- SNACKS_SET_Codec=av1
+      #- SNACKS_SCAN_Enabled=true
     devices:
       ## Intel QSV hardware acceleration (TS-453E J6412)
       - /dev/dri:/dev/dri
