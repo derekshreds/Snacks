@@ -4,7 +4,7 @@
     <TargetFramework>net10.0</TargetFramework>
     <!-- Single source of truth for release tooling and runtime version output.
          Run `node scripts/sync-version.mjs` after changing it. -->
-    <Version>2.16.0</Version>
+    <Version>2.17.0</Version>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
