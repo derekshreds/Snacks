@@ -254,11 +254,11 @@ public sealed class NotificationService
 
             using var response = await http.SendAsync(request);
             if (!response.IsSuccessStatusCode)
-                Console.WriteLine($"Notification {eventName} → {url} failed: {(int)response.StatusCode}");
+                Log.Warning($"Notification {eventName} → {url} failed: {(int)response.StatusCode}");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Notification dispatch error ({dest.Url}): {ex.Message}");
+            Log.Warning($"Notification dispatch error ({dest.Url}): {ex.Message}");
         }
     }
 

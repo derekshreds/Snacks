@@ -1,5 +1,4 @@
 using Microsoft.AspNetCore.Mvc;
-using Snacks.Services;
 
 namespace Snacks.Controllers;
 
@@ -10,14 +9,6 @@ namespace Snacks.Controllers;
 /// </summary>
 public sealed class HomeController : Controller
 {
-    private readonly TranscodingService _transcodingService;
-
-    public HomeController(TranscodingService transcodingService)
-    {
-        ArgumentNullException.ThrowIfNull(transcodingService);
-        _transcodingService = transcodingService;
-    }
-
     /******************************************************************
      *  View Actions
      ******************************************************************/
@@ -33,32 +24,4 @@ public sealed class HomeController : Controller
     /// <summary> Renders the error view. </summary>
     public IActionResult Error() => View();
 
-    /******************************************************************
-     *  App Lifecycle
-     ******************************************************************/
-
-    /// <summary> Returns a JSON liveness response indicating the application is running. </summary>
-    [HttpGet("api/health")]
-    public IActionResult Health() => Json(new
-    {
-        status    = "healthy",
-        timestamp = DateTime.UtcNow,
-        version   = "2.15.1",
-    });
-
-    /// <summary>
-    ///     Stops the active encode, cleans up partial output, then exits the process.
-    ///     In Electron mode, the host detects the clean exit and relaunches the application.
-    /// </summary>
-    [HttpPost("api/restart")]
-    public IActionResult Restart()
-    {
-        _ = Task.Run(async () =>
-        {
-            await Task.Delay(500); // allow HTTP response to complete before exiting
-            await _transcodingService.StopAndClearQueue();
-            Environment.Exit(0);
-        });
-        return Json(new { success = true, message = "Restarting..." });
-    }
 }

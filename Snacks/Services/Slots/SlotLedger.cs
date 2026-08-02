@@ -42,7 +42,7 @@ public sealed class SlotLedger
     ///     unknown / disabled / not-yet-reported devices — <see cref="TryReserve"/>
     ///     will refuse to reserve in that case.
     /// </param>
-    /// <param name="logger">Optional sink for release-reason logging. Defaults to <see cref="Console.WriteLine(string)"/>.</param>
+    /// <param name="logger">Optional sink for release-reason logging. Defaults to the persistent Serilog operations log.</param>
     public SlotLedger(Func<string, string, int> capacityResolver, Action<string>? logger = null)
     {
         _capacityResolver = capacityResolver ?? throw new ArgumentNullException(nameof(capacityResolver));
@@ -111,7 +111,7 @@ public sealed class SlotLedger
 
         var msg = $"SlotLedger: Released {jobId} on {removed.NodeId}/{removed.DeviceId} (phase={removed.Phase}, reason={reason})";
         if (_logger != null) _logger(msg);
-        else Console.WriteLine(msg);
+        else Log.Information(msg);
     }
 
     /// <summary>

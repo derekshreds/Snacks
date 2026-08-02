@@ -70,7 +70,7 @@ public sealed class SettingsController : ControllerBase
             }
             catch
             {
-                Console.WriteLine($"Settings file corrupted: {candidate}");
+                Log.Warning($"Settings file corrupted: {candidate}");
             }
         }
 
@@ -483,7 +483,7 @@ public sealed class SettingsController : ControllerBase
         }
         catch
         {
-            Console.WriteLine($"Presets file corrupted: {path}");
+            Log.Warning($"Presets file corrupted: {path}");
             return new List<SavedPreset>();
         }
     }

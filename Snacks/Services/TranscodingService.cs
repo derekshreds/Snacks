@@ -291,7 +291,7 @@ public class TranscodingService
             _ = Task.Run(async () =>
             {
                 try { await ProcessQueueAsync(_lastOptions); }
-                catch (Exception ex) { Console.WriteLine($"ProcessQueueAsync after settings change failed: {ex.Message}"); }
+                catch (Exception ex) { Log.Warning($"ProcessQueueAsync after settings change failed: {ex.Message}"); }
             });
         }
     }
@@ -317,7 +317,7 @@ public class TranscodingService
     public void SetPaused(bool paused)
     {
         _isPaused = paused;
-        Console.WriteLine($"Queue {(paused ? "paused" : "resumed")}");
+        Log.Information($"Queue {(paused ? "paused" : "resumed")}");
 
         if (!paused && _lastOptions != null)
         {
@@ -329,7 +329,7 @@ public class TranscodingService
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"Error in ProcessQueueAsync: {ex.Message}");
+                    Log.Warning($"Error in ProcessQueueAsync: {ex.Message}");
                 }
             });
         }
@@ -461,7 +461,7 @@ public class TranscodingService
                 // from _nodes, and without this refresh standalone mode's
                 // first encode permanently fails to reserve a slot.
                 try { _hardwareDetectedCallback?.Invoke(); }
-                catch (Exception ex) { Console.WriteLine($"HardwareDetected callback error: {ex.Message}"); }
+                catch (Exception ex) { Log.Warning($"HardwareDetected callback error: {ex.Message}"); }
                 await _hubContext.Clients.All.SendAsync("HardwareDetected", _detectedHardware);
             }
             catch
@@ -498,7 +498,10 @@ public class TranscodingService
                 await File.AppendAllTextAsync(logPath, $"[{DateTime.Now:HH:mm:ss}] {message}\n");
             }
         }
-        catch { }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Could not append the operation log for work item {WorkItemId}", workItemId);
+        }
     }
 
     /// <summary>Returns all persisted log lines for a work item, or an empty list if none exist.</summary>
@@ -509,7 +512,10 @@ public class TranscodingService
         if (logPath != null && File.Exists(logPath))
         {
             try { return File.ReadAllLines(logPath).ToList(); }
-            catch { }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "Could not read the operation log for work item {WorkItemId}", workItemId);
+            }
         }
 
         // Fallback: search logs directory by short ID — picks up remote job logs
@@ -524,7 +530,10 @@ public class TranscodingService
                 if (match != null)
                     return File.ReadAllLines(match).ToList();
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "Could not search persisted operation logs for work item {WorkItemId}", workItemId);
+            }
         }
 
         return new List<string>();
@@ -578,7 +587,7 @@ public class TranscodingService
         // hours after a file was last seen on disk.
         if (!File.Exists(filePath))
         {
-            Console.WriteLine($"AddFile: Skipping {Path.GetFileName(filePath)} — source file no longer exists");
+            Log.Information($"AddFile: Skipping {Path.GetFileName(filePath)} — source file no longer exists");
             try { await _mediaFileRepo.RemoveByPathAsync(Path.GetFullPath(filePath)); } catch { }
             return string.Empty;
         }
@@ -608,7 +617,7 @@ public class TranscodingService
 
             if (_isRemoteJobChecker != null && await _isRemoteJobChecker(earlyNormalizedPath))
             {
-                Console.WriteLine($"Skipping {Path.GetFileName(filePath)}: already active as a remote job");
+                Log.Information($"Skipping {Path.GetFileName(filePath)}: already active as a remote job");
                 return string.Empty;
             }
 
@@ -625,7 +634,7 @@ public class TranscodingService
                 && earlyDbFile.Status is MediaFileStatus.Failed or MediaFileStatus.Cancelled
                     or MediaFileStatus.Completed or MediaFileStatus.Queued)
             {
-                Console.WriteLine($"Skipping {Path.GetFileName(filePath)}: previously {earlyDbFile.Status} (unchanged on disk)");
+                Log.Information($"Skipping {Path.GetFileName(filePath)}: previously {earlyDbFile.Status} (unchanged on disk)");
                 return string.Empty;
             }
 
@@ -660,12 +669,12 @@ public class TranscodingService
                 long videoBitrate = await MeasureVideoBitrateAsync(new WorkItem { Path = filePath, Length = length });
                 if (videoBitrate > 0 && videoBitrate <= totalBitrate)
                 {
-                    Console.WriteLine($"Video bitrate for {_fileService.GetFileName(filePath)}: {videoBitrate}kbps (total was {totalBitrate}kbps)");
+                    Log.Information($"Video bitrate for {_fileService.GetFileName(filePath)}: {videoBitrate}kbps (total was {totalBitrate}kbps)");
                     bitrate = videoBitrate;
                 }
                 else if (videoBitrate > totalBitrate)
                 {
-                    Console.WriteLine($"Video bitrate measurement for {_fileService.GetFileName(filePath)} was {videoBitrate}kbps but total is only {totalBitrate}kbps — using total");
+                    Log.Information($"Video bitrate measurement for {_fileService.GetFileName(filePath)} was {videoBitrate}kbps but total is only {totalBitrate}kbps — using total");
                 }
             }
 
@@ -713,7 +722,7 @@ public class TranscodingService
                             fileInfo.Length,
                             resolutionLabel))
                     {
-                        Console.WriteLine($"Excluded by library rules: {workItem.FileName}");
+                        Log.Information($"Excluded by library rules: {workItem.FileName}");
                         return workItem.Id;
                     }
                 }
@@ -783,14 +792,14 @@ public class TranscodingService
             // unconditionally, even if it's above the bitrate target.
             if (effectiveOptions.EncodingMode == EncodingMode.MuxOnly && !hasMuxableWork && !needsContainerChange)
             {
-                Console.WriteLine($"Skipping {workItem.FileName}: MuxOnly mode, no audio/subtitle work");
+                Log.Information($"Skipping {workItem.FileName}: MuxOnly mode, no audio/subtitle work");
                 await MarkSkippedInDb();
                 return workItem.Id;
             }
 
             if (effectiveOptions.Skip4K && isHighDef)
             {
-                Console.WriteLine($"Skipping {workItem.FileName}: 4K video (Skip 4K enabled)");
+                Log.Information($"Skipping {workItem.FileName}: 4K video (Skip 4K enabled)");
                 await MarkSkippedInDb();
                 return workItem.Id;
             }
@@ -801,7 +810,7 @@ public class TranscodingService
             double skipMultiplier = 1.0 + (Math.Clamp(effectiveOptions.SkipPercentAboveTarget, 0, 100) / 100.0);
             if (alreadyTargetCodec && bitrate > 0 && bitrate <= effectiveOptions.TargetBitrate * skipMultiplier && !isHighDef && !bypassSkip)
             {
-                Console.WriteLine($"Skipping {workItem.FileName}: already {sourceCodecLabel} at {bitrate}kbps (target {effectiveOptions.TargetBitrate}kbps, skip threshold {skipMultiplier:P0})");
+                Log.Information($"Skipping {workItem.FileName}: already {sourceCodecLabel} at {bitrate}kbps (target {effectiveOptions.TargetBitrate}kbps, skip threshold {skipMultiplier:P0})");
                 await MarkSkippedInDb();
                 return workItem.Id;
             }
@@ -810,7 +819,7 @@ public class TranscodingService
             int fourKTarget = effectiveOptions.TargetBitrate * fourKMultiplier;
             if (alreadyTargetCodec && isHighDef && bitrate > 0 && bitrate <= fourKTarget * skipMultiplier && !bypassSkip)
             {
-                Console.WriteLine($"Skipping {workItem.FileName}: already {sourceCodecLabel} 4K at {bitrate}kbps (4K target {fourKTarget}kbps)");
+                Log.Information($"Skipping {workItem.FileName}: already {sourceCodecLabel} 4K at {bitrate}kbps (4K target {fourKTarget}kbps)");
                 await MarkSkippedInDb();
                 return workItem.Id;
             }
@@ -822,7 +831,7 @@ public class TranscodingService
                     _detectedHardware != null && IsVaapiAcceleration(_detectedHardware));
             if (isVaapiMode && !isHevc && targetIsHevc && bitrate > 0 && bitrate <= effectiveOptions.TargetBitrate && !isHighDef && !bypassSkip)
             {
-                Console.WriteLine($"Skipping {workItem.FileName}: VAAPI can't compress {bitrate}kbps H.264 below target");
+                Log.Information($"Skipping {workItem.FileName}: VAAPI can't compress {bitrate}kbps H.264 below target");
                 await MarkSkippedInDb();
                 return workItem.Id;
             }
@@ -834,12 +843,12 @@ public class TranscodingService
                     effectiveOptions, bitrate, isHevc, videoStream?.Height ?? 0, FfprobeService.IsHdr(probe),
                     ProjectAudioSummaries(probe), ProjectSubtitleSummaries(probe)))
             {
-                Console.WriteLine($"Skipping {workItem.FileName}: no work to do (video would copy, no audio/sub changes, no filters)");
+                Log.Information($"Skipping {workItem.FileName}: no work to do (video would copy, no audio/sub changes, no filters)");
                 await MarkSkippedInDb();
                 return workItem.Id;
             }
 
-            Console.WriteLine($"Queuing {workItem.FileName}: {sourceCodec} {bitrate}kbps {(isHighDef ? "4K" : "HD")}");
+            Log.Information($"Queuing {workItem.FileName}: {sourceCodec} {bitrate}kbps {(isHighDef ? "4K" : "HD")}");
 
             if (FindWorkItemByPath(normalizedPath) is { Status: WorkItemStatus.Pending
                     or WorkItemStatus.Processing or WorkItemStatus.Uploading
@@ -850,7 +859,7 @@ public class TranscodingService
 
             if (_isRemoteJobChecker != null && await _isRemoteJobChecker(normalizedPath))
             {
-                Console.WriteLine($"Skipping {workItem.FileName}: already active as a remote job");
+                Log.Information($"Skipping {workItem.FileName}: already active as a remote job");
                 return workItem.Id;
             }
 
@@ -865,17 +874,17 @@ public class TranscodingService
 
                 if (fileChanged)
                 {
-                    Console.WriteLine($"File changed on disk: {workItem.FileName} (size: {dbFile.FileSize}→{fileInfo.Length}) — resetting");
+                    Log.Information($"File changed on disk: {workItem.FileName} (size: {dbFile.FileSize}→{fileInfo.Length}) — resetting");
                     await _mediaFileRepo.ResetFileAsync(normalizedPath);
                 }
                 else if (!force && dbFile.Status is MediaFileStatus.Failed or MediaFileStatus.Cancelled)
                 {
-                    Console.WriteLine($"Skipping {workItem.FileName}: previously {dbFile.Status} ({dbFile.FailureCount} failures)");
+                    Log.Information($"Skipping {workItem.FileName}: previously {dbFile.Status} ({dbFile.FailureCount} failures)");
                     return workItem.Id;
                 }
                 else if (!force && dbFile.Status is MediaFileStatus.Completed)
                 {
-                    Console.WriteLine($"Skipping {workItem.FileName}: already completed");
+                    Log.Information($"Skipping {workItem.FileName}: already completed");
                     return workItem.Id;
                 }
             }
@@ -929,7 +938,7 @@ public class TranscodingService
             _ = Task.Run(async () =>
             {
                 try { await ProcessQueueAsync(options); }
-                catch (Exception ex) { Console.WriteLine($"Error in ProcessQueueAsync: {ex.Message}"); }
+                catch (Exception ex) { Log.Warning($"Error in ProcessQueueAsync: {ex.Message}"); }
             });
 
             return workItem.Id;
@@ -984,7 +993,7 @@ public class TranscodingService
 
             async Task MarkSkippedInDb(string reason)
             {
-                Console.WriteLine($"Skipping {workItem.FileName}: {reason}");
+                Log.Information($"Skipping {workItem.FileName}: {reason}");
                 await _mediaFileRepo.UpsertAsync(new MediaFile
                 {
                     FilePath      = normalizedPath,
@@ -1057,12 +1066,12 @@ public class TranscodingService
 
                 if (fileChanged)
                 {
-                    Console.WriteLine($"Music file changed on disk: {workItem.FileName} (size: {dbFile.FileSize}→{fileInfo.Length}) — resetting");
+                    Log.Information($"Music file changed on disk: {workItem.FileName} (size: {dbFile.FileSize}→{fileInfo.Length}) — resetting");
                     await _mediaFileRepo.ResetFileAsync(normalizedPath);
                 }
                 else if (!force && dbFile.Status is MediaFileStatus.Cancelled)
                 {
-                    Console.WriteLine($"Skipping {workItem.FileName}: previously cancelled by user");
+                    Log.Information($"Skipping {workItem.FileName}: previously cancelled by user");
                     return workItem.Id;
                 }
                 else if (!force && dbFile.Status is MediaFileStatus.Failed && dbFile.FailureCount >= 3)
@@ -1071,12 +1080,12 @@ public class TranscodingService
                     // attempts before giving up so a transient bug or one-off ffmpeg
                     // hiccup doesn't permanently bench a track. After 3 strikes the user
                     // has to fix something or explicitly force-retry.
-                    Console.WriteLine($"Skipping {workItem.FileName}: failed {dbFile.FailureCount} times — permanent fail");
+                    Log.Warning($"Skipping {workItem.FileName}: failed {dbFile.FailureCount} times — permanent fail");
                     return workItem.Id;
                 }
                 else if (!force && dbFile.Status is MediaFileStatus.Completed)
                 {
-                    Console.WriteLine($"Skipping {workItem.FileName}: already completed");
+                    Log.Information($"Skipping {workItem.FileName}: already completed");
                     return workItem.Id;
                 }
                 else if (!force && dbFile.Status is MediaFileStatus.Queued)
@@ -1110,7 +1119,7 @@ public class TranscodingService
                 FileMtime     = fileInfo.LastWriteTimeUtc.Ticks,
             });
 
-            Console.WriteLine($"Queuing music {workItem.FileName}: {sourceCodec} {sourceKbps}kbps {sourceChans}ch → {music.Codec} {music.BitrateKbps}kbps");
+            Log.Information($"Queuing music {workItem.FileName}: {sourceCodec} {sourceKbps}kbps {sourceChans}ch → {music.Codec} {music.BitrateKbps}kbps");
 
             // The Queued row IS the queue entry — no WorkItem is parked in memory.
             // The scheduler hydrates the row when it reaches the top of the queue order.
@@ -1127,7 +1136,7 @@ public class TranscodingService
             _ = Task.Run(async () =>
             {
                 try { await ProcessQueueAsync(options); }
-                catch (Exception ex) { Console.WriteLine($"Error in ProcessQueueAsync: {ex.Message}"); }
+                catch (Exception ex) { Log.Warning($"Error in ProcessQueueAsync: {ex.Message}"); }
             });
 
             return workItem.Id;
@@ -1173,7 +1182,7 @@ public class TranscodingService
                 await AddFileAsync(file, options, force, forceMux);
                 addedCount++;
             }
-            catch (Exception ex) { Console.WriteLine($"Failed to add {file}: {ex.Message}"); }
+            catch (Exception ex) { Log.Warning($"Failed to add {file}: {ex.Message}"); }
         }
 
         return $"Added {addedCount} files from directory";
@@ -1846,7 +1855,7 @@ public class TranscodingService
             // (and every move-to-front priority) that would otherwise survive it.
             if (topRows.Count >= 5 && topRows.All(r => !File.Exists(r.FilePath)))
             {
-                Console.WriteLine("QueueWindow: library storage appears offline — leaving the queue untouched until it returns");
+                Log.Information("QueueWindow: library storage appears offline — leaving the queue untouched until it returns");
                 return;
             }
 
@@ -1880,7 +1889,7 @@ public class TranscodingService
                     // Source vanished while queued — back to Unseen so the next
                     // scan re-evaluates (and the row stops occupying the window).
                     try { await _mediaFileRepo.SetStatusAsync(row.FilePath, MediaFileStatus.Unseen); }
-                    catch (Exception ex) { Console.WriteLine($"QueueWindow: failed to quarantine missing {row.FileName}: {ex.Message}"); }
+                    catch (Exception ex) { Log.Warning($"QueueWindow: failed to quarantine missing {row.FileName}: {ex.Message}"); }
                     continue;
                 }
 
@@ -1963,7 +1972,7 @@ public class TranscodingService
             MarkQueueWindowDirty();
             await SyncQueueWindowAsync();
             await NotifyQueueChangedAsync();
-            Console.WriteLine($"Queue: moved row {rowId} to the front (priority {newPriority})");
+            Log.Information($"Queue: moved row {rowId} to the front (priority {newPriority})");
             return true;
         }
 
@@ -1977,7 +1986,7 @@ public class TranscodingService
         lock (_queueLock) { _workQueue.Sort((a, b) => CompareQueueOrder(a, b, _queueNewestFirst)); }
         MarkQueueWindowDirty();
         await NotifyQueueChangedAsync();
-        Console.WriteLine($"Queue: moved {item.FileName} to the front");
+        Log.Information($"Queue: moved {item.FileName} to the front");
         return true;
     }
 
@@ -2049,7 +2058,7 @@ public class TranscodingService
         }
 
         try { await _mediaFileRepo.RemoveByPathAsync(Path.GetFullPath(item.Path)); }
-        catch (Exception ex) { Console.WriteLine($"DropMissingWorkItem: DB cleanup failed for {item.FileName}: {ex.Message}"); }
+        catch (Exception ex) { Log.Warning($"DropMissingWorkItem: DB cleanup failed for {item.FileName}: {ex.Message}"); }
 
         try { await _hubContext.Clients.All.SendAsync("WorkItemRemoved", item.Id); }
         catch { /* SignalR failures are non-fatal — UI will reconcile on next refresh */ }
@@ -2097,7 +2106,7 @@ public class TranscodingService
             else evicted++;
         }
         if (evicted > 0)
-            Console.WriteLine($"Queue sweep: evicted {evicted} finished items from memory (cap {TerminalWorkItemCap}; full history remains in the database)");
+            Log.Information($"Queue sweep: evicted {evicted} finished items from memory (cap {TerminalWorkItemCap}; full history remains in the database)");
     }
 
     /// <summary>
@@ -2125,7 +2134,7 @@ public class TranscodingService
             }
             catch { continue; }
 
-            Console.WriteLine($"PruneMissingWorkItems: dropping {item.FileName} — source no longer exists");
+            Log.Information($"PruneMissingWorkItems: dropping {item.FileName} — source no longer exists");
             await DropMissingWorkItemAsync(item);
             dropped++;
         }
@@ -2163,7 +2172,7 @@ public class TranscodingService
             {
                 MarkQueueWindowDirty();
                 await NotifyQueueChangedAsync();
-                Console.WriteLine($"Cancel: queued row {cancelRowId} ({row.FileName}) cancelled");
+                Log.Information($"Cancel: queued row {cancelRowId} ({row.FileName}) cancelled");
             }
             return;
         }
@@ -2173,7 +2182,7 @@ public class TranscodingService
 
         // Diagnostic log — if cancel ever seems to "not work", this line tells us exactly
         // which branch fired and what the item's state was going in.
-        Console.WriteLine($"Cancel: id={id} status={workItem.Status} assignedNode={workItem.AssignedNodeId ?? "<none>"} isActiveLocal={_activeLocalJobs.ContainsKey(id)}");
+        Log.Information($"Cancel: id={id} status={workItem.Status} assignedNode={workItem.AssignedNodeId ?? "<none>"} isActiveLocal={_activeLocalJobs.ContainsKey(id)}");
 
         if (workItem.Status == WorkItemStatus.Pending)
         {
@@ -2302,7 +2311,7 @@ public class TranscodingService
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"EncodeHistory: local record failed for {workItem.Id}: {ex.Message}");
+            Log.Warning($"EncodeHistory: local record failed for {workItem.Id}: {ex.Message}");
         }
     }
 
@@ -2335,7 +2344,7 @@ public class TranscodingService
             {
                 MarkQueueWindowDirty();
                 await NotifyQueueChangedAsync();
-                Console.WriteLine($"Stop: queued row {stopRowId} ({row.FileName}) returned to Unseen");
+                Log.Information($"Stop: queued row {stopRowId} ({row.FileName}) returned to Unseen");
             }
             return;
         }
@@ -2476,7 +2485,7 @@ public class TranscodingService
             {
                 if (_isPaused)
                 {
-                    Console.WriteLine("Queue is paused — stopping processing loop");
+                    Log.Information("Queue is paused — stopping processing loop");
                     break;
                 }
 
@@ -2620,7 +2629,7 @@ public class TranscodingService
                     }
                     else if (!File.Exists(musicItem.Path))
                     {
-                        Console.WriteLine($"Dropping {musicItem.FileName}: source file no longer exists at dispatch time");
+                        Log.Information($"Dropping {musicItem.FileName}: source file no longer exists at dispatch time");
                         await DropMissingWorkItemAsync(musicItem);
                     }
                     else if (!_slotLedger.TryReserve(_localNodeId, MusicDeviceId, musicItem.Id, musicItem.FileName))
@@ -2708,7 +2717,7 @@ public class TranscodingService
                 // mid-encode.
                 if (!File.Exists(workItem.Path))
                 {
-                    Console.WriteLine($"Dropping {workItem.FileName}: source file no longer exists at dispatch time");
+                    Log.Information($"Dropping {workItem.FileName}: source file no longer exists at dispatch time");
                     await DropMissingWorkItemAsync(workItem);
                     continue;
                 }
@@ -2776,7 +2785,7 @@ public class TranscodingService
                 // Status = Processing assignment would clobber the user's cancel.
                 if (workItem.Status is WorkItemStatus.Cancelled or WorkItemStatus.Stopped)
                 {
-                    Console.WriteLine($"Dropping {workItem.FileName}: cancelled/stopped during dispatch finalisation");
+                    Log.Information($"Dropping {workItem.FileName}: cancelled/stopped during dispatch finalisation");
                     UnregisterWorkItem(workItem.Id);
                     _slotLedger?.Release(workItem.Id, ReleaseReason.Cancelled);
                     try { await _hubContext.Clients.All.SendAsync("WorkItemRemoved", workItem.Id); } catch { /* SignalR errors are non-fatal */ }
@@ -2909,7 +2918,7 @@ public class TranscodingService
                     // identical fallbacks doesn't spam the log file every dispatch.
                     if (_loggedAutoCpuFallback.Add($"{hwPref}:{codec}"))
                     {
-                        Console.WriteLine(message);
+                        Log.Information(message);
                         _log?.LogWarning("{Message}", message);
                     }
                     // Per-item line (not deduped) so each affected item explains itself.
@@ -4399,7 +4408,7 @@ public class TranscodingService
         // Logged structurally so the ops log captures the silent-skip channel — items
         // dropped here vanish from the active queue without a Failed/Completed UI signal,
         // so we want every occurrence in the persistent log.
-        Console.WriteLine($"Skipping {workItem.FileName}: {reason}");
+        Log.Information($"Skipping {workItem.FileName}: {reason}");
         _log?.LogInformation(
             "DispatchSkipped jobId={JobId} fileName={FileName} reason={Reason}",
             workItem.Id, workItem.FileName, reason);
@@ -4808,27 +4817,13 @@ public class TranscodingService
     ///     so a 4K→1080p downscale doesn't get allocated a 4K-sized bitrate budget.
     /// </summary>
     internal static bool WillDownscaleBelow4K(EncoderOptions options)
-    {
-        if (!IsDownscalePolicyActive(options.DownscalePolicy)) return false;
-        return ResolveDownscaleHeight(options.DownscaleTarget) <= 1440;
-    }
+        => VideoTransformPlanner.WillDownscaleBelow4K(options);
 
     internal static bool IsDownscalePolicyActive(string policy) =>
-        string.Equals(policy, "Always",      StringComparison.OrdinalIgnoreCase)
-        || string.Equals(policy, "CapAtTarget", StringComparison.OrdinalIgnoreCase)
-        || string.Equals(policy, "IfLarger",    StringComparison.OrdinalIgnoreCase);
+        VideoTransformPlanner.IsDownscalePolicyActive(policy);
 
-    internal static int ResolveDownscaleHeight(string target) => target switch
-    {
-        "4K"    => 2160,
-        "2160p" => 2160,
-        "1440p" => 1440,
-        "1080p" => 1080,
-        "720p"  => 720,
-        "480p"  => 480,
-        "240p"  => 240,
-        _       => 1080,
-    };
+    internal static int ResolveDownscaleHeight(string target) =>
+        VideoTransformPlanner.ResolveDownscaleHeight(target);
 
     /// <summary>
     ///     Resolves the downscale target height for an active policy, or <c>null</c>
@@ -4837,24 +4832,7 @@ public class TranscodingService
     ///     hwupload path the user has chosen for all HW encoders.
     /// </summary>
     internal static string? ComputeScaleExpr(WorkItem workItem, EncoderOptions options)
-    {
-        var policy = options.DownscalePolicy;
-        if (!IsDownscalePolicyActive(policy)) return null;
-
-        int targetH = ResolveDownscaleHeight(options.DownscaleTarget);
-
-        var v = workItem.Probe?.Streams?.FirstOrDefault(s => s.CodecType == "video");
-        int sourceH = v?.Height ?? 0;
-        if (sourceH <= 0) return null;
-
-        // "Always" downscales unconditionally; "CapAtTarget"/"IfLarger" only downscale
-        // when the source is actually larger than the target.
-        bool always = string.Equals(policy, "Always", StringComparison.OrdinalIgnoreCase);
-        if (!always && sourceH <= targetH) return null;
-
-        // -2 preserves aspect ratio and rounds to an even width (required by most encoders).
-        return $"scale=w=-2:h={targetH}:flags=lanczos";
-    }
+        => VideoTransformPlanner.ComputeScaleExpr(workItem, options);
 
     /// <summary>
     ///     When <see cref="EncoderOptions.FixedFrameSize"/> is set (e.g. "640x480"),
@@ -4865,30 +4843,7 @@ public class TranscodingService
     ///     is unset or unparseable, so the caller falls back to <see cref="ComputeScaleExpr"/>.
     /// </summary>
     internal static string? ComputeFixedFrameFilter(EncoderOptions options)
-    {
-        if (string.IsNullOrWhiteSpace(options.FixedFrameSize)) return null;
-
-        // Parse "WxH" (case-insensitive).
-        var parts = options.FixedFrameSize.ToLowerInvariant().Split('x');
-        if (parts.Length != 2
-            || !int.TryParse(parts[0], out int w)
-            || !int.TryParse(parts[1], out int h)
-            || w <= 0 || h <= 0) return null;
-
-        // yuv420p (and the pad target) require even dimensions — round a hand-entered odd
-        // size down to the nearest even so ffmpeg can't reject the frame at runtime. A
-        // value that rounds to 0 (someone typed "1") is treated as unparseable.
-        w -= w % 2;
-        h -= h % 2;
-        if (w <= 0 || h <= 0) return null;
-
-        // Scale to fit inside w×h preserving aspect ratio, then pad to exact w×h
-        // with letterboxing, then force yuv420p (required by Baseline profile and
-        // most hardware players). The commas inside min() are escaped as \, so
-        // ffmpeg treats them as part of the expression, not filter-chain separators.
-        return $"scale=min(iw\\,{w}):min(ih\\,{h}):force_original_aspect_ratio=decrease," +
-               $"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,format=yuv420p";
-    }
+        => VideoTransformPlanner.ComputeFixedFrameFilter(options);
 
     /// <summary>
     ///     When <see cref="EncoderOptions.MaxFrameRate"/> is set (&gt; 0) and the source is
@@ -4900,20 +4855,7 @@ public class TranscodingService
     ///     be capped to stay level-conformant.
     /// </summary>
     internal static string? ComputeFpsCapExpr(WorkItem workItem, EncoderOptions options)
-    {
-        int cap = options.MaxFrameRate;
-        if (cap <= 0) return null;
-
-        var v = workItem.Probe?.Streams?.FirstOrDefault(s => s.CodecType == "video");
-        double? sourceFps = ParseFrameRate(v?.AvgFrameRate) ?? ParseFrameRate(v?.RFrameRate);
-
-        // Only cap when we KNOW the source exceeds it. `fps=N` duplicates frames to reach
-        // N on a slower source, so capping an unknown (or at/below-cap) rate risks silently
-        // upsampling a 24 fps file to 30 — worse than leaving it. An unknown rate is rare
-        // (ffprobe populates it for real media) and the bitrate math already trusts the probe.
-        if (sourceFps is null || sourceFps <= cap) return null;
-        return $"fps={cap}";
-    }
+        => VideoTransformPlanner.ComputeFpsCapExpr(workItem, options);
 
     /// <summary>
     ///     Parses an ffprobe frame-rate string ("num/den", e.g. "24000/1001" or "30/1")
@@ -4921,18 +4863,7 @@ public class TranscodingService
     ///     denominator/numerator ("0/0" is ffprobe's "unknown").
     /// </summary>
     internal static double? ParseFrameRate(string? rate)
-    {
-        if (string.IsNullOrWhiteSpace(rate)) return null;
-        var parts = rate.Split('/');
-        if (parts.Length == 1 && double.TryParse(parts[0], out double whole))
-            return whole > 0 ? whole : null;
-        if (parts.Length == 2
-            && double.TryParse(parts[0], out double num)
-            && double.TryParse(parts[1], out double den)
-            && num > 0 && den > 0)
-            return num / den;
-        return null;
-    }
+        => VideoTransformPlanner.ParseFrameRate(rate);
 
     private static readonly HashSet<string> _h264Profiles =
         new(StringComparer.OrdinalIgnoreCase) { "baseline", "main", "high", "high10", "high422", "high444" };
@@ -5071,11 +5002,11 @@ public class TranscodingService
         // simultaneous jobs across families.
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
-            Console.WriteLine("Auto-detect: Running on Windows, testing GPU encoders...");
+            Log.Information("Auto-detect: Running on Windows, testing GPU encoders...");
 
             if (await TestEncoderAsync("-hwaccel cuda", "hevc_nvenc"))
             {
-                Console.WriteLine("Auto-detect: NVIDIA NVENC available");
+                Log.Information("Auto-detect: NVIDIA NVENC available");
                 bool h264 = await TestEncoderAsync("-hwaccel cuda", "h264_nvenc");
                 bool av1  = await TestEncoderAsync("-hwaccel cuda", "av1_nvenc");
                 devices.Add(new HardwareDevice
@@ -5091,7 +5022,7 @@ public class TranscodingService
 
             if (await TestEncoderAsync("-hwaccel qsv -qsv_device auto", "hevc_qsv"))
             {
-                Console.WriteLine("Auto-detect: Intel QSV available");
+                Log.Information("Auto-detect: Intel QSV available");
                 bool h264 = await TestEncoderAsync("-hwaccel qsv -qsv_device auto", "h264_qsv");
                 bool av1  = await TestEncoderAsync("-hwaccel qsv -qsv_device auto", "av1_qsv");
                 devices.Add(new HardwareDevice
@@ -5107,7 +5038,7 @@ public class TranscodingService
 
             if (await TestEncoderAsync("-hwaccel auto", "hevc_amf"))
             {
-                Console.WriteLine("Auto-detect: AMD AMF available");
+                Log.Information("Auto-detect: AMD AMF available");
                 bool h264 = await TestEncoderAsync("-hwaccel auto", "h264_amf");
                 bool av1  = await TestEncoderAsync("-hwaccel auto", "av1_amf");
                 devices.Add(new HardwareDevice
@@ -5124,10 +5055,10 @@ public class TranscodingService
         // macOS GPU detection (VideoToolbox — works on both Apple Silicon and Intel Macs).
         else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
         {
-            Console.WriteLine("Auto-detect: Running on macOS, testing VideoToolbox...");
+            Log.Information("Auto-detect: Running on macOS, testing VideoToolbox...");
             if (await TestEncoderAsync("-hwaccel videotoolbox", "hevc_videotoolbox"))
             {
-                Console.WriteLine("Auto-detect: VideoToolbox available");
+                Log.Information("Auto-detect: VideoToolbox available");
                 bool h264 = await TestEncoderAsync("-hwaccel videotoolbox", "h264_videotoolbox");
                 devices.Add(new HardwareDevice
                 {
@@ -5170,7 +5101,7 @@ public class TranscodingService
                     // a CUDA card as a VAAPI device.
                     if (nodeVendor == "nvidia")
                     {
-                        Console.WriteLine($"Auto-detect: {nodePath} is NVIDIA — handled by the NVENC probe, skipping VAAPI/QSV");
+                        Log.Information($"Auto-detect: {nodePath} is NVIDIA — handled by the NVENC probe, skipping VAAPI/QSV");
                         continue;
                     }
 
@@ -5189,7 +5120,7 @@ public class TranscodingService
                         {
                             Environment.SetEnvironmentVariable("LIBVA_DRIVER_NAME", string.IsNullOrEmpty(driver) ? null : driver);
                             var label = string.IsNullOrEmpty(driver) ? "auto" : driver;
-                            Console.WriteLine($"Auto-detect: Trying AMD VAAPI on {nodePath} with {label} driver...");
+                            Log.Information($"Auto-detect: Trying AMD VAAPI on {nodePath} with {label} driver...");
 
                             var amdInit = $"-init_hw_device vaapi=hw:{nodePath} -filter_hw_device hw";
                             bool hevcOk = await TestEncoderAsync(amdInit, "hevc_vaapi");
@@ -5198,7 +5129,7 @@ public class TranscodingService
 
                             if (hevcOk || h264Ok || av1Ok)
                             {
-                                Console.WriteLine($"Auto-detect: AMD VAAPI available on {nodePath} with {label} driver (hevc={hevcOk}, h264={h264Ok}, av1={av1Ok})");
+                                Log.Information($"Auto-detect: AMD VAAPI available on {nodePath} with {label} driver (hevc={hevcOk}, h264={h264Ok}, av1={av1Ok})");
                                 devices.Add(new HardwareDevice
                                 {
                                     DeviceId           = "amd",
@@ -5221,7 +5152,7 @@ public class TranscodingService
                     // Intel probe path). QSV first. oneVPL on Linux needs the iHD driver —
                     // i965 doesn't expose QSV — so pin it before probing instead of leaving
                     // it to the host's default.
-                    Console.WriteLine($"Auto-detect: Trying Intel QSV (Linux) on {nodePath}...");
+                    Log.Information($"Auto-detect: Trying Intel QSV (Linux) on {nodePath}...");
                     Environment.SetEnvironmentVariable("LIBVA_DRIVER_NAME", "iHD");
 
                     var qsvInit = $"-hwaccel qsv -qsv_device {nodePath}";
@@ -5231,7 +5162,7 @@ public class TranscodingService
 
                     if (qsvHevc || qsvH264 || qsvAv1)
                     {
-                        Console.WriteLine($"Auto-detect: Intel QSV (Linux) available on {nodePath} (hevc={qsvHevc}, h264={qsvH264}, av1={qsvAv1})");
+                        Log.Information($"Auto-detect: Intel QSV (Linux) available on {nodePath} (hevc={qsvHevc}, h264={qsvH264}, av1={qsvAv1})");
                         devices.Add(new HardwareDevice
                         {
                             DeviceId           = "intel",
@@ -5252,7 +5183,7 @@ public class TranscodingService
                     bool nodeMatched = false;
                     foreach (var driver in driversToTry)
                     {
-                        Console.WriteLine($"Auto-detect: Trying VAAPI on {nodePath} with {driver} driver...");
+                        Log.Information($"Auto-detect: Trying VAAPI on {nodePath} with {driver} driver...");
                         Environment.SetEnvironmentVariable("LIBVA_DRIVER_NAME", driver);
 
                         var hwInit = $"-init_hw_device vaapi=hw:{nodePath} -filter_hw_device hw";
@@ -5262,7 +5193,7 @@ public class TranscodingService
 
                         if (hevcOk || h264Ok || av1Ok)
                         {
-                            Console.WriteLine($"Auto-detect: VAAPI available on {nodePath} with {driver} driver (hevc={hevcOk}, h264={h264Ok}, av1={av1Ok})");
+                            Log.Information($"Auto-detect: VAAPI available on {nodePath} with {driver} driver (hevc={hevcOk}, h264={h264Ok}, av1={av1Ok})");
                             devices.Add(new HardwareDevice
                             {
                                 DeviceId           = "intel",
@@ -5295,7 +5226,7 @@ public class TranscodingService
 
             if (await TestEncoderAsync("-hwaccel cuda", "hevc_nvenc"))
             {
-                Console.WriteLine("Auto-detect: NVIDIA NVENC available");
+                Log.Information("Auto-detect: NVIDIA NVENC available");
                 bool h264 = await TestEncoderAsync("-hwaccel cuda", "h264_nvenc");
                 bool av1  = await TestEncoderAsync("-hwaccel cuda", "av1_nvenc");
                 devices.Add(new HardwareDevice
@@ -5323,7 +5254,7 @@ public class TranscodingService
         _detectedHardware = primary?.DeviceId ?? "none";
 
         if (primary == null)
-            Console.WriteLine("Auto-detect: No hardware acceleration available, using software");
+            Log.Information("Auto-detect: No hardware acceleration available, using software");
 
         return _detectedHardware;
     }
@@ -5441,18 +5372,18 @@ public class TranscodingService
             var renderNodes = EnumerateRenderNodes();
             if (renderNodes.Length == 0)
             {
-                Console.WriteLine("Auto-detect: no /dev/dri/renderD* nodes found");
+                Log.Information("Auto-detect: no /dev/dri/renderD* nodes found");
                 if (Directory.Exists("/dev/dri"))
                 {
                     var entries = Directory.GetFileSystemEntries("/dev/dri");
-                    Console.WriteLine($"Auto-detect: /dev/dri contents: {string.Join(", ", entries)}");
+                    Log.Information($"Auto-detect: /dev/dri contents: {string.Join(", ", entries)}");
                 }
                 else
-                    Console.WriteLine("Auto-detect: /dev/dri directory does not exist");
+                    Log.Information("Auto-detect: /dev/dri directory does not exist");
                 return;
             }
 
-            Console.WriteLine($"Auto-detect: render nodes found: {string.Join(", ", renderNodes)}");
+            Log.Information($"Auto-detect: render nodes found: {string.Join(", ", renderNodes)}");
             var firstNode = renderNodes[0];
 
             var psi = new ProcessStartInfo("vainfo")
@@ -5486,11 +5417,11 @@ public class TranscodingService
             var stderr = await stderrTask;
 
             var output = !string.IsNullOrEmpty(stdout) ? stdout : stderr;
-            Console.WriteLine($"Auto-detect vainfo ({firstNode}) output:\n{output.Substring(0, Math.Min(output.Length, 1000))}");
+            Log.Information($"Auto-detect vainfo ({firstNode}) output:\n{output.Substring(0, Math.Min(output.Length, 1000))}");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Auto-detect: vainfo failed: {ex.Message}");
+            Log.Warning($"Auto-detect: vainfo failed: {ex.Message}");
         }
     }
 
@@ -5536,17 +5467,17 @@ public class TranscodingService
             if (!process.HasExited)
             {
                 try { process.Kill(entireProcessTree: true); } catch { }
-                Console.WriteLine($"Auto-detect: {encoder} test timed out");
+                Log.Warning($"Auto-detect: {encoder} test timed out");
                 return false;
             }
             var stderr = await stderrTask;
 
-            Console.WriteLine($"Auto-detect: {encoder} test exit={process.ExitCode}");
+            Log.Information($"Auto-detect: {encoder} test exit={process.ExitCode}");
             if (process.ExitCode != 0)
             {
                 // Get last 500 chars of stderr (actual error is at the end, not the build config at the start)
                 var errTail = stderr.Length > 500 ? stderr.Substring(stderr.Length - 500) : stderr;
-                Console.WriteLine($"Auto-detect: {encoder} stderr (tail): {errTail}");
+                Log.Information($"Auto-detect: {encoder} stderr (tail): {errTail}");
             }
 
             return process.ExitCode == 0;
@@ -6222,7 +6153,7 @@ public class TranscodingService
             $"-c:v libsvtav1 -preset 6 -svtav1-params rc=1 -b:v {bitrateKbps}k " +
             $"-an -sn -f null -";
 
-        Console.WriteLine($"SVT-AV1 calibration command: ffmpeg {command}");
+        Log.Information($"SVT-AV1 calibration command: ffmpeg {command}");
 
         try
         {
@@ -6257,7 +6188,7 @@ public class TranscodingService
                 return outputKb * 8 / duration;
             }
         }
-        catch (Exception ex) { Console.WriteLine($"SVT-AV1 calibration test exception: {ex.Message}"); }
+        catch (Exception ex) { Log.Information($"SVT-AV1 calibration test exception: {ex.Message}"); }
 
         return 0;
     }
@@ -6272,7 +6203,7 @@ public class TranscodingService
             $"-c:v {encoder} {lpFlag}{hwFilter} -g 25 -rc_mode CQP -global_quality:v {qp} " +
             $"-an -sn -f null -";
 
-        Console.WriteLine($"Calibration command: ffmpeg {command}");
+        Log.Information($"Calibration command: ffmpeg {command}");
 
         try
         {
@@ -6319,9 +6250,9 @@ public class TranscodingService
                 || l.Contains("not support", StringComparison.OrdinalIgnoreCase));
             var tail = string.Join("\n", lines.TakeLast(15));
             var errors = string.Join("\n", errorLines);
-            Console.WriteLine($"Calibration test produced no measurable output.\nErrors: {errors}\nLast lines:\n{tail}");
+            Log.Warning($"Calibration test produced no measurable output.\nErrors: {errors}\nLast lines:\n{tail}");
         }
-        catch (Exception ex) { Console.WriteLine($"Calibration test exception: {ex.Message}"); }
+        catch (Exception ex) { Log.Information($"Calibration test exception: {ex.Message}"); }
 
         return -1;
     }
@@ -6966,14 +6897,14 @@ public class TranscodingService
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Settings change: backlog re-evaluation failed: {ex.Message}");
+            Log.Warning($"Settings change: backlog re-evaluation failed: {ex.Message}");
         }
 
         if (removed.Count + backlogFlipped > 0)
         {
             MarkQueueWindowDirty();
             await NotifyQueueChangedAsync();
-            Console.WriteLine($"Settings change: dropped {removed.Count} hydrated + {backlogFlipped} backlog now-obsolete queue item(s).");
+            Log.Information($"Settings change: dropped {removed.Count} hydrated + {backlogFlipped} backlog now-obsolete queue item(s).");
         }
         return removed.Count + backlogFlipped;
     }
@@ -6986,7 +6917,7 @@ public class TranscodingService
     public void SetLocalEncodingPaused(bool paused)
     {
         _localEncodingPaused = paused;
-        Console.WriteLine($"Cluster: Local encoding {(paused ? "paused" : "resumed")}");
+        Log.Information($"Cluster: Local encoding {(paused ? "paused" : "resumed")}");
 
         // When unpausing, kick off queue processing for any items already waiting
         if (!paused && _lastOptions != null)
@@ -6994,7 +6925,7 @@ public class TranscodingService
             _ = Task.Run(async () =>
             {
                 try { await ProcessQueueAsync(_lastOptions); }
-                catch (Exception ex) { Console.WriteLine($"Error in ProcessQueueAsync after unpause: {ex.Message}"); }
+                catch (Exception ex) { Log.Warning($"Error in ProcessQueueAsync after unpause: {ex.Message}"); }
             });
         }
     }
@@ -7135,7 +7066,7 @@ public class TranscodingService
         if (_detectedDevices != null)
         {
             try { callback(); }
-            catch (Exception ex) { Console.WriteLine($"HardwareDetected callback error: {ex.Message}"); }
+            catch (Exception ex) { Log.Warning($"HardwareDetected callback error: {ex.Message}"); }
         }
     }
 
@@ -7150,7 +7081,7 @@ public class TranscodingService
         _ = Task.Run(async () =>
         {
             try { await ProcessQueueAsync(_lastOptions); }
-            catch (Exception ex) { Console.WriteLine($"Error in ProcessQueueAsync after schedule resume: {ex.Message}"); }
+            catch (Exception ex) { Log.Warning($"Error in ProcessQueueAsync after schedule resume: {ex.Message}"); }
         });
     }
 
@@ -7160,7 +7091,7 @@ public class TranscodingService
     /// </summary>
     public async Task StopAndClearQueue()
     {
-        Console.WriteLine("Cluster: Stopping all processing and clearing queue...");
+        Log.Information("Cluster: Stopping all processing and clearing queue...");
 
         // Snapshot every active local job, kill its ffmpeg, mark Stopped,
         // and unregister so a follow-up ProcessQueueAsync starts clean.
@@ -7215,11 +7146,11 @@ public class TranscodingService
         // rest of the DB backlog or it re-hydrates straight back into the window.
         int resetRows = 0;
         try { resetRows = await _mediaFileRepo.ResetAllQueuedAsync(); }
-        catch (Exception ex) { Console.WriteLine($"StopAndClearQueue: bulk queue reset failed: {ex.Message}"); }
+        catch (Exception ex) { Log.Warning($"StopAndClearQueue: bulk queue reset failed: {ex.Message}"); }
         MarkQueueWindowDirty();
         await NotifyQueueChangedAsync();
 
-        Console.WriteLine($"Cluster: Queue cleared ({pendingItems.Count} hydrated + {resetRows} backlog rows stopped)");
+        Log.Information($"Cluster: Queue cleared ({pendingItems.Count} hydrated + {resetRows} backlog rows stopped)");
     }
 
     /// <summary>
@@ -7236,7 +7167,7 @@ public class TranscodingService
         _ = Task.Run(async () =>
         {
             try { await ProcessQueueAsync(options); }
-            catch (Exception ex) { Console.WriteLine($"Error in ProcessQueueAsync after kick: {ex.Message}"); }
+            catch (Exception ex) { Log.Warning($"Error in ProcessQueueAsync after kick: {ex.Message}"); }
         });
         return Task.CompletedTask;
     }
@@ -7248,7 +7179,7 @@ public class TranscodingService
     /// </summary>
     public async Task ClearAllInMemoryState()
     {
-        Console.WriteLine("TranscodingService: Clearing all in-memory state...");
+        Log.Information("TranscodingService: Clearing all in-memory state...");
 
         // Snapshot then clear so reentrancy from ProcessWorkItemAsync's
         // finally block is harmless (TryRemove on an empty dict is a no-op).
@@ -7277,7 +7208,7 @@ public class TranscodingService
         }
         ClearWorkItems();
 
-        Console.WriteLine("TranscodingService: In-memory state cleared");
+        Log.Information("TranscodingService: In-memory state cleared");
     }
 
     /// <summary>
@@ -7331,7 +7262,7 @@ public class TranscodingService
         if (!silent)
         {
             _ = _hubContext.Clients.All.SendAsync("WorkItemUpdated", item);
-            Console.WriteLine($"Cluster: Re-queued {item.FileName} for processing");
+            Log.Information($"Cluster: Re-queued {item.FileName} for processing");
         }
     }
 
@@ -7349,7 +7280,7 @@ public class TranscodingService
         float percent = 1 - ((float)outputSize / workItem.Size);
         workItem.OutputSize = outputSize;
 
-        Console.WriteLine($"Cluster: Remote encode of {workItem.FileName}: {FormatSize(workItem.Size)} → {FormatSize(outputSize)} (saved {FormatSize((long)(savings * 1048576))}, {percent:P0})");
+        Log.Information($"Cluster: Remote encode of {workItem.FileName}: {FormatSize(workItem.Size)} → {FormatSize(outputSize)} (saved {FormatSize((long)(savings * 1048576))}, {percent:P0})");
 
         // Shared keep/delete decision with the local path. videoCopy is the worker's actual
         // ffmpeg-copy outcome propagated through JobCompletion; passing it (rather than letting
@@ -7370,11 +7301,11 @@ public class TranscodingService
                 "RemoteEncodeKept jobId={JobId} fileName={FileName} sourceSize={SourceSize} outputSize={OutputSize} reason={Reason} videoCopy={VideoCopy}",
                 workItem.Id, workItem.FileName, workItem.Size, outputSize, reason, videoCopy);
             if (reason != "savings")
-                Console.WriteLine($"Cluster: Kept {workItem.FileName} despite no savings — {reason}");
+                Log.Information($"Cluster: Kept {workItem.FileName} despite no savings — {reason}");
         }
         else
         {
-            Console.WriteLine($"Cluster: No savings for {workItem.FileName}, deleting output");
+            Log.Information($"Cluster: No savings for {workItem.FileName}, deleting output");
             // Master-side no-savings decision (worker reported the output, master recomputed
             // and chose to drop). Logged structurally so the ops log captures the empirical
             // outcome that drives the NoSavings status — the same row Re-evaluate now respects
@@ -7484,7 +7415,7 @@ public class TranscodingService
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Cluster: Failed to reconstruct work item {id}: {ex.Message}");
+            Log.Warning($"Cluster: Failed to reconstruct work item {id}: {ex.Message}");
             return null;
         }
     }

@@ -311,7 +311,7 @@ public sealed class ClusterController : ControllerBase
                 };
                 var sentinelPath = Path.Combine(tempDir, "_shared.json");
                 await System.IO.File.WriteAllTextAsync(sentinelPath, JsonSerializer.Serialize(sentinel, _jsonOptions));
-                Console.WriteLine($"Cluster: Accepted shared-storage mode for job {jobId} — input={ack.ResolvedInputPath}, output={ack.ResolvedOutputPath ?? "(via download)"}");
+                Log.Information($"Cluster: Accepted shared-storage mode for job {jobId} — input={ack.ResolvedInputPath}, output={ack.ResolvedOutputPath ?? "(via download)"}");
 
                 // Fire the encode immediately — the master will skip upload, so
                 // ReceiveFile's "last chunk" path that normally triggers this
@@ -321,7 +321,7 @@ public sealed class ClusterController : ControllerBase
                 var (started, rejectReason) = await _clusterService.StartAutonomousEncodingAsync(jobId, metadata, ack.ResolvedInputPath!);
                 if (!started)
                 {
-                    Console.WriteLine($"Cluster: Shared-mode encode rejected for {jobId}: {rejectReason}");
+                    Log.Warning($"Cluster: Shared-mode encode rejected for {jobId}: {rejectReason}");
                     return Ok(new MetadataAck
                     {
                         Mode   = "upload",
@@ -331,7 +331,7 @@ public sealed class ClusterController : ControllerBase
             }
             else
             {
-                Console.WriteLine($"Cluster: Registered metadata for job {jobId} — falling back to upload" +
+                Log.Information($"Cluster: Registered metadata for job {jobId} — falling back to upload" +
                     (ack.Reason != null ? $" ({ack.Reason})" : ""));
             }
 
@@ -345,7 +345,7 @@ public sealed class ClusterController : ControllerBase
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Cluster: Failed to register metadata: {ex.Message}");
+            Log.Warning($"Cluster: Failed to register metadata: {ex.Message}");
             return StatusCode(500, new { error = ex.Message });
         }
     }
@@ -619,7 +619,7 @@ public sealed class ClusterController : ControllerBase
                 hashValid = actualHash == expectedHash;
                 if (!hashValid)
                 {
-                    Console.WriteLine($"Cluster: Chunk hash mismatch for {fileName} at offset {offset}");
+                    Log.Warning($"Cluster: Chunk hash mismatch for {fileName} at offset {offset}");
                     // Truncate back to the offset to discard corrupt data
                     using var fixStream = new FileStream(filePath, FileMode.Open, FileAccess.Write);
                     fixStream.SetLength(offset);
@@ -766,7 +766,7 @@ public sealed class ClusterController : ControllerBase
             long currentSize = 0;
             try { if (System.IO.File.Exists(filePath)) currentSize = new FileInfo(filePath).Length; }
             catch { }
-            Console.WriteLine(
+            Log.Information(
                 $"Cluster: ReceiveFile FileNotFound for job {jobId} at offset {offset}: " +
                 $"{fnfEx.Message} — returning 409 with {currentSize} bytes for resume");
             return StatusCode(409, new
@@ -777,7 +777,7 @@ public sealed class ClusterController : ControllerBase
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Cluster: ReceiveFile error for job {jobId}: {ex.Message}");
+            Log.Warning($"Cluster: ReceiveFile error for job {jobId}: {ex.Message}");
             // Don't clear receiving state on transient errors — the master will retry
             // and ExpireStaleReceiving() handles the case where retries stop entirely.
             return StatusCode(500, new { error = ex.Message });

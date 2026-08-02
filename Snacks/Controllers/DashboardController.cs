@@ -186,7 +186,7 @@ public sealed class DashboardController : Controller
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Dashboard: proxy to master failed for /api/cluster/{clusterPath}: {ex.Message}");
+            Log.Warning($"Dashboard: proxy to master failed for /api/cluster/{clusterPath}: {ex.Message}");
             return Content("[]", "application/json");
         }
     }
@@ -213,7 +213,7 @@ public sealed class DashboardController : Controller
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Dashboard: proxy DELETE to master failed for /api/cluster/{clusterPath}: {ex.Message}");
+            Log.Warning($"Dashboard: proxy DELETE to master failed for /api/cluster/{clusterPath}: {ex.Message}");
             return StatusCode(502, new { success = false, error = ex.Message });
         }
     }

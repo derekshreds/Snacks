@@ -1,0 +1,1219 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Snacks Documentation</title>
+  <style>
+    :root {
+      --bg: #0b0d12;
+      --panel: #121620;
+      --panel-2: #181d29;
+      --text: #edf0f7;
+      --muted: #a8b0c2;
+      --line: #2b3242;
+      --accent: #9b7cff;
+      --accent-2: #59d3c2;
+      --warn: #ffca6a;
+      --danger: #ff7f91;
+      --ok: #78dfa3;
+      --code: #0a0c11;
+      --shadow: 0 22px 60px rgba(0, 0, 0, .28);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; scroll-padding-top: 24px; }
+    body {
+      margin: 0;
+      color: var(--text);
+      background:
+        radial-gradient(circle at 10% 0%, rgba(155, 124, 255, .14), transparent 34rem),
+        radial-gradient(circle at 100% 30%, rgba(89, 211, 194, .08), transparent 30rem),
+        var(--bg);
+      line-height: 1.65;
+    }
+
+    a { color: #b9a8ff; }
+    a:hover { color: #d3c9ff; }
+    code, pre, kbd { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
+    code {
+      padding: .12rem .35rem;
+      border: 1px solid rgba(155, 124, 255, .18);
+      border-radius: .35rem;
+      background: rgba(155, 124, 255, .08);
+      color: #e4ddff;
+    }
+    pre {
+      position: relative;
+      overflow: auto;
+      margin: 1rem 0;
+      padding: 1rem 1.1rem;
+      border: 1px solid var(--line);
+      border-radius: .7rem;
+      background: var(--code);
+      color: #dfe5f1;
+      line-height: 1.5;
+      tab-size: 2;
+    }
+    pre code { padding: 0; border: 0; background: none; color: inherit; }
+
+    .skip-link {
+      position: fixed;
+      top: .5rem;
+      left: .5rem;
+      z-index: 20;
+      transform: translateY(-160%);
+      padding: .55rem .8rem;
+      border-radius: .5rem;
+      background: var(--accent);
+      color: #08080c;
+      font-weight: 700;
+    }
+    .skip-link:focus { transform: none; }
+
+    .shell {
+      display: grid;
+      grid-template-columns: 270px minmax(0, 1fr);
+      max-width: 1480px;
+      min-height: 100vh;
+      margin: 0 auto;
+    }
+
+    aside {
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      overflow-y: auto;
+      padding: 1.5rem 1rem 2rem;
+      border-right: 1px solid var(--line);
+      background: rgba(11, 13, 18, .88);
+      backdrop-filter: blur(18px);
+    }
+    .brand {
+      display: flex;
+      gap: .75rem;
+      align-items: center;
+      margin-bottom: 1.2rem;
+      color: var(--text);
+      text-decoration: none;
+    }
+    .brand-mark {
+      display: grid;
+      place-items: center;
+      width: 42px;
+      height: 42px;
+      border: 1px solid rgba(155, 124, 255, .48);
+      border-radius: 12px;
+      background: linear-gradient(145deg, rgba(155, 124, 255, .32), rgba(89, 211, 194, .14));
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, .12);
+      font-size: 1.35rem;
+    }
+    .brand strong { display: block; font-size: 1.06rem; }
+    .brand span { display: block; color: var(--muted); font-size: .75rem; }
+    .back-link {
+      display: block;
+      margin: 0 0 1rem;
+      color: var(--muted);
+      font-size: .82rem;
+      text-decoration: none;
+    }
+    .back-link:hover { color: var(--text); }
+    .search {
+      width: 100%;
+      margin-bottom: 1rem;
+      padding: .67rem .75rem;
+      border: 1px solid var(--line);
+      border-radius: .55rem;
+      outline: none;
+      background: var(--panel);
+      color: var(--text);
+    }
+    .search:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(155, 124, 255, .12); }
+    nav a {
+      display: block;
+      margin: .08rem 0;
+      padding: .42rem .65rem;
+      border-radius: .45rem;
+      color: var(--muted);
+      font-size: .88rem;
+      text-decoration: none;
+    }
+    nav a:hover, nav a.active { background: var(--panel-2); color: var(--text); }
+    nav .group {
+      margin: 1rem .65rem .25rem;
+      color: #70798d;
+      font-size: .68rem;
+      font-weight: 800;
+      letter-spacing: .11em;
+      text-transform: uppercase;
+    }
+    .version {
+      margin: 1.25rem .65rem 0;
+      color: #6f788c;
+      font-size: .72rem;
+    }
+
+    main {
+      width: 100%;
+      max-width: 1060px;
+      padding: 3rem clamp(1.2rem, 4vw, 4.5rem) 7rem;
+    }
+    section { margin: 0 0 4.5rem; }
+    h1, h2, h3, h4 { line-height: 1.2; letter-spacing: -.025em; }
+    h1 { max-width: 850px; margin: 0 0 1rem; font-size: clamp(2.6rem, 7vw, 5.4rem); }
+    h2 {
+      margin: 0 0 1.1rem;
+      padding-top: .2rem;
+      font-size: clamp(1.8rem, 3vw, 2.55rem);
+    }
+    h3 { margin: 2rem 0 .75rem; font-size: 1.25rem; }
+    h4 { margin: 1.2rem 0 .5rem; font-size: 1rem; }
+    p { margin: .6rem 0 1rem; }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: .28rem 0; }
+    .lede { max-width: 800px; color: #c1c8d7; font-size: clamp(1.05rem, 2vw, 1.28rem); }
+    .eyebrow {
+      margin-bottom: .8rem;
+      color: var(--accent-2);
+      font-size: .76rem;
+      font-weight: 800;
+      letter-spacing: .15em;
+      text-transform: uppercase;
+    }
+    .hero {
+      margin-bottom: 5rem;
+      padding-bottom: 2.2rem;
+      border-bottom: 1px solid var(--line);
+    }
+    .hero-actions { display: flex; flex-wrap: wrap; gap: .7rem; margin-top: 1.5rem; }
+    .button {
+      display: inline-block;
+      padding: .66rem .9rem;
+      border: 1px solid var(--line);
+      border-radius: .55rem;
+      background: var(--panel);
+      color: var(--text);
+      font-weight: 700;
+      text-decoration: none;
+    }
+    .button.primary {
+      border-color: transparent;
+      background: linear-gradient(135deg, #9b7cff, #7d66d9);
+      color: #09090d;
+    }
+    .button:hover { transform: translateY(-1px); color: var(--text); }
+    .button.primary:hover { color: #09090d; }
+
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
+    .grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .card {
+      padding: 1.1rem 1.2rem;
+      border: 1px solid var(--line);
+      border-radius: .75rem;
+      background: linear-gradient(145deg, rgba(24, 29, 41, .88), rgba(18, 22, 32, .9));
+      box-shadow: var(--shadow);
+    }
+    .card h3, .card h4 { margin-top: .1rem; }
+    .card p:last-child, .card ul:last-child { margin-bottom: 0; }
+    .muted { color: var(--muted); }
+    .small { font-size: .87rem; }
+    .callout {
+      margin: 1.15rem 0;
+      padding: .85rem 1rem;
+      border: 1px solid var(--line);
+      border-left: 4px solid var(--accent);
+      border-radius: .5rem;
+      background: var(--panel);
+    }
+    .callout.warning { border-left-color: var(--warn); }
+    .callout.danger { border-left-color: var(--danger); }
+    .callout.ok { border-left-color: var(--ok); }
+    .callout strong { color: var(--text); }
+
+    .table-wrap { overflow-x: auto; margin: 1rem 0 1.4rem; border: 1px solid var(--line); border-radius: .7rem; }
+    table { width: 100%; border-collapse: collapse; background: rgba(18, 22, 32, .72); font-size: .88rem; }
+    th, td { padding: .72rem .8rem; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th {
+      position: sticky;
+      top: 0;
+      background: #191e2a;
+      color: #c7cedd;
+      font-size: .72rem;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+    }
+    tr:last-child td { border-bottom: 0; }
+    tbody tr:hover { background: rgba(155, 124, 255, .035); }
+    td code { white-space: nowrap; }
+    .method {
+      display: inline-block;
+      min-width: 3.7rem;
+      padding: .12rem .28rem;
+      border-radius: .3rem;
+      color: #0a0d11;
+      font-size: .7rem;
+      font-weight: 900;
+      text-align: center;
+    }
+    .get { background: #78dfa3; }
+    .post { background: #72b8ff; }
+    .put { background: #d4a0ff; }
+    .delete { background: #ff8d9d; }
+    .head { background: #ffca6a; }
+    .risk { color: var(--danger); font-weight: 700; }
+    .no-results { display: none; color: var(--muted); }
+    details {
+      margin: .8rem 0;
+      border: 1px solid var(--line);
+      border-radius: .6rem;
+      background: rgba(18, 22, 32, .64);
+    }
+    summary { cursor: pointer; padding: .75rem .9rem; font-weight: 750; }
+    details > div { padding: 0 .9rem .9rem; }
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: .45rem;
+      margin: 1rem 0;
+    }
+    .flow span {
+      position: relative;
+      padding: .65rem .4rem;
+      border: 1px solid var(--line);
+      border-radius: .5rem;
+      background: var(--panel);
+      color: #cbd2e1;
+      font-size: .78rem;
+      font-weight: 700;
+      text-align: center;
+    }
+    .flow span:not(:last-child)::after {
+      content: "›";
+      position: absolute;
+      right: -.37rem;
+      color: var(--accent);
+    }
+    .kbd { color: var(--muted); font-size: .8rem; }
+    kbd { padding: .1rem .32rem; border: 1px solid #4a5263; border-bottom-width: 2px; border-radius: .3rem; background: #202532; color: var(--text); }
+    footer { padding-top: 2rem; border-top: 1px solid var(--line); color: var(--muted); font-size: .85rem; }
+
+    @media (max-width: 900px) {
+      .shell { display: block; }
+      aside { position: relative; height: auto; border-right: 0; border-bottom: 1px solid var(--line); }
+      nav { columns: 2; }
+      nav .group { break-after: avoid; }
+      main { padding-top: 2.2rem; }
+      .grid.three { grid-template-columns: 1fr; }
+      .flow { grid-template-columns: repeat(3, 1fr); }
+    }
+    @media (max-width: 620px) {
+      nav { columns: 1; }
+      .grid { grid-template-columns: 1fr; }
+      .flow { grid-template-columns: repeat(2, 1fr); }
+      th, td { padding: .62rem; }
+    }
+    @media print {
+      body { color: #111; background: #fff; }
+      aside, .hero-actions, .search { display: none; }
+      .shell { display: block; max-width: none; }
+      main { max-width: none; padding: 0; }
+      section { break-inside: avoid; margin-bottom: 2rem; }
+      .card, .callout, details, .table-wrap { box-shadow: none; background: #fff; border-color: #bbb; }
+      code, pre { color: #111; background: #f5f5f5; border-color: #ccc; }
+      a { color: #111; text-decoration: none; }
+      .method { border: 1px solid #888; background: #fff; color: #111; }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#content">Skip to documentation</a>
+  <div class="shell">
+    <aside aria-label="Documentation navigation">
+      <a class="brand" href="#top">
+        <span class="brand-mark" aria-hidden="true">S</span>
+        <span><strong>Snacks</strong><span>Guide &amp; API reference</span></span>
+      </a>
+      <a class="back-link" href="/">← Back to the app</a>
+      <label class="kbd" for="doc-search">Filter API endpoints <kbd>/</kbd></label>
+      <input class="search" id="doc-search" type="search" placeholder="queue, settings, POST…" autocomplete="off">
+      <nav>
+        <div class="group">Start here</div>
+        <a href="#overview">Overview</a>
+        <a href="#quick-start">Quick start</a>
+        <a href="#everyday-use">Everyday use</a>
+        <a href="#settings">Settings</a>
+        <div class="group">Operations</div>
+        <a href="#auto-scan">Automatic scanning</a>
+        <a href="#cluster">Clusters</a>
+        <a href="#integrations">Integrations</a>
+        <a href="#data-backups">Data &amp; backups</a>
+        <a href="#observability">Logs &amp; metrics</a>
+        <a href="#troubleshooting">Troubleshooting</a>
+        <div class="group">API</div>
+        <a href="#api-basics">API basics</a>
+        <a href="#api-examples">API examples</a>
+        <a href="#api-library">Library API</a>
+        <a href="#api-queue">Queue API</a>
+        <a href="#api-config">Configuration API</a>
+        <a href="#api-operations">Operations API</a>
+        <a href="#api-realtime">SignalR events</a>
+        <a href="#api-cluster-internal">Cluster-internal API</a>
+        <div class="group">Contributors</div>
+        <a href="#development">Development</a>
+      </nav>
+      <div class="version">Documents Snacks v2.15.1 · updated 2026-07-19</div>
+    </aside>
+
+    <main id="content">
+      <header class="hero" id="top">
+        <div class="eyebrow">Automated media library transcoder</div>
+        <h1>Your complete guide to Snacks.</h1>
+        <p class="lede">
+          Install it, configure safe encoding rules, operate a multi-node cluster,
+          automate it through the JSON API, and recover confidently when something goes wrong.
+        </p>
+        <div class="hero-actions">
+          <a class="button primary" href="#quick-start">Get started</a>
+          <a class="button" href="#api-basics">Use the API</a>
+          <a class="button" href="#troubleshooting">Troubleshoot</a>
+        </div>
+      </header>
+
+      <section id="overview">
+        <div class="eyebrow">Orientation</div>
+        <h2>What Snacks does</h2>
+        <p>
+          Snacks scans video and music libraries, evaluates each file against your target
+          codec and bitrate rules, builds an FFmpeg command, validates the result, and keeps
+          the output only when it satisfies the configured policy. It can run as a web
+          container on a NAS, as an Electron desktop application, or as a distributed cluster.
+        </p>
+        <div class="flow" aria-label="Processing lifecycle">
+          <span>Discover</span><span>Probe</span><span>Decide</span><span>Encode / mux</span><span>Verify</span><span>Place output</span>
+        </div>
+        <div class="grid three">
+          <article class="card">
+            <h3>Library-first</h3>
+            <p class="muted">SQLite remembers file state across restarts, so large libraries do not start from zero after every deployment.</p>
+          </article>
+          <article class="card">
+            <h3>Hardware-aware</h3>
+            <p class="muted">NVIDIA, Intel, AMD, Apple VideoToolbox, and CPU paths are selected according to platform and configured device slots.</p>
+          </article>
+          <article class="card">
+            <h3>Failure-tolerant</h3>
+            <p class="muted">Retries, fallbacks, persistent logs, output verification, and cluster reassignment protect long-running sweeps.</p>
+          </article>
+        </div>
+        <div class="callout warning">
+          <strong>Snacks needs write access to replace or place files.</strong>
+          Test on a small directory first, keep a backup, and leave “Replace original files”
+          disabled until you have validated playback in your own clients.
+        </div>
+      </section>
+
+      <section id="quick-start">
+        <div class="eyebrow">First run</div>
+        <h2>Quick start</h2>
+
+        <h3>Docker / NAS</h3>
+        <pre><code>services:
+  snacks:
+    image: derekshreds/snacks-docker:latest
+    container_name: snacks
+    network_mode: host
+    volumes:
+      - /path/to/media:/app/work/uploads
+      - /path/to/snacks/logs:/app/work/logs
+      - /path/to/snacks/config:/app/work/config
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - SNACKS_WORK_DIR=/app/work
+      - FFMPEG_PATH=/usr/lib/jellyfin-ffmpeg/ffmpeg
+      - FFPROBE_PATH=/usr/lib/jellyfin-ffmpeg/ffprobe
+    restart: unless-stopped</code></pre>
+        <ol>
+          <li>Replace the three host paths with real paths on the NAS.</li>
+          <li>Add the appropriate GPU device/runtime configuration if using hardware acceleration.</li>
+          <li>Start the compose application and open <code>http://NAS-IP:6767</code>.</li>
+          <li>Open Settings, save a conservative preset, and process one test file.</li>
+        </ol>
+
+        <h3>Desktop</h3>
+        <p>
+          Install the Windows or Apple Silicon macOS build, launch Snacks, and use
+          <strong>Browse Library</strong>. The desktop wrapper starts the ASP.NET backend
+          locally and bundles or points it at FFmpeg. Cluster mode intentionally changes the
+          backend from localhost-only to a LAN listener.
+        </p>
+
+        <h3>Recommended first-job checklist</h3>
+        <div class="grid">
+          <div class="card">
+            <h4>Before</h4>
+            <ul>
+              <li>Use a copy of one representative file.</li>
+              <li>Choose a widely supported container and codec.</li>
+              <li>Keep original replacement off.</li>
+              <li>Confirm the detected encoder in the UI.</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h4>After</h4>
+            <ul>
+              <li>Check video, audio, subtitles, HDR, and seeking.</li>
+              <li>Compare source and output size.</li>
+              <li>Read the per-job FFmpeg log.</li>
+              <li>Only then expand to a small folder.</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <section id="everyday-use">
+        <div class="eyebrow">Workflow</div>
+        <h2>Everyday use</h2>
+        <h3>Browse and enqueue</h3>
+        <ol>
+          <li>Select <strong>Browse Library</strong>.</li>
+          <li>Navigate to a folder and choose immediate files or recursive discovery.</li>
+          <li>Optionally run <strong>Analyze</strong> first to preview Queue, Mux, and Skip decisions.</li>
+          <li>Process selected files or the whole folder.</li>
+        </ol>
+        <p>
+          A manual process action is explicit: it can force a mux pass even when the source is
+          already at the video target, allowing audio/subtitle rules and output-container
+          normalization to be applied. Automatic scanning uses the normal eligibility rules.
+        </p>
+
+        <h3>Understand queue states</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>State</th><th>Meaning</th><th>What happens next</th></tr></thead>
+            <tbody>
+              <tr><td><code>Pending</code></td><td>Waiting for a local or remote slot.</td><td>Processed according to priority and queue policy.</td></tr>
+              <tr><td><code>Uploading</code></td><td>Source is moving to a worker.</td><td>Becomes Processing after transfer and verification.</td></tr>
+              <tr><td><code>Processing</code></td><td>FFmpeg is running.</td><td>Progress and log lines arrive through SignalR.</td></tr>
+              <tr><td><code>Downloading</code></td><td>Cluster output is returning to the master.</td><td>The master validates and places it.</td></tr>
+              <tr><td><code>Completed</code></td><td>Validated output was kept.</td><td>Terminal.</td></tr>
+              <tr><td><code>NoSavings</code></td><td>Output was valid but not worth keeping under the size policy.</td><td>Terminal unless explicitly retried.</td></tr>
+              <tr><td><code>Failed</code></td><td>Retry paths were exhausted.</td><td>Inspect logs, adjust settings, then retry.</td></tr>
+              <tr><td><code>Stopped</code></td><td>Removed for now.</td><td>May reappear on a later automatic scan.</td></tr>
+              <tr><td><code>Cancelled</code></td><td>Explicitly marked “do not reprocess.”</td><td>Only a manual selection queues it again.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Stop, cancel, retry, prioritize</h3>
+        <ul>
+          <li><strong>Stop</strong> means “encode later.”</li>
+          <li><strong>Cancel</strong> is sticky against automatic reprocessing.</li>
+          <li><strong>Retry</strong> resets selected failed items to pending.</li>
+          <li><strong>Prioritize</strong> raises an item above the current maximum queue priority.</li>
+          <li><strong>Pause</strong> is persisted and affects auto-scan, local processing, and cluster dispatch.</li>
+        </ul>
+      </section>
+
+      <section id="settings">
+        <div class="eyebrow">Encoding policy</div>
+        <h2>Settings that matter most</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Area</th><th>Key choices</th><th>Guidance</th></tr></thead>
+            <tbody>
+              <tr><td>Mode</td><td>Transcode, mux-only, or hybrid</td><td>Hybrid is useful when track/container cleanup matters even for already-efficient video.</td></tr>
+              <tr><td>Video</td><td>H.264, HEVC, AV1; bitrate; hardware encoder</td><td>Choose compatibility first. AV1 may be slow or unsupported on older playback devices.</td></tr>
+              <tr><td>Resolution</td><td>Never, cap at target, always; fixed frame; FPS cap</td><td>A fixed frame overrides normal downscale behavior and adds padding when required.</td></tr>
+              <tr><td>HDR</td><td>Preserve or tone-map to SDR</td><td>Validate color and brightness with real HDR sources before a batch.</td></tr>
+              <tr><td>Audio</td><td>Languages, original tracks, output profiles</td><td>Use ISO language preferences and verify files with missing/incorrect language tags.</td></tr>
+              <tr><td>Subtitles</td><td>Languages, sidecars, OCR, image pass-through, SDH exclusion</td><td>PGS/VobSub OCR needs Tesseract data and is more expensive than text subtitle handling.</td></tr>
+              <tr><td>Output</td><td>Container, output directory, scratch directory, original replacement</td><td>Scratch should have enough free space for source-scale temporary files.</td></tr>
+              <tr><td>Reliability</td><td>Retry, log retention, deep-verification budget</td><td>Use a nonzero verification budget to continuously sample older library entries.</td></tr>
+              <tr><td>Queue</td><td>Bitrate-first or newest-first</td><td>Newest-first is best when recent downloads should jump ahead of a backlog.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout">
+          <strong>Presets are the safest way to experiment.</strong>
+          Save a known-good baseline, create a second preset for the experiment, and export
+          important presets before a major upgrade.
+        </div>
+      </section>
+
+      <section id="auto-scan">
+        <div class="eyebrow">Background operation</div>
+        <h2>Automatic scanning</h2>
+        <p>
+          Auto-scan keeps a persistent catalog, watches one or more folders, and periodically
+          finds new or materially changed media. A file modified in the last 30 minutes is
+          skipped to avoid reading it during a transfer.
+        </p>
+        <ol>
+          <li>Add watched directories in the library browser or through the API.</li>
+          <li>Set an interval in minutes and optional exclusion rules.</li>
+          <li>Enable auto-scan; use Trigger to test immediately.</li>
+          <li>Watch <code>ScanProgress</code> / <code>AutoScanCompleted</code> or the UI status.</li>
+        </ol>
+        <h3>Exclusions</h3>
+        <ul>
+          <li><code>filenamePatterns</code>: glob-style patterns such as <code>*REMUX*</code> or <code>sample?.mkv</code>.</li>
+          <li><code>minSizeGBToSkip</code>: skips files at or above the threshold.</li>
+          <li><code>excludeResolutions</code>: labels such as <code>2160p</code>, <code>1080p</code>, or <code>720p</code>.</li>
+        </ul>
+        <div class="callout danger">
+          <strong>“Clear history” is broad.</strong> It makes previously processed files eligible
+          for discovery again. Prefer Re-evaluate after a settings change when that is your goal.
+        </div>
+      </section>
+
+      <section id="cluster">
+        <div class="eyebrow">Distributed encoding</div>
+        <h2>Clusters</h2>
+        <p>
+          A master owns the authoritative queue and catalog. Worker nodes advertise capabilities,
+          accept assigned files, encode them, and return verified output. Major version
+          compatibility is checked during discovery.
+        </p>
+        <div class="grid">
+          <div class="card">
+            <h3>Master</h3>
+            <ul>
+              <li>Stores the queue and encode history.</li>
+              <li>Chooses a node/device slot per media kind.</li>
+              <li>Uploads sources and downloads results.</li>
+              <li>Can optionally encode locally.</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3>Worker</h3>
+            <ul>
+              <li>Reports GPU/CPU capabilities and slot availability.</li>
+              <li>Uses a separate temporary job directory.</li>
+              <li>Receives settings and approved integration data.</li>
+              <li>Can be paused independently.</li>
+            </ul>
+          </div>
+        </div>
+        <h3>Discovery and networking</h3>
+        <ul>
+          <li>Web/API traffic defaults to TCP port <code>6767</code>.</li>
+          <li>Automatic discovery broadcasts on UDP port <code>6768</code>.</li>
+          <li>Host networking is normally required for Docker broadcast discovery.</li>
+          <li>Manual node URLs work when broadcast does not cross subnets.</li>
+          <li>Transfer concurrency, bandwidth, and chunk size are configurable on the master.</li>
+        </ul>
+        <div class="callout warning">
+          <strong>Use a strong shared secret and TLS on untrusted networks.</strong>
+          The cluster header is Base64-encoded for transport, not encrypted. With HTTP, anyone
+          able to observe the traffic can recover it.
+        </div>
+        <h3>Shared storage mode</h3>
+        <p>
+          Shared storage avoids source/output transfer when both sides can access the same share.
+          Workers fail closed: configure explicit input and output allowlists. If mount points
+          differ, add master-prefix → worker-prefix rewrites; the longest matching prefix wins.
+          If either side cannot safely use the shared path, Snacks falls back to normal transfer.
+        </p>
+      </section>
+
+      <section id="integrations">
+        <div class="eyebrow">External systems</div>
+        <h2>Integrations and notifications</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Integration</th><th>Purpose</th><th>Credential</th></tr></thead>
+            <tbody>
+              <tr><td>Plex</td><td>Connection test and optional library rescan after completion.</td><td>Server token</td></tr>
+              <tr><td>Jellyfin</td><td>Connection test and optional library rescan after completion.</td><td>API key</td></tr>
+              <tr><td>Sonarr / Radarr</td><td>Media-manager connectivity and metadata workflow support.</td><td>API key</td></tr>
+              <tr><td>TheTVDB / TMDb</td><td>Original-language and metadata lookups used by language-aware processing.</td><td>API key; TVDB PIN optional</td></tr>
+              <tr><td>Notifications</td><td>Webhook, ntfy, or Apprise destinations for encode/scan/node events.</td><td>Destination-specific</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          Integration credentials are stored in plaintext JSON inside the Snacks config
+          directory. Protect that directory with host permissions, enable control-panel
+          authentication, and restrict network access to trusted clients.
+        </p>
+      </section>
+
+      <section id="data-backups">
+        <div class="eyebrow">Persistence</div>
+        <h2>Data, configuration, and backups</h2>
+        <p>
+          <code>SNACKS_WORK_DIR</code> selects the work root. In the standard container it is
+          <code>/app/work</code>; desktop defaults under the current user's local application data.
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Path under work directory</th><th>Contents</th><th>Back up?</th></tr></thead>
+            <tbody>
+              <tr><td><code>config/snacks.db</code></td><td>SQLite catalog, status, transitions, and encode history.</td><td>Yes</td></tr>
+              <tr><td><code>config/settings.json</code></td><td>Global encoder options.</td><td>Yes</td></tr>
+              <tr><td><code>config/presets.json</code></td><td>Named encoder presets.</td><td>Yes</td></tr>
+              <tr><td><code>config/autoscan.json</code></td><td>Watch folders, interval, pause state, exclusions.</td><td>Yes</td></tr>
+              <tr><td><code>config/cluster.json</code></td><td>Role, identity, shared secret, discovery, shared paths.</td><td>Yes; sensitive</td></tr>
+              <tr><td><code>config/node-settings.json</code></td><td>Per-node devices, schedules, and limits.</td><td>Yes</td></tr>
+              <tr><td><code>config/integrations.json</code></td><td>Third-party endpoints and credentials.</td><td>Yes; sensitive</td></tr>
+              <tr><td><code>config/notifications.json</code></td><td>Notification destinations and event toggles.</td><td>Yes; sensitive</td></tr>
+              <tr><td><code>config/auth.json</code></td><td>Password hash and session signing secret.</td><td>Yes; sensitive</td></tr>
+              <tr><td><code>config/networking.json</code></td><td>Cluster transfer limits and chunk size.</td><td>Yes</td></tr>
+              <tr><td><code>logs/</code></td><td>Rolling application log and per-encode FFmpeg logs.</td><td>Optional</td></tr>
+              <tr><td><code>remote-jobs/</code></td><td>Worker transfer and encode scratch space.</td><td>No</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <h3>Backup procedure</h3>
+        <ol>
+          <li>Pause the queue and wait for active work to finish.</li>
+          <li>Stop Snacks so SQLite WAL state and config writes are quiescent.</li>
+          <li>Copy the complete <code>config/</code> directory as one unit.</li>
+          <li>Restart Snacks and verify <code>/api/health</code>.</li>
+        </ol>
+        <p>
+          JSON configuration writes are atomic and keep <code>.bak</code> fallbacks, but a
+          host-level backup remains the recovery boundary for accidental deletion or disk loss.
+        </p>
+      </section>
+
+      <section id="observability">
+        <div class="eyebrow">Operate it</div>
+        <h2>Logs, diagnostics, health, and metrics</h2>
+        <ul>
+          <li><code>GET /api/health</code> is an unauthenticated liveness check.</li>
+          <li><code>GET /metrics</code> exposes Prometheus text and is cached for 15 seconds.</li>
+          <li><code>GET /api/diagnostics/log?lines=200</code> returns the latest application-log tail.</li>
+          <li><code>GET /api/diagnostics/logs.zip</code> downloads available logs.</li>
+          <li>The Cluster Logs page can select a remote node; requests are proxied using the cluster secret.</li>
+        </ul>
+        <pre><code># Liveness
+curl -fsS http://snacks-host:6767/api/health
+
+# Prometheus scrape
+curl -fsS http://snacks-host:6767/metrics
+
+# Authenticated local log tail
+curl -b snacks.cookies \
+  "http://snacks-host:6767/api/diagnostics/log?lines=300"</code></pre>
+      </section>
+
+      <section id="troubleshooting">
+        <div class="eyebrow">Recovery</div>
+        <h2>Troubleshooting</h2>
+        <details open>
+          <summary>The library browser is empty</summary>
+          <div>
+            Confirm the media mount exists inside the container and that the process can read it:
+            <pre><code>docker exec snacks ls -la /app/work/uploads</code></pre>
+            In container mode, paths outside the configured upload root are rejected by the API.
+          </div>
+        </details>
+        <details>
+          <summary>Hardware acceleration is missing</summary>
+          <div>
+            Check driver availability and device passthrough. On Linux:
+            <pre><code>docker exec snacks ls -la /dev/dri
+docker exec snacks vainfo</code></pre>
+            NVIDIA also requires the NVIDIA container runtime and its video capability; privileged
+            mode alone does not provide CUDA/NVENC libraries.
+          </div>
+        </details>
+        <details>
+          <summary>An output is larger than its source</summary>
+          <div>
+            Hardware quality modes are not exact bitrate guarantees. Snacks discards an output
+            that is not smaller unless a mux or configured audio-output rule justifies growth.
+            Lower the target, choose a different rate-control path, or inspect the command log.
+          </div>
+        </details>
+        <details>
+          <summary>The queue does not move</summary>
+          <div>
+            Check the persisted pause state, device-slot schedules, worker reachability, free
+            scratch space, and the latest operations log. For a cluster, verify shared-secret and
+            major-version compatibility on every node.
+          </div>
+        </details>
+        <details>
+          <summary>Progress is not updating</summary>
+          <div>
+            Confirm the SignalR connection indicator is green. When UI authentication is enabled,
+            the hub requires the same valid session cookie as the JSON API. Check proxy WebSocket
+            support if Snacks is behind a reverse proxy.
+          </div>
+        </details>
+        <details>
+          <summary>A file keeps failing</summary>
+          <div>
+            Open its FFmpeg log, verify the source with Library Health, and test the command's
+            decode/encoder assumptions. Retry only after changing the cause; clearing broad history
+            can create a much larger queue than intended.
+          </div>
+        </details>
+        <details>
+          <summary>Authentication configuration is unusable</summary>
+          <div>
+            Stop Snacks, back up the config directory, and remove only
+            <code>config/auth.json</code>. On the next start, authentication returns to its default
+            disabled state and a new session secret is generated.
+          </div>
+        </details>
+      </section>
+
+      <section id="api-basics">
+        <div class="eyebrow">Automation</div>
+        <h2>Public API basics</h2>
+        <p>
+          The web UI uses the same JSON endpoints documented below. Paths are relative to the
+          running instance, for example <code>http://snacks-host:6767</code>. JSON properties use
+          <code>camelCase</code>; incoming property names are case-insensitive. Dates are UTC ISO 8601.
+        </p>
+        <div class="callout warning">
+          <strong>Compatibility note.</strong> The API is not URL-versioned. Treat this reference as
+          the v2.15.1 contract and test automation against new Snacks releases before deployment.
+        </div>
+        <p>
+          The running app also publishes a generated, machine-readable OpenAPI document at
+          <a href="/openapi/v1.json"><code>/openapi/v1.json</code></a>. It contains the supported
+          public/UI API and intentionally excludes the internal cluster RPC protocol.
+        </p>
+
+        <h3>Authentication</h3>
+        <p>
+          With control-panel authentication disabled, ordinary API routes require no credential.
+          When enabled, sign in through the form endpoint and retain the
+          <code>snacks_session</code> cookie. The cookie is HTTP-only and signed; its embedded
+          token expires after 14 days (the browser cookie itself is session-scoped).
+        </p>
+        <pre><code>BASE="http://snacks-host:6767"
+
+curl -fsS -c snacks.cookies \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode "username=admin" \
+  --data-urlencode "password=your-password" \
+  --data-urlencode "returnUrl=/" \
+  "$BASE/Auth/Login"
+
+curl -fsS -b snacks.cookies "$BASE/api/queue/stats"</code></pre>
+        <p>
+          <code>/api/health</code>, <code>/metrics</code>, static assets, the login page, and
+          secret-authenticated cluster RPC are intentionally outside cookie authentication.
+          SignalR is protected whenever UI authentication is enabled.
+        </p>
+
+        <h3>Conventions</h3>
+        <ul>
+          <li>Send <code>Content-Type: application/json</code> for JSON request bodies.</li>
+          <li>Success is generally JSON with either the requested object or <code>{ "success": true }</code>.</li>
+          <li>Validation failures normally use HTTP 400; missing items use 404; active analysis conflicts use 409.</li>
+          <li>An expired/missing UI session receives HTTP 401 for <code>/api/*</code>.</li>
+          <li>Destructive endpoints are marked <span class="risk">destructive</span> below.</li>
+          <li>File paths refer to the Snacks host filesystem, not the API client's filesystem.</li>
+        </ul>
+      </section>
+
+      <section id="api-examples">
+        <div class="eyebrow">Recipes</div>
+        <h2>API examples</h2>
+
+        <h3>Inspect and pause the queue</h3>
+        <pre><code>curl -fsS -b snacks.cookies \
+  "$BASE/api/queue/items?status=Pending&amp;skip=0&amp;limit=50"
+
+curl -fsS -b snacks.cookies \
+  -H "Content-Type: application/json" \
+  -d '{"paused":true}' \
+  "$BASE/api/queue/paused"</code></pre>
+
+        <h3>Queue one file with current settings</h3>
+        <pre><code>curl -fsS -b snacks.cookies "$BASE/api/settings" &gt; settings.json
+
+jq -n \
+  --arg filePath "/app/work/uploads/Movies/Movie.mkv" \
+  --slurpfile options settings.json \
+  '{filePath:$filePath, options:$options[0]}' &gt; request.json
+
+curl -fsS -b snacks.cookies \
+  -H "Content-Type: application/json" \
+  --data-binary @request.json \
+  "$BASE/api/library/process-file"</code></pre>
+
+        <h3>Analyze a directory without queueing</h3>
+        <pre><code>jq -n \
+  --arg directoryPath "/app/work/uploads/Movies" \
+  --slurpfile options settings.json \
+  '{directoryPath:$directoryPath, recursive:true, options:$options[0]}' &gt; analyze.json
+
+JOB_ID=$(curl -fsS -b snacks.cookies \
+  -H "Content-Type: application/json" \
+  --data-binary @analyze.json \
+  "$BASE/api/library/analyze-directory" | jq -r .jobId)
+
+curl -fsS -b snacks.cookies "$BASE/api/library/analyze-status/$JOB_ID"
+curl -fsS -b snacks.cookies "$BASE/api/library/analyze-results/$JOB_ID"</code></pre>
+
+        <h3>Update settings safely</h3>
+        <pre><code># Read-modify-write so unknown/newer fields are preserved.
+curl -fsS -b snacks.cookies "$BASE/api/settings" |
+  jq '.targetBitrate = 3000 | .queueNewestFirst = true' &gt; settings.updated.json
+
+curl -fsS -b snacks.cookies \
+  -H "Content-Type: application/json" \
+  --data-binary @settings.updated.json \
+  "$BASE/api/settings"</code></pre>
+      </section>
+
+      <section id="api-library">
+        <div class="eyebrow">Endpoint reference</div>
+        <h2>Library API</h2>
+        <p class="no-results">No API endpoints match the current filter.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Method</th><th>Path</th><th>Inputs</th><th>Purpose / response</th></tr></thead>
+            <tbody>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/library/directories</code></td><td>—</td><td>Browsable roots with names and media counts.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/library/subdirectories</code></td><td><code>directoryPath</code></td><td>Immediate allowed child directories.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/library/files</code></td><td><code>directoryPath</code>, <code>recursive=true</code>, <code>skip=0</code>, <code>limit=1000</code> (max 5000)</td><td><code>{files,total,videoTotal,musicTotal,truncated}</code>.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/library/process-file</code></td><td><code>{filePath, options}</code></td><td>Queues one file as an explicit/manual job.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/library/process-directory</code></td><td><code>{directoryPath, recursive, options}</code></td><td>Queues allowed media under a directory.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/library/analyze-directory</code></td><td><code>{directoryPath, recursive, options}</code></td><td>Starts dry-run analysis; returns <code>{success,jobId}</code>.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/library/analyze-status/{jobId}</code></td><td>Path ID</td><td><code>{state,processed,total,error}</code>; total is −1 while enumerating.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/library/analyze-results/{jobId}</code></td><td>Path ID</td><td>Results, summary, total, and truncation state; 409 while running.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/library/analyze-cancel/{jobId}</code></td><td>Path ID</td><td>Cancels an active analysis job.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/library/health</code></td><td><code>filter</code>, <code>q</code>, <code>skip=0</code>, <code>limit=100</code></td><td><code>{items,total,summary}</code>; issue filters include no-audio, no-video, no-duration, failed, verify-failed.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/library/insights</code></td><td>—</td><td>Library totals plus codec, resolution, and status distributions.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/library/health/verify</code></td><td><code>{filePath}</code></td><td>Runs bounded FFmpeg decode samples; returns <code>{ok,issues}</code>.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/library/health/reset-verify-file</code></td><td><code>{filePath}</code></td><td>Clears one failed-verification flag without deleting the file.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/library/health/reset-verify</code></td><td><code>{filter,q}</code></td><td>Bulk-clears verification flags matching the current health view.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/library/health/delete</code></td><td><code>{filePath}</code></td><td><span class="risk">Destructive:</span> deletes a flagged file and its catalog row.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/library/health/delete-all</code></td><td><code>{filter,q}</code></td><td><span class="risk">Destructive:</span> bulk-deletes matching flagged files; returns deleted/failed/capped counts.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="api-queue">
+        <div class="eyebrow">Endpoint reference</div>
+        <h2>Queue API</h2>
+        <p class="no-results">No API endpoints match the current filter.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Method</th><th>Path</th><th>Inputs</th><th>Purpose / response</th></tr></thead>
+            <tbody>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/queue/items</code></td><td><code>limit</code>, <code>skip=0</code>, <code>status</code></td><td>Paginated non-active queue plus all active items and totals.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/queue/stats</code></td><td>—</td><td>Pending, active, completed, failed, and related aggregate counts.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/queue/item/{id}</code></td><td>Work item ID</td><td>One in-memory work item or 404.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/queue/logs/{id}</code></td><td>Work item ID</td><td>Available per-job log lines.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/queue/prioritize/{id}</code></td><td>Work item ID</td><td>Moves a pending item to the front using queue priority.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/queue/stop/{id}</code></td><td>Work item ID</td><td>Stops active work and marks it eligible for later reprocessing.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/queue/cancel/{id}</code></td><td>Work item ID</td><td>Stops/cancels and prevents automatic reprocessing.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/queue/retry</code></td><td><code>{filePath}</code></td><td>Retries one failed file under the current encoder settings.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/queue/failed</code></td><td>—</td><td>Returns failed queue entries.</td></tr>
+              <tr class="api-row"><td><span class="method delete">DELETE</span></td><td><code>/api/queue/failed</code></td><td>—</td><td><span class="risk">Destructive to history:</span> removes all failed entries.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/queue/paused</code></td><td>—</td><td>Returns the persisted pause state.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/queue/paused</code></td><td><code>{paused:true|false}</code></td><td>Pauses/resumes the processing system.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="api-config">
+        <div class="eyebrow">Endpoint reference</div>
+        <h2>Configuration API</h2>
+        <p class="no-results">No API endpoints match the current filter.</p>
+        <h3>Encoder settings and presets</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Method</th><th>Path</th><th>Inputs</th><th>Purpose / response</th></tr></thead>
+            <tbody>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/settings</code></td><td>—</td><td>Full effective <code>EncoderOptions</code> JSON.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/settings</code></td><td>Settings object</td><td>Saves settings atomically and applies presence-aware migration.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/settings/reevaluate</code></td><td><code>forceRetryNoSavings=false</code></td><td>Re-evaluates catalog eligibility using current settings.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/settings/presets</code></td><td>—</td><td>Lists saved preset names and values.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/settings/presets</code></td><td><code>{name, options}</code></td><td>Creates or replaces a named preset.</td></tr>
+              <tr class="api-row"><td><span class="method delete">DELETE</span></td><td><code>/api/settings/presets/{name}</code></td><td>Preset name</td><td>Deletes one preset.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/settings/presets/export/{name}</code></td><td>Preset name</td><td>Downloads one preset as JSON.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/settings/presets/import</code></td><td>Exported preset JSON</td><td>Validates and imports a preset.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Auto-scan</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Method</th><th>Path</th><th>Inputs</th><th>Purpose / response</th></tr></thead>
+            <tbody>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/auto-scan/config</code></td><td>—</td><td>Schedule, watch folders, last scan, pause state, exclusions.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/auto-scan/enabled</code></td><td><code>{enabled}</code></td><td>Enables/disables scheduled scans.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/auto-scan/interval</code></td><td><code>{intervalMinutes}</code></td><td>Sets the scan interval.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/auto-scan/directories</code></td><td><code>{path}</code></td><td>Adds an allowed watch directory.</td></tr>
+              <tr class="api-row"><td><span class="method delete">DELETE</span></td><td><code>/api/auto-scan/directories</code></td><td><code>{path}</code></td><td>Removes a watch directory.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/auto-scan/trigger</code></td><td>—</td><td>Starts an immediate background scan.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/auto-scan/clear-history</code></td><td>—</td><td><span class="risk">Broad reset:</span> clears persisted processing history.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/auto-scan/exclusions</code></td><td>—</td><td>Returns current <code>ExclusionRules</code>.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/auto-scan/exclusions</code></td><td><code>{filenamePatterns,minSizeGBToSkip,excludeResolutions}</code></td><td>Saves exclusion rules.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Auth, notifications, integrations, and networking</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Method</th><th>Path</th><th>Inputs</th><th>Purpose / response</th></tr></thead>
+            <tbody>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/auth/config</code></td><td>—</td><td>Returns only <code>enabled</code>, <code>username</code>, and <code>hasPassword</code>.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/auth/config</code></td><td><code>{enabled,username,password}</code></td><td>Saves auth; null/empty password preserves the existing hash. Clears the current cookie.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/notifications/config</code></td><td>—</td><td>Full destination and event-toggle configuration.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/notifications/config</code></td><td>Notification config</td><td>Saves destinations and toggles.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/notifications/test</code></td><td>One destination object</td><td>Sends a test notification.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/integrations/config</code></td><td>—</td><td>Returns Plex, Jellyfin, Sonarr, Radarr, TVDB, and TMDb configuration.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/integrations/config</code></td><td>Integration config</td><td>Saves third-party configuration.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/integrations/test/plex</code></td><td><code>{baseUrl,token}</code></td><td>Tests Plex credentials/connectivity without saving.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/integrations/test/jellyfin</code></td><td><code>{baseUrl,token}</code></td><td>Tests Jellyfin credentials/connectivity without saving.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/integrations/test/sonarr</code></td><td><code>{baseUrl,apiKey}</code></td><td>Tests Sonarr credentials/connectivity without saving.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/integrations/test/radarr</code></td><td><code>{baseUrl,apiKey}</code></td><td>Tests Radarr credentials/connectivity without saving.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/integrations/test/tvdb</code></td><td><code>{apiKey,pin}</code></td><td>Tests TVDB authentication without saving.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/integrations/test/tmdb</code></td><td><code>{apiKey}</code></td><td>Tests TMDb authentication without saving.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/networking</code></td><td>—</td><td>Returns cluster transfer concurrency, rate, and chunk settings.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/networking</code></td><td><code>NetworkingSettings</code></td><td>Saves validated master-side transfer limits.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="api-operations">
+        <div class="eyebrow">Endpoint reference</div>
+        <h2>Dashboard, cluster administration, and diagnostics</h2>
+        <p class="no-results">No API endpoints match the current filter.</p>
+        <h3>Dashboard analytics</h3>
+        <p>Dashboard GET routes accept optional <code>kind=video|music</code>. Windowed routes clamp <code>days</code> to 1–365.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Method</th><th>Path</th><th>Inputs</th><th>Purpose</th></tr></thead>
+            <tbody>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/dashboard/summary</code></td><td><code>kind</code></td><td>Lifetime hero totals.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/dashboard/savings-over-time</code></td><td><code>days=30</code>, <code>kind</code></td><td>Continuous daily savings series.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/dashboard/device-utilization</code></td><td><code>days=30</code>, <code>kind</code></td><td>Per-device work totals.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/dashboard/codec-mix</code></td><td><code>days=30</code>, <code>kind</code></td><td>Output codec distribution.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/dashboard/node-throughput</code></td><td><code>days=30</code>, <code>kind</code></td><td>Per-node leaderboard.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/dashboard/recent</code></td><td><code>limit=25</code>, <code>kind</code></td><td>Recent successful encodes.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/dashboard/top-savings</code></td><td><code>limit=10</code>, <code>days=365</code>, <code>kind</code></td><td>Largest compression wins.</td></tr>
+              <tr class="api-row"><td><span class="method delete">DELETE</span></td><td><code>/api/dashboard/history</code></td><td>—</td><td><span class="risk">Destructive to history:</span> deletes the complete encode-history ledger.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Cluster administration</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Method</th><th>Path</th><th>Inputs</th><th>Purpose</th></tr></thead>
+            <tbody>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/cluster-admin/config</code></td><td>—</td><td>Cluster role, identity, discovery, secret, timing, and shared-storage config.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/cluster-admin/config</code></td><td><code>ClusterConfig</code></td><td>Saves and applies cluster configuration.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/cluster-admin/status</code></td><td>—</td><td>Local state, version, nodes, schedules, and live cluster status.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/cluster-admin/workers</code></td><td>—</td><td>Connected/discovered worker list.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/cluster-admin/node-paused</code></td><td><code>{nodeId,paused}</code></td><td>Pauses/resumes one worker.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/cluster-admin/local-encoding-paused</code></td><td><code>{paused}</code></td><td>Pauses/resumes encoding on the master itself.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/cluster-admin/node-settings</code></td><td>—</td><td>Per-node devices, slot limits, and schedules.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/cluster-admin/node-settings</code></td><td><code>NodeSettings</code></td><td>Saves settings for one node.</td></tr>
+              <tr class="api-row"><td><span class="method delete">DELETE</span></td><td><code>/api/cluster-admin/node-settings</code></td><td><code>{nodeId}</code></td><td>Removes stored settings for a node.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/cluster-admin/folder-settings</code></td><td><code>{path, encodingOverrides}</code></td><td>Saves or clears per-folder encoder overrides for a watched folder.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/cluster-admin/master-time</code></td><td>—</td><td>Returns master time for schedule diagnostics.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/cluster-admin/integration-sync</code></td><td>—</td><td>Shows worker integration-sync state.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/cluster-admin/integration-sync/refresh</code></td><td>—</td><td>Forces an integration-data refresh.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Health, diagnostics, and lifecycle</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Method</th><th>Path</th><th>Inputs</th><th>Purpose</th></tr></thead>
+            <tbody>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/health</code></td><td>—</td><td>Unauthenticated liveness JSON with UTC timestamp and version.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/metrics</code></td><td>—</td><td>Unauthenticated Prometheus text exposition.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/diagnostics/log</code></td><td><code>lines=200</code> (1–5000), optional <code>nodeId</code></td><td>Latest operation-log tail, local or proxied.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/diagnostics/logs.zip</code></td><td>Optional <code>nodeId</code></td><td>Downloads local or remote logs as ZIP.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/restart</code></td><td>—</td><td><span class="risk">Interruptive:</span> stops active work, clears the queue process, and exits for host restart.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="api-realtime">
+        <div class="eyebrow">Realtime API</div>
+        <h2>SignalR events</h2>
+        <p>
+          Connect an ASP.NET Core SignalR client to <code>/transcodingHub</code>. Browser clients
+          automatically send the Snacks session cookie. The hub supports
+          <code>JoinGroupAsync(groupName)</code> and <code>LeaveGroupAsync(groupName)</code>;
+          current application broadcasts are predominantly global.
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Event</th><th>Typical arguments</th><th>Use</th></tr></thead>
+            <tbody>
+              <tr class="api-row"><td><code>WorkItemUpdated</code></td><td>Work item object</td><td>Status, progress, transfer, assignment, completion updates.</td></tr>
+              <tr class="api-row"><td><code>WorkItemRemoved</code></td><td>Work item ID</td><td>Remove an item from the live UI.</td></tr>
+              <tr class="api-row"><td><code>QueueChanged</code></td><td>None</td><td>Refetch paginated queue state.</td></tr>
+              <tr class="api-row"><td><code>TranscodingLog</code></td><td>Work item ID, line</td><td>Append a live FFmpeg/log line.</td></tr>
+              <tr class="api-row"><td><code>HardwareDetected</code></td><td>Hardware descriptor</td><td>Refresh encoder/device UI.</td></tr>
+              <tr class="api-row"><td><code>ScanProgress</code></td><td>Progress object</td><td>Update background scan progress.</td></tr>
+              <tr class="api-row"><td><code>AutoScanCompleted</code></td><td>New-file count, total seen</td><td>Refresh scan summary and queue.</td></tr>
+              <tr class="api-row"><td><code>HistoryCleared</code></td><td>None</td><td>Refresh catalog/queue after auto-scan history reset.</td></tr>
+              <tr class="api-row"><td><code>EncodeHistoryAdded</code></td><td>Encode-history record</td><td>Refresh dashboard analytics.</td></tr>
+              <tr class="api-row"><td><code>EncodeHistoryCleared</code></td><td>None</td><td>Clear dashboard client state.</td></tr>
+              <tr class="api-row"><td><code>WorkerConnected</code></td><td>Cluster node</td><td>Add a worker to cluster status.</td></tr>
+              <tr class="api-row"><td><code>WorkerUpdated</code></td><td>Cluster node</td><td>Update node health, slots, and activity.</td></tr>
+              <tr class="api-row"><td><code>WorkerDisconnected</code></td><td>Node ID</td><td>Mark/remove a disconnected worker.</td></tr>
+              <tr class="api-row"><td><code>ClusterConfigChanged</code></td><td>Config-change summary</td><td>Refresh cluster mode UI.</td></tr>
+              <tr class="api-row"><td><code>NodeSettingsChanged</code></td><td>Node settings</td><td>Refresh device/schedule state.</td></tr>
+              <tr class="api-row"><td><code>ClusterNodePaused</code></td><td>Boolean</td><td>Update worker pause state.</td></tr>
+              <tr class="api-row"><td><code>ClusterWarning</code></td><td>Warning message</td><td>Surface dispatch/network warnings.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <pre><code>const connection = new signalR.HubConnectionBuilder()
+  .withUrl("/transcodingHub")
+  .withAutomaticReconnect()
+  .build();
+
+connection.on("WorkItemUpdated", item =&gt; console.log(item.id, item.status, item.progress));
+connection.on("QueueChanged", () =&gt; refreshQueue());
+await connection.start();</code></pre>
+      </section>
+
+      <section id="api-cluster-internal">
+        <div class="eyebrow">Internal protocol</div>
+        <h2>Cluster-internal API</h2>
+        <div class="callout warning">
+          <strong>Not a general automation surface.</strong> Routes under <code>/api/cluster/*</code>
+          coordinate trusted Snacks nodes and may change with cluster protocol changes. Prefer
+          <code>/api/cluster-admin/*</code> for administrative automation.
+        </div>
+        <p>
+          Every cluster-internal request requires
+          <code>X-Snacks-Secret: Base64(UTF-8(shared secret))</code>. Credential-sync routes add
+          LAN-source and active-node checks. The protocol covers:
+        </p>
+        <ul>
+          <li>Handshake, heartbeat, capabilities, node registry, and cluster state.</li>
+          <li>Job metadata, progress, completion, failure, cancellation, pause, and shutdown.</li>
+          <li>Chunked source upload, HEAD status/resume, output download, sidecars, and cleanup.</li>
+          <li>Dashboard and diagnostics mirrors used when a worker proxies to the master.</li>
+        </ul>
+        <pre><code>SECRET_HEADER=$(printf '%s' "$SNACKS_SHARED_SECRET" | base64 | tr -d '\n')
+
+curl -fsS \
+  -H "X-Snacks-Secret: $SECRET_HEADER" \
+  "$BASE/api/cluster/heartbeat"</code></pre>
+      </section>
+
+      <section id="development">
+        <div class="eyebrow">Contributing</div>
+        <h2>Development and verification</h2>
+        <p>
+          The backend targets .NET 10 and serves Razor views, JSON controllers, static ES
+          modules, and SignalR. Electron 43 wraps the published backend for desktop releases.
+        </p>
+        <pre><code># Build and run the unit/integration test suite
+dotnet build Snacks.sln --configuration Release
+dotnet test Snacks.sln --configuration Release --no-build --verbosity minimal
+
+# Run the web backend
+dotnet run --project Snacks/Snacks.csproj
+
+# Validate Electron, browser modules, API docs, and version synchronization
+npm --prefix electron-app ci
+npm --prefix electron-app run check
+
+# Validate a generated OpenAPI document from a running backend
+node scripts/validate-openapi.mjs http://localhost:6767/openapi/v1.json
+
+# After changing the Version element in Snacks/Snacks.csproj
+node scripts/sync-version.mjs
+
+# Run documented multi-process scenarios (see e2e/README.md)
+./e2e/scenarios/01-sweep-memory.sh</code></pre>
+        <h3>Architecture map</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Area</th><th>Location</th><th>Responsibility</th></tr></thead>
+            <tbody>
+              <tr><td>Composition</td><td><code>Snacks/Program.cs</code></td><td>DI, Kestrel, SQLite, logging, middleware, routes.</td></tr>
+              <tr><td>HTTP API</td><td><code>Snacks/Controllers/</code></td><td>UI pages, JSON endpoints, cluster RPC.</td></tr>
+              <tr><td>Pipeline</td><td><code>Snacks/Services/TranscodingService.cs</code>, <code>VideoTransformPlanner.cs</code></td><td>Queue, FFmpeg execution, pure transform planning, retry, validation.</td></tr>
+              <tr><td>Cluster</td><td><code>Snacks/Services/Cluster*.cs</code></td><td>Discovery, orchestration, pure capacity policy, transfer, recovery.</td></tr>
+              <tr><td>Persistence</td><td><code>Snacks/Data/</code></td><td>EF Core SQLite context, repositories, migrations.</td></tr>
+              <tr><td>Browser UI</td><td><code>Snacks/Views/</code>, <code>Snacks/wwwroot/</code></td><td>Razor shell, ES modules, CSS, static assets.</td></tr>
+              <tr><td>Desktop</td><td><code>electron-app/</code></td><td>Backend lifecycle, native window, packaging/signing.</td></tr>
+              <tr><td>Tests</td><td><code>Snacks.Tests/</code>, <code>electron-app/tests/</code>, <code>e2e/</code></td><td>Pipeline/cluster regressions, browser/API-contract checks, and multi-process scenarios.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <footer>
+        <p>
+          Snacks documentation for v2.15.1. This file is self-contained: save or print it for
+          offline use. The running app serves it at <code>/docs/index.html</code>.
+        </p>
+      </footer>
+    </main>
+  </div>
+
+  <script>
+    (() => {
+      const search = document.getElementById("doc-search");
+      const rows = [...document.querySelectorAll(".api-row")];
+      const emptyMessages = [...document.querySelectorAll(".no-results")];
+      const navLinks = [...document.querySelectorAll("nav a")];
+      const sections = [...document.querySelectorAll("main section[id]")];
+
+      function filterRows() {
+        const query = search.value.trim().toLowerCase();
+        rows.forEach(row => {
+          row.hidden = query !== "" && !row.textContent.toLowerCase().includes(query);
+        });
+        emptyMessages.forEach(message => {
+          const section = message.closest("section");
+          const sectionRows = [...section.querySelectorAll(".api-row")];
+          message.style.display = query && sectionRows.length && sectionRows.every(row => row.hidden)
+            ? "block"
+            : "none";
+        });
+      }
+
+      search.addEventListener("input", filterRows);
+      document.addEventListener("keydown", event => {
+        if (event.key === "/" && document.activeElement !== search) {
+          event.preventDefault();
+          search.focus();
+        }
+        if (event.key === "Escape" && document.activeElement === search) {
+          search.value = "";
+          filterRows();
+          search.blur();
+        }
+      });
+
+      const observer = new IntersectionObserver(entries => {
+        const visible = entries
+          .filter(entry => entry.isIntersecting)
+          .sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
+        if (!visible) return;
+        navLinks.forEach(link => link.classList.toggle(
+          "active",
+          link.getAttribute("href") === "#" + visible.target.id
+        ));
+      }, { rootMargin: "-15% 0px -70% 0px", threshold: [0, .1, .5] });
+
+      sections.forEach(section => observer.observe(section));
+    })();
+  </script>
+</body>
+</html>

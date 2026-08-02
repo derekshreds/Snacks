@@ -142,7 +142,7 @@ public sealed class LibraryAnalysisJobService
             {
                 job.State = JobState.Failed;
                 job.Error = ex.Message;
-                Console.WriteLine($"Library analysis job {job.Id} failed: {ex}");
+                Log.Warning($"Library analysis job {job.Id} failed: {ex}");
             }
             finally
             {

@@ -205,6 +205,10 @@ xcrun stapler validate electron-app/dist/Snacks-*-arm64.dmg
 
 ## Usage
 
+For a complete user guide, operations handbook, and public API reference, open
+[`Snacks/wwwroot/docs/index.html`](Snacks/wwwroot/docs/index.html) directly or
+visit `http://YOUR-SNACKS-HOST:6767/docs/index.html` on a running instance.
+
 ### Browse & Select
 
 Click **Browse Library** to open the file browser.
@@ -395,6 +399,7 @@ Snacks/
     Hubs/                  SignalR real-time communication
     Views/                 Razor pages
     wwwroot/               Static assets (JS, CSS, fonts)
+      docs/index.html       User guide, operations handbook, and public API reference
   release-notes/          Per-version release notes
   electron-app/           Electron desktop wrapper
     main.js               Electron main process

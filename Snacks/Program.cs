@@ -95,7 +95,10 @@ else
                     bindAllInterfaces = true;
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "Could not read cluster configuration while selecting the listen address");
+            }
         }
     }
 }
@@ -135,6 +138,19 @@ builder.Services.AddControllersWithViews()
         options.JsonSerializerOptions.Converters.Add(new Snacks.Json.UtcDateTimeConverter());
         options.JsonSerializerOptions.Converters.Add(new Snacks.Json.NullableUtcDateTimeConverter());
     });
+
+// Machine-readable contract for the supported UI/public JSON API. Cluster RPC
+// routes are an internal protocol and intentionally excluded.
+builder.Services.AddOpenApi("v1", options =>
+{
+    options.ShouldInclude = description =>
+    {
+        var path = description.RelativePath ?? "";
+        return (path.StartsWith("api/", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(path, "metrics", StringComparison.OrdinalIgnoreCase))
+            && !path.StartsWith("api/cluster/", StringComparison.OrdinalIgnoreCase);
+    };
+});
 
 builder.Services.AddSignalR()
     .AddJsonProtocol(options =>
@@ -256,5 +272,13 @@ app.MapControllerRoute(
 
 app.MapControllers(); // Attribute-routed controllers (ClusterController)
 app.MapHub<TranscodingHub>("/transcodingHub");
+app.MapOpenApi("/openapi/{documentName}.json");
 
-app.Run();
+try
+{
+    app.Run();
+}
+finally
+{
+    Log.CloseAndFlush();
+}
