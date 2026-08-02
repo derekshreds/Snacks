@@ -80,7 +80,7 @@ public sealed class RollingVerificationService : IHostedService, IDisposable
                     // whole batch against dead storage.
                     if (++consecutiveMissing >= 5)
                     {
-                        Console.WriteLine("RollingVerify: library storage appears offline — skipping this tick");
+                        Log.Information("RollingVerify: library storage appears offline — skipping this tick");
                         return;
                     }
 
@@ -103,20 +103,20 @@ public sealed class RollingVerificationService : IHostedService, IDisposable
                     await _mediaFileRepo.SetVerifyResultAsync(row.FilePath, summary);
 
                     if (!result.Ok)
-                        Console.WriteLine($"RollingVerify: problems in {row.FileName}: {summary}");
+                        Log.Information($"RollingVerify: problems in {row.FileName}: {summary}");
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"RollingVerify: verify of {row.FileName} failed: {ex.Message}");
+                    Log.Warning($"RollingVerify: verify of {row.FileName} failed: {ex.Message}");
                 }
             }
 
             if (candidates.Count > 0)
-                Console.WriteLine($"RollingVerify: checked {candidates.Count} file(s) this hour (budget {perDay}/day)");
+                Log.Information($"RollingVerify: checked {candidates.Count} file(s) this hour (budget {perDay}/day)");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"RollingVerify: tick failed: {ex.Message}");
+            Log.Warning($"RollingVerify: tick failed: {ex.Message}");
         }
         finally
         {

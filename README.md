@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-2.16.0-8b5cf6?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-2.17.0-8b5cf6?style=flat-square" alt="Version">
   <img src="https://img.shields.io/badge/.NET-10.0-512bd4?style=flat-square" alt=".NET 10">
   <img src="https://img.shields.io/badge/Electron-41-47848f?style=flat-square" alt="Electron">
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License">
@@ -204,6 +204,10 @@ xcrun stapler validate electron-app/dist/Snacks-*-arm64.dmg
 ---
 
 ## Usage
+
+For a complete user guide, operations handbook, and public API reference, open
+[`Snacks/wwwroot/docs/index.html`](Snacks/wwwroot/docs/index.html) directly or
+visit `http://YOUR-SNACKS-HOST:6767/docs/index.html` on a running instance.
 
 ### Browse & Select
 
@@ -467,6 +471,7 @@ Snacks/
     Hubs/                  SignalR real-time communication
     Views/                 Razor pages
     wwwroot/               Static assets (JS, CSS, fonts)
+      docs/index.html       User guide, operations handbook, and public API reference
   release-notes/          Per-version release notes
   electron-app/           Electron desktop wrapper
     main.js               Electron main process
@@ -514,5 +519,5 @@ Creates a self-contained `.dmg` at `electron-app/dist/` with the .NET runtime, F
 ---
 
 <p align="center">
-  <strong>Snacks</strong> v2.16.0 &copy; 2026 Derek Morris
+  <strong>Snacks</strong> v2.17.0 &copy; 2026 Derek Morris
 </p>

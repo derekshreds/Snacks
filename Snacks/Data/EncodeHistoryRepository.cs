@@ -46,7 +46,7 @@ public class EncodeHistoryRepository
         {
             // History recording is non-critical — never let an analytics
             // write failure abort the encode pipeline. Log and move on.
-            Console.WriteLine($"EncodeHistory: failed to record {record.JobId}: {ex.Message}");
+            Log.Warning($"EncodeHistory: failed to record {record.JobId}: {ex.Message}");
         }
     }
 

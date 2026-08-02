@@ -74,7 +74,7 @@ public sealed class NetworkingSettingsService
         }
 
         try { Changed?.Invoke(value); }
-        catch (Exception ex) { Console.WriteLine($"NetworkingSettings: Changed handler threw: {ex.Message}"); }
+        catch (Exception ex) { Log.Information($"NetworkingSettings: Changed handler threw: {ex.Message}"); }
     }
 
     private static void Validate(NetworkingSettings v)
@@ -102,7 +102,7 @@ public sealed class NetworkingSettingsService
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"NetworkingSettings: Failed to load {path}: {ex.Message} — falling back to defaults");
+            Log.Warning($"NetworkingSettings: Failed to load {path}: {ex.Message} — falling back to defaults");
             return new NetworkingSettings();
         }
     }

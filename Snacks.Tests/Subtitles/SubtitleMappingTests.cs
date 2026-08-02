@@ -155,8 +155,8 @@ public sealed class SubtitleMappingTests
         var fr = flags.IndexOf("-map 0:2", System.StringComparison.Ordinal);
         var en = flags.IndexOf("-map 0:1", System.StringComparison.Ordinal);
 
-        fr.Should().BeGreaterOrEqualTo(0);
-        en.Should().BeGreaterOrEqualTo(0);
+        fr.Should().BeGreaterThanOrEqualTo(0);
+        en.Should().BeGreaterThanOrEqualTo(0);
         fr.Should().BeLessThan(en, because: "French is the higher-priority preference");
     }
 

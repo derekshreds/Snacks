@@ -218,11 +218,11 @@ public sealed class IntegrationService
                     sReq.Headers.TryAddWithoutValidation("X-Plex-Token", p.Token);
                     using var sResp = await http.SendAsync(sReq);
                     if (sResp.IsSuccessStatusCode) return;
-                    Console.WriteLine($"Plex scoped rescan failed (HTTP {(int)sResp.StatusCode}); falling back to full refresh");
+                    Log.Warning($"Plex scoped rescan failed (HTTP {(int)sResp.StatusCode}); falling back to full refresh");
                 }
                 else
                 {
-                    Console.WriteLine($"Plex: no library root matched '{snacksFilePath}'; falling back to full refresh");
+                    Log.Information($"Plex: no library root matched '{snacksFilePath}'; falling back to full refresh");
                 }
             }
 
@@ -232,11 +232,11 @@ public sealed class IntegrationService
             req.Headers.TryAddWithoutValidation("X-Plex-Token", p.Token);
             using var resp = await http.SendAsync(req);
             if (!resp.IsSuccessStatusCode)
-                Console.WriteLine($"Plex rescan failed: HTTP {(int)resp.StatusCode}");
+                Log.Warning($"Plex rescan failed: HTTP {(int)resp.StatusCode}");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Plex rescan error: {ex.Message}");
+            Log.Warning($"Plex rescan error: {ex.Message}");
         }
     }
 
@@ -268,11 +268,11 @@ public sealed class IntegrationService
                     req.Headers.TryAddWithoutValidation("X-Emby-Token", j.Token);
                     using var resp = await http.SendAsync(req);
                     if (resp.IsSuccessStatusCode) return;
-                    Console.WriteLine($"Jellyfin scoped rescan failed (HTTP {(int)resp.StatusCode}); falling back to full refresh");
+                    Log.Warning($"Jellyfin scoped rescan failed (HTTP {(int)resp.StatusCode}); falling back to full refresh");
                 }
                 else
                 {
-                    Console.WriteLine($"Jellyfin: no library root matched '{snacksFilePath}'; falling back to full refresh");
+                    Log.Information($"Jellyfin: no library root matched '{snacksFilePath}'; falling back to full refresh");
                 }
             }
 
@@ -282,11 +282,11 @@ public sealed class IntegrationService
             fullReq.Headers.TryAddWithoutValidation("X-Emby-Token", j.Token);
             using var fullResp = await http.SendAsync(fullReq);
             if (!fullResp.IsSuccessStatusCode)
-                Console.WriteLine($"Jellyfin rescan failed: HTTP {(int)fullResp.StatusCode}");
+                Log.Warning($"Jellyfin rescan failed: HTTP {(int)fullResp.StatusCode}");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Jellyfin rescan error: {ex.Message}");
+            Log.Warning($"Jellyfin rescan error: {ex.Message}");
         }
     }
 
@@ -436,12 +436,12 @@ public sealed class IntegrationService
             }
             else
             {
-                Console.WriteLine($"Plex section lookup failed: HTTP {(int)resp.StatusCode}");
+                Log.Warning($"Plex section lookup failed: HTTP {(int)resp.StatusCode}");
             }
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Plex section lookup error: {ex.Message}");
+            Log.Warning($"Plex section lookup error: {ex.Message}");
         }
 
         lock (_rootsLock)
@@ -477,7 +477,7 @@ public sealed class IntegrationService
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Plex section parse error: {ex.Message}");
+            Log.Warning($"Plex section parse error: {ex.Message}");
         }
         return list;
     }
@@ -514,12 +514,12 @@ public sealed class IntegrationService
             }
             else
             {
-                Console.WriteLine($"Jellyfin library lookup failed: HTTP {(int)resp.StatusCode}");
+                Log.Warning($"Jellyfin library lookup failed: HTTP {(int)resp.StatusCode}");
             }
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Jellyfin library lookup error: {ex.Message}");
+            Log.Warning($"Jellyfin library lookup error: {ex.Message}");
         }
 
         lock (_rootsLock)
@@ -555,7 +555,7 @@ public sealed class IntegrationService
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Jellyfin library parse error: {ex.Message}");
+            Log.Warning($"Jellyfin library parse error: {ex.Message}");
         }
         return list;
     }
@@ -611,7 +611,7 @@ public sealed class IntegrationService
         catch (OperationCanceledException) { throw; }
         catch (Exception ex)
         {
-            Console.WriteLine($"Original-language lookup error ({provider}): {ex.Message}");
+            Log.Warning($"Original-language lookup error ({provider}): {ex.Message}");
             return null;
         }
     }

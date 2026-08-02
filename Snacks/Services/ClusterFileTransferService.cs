@@ -85,7 +85,7 @@ public sealed class ClusterFileTransferService
 
         var body = await response.Content.ReadAsStringAsync(ct);
         var ack = TryParseAck(body);
-        Console.WriteLine($"Cluster: Registered metadata for job {metadata.JobId} — node mode={ack.Mode}" +
+        Log.Information($"Cluster: Registered metadata for job {metadata.JobId} — node mode={ack.Mode}" +
             (ack.Reason != null ? $" ({ack.Reason})" : ""));
         return ack;
     }
@@ -117,7 +117,7 @@ public sealed class ClusterFileTransferService
         // The throttle's chunk size is user-configurable (Networking tab);
         // fall back to the historical 50MB constant when no throttle is wired.
         int chunkSize = _throttle?.ChunkSizeBytes ?? ChunkSize;
-        Console.WriteLine(
+        Log.Information(
             $"Cluster: Uploading {workItem.FileName} ({totalSize / 1048576}MB) to " +
             $"{workItem.AssignedNodeName} in {chunkSize / 1048576}MB chunks...");
 
@@ -126,7 +126,7 @@ public sealed class ClusterFileTransferService
 
         if (rawOffset >= totalSize)
         {
-            Console.WriteLine("Cluster: Node already has the complete file — sending completion signal");
+            Log.Information("Cluster: Node already has the complete file — sending completion signal");
 
             // The node has the file but encoding may not have started (e.g., master
             // crashed after the previous upload). Re-send the last chunk as a zero-offset
@@ -145,18 +145,18 @@ public sealed class ClusterFileTransferService
             {
                 var response = await client.SendAsync(request, ct);
                 if (!response.IsSuccessStatusCode)
-                    Console.WriteLine($"Cluster: Completion signal returned {(int)response.StatusCode}");
+                    Log.Information($"Cluster: Completion signal returned {(int)response.StatusCode}");
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Cluster: Completion signal failed: {ex.Message}");
+                Log.Warning($"Cluster: Completion signal failed: {ex.Message}");
             }
 
             return;
         }
 
         if (offset > 0)
-            Console.WriteLine(
+            Log.Information(
                 $"Cluster: Resuming upload at {offset / 1048576}MB (aligned from {rawOffset / 1048576}MB)");
 
         int       consecutiveFailures    = 0;
@@ -235,7 +235,7 @@ public sealed class ClusterFileTransferService
                         {
                             var realOffset = await GetNodeReceivedBytesAsync(client, baseUrl, workItem.Id);
                             var aligned = (realOffset / chunkSize) * chunkSize;
-                            Console.WriteLine(
+                            Log.Information(
                                 $"Cluster: Offset mismatch at {offset / 1048576}MB — " +
                                 $"node has {realOffset / 1048576}MB, re-aligning to {aligned / 1048576}MB");
                             offset = aligned;
@@ -303,7 +303,7 @@ public sealed class ClusterFileTransferService
                     consecutiveFailures++;
                     var delay = 5;
 
-                    Console.WriteLine(
+                    Log.Information(
                         $"Cluster: Upload chunk failed at {offset / 1048576}MB " +
                         $"(failure {consecutiveFailures}/{MaxConsecutiveFailures}): " +
                         $"{ex.Message} — retrying in {delay}s...");
@@ -327,7 +327,7 @@ public sealed class ClusterFileTransferService
             throw new Exception(
                 $"Upload size mismatch — sent {totalSize}, node has {finalSize}");
 
-        Console.WriteLine(
+        Log.Information(
             $"Cluster: Upload of {workItem.FileName} complete ({totalSize / 1048576}MB)");
     }
 
@@ -368,7 +368,7 @@ public sealed class ClusterFileTransferService
                     outputPath, FileMode.Open, FileAccess.Write))
                     truncStream.SetLength(offset);
 
-                Console.WriteLine(
+                Log.Information(
                     $"Cluster: Resuming download at {offset / 1048576}MB " +
                     $"(aligned from {rawOffset / 1048576}MB)");
             }
@@ -464,7 +464,7 @@ public sealed class ClusterFileTransferService
                 consecutiveFailures++;
                 var delay = Math.Min(consecutiveFailures * 10, 60);
 
-                Console.WriteLine(
+                Log.Information(
                     $"Cluster: Download chunk failed at {offset / 1048576}MB " +
                     $"(failure {consecutiveFailures}/{MaxConsecutiveFailures}): " +
                     $"{ex.Message} — retrying in {delay}s...");
@@ -493,7 +493,7 @@ public sealed class ClusterFileTransferService
         // Per-chunk SHA256 verification during download guarantees integrity,
         // so no full-file hash check is needed here.
         workItem.ErrorMessage = null;
-        Console.WriteLine($"Cluster: Download of result complete ({offset / 1048576}MB)");
+        Log.Information($"Cluster: Download of result complete ({offset / 1048576}MB)");
     }
 
     /******************************************************************
@@ -531,13 +531,13 @@ public sealed class ClusterFileTransferService
             var headerValue = response.Headers.TryGetValues("X-Received-Bytes", out var hv)
                 ? hv.FirstOrDefault() ?? "<missing>"
                 : "<missing>";
-            Console.WriteLine(
+            Log.Information(
                 $"Cluster: GetNodeReceivedBytesAsync({jobId}) degraded to 0 — " +
                 $"status={(int)response.StatusCode}, X-Received-Bytes={headerValue}");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Cluster: GetNodeReceivedBytesAsync({jobId}) failed: {ex.Message}");
+            Log.Warning($"Cluster: GetNodeReceivedBytesAsync({jobId}) failed: {ex.Message}");
         }
 
         return 0;

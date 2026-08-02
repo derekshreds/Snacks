@@ -100,7 +100,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
         if (_config.QueuePaused)
         {
             _transcodingService.SetPaused(true);
-            Console.WriteLine("Queue was paused when app last shut down — staying paused.");
+            Log.Information("Queue was paused when app last shut down — staying paused.");
         }
 
         _ = Task.Run(async () =>
@@ -311,7 +311,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
     /// </summary>
     public async Task ClearHistoryAsync()
     {
-        Console.WriteLine("ClearHistory: Starting full state reset...");
+        Log.Information("ClearHistory: Starting full state reset...");
 
         // Cancel any in-flight scan before acquiring the lock to avoid deadlock.
         // RunScanAsync disposes/replaces _scanCts under _scanLock, which we don't
@@ -353,7 +353,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
 
             await _hubContext.Clients.All.SendAsync("HistoryCleared");
 
-            Console.WriteLine("ClearHistory: Full state reset complete");
+            Log.Information("ClearHistory: Full state reset complete");
         }
         finally
         {
@@ -377,7 +377,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
     {
         if (_clusterService.IsNodeMode)
         {
-            Console.WriteLine("Node mode: Skipping queue resume from database");
+            Log.Information("Node mode: Skipping queue resume from database");
             return;
         }
 
@@ -386,17 +386,17 @@ public sealed class AutoScanService : IHostedService, IDisposable
             int requeued = await _mediaFileRepo.RequeueOrphanedLocalProcessingAsync();
             int pending  = await _mediaFileRepo.CountQueuedLocalAsync();
             if (requeued > 0)
-                Console.WriteLine($"Resume: {requeued} interrupted local encode(s) returned to the queue");
+                Log.Information($"Resume: {requeued} interrupted local encode(s) returned to the queue");
             if (pending == 0)
                 return;
 
-            Console.WriteLine($"Resume: {pending} pending item(s) in the DB queue — hydrating on demand");
+            Log.Information($"Resume: {pending} pending item(s) in the DB queue — hydrating on demand");
             _transcodingService.MarkQueueWindowDirty();
             await _transcodingService.KickQueueAsync(LoadEncoderOptions());
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Resume: Error resuming local queue: {ex.Message}");
+            Log.Warning($"Resume: Error resuming local queue: {ex.Message}");
         }
     }
 
@@ -417,7 +417,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
             }
             catch (TimeoutException)
             {
-                Console.WriteLine("Resume: Cluster recovery timed out after 3 minutes — checking for orphaned remote items");
+                Log.Warning("Resume: Cluster recovery timed out after 3 minutes — checking for orphaned remote items");
             }
 
             var options       = LoadEncoderOptions();
@@ -430,7 +430,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
             if (remoteOrphans.Count == 0)
                 return;
 
-            Console.WriteLine($"Resume: Checking {remoteOrphans.Count} remote item(s) not recovered by cluster");
+            Log.Information($"Resume: Checking {remoteOrphans.Count} remote item(s) not recovered by cluster");
 
             foreach (var file in remoteOrphans)
             {
@@ -442,18 +442,18 @@ public sealed class AutoScanService : IHostedService, IDisposable
 
                 // Clearing the assignment back to Queued returns the row to the DB
                 // pending queue — the scheduler hydrates it when it reaches the top.
-                Console.WriteLine($"Resume: Orphaned remote item {file.FileName} — clearing assignment and re-queuing");
+                Log.Information($"Resume: Orphaned remote item {file.FileName} — clearing assignment and re-queuing");
                 await _mediaFileRepo.ClearRemoteAssignmentAsync(file.FilePath, MediaFileStatus.Queued);
             }
 
             _transcodingService.MarkQueueWindowDirty();
             await _transcodingService.KickQueueAsync(options);
 
-            Console.WriteLine("Resume: Remote orphan check complete");
+            Log.Information("Resume: Remote orphan check complete");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Resume: Error checking remote orphans: {ex.Message}");
+            Log.Warning($"Resume: Error checking remote orphans: {ex.Message}");
         }
     }
 
@@ -532,7 +532,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
                     && done > 0 && done < subdirs.Count)
                 {
                     startOffset = done;
-                    Console.WriteLine($"AutoScan: Resuming {dirEntry.Path} at subdirectory {done:N0}/{subdirs.Count:N0} (interrupted-sweep checkpoint)");
+                    Log.Information($"AutoScan: Resuming {dirEntry.Path} at subdirectory {done:N0}/{subdirs.Count:N0} (interrupted-sweep checkpoint)");
                 }
 
                 for (int offset = startOffset; offset < subdirs.Count; offset += DirChunkSize)
@@ -561,7 +561,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
                             try { earlySize = new FileInfo(normalizedPath).Length; } catch { }
                             if (exclusions.IsExcluded(Path.GetFileName(normalizedPath), earlySize, resolutionLabel: null))
                             {
-                                Console.WriteLine($"AutoScan: Excluded by library rules: {Path.GetFileName(file)}");
+                                Log.Information($"AutoScan: Excluded by library rules: {Path.GetFileName(file)}");
                                 continue;
                             }
 
@@ -577,7 +577,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
 
                                     if (sizeDelta > 0.10)
                                     {
-                                        Console.WriteLine(
+                                        Log.Information(
                                             $"AutoScan: File changed on disk: {Path.GetFileName(file)} ({sizeDelta:P0} size change) — re-queuing");
                                         await _mediaFileRepo.ResetFileAsync(normalizedPath);
                                         newFiles.Add(file);
@@ -652,7 +652,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
             // until the next app restart. Skips active encodes — those have their
             // own missing-source handling on the encode path.
             try { await _transcodingService.PruneMissingWorkItemsAsync(); }
-            catch (Exception ex) { Console.WriteLine($"AutoScan: PruneMissingWorkItems failed: {ex.Message}"); }
+            catch (Exception ex) { Log.Warning($"AutoScan: PruneMissingWorkItems failed: {ex.Message}"); }
 
             lock (_configLock)
             {
@@ -668,11 +668,11 @@ public sealed class AutoScanService : IHostedService, IDisposable
         }
         catch (OperationCanceledException)
         {
-            Console.WriteLine("AutoScan: Scan cancelled");
+            Log.Information("AutoScan: Scan cancelled");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"AutoScan: Error during scan: {ex.Message}");
+            Log.Warning($"AutoScan: Error during scan: {ex.Message}");
         }
         finally
         {
@@ -702,7 +702,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
             var lastWrite = File.GetLastWriteTimeUtc(file);
             if (DateTime.UtcNow - lastWrite < TimeSpan.FromMinutes(30))
             {
-                Console.WriteLine(
+                Log.Information(
                     $"AutoScan: Skipping {Path.GetFileName(file)}: " +
                     $"modified {(int)(DateTime.UtcNow - lastWrite).TotalMinutes}m ago, may still be transferring");
                 return false;
@@ -770,14 +770,14 @@ public sealed class AutoScanService : IHostedService, IDisposable
                         }
                         else
                         {
-                            Console.WriteLine($"AutoScan: Partial [snacks] file detected, deleting: {snacksFile}");
+                            Log.Information($"AutoScan: Partial [snacks] file detected, deleting: {snacksFile}");
                             try { File.Delete(snacksFile); } catch { }
                         }
                     }
                     catch (OperationCanceledException) { throw; }
                     catch
                     {
-                        Console.WriteLine($"AutoScan: Corrupt [snacks] file detected, deleting: {snacksFile}");
+                        Log.Warning($"AutoScan: Corrupt [snacks] file detected, deleting: {snacksFile}");
                         try { File.Delete(snacksFile); } catch { }
                     }
                 }
@@ -800,7 +800,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
         catch (Exception ex)
         {
-            Console.WriteLine($"AutoScan: Failed to add {file}: {ex.Message}");
+            Log.Warning($"AutoScan: Failed to add {file}: {ex.Message}");
             return false;
         }
     }
@@ -850,7 +850,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"AutoScan: failed to persist scan checkpoint: {ex.Message}");
+            Log.Warning($"AutoScan: failed to persist scan checkpoint: {ex.Message}");
         }
     }
 
@@ -906,15 +906,15 @@ public sealed class AutoScanService : IHostedService, IDisposable
 
             if (seenFiles.Count > 0)
             {
-                Console.WriteLine($"AutoScan: Migrating {seenFiles.Count} SeenFiles entries to database...");
+                Log.Information($"AutoScan: Migrating {seenFiles.Count} SeenFiles entries to database...");
                 await _mediaFileRepo.BulkInsertSeenFilesAsync(seenFiles);
-                Console.WriteLine("AutoScan: Migration complete.");
+                Log.Information("AutoScan: Migration complete.");
                 SaveConfig();
             }
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"AutoScan: SeenFiles migration failed (non-fatal): {ex.Message}");
+            Log.Warning($"AutoScan: SeenFiles migration failed (non-fatal): {ex.Message}");
         }
     }
 
@@ -934,7 +934,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"AutoScan: Failed to load settings: {ex.Message}");
+                Log.Warning($"AutoScan: Failed to load settings: {ex.Message}");
             }
         }
 
@@ -955,7 +955,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"AutoScan: Failed to load config: {ex.Message}");
+                Log.Warning($"AutoScan: Failed to load config: {ex.Message}");
                 _config = new AutoScanConfig();
             }
         }
@@ -991,7 +991,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"AutoScan: Failed to save config: {ex.Message}");
+            Log.Warning($"AutoScan: Failed to save config: {ex.Message}");
         }
     }
 }

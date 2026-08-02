@@ -4,7 +4,7 @@ namespace Snacks.Services;
 
 /// <summary>
 ///     Gates the UI behind cookie-based login when <see cref="AuthConfig.Enabled"/> is true.
-///     Login page, static files, SignalR hub, and cluster (master↔node) traffic are always allowed.
+///     Login page, static files, health checks, and cluster (master↔node) traffic are always allowed.
 ///     Cluster nodes authenticate via the shared secret handled separately by ClusterAuthMiddleware.
 /// </summary>
 public sealed class AuthMiddleware
@@ -12,7 +12,6 @@ public sealed class AuthMiddleware
     private static readonly string[] AllowlistPrefixes =
     {
         "/Auth/",             // login form
-        "/transcodingHub",    // SignalR
         "/api/cluster/",      // inter-node RPC (secret-authenticated)
         "/api/health",        // liveness probe
         "/lib/", "/css/", "/js/", "/img/", "/favicon",
@@ -99,7 +98,7 @@ public sealed class AuthMiddleware
             : null;
     }
 
-    private static bool IsAllowlisted(string path)
+    internal static bool IsAllowlisted(string path)
     {
         // Prometheus scrape — aggregate counters only, no file paths or credentials;
         // scrapers can't do cookie login. Exact match (not a prefix) so a future

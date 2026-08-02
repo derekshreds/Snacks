@@ -26,7 +26,7 @@ public sealed class AuthController : Controller
     [HttpGet]
     public IActionResult Login(string? returnUrl = null)
     {
-        ViewData["ReturnUrl"] = returnUrl ?? "/";
+        ViewData["ReturnUrl"] = NormalizeReturnUrl(returnUrl);
         return View();
     }
 
@@ -45,7 +45,7 @@ public sealed class AuthController : Controller
         if (string.IsNullOrEmpty(cfg.PasswordHash))
         {
             ViewData["Error"]     = "No password is configured. Delete auth.json to reset.";
-            ViewData["ReturnUrl"] = returnUrl ?? "/";
+            ViewData["ReturnUrl"] = NormalizeReturnUrl(returnUrl);
             return View();
         }
 
@@ -53,7 +53,7 @@ public sealed class AuthController : Controller
             || !_auth.VerifyPassword(password ?? ""))
         {
             ViewData["Error"]     = "Invalid username or password";
-            ViewData["ReturnUrl"] = returnUrl ?? "/";
+            ViewData["ReturnUrl"] = NormalizeReturnUrl(returnUrl);
             return View();
         }
 
@@ -65,7 +65,7 @@ public sealed class AuthController : Controller
             Secure   = Request.IsHttps
         });
 
-        return Redirect(string.IsNullOrEmpty(returnUrl) ? "/" : returnUrl);
+        return LocalRedirect(NormalizeReturnUrl(returnUrl));
     }
 
     /******************************************************************
@@ -78,5 +78,31 @@ public sealed class AuthController : Controller
     {
         Response.Cookies.Delete(AuthService.CookieName);
         return Redirect("/Auth/Login");
+    }
+
+    /// <summary>
+    ///     Accepts only application-local return paths. This keeps a crafted login URL
+    ///     from turning the successful-login redirect into an open redirect.
+    /// </summary>
+    internal static string NormalizeReturnUrl(string? returnUrl)
+    {
+        if (string.IsNullOrWhiteSpace(returnUrl)) return "/";
+
+        // Match ASP.NET Core's local-URL rules without requiring an HttpContext:
+        // "/path" and "~/path" are local; scheme-relative and slash-backslash
+        // variants are not.
+        if (returnUrl[0] == '/')
+        {
+            if (returnUrl.Length == 1) return returnUrl;
+            return returnUrl[1] is not ('/' or '\\') ? returnUrl : "/";
+        }
+
+        if (returnUrl.Length > 1 && returnUrl[0] == '~' && returnUrl[1] == '/')
+        {
+            if (returnUrl.Length == 2) return "/";
+            return returnUrl[2] is not ('/' or '\\') ? returnUrl[1..] : "/";
+        }
+
+        return "/";
     }
 }

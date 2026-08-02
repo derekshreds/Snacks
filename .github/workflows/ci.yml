@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: .NET build, test, audit, and OpenAPI
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Restore
+        run: dotnet restore Snacks.sln
+
+      - name: Build
+        run: dotnet build Snacks.sln --configuration Release --no-restore
+
+      - name: Test
+        run: dotnet test Snacks.sln --configuration Release --no-build --verbosity minimal
+
+      - name: Audit NuGet dependencies
+        run: dotnet list Snacks/Snacks.csproj package --vulnerable --include-transitive --no-restore
+
+      - name: Start smoke-test server
+        run: |
+          SNACKS_WORK_DIR="${RUNNER_TEMP}/snacks-smoke" \
+          ASPNETCORE_ENVIRONMENT=Production \
+          ASPNETCORE_URLS=http://127.0.0.1:16767 \
+          dotnet run --project Snacks/Snacks.csproj --configuration Release --no-build --no-launch-profile \
+            >"${RUNNER_TEMP}/snacks-server.log" 2>&1 &
+          echo $! >"${RUNNER_TEMP}/snacks-server.pid"
+
+      - name: Verify HTTP routes and OpenAPI contract
+        run: |
+          trap 'kill "$(cat "${RUNNER_TEMP}/snacks-server.pid")" 2>/dev/null || true' EXIT
+          for attempt in {1..30}; do
+            curl -fsS http://127.0.0.1:16767/api/health && break
+            sleep 1
+          done
+          curl -fsS -o /dev/null http://127.0.0.1:16767/docs/index.html
+          node scripts/validate-openapi.mjs http://127.0.0.1:16767/openapi/v1.json
+
+      - name: Show server log after failure
+        if: failure()
+        run: cat "${RUNNER_TEMP}/snacks-server.log"
+
+  frontend:
+    name: Electron and browser-module checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    defaults:
+      run:
+        working-directory: electron-app
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: electron-app/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run frontend and contract checks
+        run: npm run check

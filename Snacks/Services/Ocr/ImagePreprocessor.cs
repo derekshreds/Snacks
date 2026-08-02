@@ -71,11 +71,9 @@ public static class ImagePreprocessor
         using (var canvas = new SKCanvas(scaled))
         {
             canvas.Clear(SKColors.Black);
-            using var paint = new SKPaint
-            {
-                IsAntialias   = true,
-                FilterQuality = SKFilterQuality.High,
-            };
+            using var paint = new SKPaint { IsAntialias = true };
+            var sampling = new SKSamplingOptions(
+                new SKCubicResampler(1f / 3f, 1f / 3f));
             if (skewRad != 0)
             {
                 float skewX = (float)Math.Tan(skewRad);
@@ -84,11 +82,11 @@ public static class ImagePreprocessor
                 m = m.PreConcat(SKMatrix.CreateScale(factor, factor));
                 m = m.PreConcat(SKMatrix.CreateSkew(skewX, 0));
                 canvas.SetMatrix(m);
-                canvas.DrawBitmap(softBmp, 0, 0, paint);
+                canvas.DrawBitmap(softBmp, 0, 0, sampling, paint);
             }
             else
             {
-                canvas.DrawBitmap(softBmp, new SKRect(0, 0, upW, upH), paint);
+                canvas.DrawBitmap(softBmp, new SKRect(0, 0, upW, upH), sampling, paint);
             }
         }
 

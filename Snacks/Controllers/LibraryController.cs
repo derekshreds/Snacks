@@ -92,7 +92,7 @@ public sealed class LibraryController : ControllerBase
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Error getting directories: {ex}");
+            Log.Warning($"Error getting directories: {ex}");
             return BadRequest(ex.Message);
         }
     }
@@ -203,7 +203,7 @@ public sealed class LibraryController : ControllerBase
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Get directory files error: {ex}");
+            Log.Warning($"Get directory files error: {ex}");
             return BadRequest(ex.Message);
         }
     }
