@@ -13,6 +13,13 @@ const version = match[1].trim();
 if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version))
     throw new Error(`Unsupported semantic version: ${version}`);
 
+const electronPkg = JSON.parse(
+    await readFile(path.join(repoRoot, 'electron-app', 'package.json'), 'utf8'));
+const electronRange = electronPkg.devDependencies?.electron ?? electronPkg.dependencies?.electron;
+const electronMajor = electronRange?.match(/\d+/)?.[0];
+if (!electronMajor)
+    throw new Error('No electron dependency found in electron-app/package.json');
+
 const edits = [
     {
         file: 'electron-app/package.json',
@@ -36,6 +43,7 @@ const edits = [
         file: 'README.md',
         update: text => text
             .replace(/version-\d+\.\d+\.\d+-/g, `version-${version}-`)
+            .replace(/badge\/Electron-\d+-/g, `badge/Electron-${electronMajor}-`)
             .replace(/<strong>Snacks<\/strong> v\d+\.\d+\.\d+/g, `<strong>Snacks</strong> v${version}`)
     },
     {
@@ -50,6 +58,7 @@ const edits = [
             .replace(/Documents Snacks v\d+\.\d+\.\d+/g, `Documents Snacks v${version}`)
             .replace(/the v\d+\.\d+\.\d+ contract/g, `the v${version} contract`)
             .replace(/Snacks documentation for v\d+\.\d+\.\d+/g, `Snacks documentation for v${version}`)
+            .replace(/Electron \d+ wraps/g, `Electron ${electronMajor} wraps`)
     }
 ];
 
