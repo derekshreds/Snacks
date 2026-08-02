@@ -5062,68 +5062,84 @@ public class TranscodingService
         {
             Log.Information("Auto-detect: Running on Windows, testing GPU encoders...");
 
-            if (await TestEncoderAsync("-hwaccel cuda", "hevc_nvenc"))
+            // Probe every codec per vendor and admit the device when ANY passes —
+            // the same rule the Linux VAAPI path already uses. Gating a vendor on
+            // its HEVC probe alone erases the whole GPU when only one codec's init
+            // fails: h264-only NVENC silicon (Kepler/first-gen Maxwell), and RDNA4 +
+            // recent Adrenalin where HEVC/AV1 AMF init has failed while H.264 AMF
+            // worked.
             {
-                Log.Information("Auto-detect: NVIDIA NVENC available");
+                bool hevc = await TestEncoderAsync("-hwaccel cuda", "hevc_nvenc");
                 bool h264 = await TestEncoderAsync("-hwaccel cuda", "h264_nvenc");
                 bool av1  = await TestEncoderAsync("-hwaccel cuda", "av1_nvenc");
-                devices.Add(new HardwareDevice
+                if (hevc || h264 || av1)
                 {
-                    DeviceId           = "nvidia",
-                    DisplayName        = "NVIDIA NVENC",
-                    SupportedCodecs    = BuildSupportedCodecs(true, h264, av1),
-                    Encoders           = BuildNvidiaEncoders(true, h264, av1),
-                    DefaultConcurrency = DefaultConcurrencyFor("nvidia"),
-                    IsHardware         = true,
-                });
+                    Log.Information($"Auto-detect: NVIDIA NVENC available (hevc={hevc}, h264={h264}, av1={av1})");
+                    devices.Add(new HardwareDevice
+                    {
+                        DeviceId           = "nvidia",
+                        DisplayName        = "NVIDIA NVENC",
+                        SupportedCodecs    = BuildSupportedCodecs(hevc, h264, av1),
+                        Encoders           = BuildNvidiaEncoders(hevc, h264, av1),
+                        DefaultConcurrency = DefaultConcurrencyFor("nvidia"),
+                        IsHardware         = true,
+                    });
+                }
             }
 
-            if (await TestEncoderAsync("-hwaccel qsv -qsv_device auto", "hevc_qsv"))
             {
-                Log.Information("Auto-detect: Intel QSV available");
+                bool hevc = await TestEncoderAsync("-hwaccel qsv -qsv_device auto", "hevc_qsv");
                 bool h264 = await TestEncoderAsync("-hwaccel qsv -qsv_device auto", "h264_qsv");
                 bool av1  = await TestEncoderAsync("-hwaccel qsv -qsv_device auto", "av1_qsv");
-                devices.Add(new HardwareDevice
+                if (hevc || h264 || av1)
                 {
-                    DeviceId           = "intel",
-                    DisplayName        = "Intel QSV",
-                    SupportedCodecs    = BuildSupportedCodecs(true, h264, av1),
-                    Encoders           = BuildIntelEncoders(true, h264, av1, qsv: true),
-                    DefaultConcurrency = DefaultConcurrencyFor("intel"),
-                    IsHardware         = true,
-                });
+                    Log.Information($"Auto-detect: Intel QSV available (hevc={hevc}, h264={h264}, av1={av1})");
+                    devices.Add(new HardwareDevice
+                    {
+                        DeviceId           = "intel",
+                        DisplayName        = "Intel QSV",
+                        SupportedCodecs    = BuildSupportedCodecs(hevc, h264, av1),
+                        Encoders           = BuildIntelEncoders(hevc, h264, av1, qsv: true),
+                        DefaultConcurrency = DefaultConcurrencyFor("intel"),
+                        IsHardware         = true,
+                    });
+                }
             }
 
-            if (await TestEncoderAsync("-hwaccel auto", "hevc_amf"))
             {
-                Log.Information("Auto-detect: AMD AMF available");
+                bool hevc = await TestEncoderAsync("-hwaccel auto", "hevc_amf");
                 bool h264 = await TestEncoderAsync("-hwaccel auto", "h264_amf");
                 bool av1  = await TestEncoderAsync("-hwaccel auto", "av1_amf");
-                devices.Add(new HardwareDevice
+                if (hevc || h264 || av1)
                 {
-                    DeviceId           = "amd",
-                    DisplayName        = "AMD AMF",
-                    SupportedCodecs    = BuildSupportedCodecs(true, h264, av1),
-                    Encoders           = BuildAmdEncoders(true, h264, av1, amf: true),
-                    DefaultConcurrency = DefaultConcurrencyFor("amd"),
-                    IsHardware         = true,
-                });
+                    Log.Information($"Auto-detect: AMD AMF available (hevc={hevc}, h264={h264}, av1={av1})");
+                    devices.Add(new HardwareDevice
+                    {
+                        DeviceId           = "amd",
+                        DisplayName        = "AMD AMF",
+                        SupportedCodecs    = BuildSupportedCodecs(hevc, h264, av1),
+                        Encoders           = BuildAmdEncoders(hevc, h264, av1, amf: true),
+                        DefaultConcurrency = DefaultConcurrencyFor("amd"),
+                        IsHardware         = true,
+                    });
+                }
             }
         }
         // macOS GPU detection (VideoToolbox — works on both Apple Silicon and Intel Macs).
         else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
         {
             Log.Information("Auto-detect: Running on macOS, testing VideoToolbox...");
-            if (await TestEncoderAsync("-hwaccel videotoolbox", "hevc_videotoolbox"))
+            bool vtHevc = await TestEncoderAsync("-hwaccel videotoolbox", "hevc_videotoolbox");
+            bool vtH264 = await TestEncoderAsync("-hwaccel videotoolbox", "h264_videotoolbox");
+            if (vtHevc || vtH264)
             {
-                Log.Information("Auto-detect: VideoToolbox available");
-                bool h264 = await TestEncoderAsync("-hwaccel videotoolbox", "h264_videotoolbox");
+                Log.Information($"Auto-detect: VideoToolbox available (hevc={vtHevc}, h264={vtH264})");
                 devices.Add(new HardwareDevice
                 {
                     DeviceId           = "apple",
                     DisplayName        = "Apple VideoToolbox",
-                    SupportedCodecs    = BuildSupportedCodecs(true, h264, av1: false),
-                    Encoders           = BuildAppleEncoders(true, h264),
+                    SupportedCodecs    = BuildSupportedCodecs(vtHevc, vtH264, av1: false),
+                    Encoders           = BuildAppleEncoders(vtHevc, vtH264),
                     DefaultConcurrency = DefaultConcurrencyFor("apple"),
                     IsHardware         = true,
                 });
@@ -5501,43 +5517,68 @@ public class TranscodingService
     /// </summary>
     private async Task<bool> TestEncoderAsync(string hwFlags, string encoder)
     {
-        foreach (var (args, lowPower) in BuildEncoderProbeAttempts(hwFlags, encoder))
+        foreach (var (args, variant) in BuildEncoderProbeAttempts(hwFlags, encoder))
         {
-            if (await RunEncoderProbeAsync(args, lowPower ? $"{encoder} (low_power)" : encoder))
+            if (await RunEncoderProbeAsync(args, variant.Length == 0 ? encoder : $"{encoder} ({variant})"))
                 return true;
         }
         return false;
     }
 
     /// <summary>
-    ///     Builds the ordered ffmpeg argument sets used to probe an encoder. Non-VAAPI
-    ///     encoders get a single bare attempt. VAAPI encoders are probed with the CQP
-    ///     flags real encodes use — twice: plain first, then with <c>-low_power 1</c>.
+    ///     Builds the ordered ffmpeg argument sets used to probe an encoder; a pass on
+    ///     any attempt marks the encoder usable. The <c>variant</c> element names the
+    ///     non-default attempt for log output ("" for the plain attempt).
     ///
-    ///     <para>Neither attempt alone covers the VAAPI hardware matrix. AMD (Mesa
-    ///     radeonsi) only exposes the normal entrypoint (VAEntrypointEncSlice) and
-    ///     rejects <c>-low_power</c> with EINVAL; LP-only Intel parts (Jasper Lake,
-    ///     Elkhart Lake, and the ADL-N/Twin Lake N-series — N95/N100/N305/N355) only
-    ///     expose VAEntrypointEncSliceLP and reject plain CQP. Probing only one mode
-    ///     has shipped a regression in each direction already — LP-only dropped every
-    ///     AMD encode to software, plain-only dropped LP-only Intel to software. Plain
-    ///     goes first so healthy AMD and full-featured Intel never pay a second probe.</para>
+    ///     <para>VAAPI encoders are probed with the CQP flags real encodes use — twice:
+    ///     plain first, then with <c>-low_power 1</c>. Neither attempt alone covers the
+    ///     hardware matrix. AMD (Mesa radeonsi) only exposes the normal entrypoint
+    ///     (VAEntrypointEncSlice) and rejects <c>-low_power</c> with EINVAL; LP-only
+    ///     Intel parts (Jasper Lake, Elkhart Lake, and the ADL-N/Twin Lake N-series —
+    ///     N95/N100/N305/N355) only expose VAEntrypointEncSliceLP and reject plain CQP.
+    ///     Probing only one mode has shipped a regression in each direction already —
+    ///     LP-only dropped every AMD encode to software, plain-only dropped LP-only
+    ///     Intel to software. Plain goes first so healthy AMD and full-featured Intel
+    ///     never pay a second probe.</para>
+    ///
+    ///     <para>AMF encoders also get two attempts: bare defaults first, then with an
+    ///     explicit usage/quality/CQP session. A 9070 XT (RDNA4, Adrenalin 26.7.1)
+    ///     reported AMF undetected while an explicitly configured <c>hevc_amf</c>
+    ///     session (<c>-usage transcoding -quality quality -qp_i 24 -qp_p 24</c>)
+    ///     encoded fine, and HEVC/AV1-init-only AMF failures on RDNA4 are a known
+    ///     driver defect class (LizardByte/Sunshine#5385) — so default-parameter init
+    ///     alone can't be trusted to prove absence. <c>-qp_i/-qp_p</c> are H.264/HEVC
+    ///     options; the AV1 attempt carries only the session flags.</para>
     /// </summary>
-    internal static (string args, bool lowPower)[] BuildEncoderProbeAttempts(string hwFlags, string encoder)
+    internal static (string args, string variant)[] BuildEncoderProbeAttempts(string hwFlags, string encoder)
     {
         string Args(string vf, string extra) =>
             $"-y {hwFlags} -f lavfi -i color=c=black:s=256x256:d=0.1 {vf} -c:v {encoder} {extra} -frames:v 1 -f null -";
 
-        if (!encoder.Contains("vaapi"))
-            return [(Args("", ""), false)];
+        if (encoder.Contains("vaapi"))
+        {
+            const string vf = "-vf format=nv12|vaapi,hwupload";
+            string cqp = $"-rc_mode CQP -global_quality:v {VaapiQualityScale.For(encoder).FixedCqp}";
+            return
+            [
+                (Args(vf, cqp), ""),
+                (Args(vf, $"-low_power 1 {cqp}"), "low_power"),
+            ];
+        }
 
-        const string vf = "-vf format=nv12|vaapi,hwupload";
-        string cqp = $"-rc_mode CQP -global_quality:v {VaapiQualityScale.For(encoder).FixedCqp}";
-        return
-        [
-            (Args(vf, cqp), false),
-            (Args(vf, $"-low_power 1 {cqp}"), true),
-        ];
+        if (encoder.Contains("amf"))
+        {
+            string explicitFlags = encoder.Contains("av1")
+                ? "-usage transcoding -quality quality -pix_fmt yuv420p"
+                : "-usage transcoding -quality quality -qp_i 24 -qp_p 24 -pix_fmt yuv420p";
+            return
+            [
+                (Args("", ""), ""),
+                (Args("", explicitFlags), "explicit_session"),
+            ];
+        }
+
+        return [(Args("", ""), "")];
     }
 
     /// <summary>

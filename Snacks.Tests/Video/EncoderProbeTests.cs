@@ -32,16 +32,16 @@ public sealed class EncoderProbeTests
 
         attempts.Should().HaveCount(2);
 
-        var (plainArgs, plainLp) = attempts[0];
-        var (lpArgs, lpFlagged)  = attempts[1];
+        var (plainArgs, plainVariant) = attempts[0];
+        var (lpArgs, lpVariant)       = attempts[1];
 
         // Plain goes first so healthy AMD / full-featured Intel never pay a second probe.
-        plainLp.Should().BeFalse();
+        plainVariant.Should().BeEmpty();
         plainArgs.Should().NotContain("-low_power");
 
         // The retry is what keeps LP-only Intel (N100/N305/N355, Jasper/Elkhart Lake)
         // from silently falling back to CPU — the regression behind the N355 report.
-        lpFlagged.Should().BeTrue();
+        lpVariant.Should().Be("low_power");
         lpArgs.Should().Contain("-low_power 1");
 
         foreach (var (args, _) in attempts)
@@ -55,23 +55,65 @@ public sealed class EncoderProbeTests
     }
 
     /// <summary>
-    ///     Non-VAAPI encoders keep the single bare attempt: no CQP flags, no hwupload
-    ///     filter, and never <c>-low_power</c> (QSV's own low_power option defaults to
-    ///     auto — the runtime negotiates it, unlike VAAPI).
+    ///     AMF encoders are probed twice: bare defaults, then an explicitly configured
+    ///     session. RDNA4 + recent Adrenalin drivers have failed per-codec AMF init
+    ///     under default parameters while an explicit usage/quality/QP session encoded
+    ///     fine (RX 9070 XT field report; same defect class as
+    ///     LizardByte/Sunshine#5385), so a bare-defaults failure alone must not erase
+    ///     the encoder. <c>-qp_i/-qp_p</c> are H.264/HEVC-only options and must stay
+    ///     off the AV1 attempt.
+    /// </summary>
+    [Theory]
+    [InlineData("hevc_amf", true)]
+    [InlineData("h264_amf", true)]
+    [InlineData("av1_amf", false)]
+    public void Amf_probe_tries_bare_then_explicit_session(string encoder, bool expectQpFlags)
+    {
+        var attempts = TranscodingService.BuildEncoderProbeAttempts("-hwaccel auto", encoder);
+
+        attempts.Should().HaveCount(2);
+
+        var (bareArgs, bareVariant)         = attempts[0];
+        var (explicitArgs, explicitVariant) = attempts[1];
+
+        // Bare goes first — it's the historical probe, and a pass skips the second run.
+        bareVariant.Should().BeEmpty();
+        bareArgs.Should().NotContain("-usage").And.NotContain("-quality").And.NotContain("-qp_i");
+
+        explicitVariant.Should().Be("explicit_session");
+        explicitArgs.Should().Contain("-usage transcoding -quality quality");
+        if (expectQpFlags)
+            explicitArgs.Should().Contain("-qp_i 24 -qp_p 24");
+        else
+            explicitArgs.Should().NotContain("-qp_i").And.NotContain("-qp_p");
+
+        foreach (var (args, _) in attempts)
+        {
+            args.Should().Contain("-hwaccel auto");
+            args.Should().Contain($"-c:v {encoder}");
+            args.Should().Contain("-frames:v 1");
+            args.Should().NotContain("-low_power");
+            args.Should().NotContain("hwupload");
+        }
+    }
+
+    /// <summary>
+    ///     Other non-VAAPI encoders keep the single bare attempt: no CQP flags, no
+    ///     hwupload filter, and never <c>-low_power</c> (QSV's own low_power option
+    ///     defaults to auto — the runtime negotiates it, unlike VAAPI).
     /// </summary>
     [Theory]
     [InlineData("hevc_qsv",  "-hwaccel qsv -qsv_device /dev/dri/renderD128")]
     [InlineData("hevc_nvenc", "-hwaccel cuda")]
-    [InlineData("hevc_amf",   "-hwaccel auto")]
     [InlineData("hevc_videotoolbox", "-hwaccel videotoolbox")]
     public void Non_vaapi_probe_is_a_single_bare_attempt(string encoder, string hwFlags)
     {
         var attempts = TranscodingService.BuildEncoderProbeAttempts(hwFlags, encoder);
 
         attempts.Should().HaveCount(1);
-        var (args, lowPower) = attempts[0];
+        var (args, variant) = attempts[0];
 
-        lowPower.Should().BeFalse();
+        variant.Should().BeEmpty();
         args.Should().Contain(hwFlags);
         args.Should().Contain($"-c:v {encoder}");
         args.Should().Contain("-frames:v 1");
