@@ -364,7 +364,7 @@
         <div class="group">Contributors</div>
         <a href="#development">Development</a>
       </nav>
-      <div class="version">Documents Snacks v2.16.0 · updated 2026-07-19</div>
+      <div class="version">Documents Snacks v2.16.0 · updated 2026-08-02</div>
     </aside>
 
     <main id="content">
@@ -442,12 +442,43 @@
           <li>Open Settings, save a conservative preset, and process one test file.</li>
         </ol>
 
+        <h3 id="changing-the-port">Changing the port</h3>
+        <p>
+          Snacks configures its listener explicitly, so the generic ASP.NET variables
+          (<code>HTTP_PORTS</code>, <code>DOTNET_URLS</code>) are ignored. How to move off
+          <code>6767</code> depends on the network mode:
+        </p>
+        <ul>
+          <li>
+            <strong>Host networking</strong> (the compose file above): Docker silently ignores
+            <code>ports:</code> mappings under <code>network_mode: host</code>. Set the port through
+            the one variable Snacks honors:
+            <pre><code>environment:
+  - ASPNETCORE_URLS=http://0.0.0.0:7070</code></pre>
+            Keep the <code>0.0.0.0</code> host so the UI and cluster peers can reach it over the LAN.
+          </li>
+          <li>
+            <strong>Bridge networking</strong>: remove <code>network_mode: host</code> and map the
+            host port onto the container's default instead — no environment variable needed:
+            <pre><code>ports:
+  - "7070:6767"</code></pre>
+            Note that UDP broadcast discovery for clusters does not work across a bridge network;
+            use manual node URLs, or stay on host networking.
+          </li>
+        </ul>
+        <p>
+          Cluster nodes announce whatever port they actually bound, so a custom port is safe with
+          discovery. The UDP discovery port <code>6768</code> itself is fixed.
+        </p>
+
         <h3>Desktop</h3>
         <p>
           Install the Windows or Apple Silicon macOS build, launch Snacks, and use
           <strong>Browse Library</strong>. The desktop wrapper starts the ASP.NET backend
           locally and bundles or points it at FFmpeg. Cluster mode intentionally changes the
-          backend from localhost-only to a LAN listener.
+          backend from localhost-only to a LAN listener. There is no port to configure: the
+          wrapper prefers <code>6767</code> and automatically starts on another free port when
+          it is taken.
         </p>
 
         <h3>Recommended first-job checklist</h3>
@@ -599,8 +630,8 @@
         </div>
         <h3>Discovery and networking</h3>
         <ul>
-          <li>Web/API traffic defaults to TCP port <code>6767</code>.</li>
-          <li>Automatic discovery broadcasts on UDP port <code>6768</code>.</li>
+          <li>Web/API traffic defaults to TCP port <code>6767</code> (see <a href="#changing-the-port">Changing the port</a>); nodes announce the port they actually bound.</li>
+          <li>Automatic discovery broadcasts on UDP port <code>6768</code> (fixed).</li>
           <li>Host networking is normally required for Docker broadcast discovery.</li>
           <li>Manual node URLs work when broadcast does not cross subnets.</li>
           <li>Transfer concurrency, bandwidth, and chunk size are configurable on the master.</li>
@@ -738,6 +769,28 @@ curl -b snacks.cookies \
 docker exec snacks vainfo</code></pre>
             NVIDIA also requires the NVIDIA container runtime and its video capability; privileged
             mode alone does not provide CUDA/NVENC libraries.
+          </div>
+        </details>
+        <details>
+          <summary>Port 6767 is already in use, or the port will not change</summary>
+          <div>
+            <p>
+              A startup failure like
+              <code>Failed to bind to address http://[::]:6767: address already in use</code>
+              means another process owns the port. Warnings such as
+              <code>Overriding HTTP_PORTS…</code> or
+              <code>Overriding address(es)… Binding to endpoints defined via IConfiguration
+              and/or UseKestrel() instead</code> mean a port was supplied through a variable
+              Snacks does not honor — it configures its listener explicitly, and only
+              <code>ASPNETCORE_URLS</code> is read.
+            </p>
+            <p>
+              With Docker host networking, <code>ports:</code> mappings are silently ignored;
+              set <code>ASPNETCORE_URLS=http://0.0.0.0:7070</code> instead. With bridge
+              networking, map <code>"7070:6767"</code> and leave the environment alone. The
+              desktop app resolves port conflicts automatically. See
+              <a href="#changing-the-port">Changing the port</a>.
+            </p>
           </div>
         </details>
         <details>

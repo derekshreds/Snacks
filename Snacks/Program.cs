@@ -107,6 +107,14 @@ else
 var normalizedUrl = listenUrl.Split(';')[0].Replace("://+", "://0.0.0.0").Replace("://*", "://0.0.0.0");
 var listenPort = new Uri(normalizedUrl).Port;
 
+// The explicit Kestrel config below overrides HTTP_PORTS / DOTNET_URLS / appsettings
+// endpoints, so name the one variable that actually works while the reader is looking
+// at startup output trying to move the port.
+Log.Information(
+    $"Listening on {(bindAllInterfaces ? "0.0.0.0" : "localhost")}:{listenPort} — " +
+    "set ASPNETCORE_URLS (e.g. http://0.0.0.0:7070) to change the port; " +
+    "HTTP_PORTS and DOTNET_URLS are not honored");
+
 builder.WebHost.ConfigureKestrel(serverOptions =>
 {
     // Explicit Kestrel config overrides ASPNETCORE_URLS — no duplicate listeners.
