@@ -10,10 +10,11 @@
  * delegated to the dialog.
  */
 
-import { autoScanApi }        from '../../api.js';
-import { escapeHtml }         from '../../utils/dom.js';
-import { showConfirmModal }   from '../../utils/modal-controller.js';
-import { pickFolder }         from '../folder-picker.js';
+import { autoScanApi }                  from '../../api.js';
+import { escapeHtml }                   from '../../utils/dom.js';
+import { showConfirmModal }             from '../../utils/modal-controller.js';
+import { pickFolder }                   from '../folder-picker.js';
+import { applyEnvLocks, addEnvLockNote } from '../env-locks.js';
 
 
 // ---------------------------------------------------------------------------
@@ -106,9 +107,27 @@ export class AutoScanPanel {
 
             this._renderDirectories(config.directories || []);
             this._renderStatus(config);
+            this._applyEnvLocks(config._envLocked);
         } catch (err) {
             console.error('Error loading auto-scan config:', err);
         }
+    }
+
+    /**
+     * Locks controls driven by SNACKS_SCAN_* env vars. Runs after every load
+     * so re-rendered directory rows pick the lock back up.
+     */
+    _applyEnvLocks(lockedPaths) {
+        const byId = (id) => document.getElementById(id);
+        const any = applyEnvLocks(lockedPaths, (path) => ({
+            enabled:         byId('autoScanEnabled'),
+            intervalMinutes: byId('autoScanInterval'),
+            directories:     [byId('autoScanDirectories'), byId('addWatchedDirectory')],
+            exclusionRules:  [byId('exclusionPatternsChips'), byId('exclusionMinSize'),
+                              byId('exclusionResolutionsChips'), byId('saveExclusionRules')],
+        })[path] ?? null);
+
+        if (any) addEnvLockNote(byId('autoScanStatus')?.parentElement);
     }
 
     /** Shortcut for incremental reloads (used by cross-module callbacks). */

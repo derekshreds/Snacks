@@ -3966,6 +3966,8 @@ public sealed class ClusterService : IHostedService, IDisposable
                 Log.Warning(ex, "Could not load encoder settings from disk; using defaults");
             }
             options ??= new EncoderOptions();
+            // Disk fallback only — GetLastOptions() already carries env-applied values.
+            EnvConfigOverrides.Apply(options, EnvConfigOverrides.SettingsPrefix);
         }
         return options;
     }

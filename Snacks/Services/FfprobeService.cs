@@ -97,10 +97,11 @@ public class FfprobeService
         process.WaitForExit(); // Ensures async OutputDataReceived/ErrorDataReceived events have finished firing
 
         // ffprobe writes JSON to stdout, but some builds redirect it to stderr.
-        // Use whichever stream captured more content.
-        string correctOutput = outputBuilder.Length > errorBuilder.Length
-            ? outputBuilder.ToString()
-            : errorBuilder.ToString();
+        // Prefer stdout whenever it actually contains JSON — "whichever is longer"
+        // picked stderr when a valid probe was accompanied by many warning lines,
+        // returning an empty ProbeResult for a perfectly probeable file.
+        string stdout = outputBuilder.ToString();
+        string correctOutput = stdout.IndexOf('{') >= 0 ? stdout : errorBuilder.ToString();
 
         try
         {

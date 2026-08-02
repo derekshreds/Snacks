@@ -261,9 +261,26 @@ public sealed class EncoderOptions
     /// <summary>
     ///     Hardware acceleration mode: "auto", "intel", "amd", "nvidia", "apple", or "none"
     ///     (the values the UI writes). Legacy aliases ("nvenc", "vaapi", "qsv", "amf") are
-    ///     mapped to these on settings restore.
+    ///     normalized in the setter so every load path is covered — headless and cluster
+    ///     nodes deserialize settings.json without ever running the browser form, and an
+    ///     unmapped alias falls through the encoder switches to silent software encoding.
+    ///     "vaapi" is vendor-ambiguous (Intel AND AMD use VAAPI on Linux) and maps to
+    ///     "auto" so hardware detection resolves the actual vendor.
     /// </summary>
-    public string HardwareAcceleration { get; set; } = "auto";
+    public string HardwareAcceleration
+    {
+        get => _hardwareAcceleration;
+        set => _hardwareAcceleration = value?.ToLowerInvariant() switch
+        {
+            "nvenc" or "cuda" => "nvidia",
+            "qsv"             => "intel",
+            "amf"             => "amd",
+            "vaapi"           => "auto",
+            null or ""        => "auto",
+            var v             => v,
+        };
+    }
+    private string _hardwareAcceleration = "auto";
 
     /// <summary>
     ///     Linux VAAPI device node path for the GPU that should service this job

@@ -6,7 +6,8 @@
  * the supplied URL + credential are valid.
  */
 
-import { integrationsApi } from '../../api.js';
+import { integrationsApi }               from '../../api.js';
+import { applyEnvLocks, addEnvLockNote } from '../env-locks.js';
 
 
 // ---------------------------------------------------------------------------
@@ -110,7 +111,28 @@ async function load() {
 
         setVal('tmdbEnabled',     cfg.tmdb?.enabled);
         setVal('tmdbApiKey',      cfg.tmdb?.apiKey);
+
+        applyLocks(cfg._envLocked);
     } catch { /* endpoint may be gated by auth */ }
+}
+
+/**
+ * Locks controls driven by SNACKS_INTEG_* env vars. Paths arrive as
+ * `section.property` (e.g. "plex.token"); ids follow `sectionProperty`
+ * except the divergent rescan/token names mapped below.
+ */
+function applyLocks(lockedPaths) {
+    const ID_MAP = {
+        'plex.rescanOnComplete':     'plexRescan',
+        'jellyfin.rescanOnComplete': 'jellyfinRescan',
+    };
+    const any = applyEnvLocks(lockedPaths, (path) => {
+        const mapped = ID_MAP[path]
+            ?? path.replace(/\.(\w)/, (_, c) => c.toUpperCase());
+        return document.getElementById(mapped);
+    });
+
+    if (any) addEnvLockNote(document.getElementById('saveIntegrationConfig')?.parentElement);
 }
 
 /**

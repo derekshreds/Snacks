@@ -388,6 +388,15 @@ export const authApi = {
      */
     save: (enabled, username, password) => postJson('/api/auth/config', { enabled, username, password }),
 
+    /** Fetches the stored API key ("" when none). Env-provided keys are never returned. */
+    getApiKey: () => getJson('/api/auth/apikey'),
+
+    /** Generates and persists a new API key, replacing any previous stored key. */
+    generateApiKey: () => postJson('/api/auth/apikey/generate'),
+
+    /** Removes the stored API key (a SNACKS_API_KEY env key stays valid). */
+    deleteApiKey: () => deleteJson('/api/auth/apikey'),
+
     /** Signs the current user out; navigation is typically handled by the caller. */
     logout: () => fetch('/Auth/Logout', { method: 'POST' }),
 };

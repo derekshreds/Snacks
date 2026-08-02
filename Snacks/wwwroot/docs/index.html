@@ -364,7 +364,7 @@
         <div class="group">Contributors</div>
         <a href="#development">Development</a>
       </nav>
-      <div class="version">Documents Snacks v2.15.1 · updated 2026-07-19</div>
+      <div class="version">Documents Snacks v2.16.0 · updated 2026-07-19</div>
     </aside>
 
     <main id="content">
@@ -678,6 +678,24 @@
           JSON configuration writes are atomic and keep <code>.bak</code> fallbacks, but a
           host-level backup remains the recovery boundary for accidental deletion or disk loss.
         </p>
+
+        <h3>Environment-variable overrides</h3>
+        <p>
+          Encoder, auto-scan, and integration settings can be pinned from the environment —
+          handy for version-controlling configuration in a compose file. Overrides are applied
+          in-memory on every load and never written to the JSON files, so removing a variable
+          reverts to the file's value. Env-pinned settings show a lock icon in the GUI.
+        </p>
+        <ul>
+          <li><code>SNACKS_SET_&lt;Prop&gt;</code> → <code>settings.json</code>, nested properties via <code>__</code> (e.g. <code>SNACKS_SET_Music__BitrateKbps</code>).</li>
+          <li><code>SNACKS_SCAN_&lt;Prop&gt;</code> → <code>autoscan.json</code>.</li>
+          <li><code>SNACKS_INTEG_&lt;Section&gt;__&lt;Prop&gt;</code> → <code>integrations.json</code>.</li>
+        </ul>
+        <p>
+          Property names are case-insensitive. Booleans accept <code>true/false/1/0/yes/no/on/off</code>;
+          string lists accept comma-separated or JSON values. An invalid or unknown variable logs a
+          warning once and is skipped — startup never fails on a bad override.
+        </p>
       </section>
 
       <section id="observability">
@@ -774,7 +792,7 @@ docker exec snacks vainfo</code></pre>
         </p>
         <div class="callout warning">
           <strong>Compatibility note.</strong> The API is not URL-versioned. Treat this reference as
-          the v2.15.1 contract and test automation against new Snacks releases before deployment.
+          the v2.16.0 contract and test automation against new Snacks releases before deployment.
         </div>
         <p>
           The running app also publishes a generated, machine-readable OpenAPI document at
@@ -804,6 +822,15 @@ curl -fsS -b snacks.cookies "$BASE/api/queue/stats"</code></pre>
           secret-authenticated cluster RPC are intentionally outside cookie authentication.
           SignalR is protected whenever UI authentication is enabled.
         </p>
+        <p>
+          For callers that can't do cookie login, <code>/api/*</code> also accepts an API key —
+          sent as an <code>X-Api-Key</code> header or an <code>Authorization: Bearer</code> token.
+          Generate one in <strong>Settings → Security → API Access</strong> (or via
+          <code>POST /api/auth/apikey/generate</code>), or supply one through the
+          <code>SNACKS_API_KEY</code> environment variable; both work at once, and the env-supplied
+          key is never revealed by the API.
+        </p>
+        <pre><code>curl -fsS -H "X-Api-Key: $SNACKS_API_KEY" "$BASE/api/queue/stats"</code></pre>
 
         <h3>Conventions</h3>
         <ul>
@@ -967,6 +994,9 @@ curl -fsS -b snacks.cookies \
             <tbody>
               <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/auth/config</code></td><td>—</td><td>Returns only <code>enabled</code>, <code>username</code>, and <code>hasPassword</code>.</td></tr>
               <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/auth/config</code></td><td><code>{enabled,username,password}</code></td><td>Saves auth; null/empty password preserves the existing hash. Clears the current cookie.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/auth/apikey</code></td><td>—</td><td>Returns the stored API key. A key supplied via <code>SNACKS_API_KEY</code> is never exposed here.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/auth/apikey/generate</code></td><td>—</td><td>Generates and persists a new stored API key, replacing any previous one.</td></tr>
+              <tr class="api-row"><td><span class="method delete">DELETE</span></td><td><code>/api/auth/apikey</code></td><td>—</td><td>Removes the stored API key. A key set via <code>SNACKS_API_KEY</code> stays valid.</td></tr>
               <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/notifications/config</code></td><td>—</td><td>Full destination and event-toggle configuration.</td></tr>
               <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/notifications/config</code></td><td>Notification config</td><td>Saves destinations and toggles.</td></tr>
               <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/notifications/test</code></td><td>One destination object</td><td>Sends a test notification.</td></tr>
@@ -1159,7 +1189,7 @@ node scripts/sync-version.mjs
 
       <footer>
         <p>
-          Snacks documentation for v2.15.1. This file is self-contained: save or print it for
+          Snacks documentation for v2.16.0. This file is self-contained: save or print it for
           offline use. The running app serves it at <code>/docs/index.html</code>.
         </p>
       </footer>

@@ -53,9 +53,11 @@ public sealed class AuthService
         {
             return new
             {
-                enabled     = _config.Enabled,
-                username    = _config.Username,
-                hasPassword = !string.IsNullOrEmpty(_config.PasswordHash),
+                enabled      = _config.Enabled,
+                username     = _config.Username,
+                hasPassword  = !string.IsNullOrEmpty(_config.PasswordHash),
+                hasApiKey    = !string.IsNullOrEmpty(_config.ApiKey),
+                envApiKeySet = HasEnvApiKey,
             };
         }
     }
@@ -77,6 +79,7 @@ public sealed class AuthService
                 Username      = username ?? "",
                 PasswordHash  = _config.PasswordHash,
                 SessionSecret = _config.SessionSecret,
+                ApiKey        = _config.ApiKey,
             };
 
             if (!string.IsNullOrEmpty(newPassword))
@@ -164,6 +167,65 @@ public sealed class AuthService
     public bool IsAuthRequired()
     {
         lock (_lock) return _config.Enabled && !string.IsNullOrEmpty(_config.PasswordHash);
+    }
+
+    /******************************************************************
+     *  API Key
+     ******************************************************************/
+
+    /// <summary> Whether an API key is configured via the SNACKS_API_KEY environment variable. </summary>
+    public bool HasEnvApiKey =>
+        !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("SNACKS_API_KEY"));
+
+    /// <summary>
+    ///     Validates a presented API key against the SNACKS_API_KEY env var and the stored
+    ///     key, both via constant-time comparison. Empty presented or configured keys never
+    ///     match — an unconfigured key must not accept an empty header.
+    /// </summary>
+    /// <param name="presented"> The key from the X-Api-Key header or Bearer token. </param>
+    public bool ValidateApiKey(string? presented)
+    {
+        if (string.IsNullOrEmpty(presented)) return false;
+
+        var envKey = Environment.GetEnvironmentVariable("SNACKS_API_KEY");
+        if (!string.IsNullOrEmpty(envKey) && SecretCompare.ConstantTimeEquals(envKey, presented))
+            return true;
+
+        string stored;
+        lock (_lock) stored = _config.ApiKey;
+        return !string.IsNullOrEmpty(stored) && SecretCompare.ConstantTimeEquals(stored, presented);
+    }
+
+    /// <summary>
+    ///     Generates, persists, and returns a new stored API key, replacing any previous one.
+    ///     An env-provided SNACKS_API_KEY is unaffected and stays valid alongside it.
+    /// </summary>
+    public string GenerateApiKey()
+    {
+        var key = "snk_" + Convert.ToBase64String(RandomNumberGenerator.GetBytes(32))
+            .Replace("+", "-").Replace("/", "_").TrimEnd('=');
+        lock (_lock)
+        {
+            _config.ApiKey = key;
+            _configFileService.Save("auth.json", _config);
+        }
+        return key;
+    }
+
+    /// <summary> Returns the stored API key ("" when none). The env key is never exposed. </summary>
+    public string GetStoredApiKey()
+    {
+        lock (_lock) return _config.ApiKey;
+    }
+
+    /// <summary> Removes the stored API key. An env-provided SNACKS_API_KEY is unaffected. </summary>
+    public void ClearApiKey()
+    {
+        lock (_lock)
+        {
+            _config.ApiKey = "";
+            _configFileService.Save("auth.json", _config);
+        }
     }
 
     /******************************************************************

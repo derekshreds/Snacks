@@ -39,6 +39,12 @@ const edits = [
             .replace(/<strong>Snacks<\/strong> v\d+\.\d+\.\d+/g, `<strong>Snacks</strong> v${version}`)
     },
     {
+        file: 'Snacks.Tests/Settings/AppVersionTests.cs',
+        update: text => text.replace(
+            /AppVersion\.Current\.Should\(\)\.Be\("[^"]+"\)/,
+            `AppVersion.Current.Should().Be("${version}")`)
+    },
+    {
         file: 'Snacks/wwwroot/docs/index.html',
         update: text => text
             .replace(/Documents Snacks v\d+\.\d+\.\d+/g, `Documents Snacks v${version}`)

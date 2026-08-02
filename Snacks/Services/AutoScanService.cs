@@ -928,8 +928,9 @@ public sealed class AutoScanService : IHostedService, IDisposable
         {
             try
             {
-                var json = File.ReadAllText(_settingsPath);
-                return JsonSerializer.Deserialize<EncoderOptions>(json, _jsonOptions) ?? new EncoderOptions();
+                var json   = File.ReadAllText(_settingsPath);
+                var parsed = JsonSerializer.Deserialize<EncoderOptions>(json, _jsonOptions) ?? new EncoderOptions();
+                return EnvConfigOverrides.Apply(parsed, EnvConfigOverrides.SettingsPrefix);
             }
             catch (Exception ex)
             {
@@ -937,7 +938,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
             }
         }
 
-        return new EncoderOptions();
+        return EnvConfigOverrides.Apply(new EncoderOptions(), EnvConfigOverrides.SettingsPrefix);
     }
 
     /// <summary>
@@ -958,15 +959,35 @@ public sealed class AutoScanService : IHostedService, IDisposable
                 _config = new AutoScanConfig();
             }
         }
+
+        EnvConfigOverrides.Apply(_config, EnvConfigOverrides.AutoScanPrefix);
     }
 
-    /// <summary> Serializes the current auto-scan config to <c>autoscan.json</c>. </summary>
+    /// <summary>
+    ///     Serializes the current auto-scan config to <c>autoscan.json</c>. Properties driven
+    ///     by SNACKS_SCAN_* env vars are restored from the on-disk file first (via a deep
+    ///     copy, so the live config keeps its env values) — unsetting a var reverts cleanly.
+    /// </summary>
     private void SaveConfig()
     {
         try
         {
-            var json = JsonSerializer.Serialize(_config, _jsonOptions);
-            File.WriteAllText(_configPath, json);
+            var copy = JsonSerializer.Deserialize<AutoScanConfig>(
+                JsonSerializer.Serialize(_config, _jsonOptions), _jsonOptions) ?? _config;
+
+            var fileState = new AutoScanConfig();
+            if (File.Exists(_configPath))
+            {
+                try
+                {
+                    fileState = JsonSerializer.Deserialize<AutoScanConfig>(
+                        File.ReadAllText(_configPath), _jsonOptions) ?? fileState;
+                }
+                catch { /* corrupt file — locked keys fall back to defaults */ }
+            }
+            EnvConfigOverrides.RestoreLockedValues(copy, fileState, EnvConfigOverrides.AutoScanPrefix);
+
+            File.WriteAllText(_configPath, JsonSerializer.Serialize(copy, _jsonOptions));
         }
         catch (Exception ex)
         {

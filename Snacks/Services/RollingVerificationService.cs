@@ -129,10 +129,12 @@ public sealed class RollingVerificationService : IHostedService, IDisposable
     {
         try
         {
-            var path = Path.Combine(_fileService.GetWorkingDirectory(), "config", "settings.json");
-            if (!File.Exists(path)) return 0;
-            var parsed = JsonSerializer.Deserialize<EncoderOptions>(File.ReadAllText(path), _jsonOptions);
-            return Math.Max(0, parsed?.VerifyFilesPerDay ?? 0);
+            var path   = Path.Combine(_fileService.GetWorkingDirectory(), "config", "settings.json");
+            var parsed = File.Exists(path)
+                ? JsonSerializer.Deserialize<EncoderOptions>(File.ReadAllText(path), _jsonOptions) ?? new EncoderOptions()
+                : new EncoderOptions();
+            EnvConfigOverrides.Apply(parsed, EnvConfigOverrides.SettingsPrefix);
+            return Math.Max(0, parsed.VerifyFilesPerDay);
         }
         catch
         {

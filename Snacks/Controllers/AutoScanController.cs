@@ -28,15 +28,38 @@ public sealed class AutoScanController : ControllerBase
      *  Configuration
      ******************************************************************/
 
-    /// <summary> Returns the current auto-scan configuration. </summary>
+    /// <summary>
+    ///     Returns the current auto-scan configuration with an <c>_envLocked</c> metadata
+    ///     array so the panel can render env-driven fields read-only. Self-serialized
+    ///     camelCase — MVC's naming policy does not rename JsonNode keys.
+    /// </summary>
     [HttpGet("config")]
-    public IActionResult GetConfig() => new JsonResult(_autoScan.GetConfig());
+    public IActionResult GetConfig()
+    {
+        var node = System.Text.Json.JsonSerializer.SerializeToNode(_autoScan.GetConfig(), _responseJsonOptions)!.AsObject();
+        node["_envLocked"] = new System.Text.Json.Nodes.JsonArray(
+            EnvConfigOverrides.LockedPaths(EnvConfigOverrides.AutoScanPrefix, typeof(AutoScanConfig))
+                .Select(p => (System.Text.Json.Nodes.JsonNode)p).ToArray());
+        return new JsonResult(node);
+    }
+
+    private static readonly System.Text.Json.JsonSerializerOptions _responseJsonOptions = new()
+    {
+        PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase,
+    };
+
+    /// <summary> 409 result for writes to a property currently driven by a SNACKS_SCAN_* env var, else null. </summary>
+    private IActionResult? RejectIfEnvLocked(string camelPath)
+        => EnvConfigOverrides.LockedPaths(EnvConfigOverrides.AutoScanPrefix, typeof(AutoScanConfig)).Contains(camelPath)
+            ? Conflict(new { error = "This setting is managed by an environment variable." })
+            : null;
 
     /// <summary> Enables or disables the auto-scan background service. </summary>
     /// <param name="request"> Contains the new enabled state. </param>
     [HttpPost("enabled")]
     public IActionResult SetEnabled([FromBody] AutoScanEnabledRequest request)
     {
+        if (RejectIfEnvLocked("enabled") is { } locked) return locked;
         try
         {
             _autoScan.SetEnabled(request.Enabled);
@@ -53,6 +76,7 @@ public sealed class AutoScanController : ControllerBase
     [HttpPost("interval")]
     public IActionResult SetInterval([FromBody] AutoScanIntervalRequest request)
     {
+        if (RejectIfEnvLocked("intervalMinutes") is { } locked) return locked;
         if (request.IntervalMinutes < 1 || request.IntervalMinutes > 1440)
             return BadRequest("Interval must be between 1 and 1440 minutes");
         _autoScan.SetInterval(request.IntervalMinutes);
@@ -71,6 +95,7 @@ public sealed class AutoScanController : ControllerBase
     [HttpPost("directories")]
     public IActionResult AddDirectory([FromBody] AutoScanDirectoryRequest request)
     {
+        if (RejectIfEnvLocked("directories") is { } locked) return locked;
         if (string.IsNullOrEmpty(request.Path)) return BadRequest("Path is required");
         if (!Directory.Exists(request.Path)) return BadRequest($"Directory does not exist: {request.Path}");
         if (!_fileService.IsPathAllowed(request.Path))
@@ -84,6 +109,7 @@ public sealed class AutoScanController : ControllerBase
     [HttpDelete("directories")]
     public IActionResult RemoveDirectory([FromBody] AutoScanDirectoryRequest request)
     {
+        if (RejectIfEnvLocked("directories") is { } locked) return locked;
         if (string.IsNullOrEmpty(request.Path)) return BadRequest("Directory path is required");
         _autoScan.RemoveDirectory(request.Path);
         return new JsonResult(new { success = true });
@@ -122,6 +148,7 @@ public sealed class AutoScanController : ControllerBase
     [HttpPost("exclusions")]
     public IActionResult SaveExclusions([FromBody] ExclusionRules rules)
     {
+        if (RejectIfEnvLocked("exclusionRules") is { } locked) return locked;
         _autoScan.UpdateExclusionRules(rules ?? new ExclusionRules());
         return new JsonResult(new { success = true });
     }

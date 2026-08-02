@@ -29,12 +29,40 @@
     </div>
 
     <div class="col-md-6">
+        <div class="encoder-panel rounded mb-4">
+            <h6 class="fw-bold mb-3"><i class="fas fa-key me-2 text-primary"></i>API Access</h6>
+            <p class="small text-muted">
+                Lets scripts and orchestrators call the API when sign-in is enabled — e.g. pause/resume
+                the queue or trigger a scan. Send the key as an <code>X-Api-Key</code> header or an
+                <code>Authorization: Bearer</code> token.
+            </p>
+
+            <div class="input-group mb-2">
+                <input type="password" class="form-control" id="apiKeyValue" readonly placeholder="No API key generated" autocomplete="off">
+                <button class="btn btn-outline-secondary" id="revealApiKeyBtn" type="button" title="Show / hide"><i class="fas fa-eye"></i></button>
+                <button class="btn btn-outline-secondary" id="copyApiKeyBtn" type="button" title="Copy to clipboard"><i class="fas fa-copy"></i></button>
+            </div>
+
+            <div class="d-flex gap-2 mb-2">
+                <button class="btn btn-primary btn-sm" id="generateApiKeyBtn"><i class="fas fa-sync me-1"></i>Generate new key</button>
+                <button class="btn btn-outline-danger btn-sm" id="deleteApiKeyBtn"><i class="fas fa-trash me-1"></i>Remove</button>
+            </div>
+
+            <div class="form-text" id="envApiKeyHint" style="display:none;">
+                <i class="fas fa-lock me-1"></i>An additional API key is configured via the <code>SNACKS_API_KEY</code> environment variable.
+            </div>
+            <div class="form-text">
+                Example: <code>curl -H "X-Api-Key: KEY" -X POST http://host:6767/api/queue/paused -H "Content-Type: application/json" -d '{"paused":true}'</code>
+            </div>
+        </div>
+
         <div class="encoder-panel rounded">
             <h6 class="fw-bold mb-3"><i class="fas fa-shield-alt me-2 text-warning"></i>Notes</h6>
             <ul class="small text-muted mb-0">
                 <li>When enabled, every browser request must present a valid session cookie.</li>
                 <li>Cluster traffic between master and nodes uses the shared secret configured in the Cluster tab — it is independent of this login.</li>
                 <li>Disabling auth rotates the session secret, invalidating all existing cookies.</li>
+                <li>API keys grant full API access — treat them like a password.</li>
             </ul>
         </div>
     </div>

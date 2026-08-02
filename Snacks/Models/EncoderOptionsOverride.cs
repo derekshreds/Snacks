@@ -199,6 +199,17 @@ public sealed class EncoderOptionsOverride
         if (over.Format != null)                      target.Format                     = over.Format;
         if (over.Codec != null)                       target.Codec                      = over.Codec;
         if (over.Encoder != null)                     target.Encoder                    = over.Encoder;
+        // The pipeline branches on Encoder, not Codec (GetEncoder, skip logic, cluster
+        // routing). The settings form keeps the pair consistent, but the override dialog
+        // only writes Codec — without re-deriving, a folder's "AV1" override still
+        // encoded with the global libx265.
+        if (over.Codec != null && over.Encoder == null)
+            target.Encoder = over.Codec.ToLowerInvariant() switch
+            {
+                "av1"  => "libsvtav1",
+                "h264" => "libx264",
+                _      => "libx265",
+            };
         if (over.TargetBitrate.HasValue)              target.TargetBitrate              = over.TargetBitrate.Value;
         if (over.StrictBitrate.HasValue)              target.StrictBitrate              = over.StrictBitrate.Value;
         if (over.FourKBitrateMultiplier.HasValue)     target.FourKBitrateMultiplier     = over.FourKBitrateMultiplier.Value;

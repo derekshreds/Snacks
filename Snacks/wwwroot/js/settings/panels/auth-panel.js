@@ -28,7 +28,24 @@ async function load() {
         document.getElementById('authEnabledHint').textContent = cfg.hasPassword
             ? 'A password is set. Leave the password field blank to keep it.'
             : 'No password set yet. Enter one below to enable sign-in.';
+
+        const envHint = document.getElementById('envApiKeyHint');
+        if (envHint) envHint.style.display = cfg.envApiKeySet ? '' : 'none';
+
+        await loadApiKey();
     } catch { /* auth may already gate this */ }
+}
+
+/**
+ * Fetches the stored API key into the masked field. The field stays
+ * type=password until the user clicks reveal.
+ */
+async function loadApiKey() {
+    try {
+        const data  = await authApi.getApiKey();
+        const input = document.getElementById('apiKeyValue');
+        if (input) input.value = data.apiKey || '';
+    } catch { /* gated pre-auth, same as the rest of the panel */ }
 }
 
 /**
@@ -82,6 +99,55 @@ async function signOut() {
 
 
 // ---------------------------------------------------------------------------
+// API key actions
+// ---------------------------------------------------------------------------
+
+async function generateApiKey() {
+    try {
+        const data  = await authApi.generateApiKey();
+        const input = document.getElementById('apiKeyValue');
+        if (input) {
+            input.value = data.apiKey || '';
+            input.type  = 'text'; // show the fresh key so it can be copied immediately
+        }
+        showToast('New API key generated — the old key no longer works', 'success');
+    } catch (e) {
+        showToast('Generate failed: ' + e.message, 'danger');
+    }
+}
+
+async function deleteApiKey() {
+    try {
+        await authApi.deleteApiKey();
+        const input = document.getElementById('apiKeyValue');
+        if (input) input.value = '';
+        showToast('API key removed', 'success');
+    } catch (e) {
+        showToast('Remove failed: ' + e.message, 'danger');
+    }
+}
+
+function toggleApiKeyVisibility() {
+    const input = document.getElementById('apiKeyValue');
+    if (input) input.type = input.type === 'password' ? 'text' : 'password';
+}
+
+async function copyApiKey() {
+    const input = document.getElementById('apiKeyValue');
+    if (!input?.value) { showToast('No API key to copy', 'warning'); return; }
+    try {
+        await navigator.clipboard.writeText(input.value);
+        showToast('API key copied', 'success');
+    } catch {
+        // Clipboard API needs a secure context — fall back to select-for-copy.
+        input.type = 'text';
+        input.select();
+        showToast('Press Ctrl/Cmd+C to copy', 'info');
+    }
+}
+
+
+// ---------------------------------------------------------------------------
 // Public entry points
 // ---------------------------------------------------------------------------
 
@@ -89,8 +155,12 @@ async function signOut() {
  * Wires the panel's DOM controls. Safe to call once at startup.
  */
 export function initAuthPanel() {
-    document.getElementById('saveAuthConfig')?.addEventListener('click', save);
-    document.getElementById('signOutBtn')    ?.addEventListener('click', signOut);
+    document.getElementById('saveAuthConfig')    ?.addEventListener('click', save);
+    document.getElementById('signOutBtn')        ?.addEventListener('click', signOut);
+    document.getElementById('generateApiKeyBtn') ?.addEventListener('click', generateApiKey);
+    document.getElementById('deleteApiKeyBtn')   ?.addEventListener('click', deleteApiKey);
+    document.getElementById('revealApiKeyBtn')   ?.addEventListener('click', toggleApiKeyVisibility);
+    document.getElementById('copyApiKeyBtn')     ?.addEventListener('click', copyApiKey);
 }
 
 /** Lazy data load, invoked when the settings modal is first opened. */
