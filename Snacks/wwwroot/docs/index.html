@@ -394,9 +394,11 @@
         <a href="#quick-start">Quick start</a>
         <a href="#everyday-use">Everyday use</a>
         <a href="#settings">Settings</a>
+        <a href="#processing-details">Processing &amp; file safety</a>
         <div class="group">Operations</div>
         <a href="#auto-scan">Automatic scanning</a>
         <a href="#cluster">Clusters</a>
+        <a href="#hardware-containers">Hardware &amp; containers</a>
         <a href="#integrations">Integrations</a>
         <a href="#data-backups">Data &amp; backups</a>
         <a href="#observability">Logs &amp; metrics</a>
@@ -413,7 +415,7 @@
         <div class="group">Contributors</div>
         <a href="#development">Development</a>
       </nav>
-      <div class="version">Documents Snacks v2.17.0 · updated 2026-08-02</div>
+      <div class="version">Documents Snacks v2.17.0 · updated 2026-08-07</div>
       </div>
     </aside>
 
@@ -624,6 +626,65 @@
         </div>
       </section>
 
+      <section id="processing-details">
+        <div class="eyebrow">What happens to a file</div>
+        <h2>Processing, retries, and file safety</h2>
+        <p>
+          Snacks stages output separately from the source, validates the result, and only then
+          performs final placement. Encoding never writes into the source file in place. Keep
+          <strong>Replace original files</strong> disabled until the chosen settings have been
+          tested with the playback clients and media types that matter to you.
+        </p>
+
+        <h3>Eligibility and smart filtering</h3>
+        <ul>
+          <li>Files whose codec is already at least as efficient as the target can be skipped when they sit below the configured bitrate ceiling and tolerance.</li>
+          <li>4K files use the configured 2×–8× bitrate multiplier; <strong>Skip 4K</strong> takes precedence over the remaining video rules.</li>
+          <li>Snacks does not re-encode AV1 down to HEVC or H.264, or HEVC down to H.264, merely to satisfy an exact codec-name match.</li>
+          <li>Mux, audio, subtitle, container, crop, resolution, frame-rate, and HDR work can make an otherwise efficient file eligible for processing.</li>
+          <li><strong>Analyze</strong> applies the same decision policy without adding work to the queue.</li>
+          <li>A filename already containing <code>[snacks]</code> is treated as previously produced output and is not automatically fed back into the pipeline.</li>
+        </ul>
+
+        <h3>Output names and placement</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Configuration</th><th>Result</th></tr></thead>
+            <tbody>
+              <tr><td>No output directory; replacement off</td><td><code>Movie [snacks].mkv</code> is placed beside the original, which remains untouched.</td></tr>
+              <tr><td>Output directory; replacement off</td><td>The tagged output is kept in that directory and the original stays in place.</td></tr>
+              <tr><td>Scratch/encode directory configured</td><td>Temporary output is created there, then moved to the requested final destination after validation.</td></tr>
+              <tr><td>Replacement on</td><td>The validated output is moved into the source directory with the <code>[snacks]</code> tag removed; replacement happens only during final placement.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          Sidecar files produced during processing move with the output. A stale tagged output
+          left by an interrupted attempt is removed before FFmpeg starts again. If an ordinary
+          encode is not smaller than its source, Snacks discards it as <code>NoSavings</code>;
+          intentional remuxes and explicitly configured audio-output growth are retained.
+        </p>
+
+        <h3>Video retry ladder</h3>
+        <p>
+          Retries are selected from the failure itself, so not every job uses every stage. The
+          normal escalation order is:
+        </p>
+        <ol>
+          <li>Retry unsupported hardware features with conservative encoder flags.</li>
+          <li>For decoder/filter-graph failures, use software decode while preserving hardware encode where supported.</li>
+          <li>Drop image-based subtitles while retaining text and successfully OCR-produced subtitles.</li>
+          <li>Retry without subtitles if a broken subtitle stream still prevents completion.</li>
+          <li>When <strong>Retry on failure</strong> is enabled, use the correct software encoder for the requested target codec.</li>
+        </ol>
+        <p>
+          Failed partial output is cleaned between attempts. When all retries are exhausted, the
+          source remains unchanged and the final reason is stored in the job log and catalog.
+          The music path is deliberately simpler: it validates duration and discards empty,
+          invalid, or no-savings output instead of using the video retry ladder.
+        </p>
+      </section>
+
       <section id="auto-scan">
         <div class="eyebrow">Background operation</div>
         <h2>Automatic scanning</h2>
@@ -631,6 +692,12 @@
           Auto-scan keeps a persistent catalog, watches one or more folders, and periodically
           finds new or materially changed media. A file modified in the last 30 minutes is
           skipped to avoid reading it during a transfer.
+        </p>
+        <p>
+          A known path is treated as replaced media when its size changes by more than 10% or its
+          duration changes by more than 30 seconds. It is then probed and evaluated as new work.
+          Previously processed rows are retained in SQLite across restarts, failed files carry a
+          failure count, and interrupted <code>[snacks]</code> output is cleaned before retrying.
         </p>
         <ol>
           <li>Add watched directories in the library browser or through the API.</li>
@@ -697,6 +764,55 @@
           Workers fail closed: configure explicit input and output allowlists. If mount points
           differ, add master-prefix → worker-prefix rewrites; the longest matching prefix wins.
           If either side cannot safely use the shared path, Snacks falls back to normal transfer.
+        </p>
+      </section>
+
+      <section id="hardware-containers">
+        <div class="eyebrow">Platform details</div>
+        <h2>Hardware acceleration and containers</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Encoder family</th><th>Docker / Linux</th><th>Windows</th><th>macOS</th></tr></thead>
+            <tbody>
+              <tr><td>NVIDIA</td><td>NVENC through CUDA runtime</td><td>NVENC</td><td>—</td></tr>
+              <tr><td>Intel</td><td>VAAPI</td><td>QSV</td><td>—</td></tr>
+              <tr><td>AMD</td><td>VAAPI</td><td>AMF</td><td>—</td></tr>
+              <tr><td>Apple</td><td>—</td><td>—</td><td>VideoToolbox H.264/HEVC</td></tr>
+              <tr><td>Software</td><td>x264, x265, SVT-AV1</td><td>x264, x265, SVT-AV1</td><td>x264, x265, SVT-AV1</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <ul>
+          <li>Hardware detection runs automatically and tests real encoder availability rather than relying only on device names.</li>
+          <li>Linux detection checks every <code>/dev/dri/renderD*</code> node, so an Intel iGPU can still be found when a discrete GPU owns <code>renderD128</code>.</li>
+          <li>On older Intel/AMD devices, Snacks can decode an unsupported source in software and still encode through VAAPI.</li>
+          <li>QNAP commonly needs <code>privileged: true</code> because its video/render group layout differs from conventional Linux hosts. Unraid normally uses group access instead; follow <code>unraid/README.md</code>.</li>
+          <li>Intel Elkhart Lake devices such as the QNAP TS-453E use VAAPI constant-quality control rather than VBR.</li>
+          <li>Apple silicon can use VideoToolbox AV1 decode where available, but FFmpeg does not expose an AV1 VideoToolbox encoder; AV1 output therefore uses SVT-AV1 software encoding.</li>
+        </ul>
+
+        <h3>NVIDIA in Docker</h3>
+        <p>
+          Passing <code>/dev/dri</code> or enabling privileged mode is not enough for NVENC.
+          Install the NVIDIA Container Toolkit on the host and configure the NVIDIA runtime:
+        </p>
+        <pre><code>runtime: nvidia
+environment:
+  - NVIDIA_VISIBLE_DEVICES=all
+  - NVIDIA_DRIVER_CAPABILITIES=compute,video,utility</code></pre>
+
+        <h3>Healthcheck</h3>
+        <p>Add this to the Docker service when the host should monitor application liveness:</p>
+        <pre><code>healthcheck:
+  test: ["CMD", "curl", "-f", "http://localhost:6767/api/health"]
+  interval: 30s
+  timeout: 10s
+  retries: 3
+  start_period: 40s</code></pre>
+        <p>
+          The maintained QNAP example is <code>deploy-compose.yml</code>. Typical media roots are
+          <code>/share/CACHEDEV1_DATA/Multimedia</code> or <code>/share/Public</code> on QNAP and
+          <code>/volume1/video</code> or <code>/volume1/Media</code> on Synology.
         </p>
       </section>
 
@@ -774,8 +890,31 @@
         </ul>
         <p>
           Property names are case-insensitive. Booleans accept <code>true/false/1/0/yes/no/on/off</code>;
-          string lists accept comma-separated or JSON values. An invalid or unknown variable logs a
-          warning once and is skipped — startup never fails on a bad override.
+          numbers and enums accept their plain values; string lists accept comma-separated or JSON
+          values; nested objects and other complex values accept JSON. An invalid or unknown
+          variable logs a warning once and is skipped — startup never fails on a bad override.
+        </p>
+        <pre><code>environment:
+  - SNACKS_API_KEY=change-me
+  - SNACKS_SET_Codec=av1
+  - SNACKS_SET_TargetBitrate=2500
+  - SNACKS_SET_Music__BitrateKbps=256
+  - SNACKS_SET_AudioLanguagesToKeep=en,ja
+  - 'SNACKS_SET_AudioOutputs=[{"Codec":"aac","Layout":"Stereo","BitrateKbps":192}]'
+  - 'SNACKS_SCAN_Directories=["/media/tv","/media/movies"]'
+  - SNACKS_SCAN_Enabled=true
+  - SNACKS_SCAN_IntervalMinutes=30
+  - SNACKS_INTEG_Plex__BaseUrl=http://plex:32400
+  - SNACKS_INTEG_Plex__Token=replace-me
+  - SNACKS_INTEG_Plex__RescanOnComplete=true
+  - SNACKS_INTEG_Plex__Enabled=true</code></pre>
+        <p>
+          Environment values win on every load, but are never copied into the JSON files.
+          <code>HardwareDevicePath</code> is dispatch-specific and cannot be pinned. Runtime scan
+          state—<code>QueuePaused</code>, <code>LastScanTime</code>, and
+          <code>LastScanNewFiles</code>—is also excluded; control pause state through the queue API.
+          On a worker, settings sent with a master-assigned job are authoritative, so node-local
+          <code>SNACKS_SET_*</code> values affect only work queued by that node itself.
         </p>
       </section>
 
@@ -1272,6 +1411,40 @@ node scripts/sync-version.mjs
 
 # Run documented multi-process scenarios (see e2e/README.md)
 ./e2e/scenarios/01-sweep-memory.sh</code></pre>
+        <div class="callout">
+          <strong>Building a desktop package or publishing a release?</strong>
+          The source repository includes <code>docs/BUILDING.md</code>, which is the maintained
+          guide for prerequisites, FFmpeg staging, Windows signing, macOS dylib bundling and
+          notarization, Docker publishing, versioning, E2E tests, and the release checklist.
+          <a href="https://github.com/derekshreds/Snacks/blob/master/docs/BUILDING.md">Open it on GitHub.</a>
+        </div>
+        <h3>Desktop packaging summary</h3>
+        <div class="grid">
+          <div class="card">
+            <h4>Windows x64</h4>
+            <ol>
+              <li>Install .NET 10 and Node.js 22 or newer.</li>
+              <li>Place <code>ffmpeg.exe</code> and <code>ffprobe.exe</code> in <code>electron-app/ffmpeg/</code>.</li>
+              <li>Run <code>run-electron-dev.bat</code> for development or <code>build-installer.bat</code> for NSIS output.</li>
+              <li>Optional signing reads <code>signing/snacks-signing.pfx</code> and the gitignored <code>signing/password.txt</code>.</li>
+            </ol>
+          </div>
+          <div class="card">
+            <h4>Apple silicon macOS</h4>
+            <ol>
+              <li>Install .NET 10, Node.js 22+, Xcode tools, and <code>brew install ffmpeg tesseract leptonica</code>.</li>
+              <li>Copy the Homebrew FFmpeg and FFprobe binaries into <code>electron-app/ffmpeg/</code>.</li>
+              <li>Run <code>./build-mac.sh</code>; it bundles non-system FFmpeg/OCR dylibs and produces a self-contained DMG.</li>
+              <li>Optional distribution signing uses <code>CSC_NAME</code>, <code>APPLE_ID</code>, <code>APPLE_APP_SPECIFIC_PASSWORD</code>, and <code>APPLE_TEAM_ID</code> from <code>electron-app/.env.mac.local</code>.</li>
+            </ol>
+          </div>
+        </div>
+        <p>
+          The Windows installer and macOS DMG are written beneath <code>electron-app/dist/</code>.
+          Never commit signing certificates, passwords, or Apple credentials. The Docker
+          <code>build-and-export.bat</code> script pushes two public image names and requires an
+          explicit confirmation; use a normal local <code>docker buildx build</code> for testing.
+        </p>
         <h3>Architecture map</h3>
         <div class="table-wrap">
           <table>

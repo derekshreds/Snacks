@@ -24,6 +24,7 @@
 <p align="center">
   <a href="https://snacksvideo.com/">Website</a> ·
   <a href="https://snacksvideo.com/docs/">Documentation</a> ·
+  <a href="Snacks/wwwroot/docs/index.html">Offline guide</a> ·
   <a href="https://github.com/derekshreds/Snacks/releases/latest">Downloads</a> ·
   <a href="https://discord.com/invite/DT3nWdq4av">Discord</a>
 </p>
@@ -199,7 +200,11 @@ Desktop packages use the Electron wrapper in `electron-app/`:
 - `build-mac.sh` builds the Apple silicon DMG.
 - `run-electron-dev.bat` starts the Windows desktop development environment.
 
-The build scripts package the backend, FFmpeg, and required runtime components into the desktop artifacts. See [development and verification](https://snacksvideo.com/docs/#development) for the repository-specific checks used before a release.
+The build scripts package the backend, FFmpeg, and required runtime components into the desktop
+artifacts. See the repository's [complete build and release guide](docs/BUILDING.md) for FFmpeg
+staging, Windows signing, macOS dylib bundling/notarization, Docker publishing, and release checks.
+The [development and verification handbook](https://snacksvideo.com/docs/#development) contains
+the shorter day-to-day workflow.
 
 Bug reports and focused pull requests are welcome through [GitHub Issues](https://github.com/derekshreds/Snacks/issues).
 
@@ -209,6 +214,9 @@ Bug reports and focused pull requests are welcome through [GitHub Issues](https:
 
 - [Product website](https://snacksvideo.com/)
 - [User guide and operations handbook](https://snacksvideo.com/docs/)
+- [Offline HTML guide included in this repository](Snacks/wwwroot/docs/index.html)
+- [Build and release guide](docs/BUILDING.md)
+- [Unraid installation guide](unraid/README.md)
 - [Latest release and desktop downloads](https://github.com/derekshreds/Snacks/releases/latest)
 - [Docker Hub](https://hub.docker.com/r/derekshreds/snacks-docker)
 - [Discord community](https://discord.com/invite/DT3nWdq4av)

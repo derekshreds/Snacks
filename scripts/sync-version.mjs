@@ -59,6 +59,10 @@ const edits = [
             .replace(/the v\d+\.\d+\.\d+ contract/g, `the v${version} contract`)
             .replace(/Snacks documentation for v\d+\.\d+\.\d+/g, `Snacks documentation for v${version}`)
             .replace(/Electron \d+ wraps/g, `Electron ${electronMajor} wraps`)
+    },
+    {
+        file: 'docs/BUILDING.md',
+        update: text => text.replace(/Electron \d+/g, `Electron ${electronMajor}`)
     }
 ];
 

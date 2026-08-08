@@ -91,7 +91,7 @@ bash electron-app/scripts/bundle-ocr-mac.sh electron-app/backend
 echo "Backend published."
 echo
 
-# SkiaSharp 2.88.8 ships macOS arm64 natives in the base package, so nothing to do
+# SkiaSharp currently ships macOS arm64 natives in the base package, so nothing to do
 # here for image rendering. If a future SDK bump drops them, libSkiaSharp.dylib will
 # be missing from the publish output and the app will fail at runtime.
 if ! ls electron-app/backend/libSkiaSharp*.dylib >/dev/null 2>&1; then
