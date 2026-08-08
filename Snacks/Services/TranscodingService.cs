@@ -91,6 +91,7 @@ public class TranscodingService
     private readonly IHubContext<TranscodingHub> _hubContext;
     private readonly MediaFileRepository _mediaFileRepo;
     private readonly ILogger<TranscodingService>? _log;
+    private readonly FfmpegCapabilityService _ffmpegCapabilities;
 
     /// <summary>Path to the FFmpeg binary, resolved from the <c>FFMPEG_PATH</c> environment variable.</summary>
     private readonly string _ffmpegPath;
@@ -386,6 +387,35 @@ public class TranscodingService
         _folderOverrideResolver?.Invoke(filePath);
 
     /// <summary>
+    ///     Resolves the current video policy for a hydrated work item. Both local and
+    ///     cluster schedulers call this before slot selection so profile codec/encoder
+    ///     requirements participate in routing rather than being applied afterwards.
+    /// </summary>
+    public VideoPolicyResolution ResolveVideoPolicyForWorkItem(
+        WorkItem workItem,
+        EncoderOptions globalOptions,
+        EncoderOptionsOverride? nodeOverride = null)
+    {
+        var resolution = VideoPolicyResolver.Resolve(
+            globalOptions,
+            ResolveFolderOverride(workItem.Path),
+            nodeOverride,
+            VideoSourceFacts.From(workItem));
+        ApplyVideoPlan(workItem, resolution.Plan);
+        return resolution;
+    }
+
+    private static void ApplyVideoPlan(WorkItem workItem, VideoJobPlan plan)
+    {
+        workItem.VideoPlan         = plan.Clone();
+        workItem.VideoPolicyAction = plan.Action;
+        workItem.VideoRuleName     = plan.RuleName;
+        workItem.VideoProfileName  = plan.ProfileName;
+        workItem.VideoEncoderName  = plan.ExplicitEncoder;
+        workItem.WaitReason        = plan.BlockingReason;
+    }
+
+    /// <summary>
     ///     Initializes the service and eagerly starts hardware acceleration detection in the
     ///     background so that the first queue item does not pay the detection cost.
     /// </summary>
@@ -431,7 +461,8 @@ public class TranscodingService
         IntegrationService? integrationService = null,
         SubtitleExtractionService? subtitleExtractionService = null,
         EncodeHistoryRepository? encodeHistoryRepo = null,
-        ILogger<TranscodingService>? logger = null)
+        ILogger<TranscodingService>? logger = null,
+        FfmpegCapabilityService? ffmpegCapabilities = null)
     {
         _fileService               = fileService;
         _ffprobeService            = ffprobeService;
@@ -442,6 +473,7 @@ public class TranscodingService
         _subtitleExtractionService = subtitleExtractionService;
         _encodeHistoryRepo         = encodeHistoryRepo;
         _log                       = logger;
+        _ffmpegCapabilities        = ffmpegCapabilities ?? new FfmpegCapabilityService();
         _ffmpegPath          = Environment.GetEnvironmentVariable("FFMPEG_PATH") ?? "ffmpeg";
 
         // Periodic memory sweep — releases probe data on finished items and caps
@@ -462,6 +494,11 @@ public class TranscodingService
                 // first encode permanently fails to reserve a slot.
                 try { _hardwareDetectedCallback?.Invoke(); }
                 catch (Exception ex) { Log.Warning($"HardwareDetected callback error: {ex.Message}"); }
+                // Encoder/device capability changes can make an exact profile
+                // schedulable. Re-evaluate the queue immediately instead of waiting
+                // for an unrelated enqueue or an active job to finish.
+                MarkQueueWindowDirty();
+                try { _onWorkItemQueued?.Invoke(); } catch { }
                 await _hubContext.Clients.All.SendAsync("HardwareDetected", _detectedHardware);
             }
             catch
@@ -686,6 +723,11 @@ public class TranscodingService
                 Bitrate = bitrate,
                 Length = length,
                 IsHevc = isHevc,
+                SourceCodec = sourceCodec,
+                SourceWidth = probe.Streams.FirstOrDefault(s => s.CodecType == "video")?.Width ?? 0,
+                SourceHeight = probe.Streams.FirstOrDefault(s => s.CodecType == "video")?.Height ?? 0,
+                SourcePixelFormat = probe.Streams.FirstOrDefault(s => s.CodecType == "video")?.PixFmt,
+                SourceIsHdr = FfprobeService.IsHdr(probe),
                 Probe = probe,
                 Kind = MediaKind.Video,
                 ForceMux = forceMux,
@@ -734,9 +776,31 @@ public class TranscodingService
             // provider, and so WouldSkipUnderOptions / AnalyzeFileAsync can stay in sync.
             // Reuses the row fetched before the probe — nothing else mutates it mid-add.
             var dbFile = earlyDbFile;
-            string? originalLanguage = await ResolveOriginalLanguageAsync(filePath, options, dbFile, cancellationToken);
-            var effectiveOptions = WithOriginalLanguageMerged(options, originalLanguage);
+            var folderOverride = ResolveFolderOverride(filePath);
+            var policy = VideoPolicyResolver.Resolve(
+                options,
+                folderOverride,
+                null,
+                VideoSourceFacts.From(probe, fileInfo.Length, bitrate, length));
+            workItem.VideoPlan         = policy.Plan.Clone();
+            workItem.VideoPolicyAction = policy.Plan.Action;
+            workItem.VideoRuleName     = policy.Plan.RuleName;
+            workItem.VideoProfileName  = policy.Plan.ProfileName;
+            workItem.WaitReason        = policy.Plan.BlockingReason;
+
+            string? originalLanguage = await ResolveOriginalLanguageAsync(filePath, policy.Options, dbFile, cancellationToken);
+            var effectiveOptions = WithOriginalLanguageMerged(policy.Options, originalLanguage);
             bool isHdr = FfprobeService.IsHdr(probe);
+
+            // Target codec is profile-dependent. Recompute the legacy ladder inputs after
+            // policy resolution so its Simple arm remains unchanged while Advanced profiles
+            // do not accidentally inherit the caller's global codec.
+            targetIsHevc = effectiveOptions.Encoder.Contains("265", StringComparison.OrdinalIgnoreCase)
+                           || VideoSourceFacts.NormalizeCodec(effectiveOptions.Codec) == "h265";
+            targetIsAv1 = effectiveOptions.Encoder.Contains("av1", StringComparison.OrdinalIgnoreCase)
+                          || effectiveOptions.Encoder.Contains("svt", StringComparison.OrdinalIgnoreCase)
+                          || VideoSourceFacts.NormalizeCodec(effectiveOptions.Codec) == "av1";
+            alreadyTargetCodec = SourceCodecMeetsTarget(isAv1, isHevc, isH264, targetIsHevc, targetIsAv1);
 
             async Task MarkSkippedInDb()
             {
@@ -767,12 +831,24 @@ public class TranscodingService
                 });
             }
 
+            bool advancedBlocked = !string.IsNullOrEmpty(policy.Plan.BlockingReason);
+            if (!advancedBlocked && policy.Plan.Action == AdvancedVideoAction.Skip)
+            {
+                Log.Information($"Skipping {workItem.FileName}: advanced video policy{(policy.Plan.RuleName == null ? "" : $" rule '{policy.Plan.RuleName}'")}");
+                await MarkSkippedInDb();
+                return workItem.Id;
+            }
+
+            bool forceProfileTranscode = advancedBlocked
+                                         || policy.Plan.Action == AdvancedVideoAction.TranscodeWithProfile;
+
             // "Process Item" / "Process Directory" force-mux: evaluate this file as Hybrid
             // even when the global mode is Transcode, so an at-target file gets a video-copy
             // mux pass (audio/subs re-applied, container normalized) instead of being skipped.
             // Above-target / wrong-codec files still re-encode through the normal ladder below.
             // Cloned so the caller's options object isn't mutated.
-            if (forceMux && effectiveOptions.EncodingMode == EncodingMode.Transcode)
+            if (forceMux && policy.Plan.Action == AdvancedVideoAction.UseSimpleSettings
+                         && effectiveOptions.EncodingMode == EncodingMode.Transcode)
             {
                 effectiveOptions = effectiveOptions.Clone();
                 effectiveOptions.EncodingMode = EncodingMode.Hybrid;
@@ -783,7 +859,8 @@ public class TranscodingService
             // setting is never what the user wants. For a force-mux item, a container change
             // (source extension != the configured output Format) also counts as work.
             bool hasMuxableWork       = HasMuxableWork(effectiveOptions, probe);
-            bool needsContainerChange = forceMux && NeedsContainerChange(effectiveOptions, filePath);
+            bool needsContainerChange = (forceMux || policy.Plan.Action == AdvancedVideoAction.MuxOnly)
+                                        && NeedsContainerChange(effectiveOptions, filePath);
             bool bypassSkip = (effectiveOptions.EncodingMode != EncodingMode.Transcode && hasMuxableWork)
                               || needsContainerChange;
 
@@ -797,7 +874,7 @@ public class TranscodingService
                 return workItem.Id;
             }
 
-            if (effectiveOptions.Skip4K && isHighDef)
+            if (!forceProfileTranscode && effectiveOptions.Skip4K && isHighDef)
             {
                 Log.Information($"Skipping {workItem.FileName}: 4K video (Skip 4K enabled)");
                 await MarkSkippedInDb();
@@ -808,7 +885,7 @@ public class TranscodingService
             // already as efficient as the target (e.g. an AV1 source under an HEVC target).
             string sourceCodecLabel = isAv1 ? "AV1" : isHevc ? "HEVC" : isH264 ? "H.264" : sourceCodec.ToUpperInvariant();
             double skipMultiplier = 1.0 + (Math.Clamp(effectiveOptions.SkipPercentAboveTarget, 0, 100) / 100.0);
-            if (alreadyTargetCodec && bitrate > 0 && bitrate <= effectiveOptions.TargetBitrate * skipMultiplier && !isHighDef && !bypassSkip)
+            if (!forceProfileTranscode && alreadyTargetCodec && bitrate > 0 && bitrate <= effectiveOptions.TargetBitrate * skipMultiplier && !isHighDef && !bypassSkip)
             {
                 Log.Information($"Skipping {workItem.FileName}: already {sourceCodecLabel} at {bitrate}kbps (target {effectiveOptions.TargetBitrate}kbps, skip threshold {skipMultiplier:P0})");
                 await MarkSkippedInDb();
@@ -817,7 +894,7 @@ public class TranscodingService
 
             int fourKMultiplier = Math.Clamp(effectiveOptions.FourKBitrateMultiplier, 2, 8);
             int fourKTarget = effectiveOptions.TargetBitrate * fourKMultiplier;
-            if (alreadyTargetCodec && isHighDef && bitrate > 0 && bitrate <= fourKTarget * skipMultiplier && !bypassSkip)
+            if (!forceProfileTranscode && alreadyTargetCodec && isHighDef && bitrate > 0 && bitrate <= fourKTarget * skipMultiplier && !bypassSkip)
             {
                 Log.Information($"Skipping {workItem.FileName}: already {sourceCodecLabel} 4K at {bitrate}kbps (4K target {fourKTarget}kbps)");
                 await MarkSkippedInDb();
@@ -829,7 +906,7 @@ public class TranscodingService
             bool isVaapiMode = IsVaapiAcceleration(effectiveOptions.HardwareAcceleration) ||
                 (effectiveOptions.HardwareAcceleration.Equals("auto", StringComparison.OrdinalIgnoreCase) &&
                     _detectedHardware != null && IsVaapiAcceleration(_detectedHardware));
-            if (isVaapiMode && ((targetIsHevc && !isHevc) || (targetIsAv1 && !isAv1))
+            if (!forceProfileTranscode && isVaapiMode && ((targetIsHevc && !isHevc) || (targetIsAv1 && !isAv1))
                 && bitrate > 0 && bitrate <= effectiveOptions.TargetBitrate && !isHighDef && !bypassSkip)
             {
                 Log.Information($"Skipping {workItem.FileName}: VAAPI can't compress {bitrate}kbps {sourceCodecLabel} below target");
@@ -840,7 +917,7 @@ public class TranscodingService
             // No-op gate: an HEVC file just above the bitrate ceiling would otherwise fall through
             // to a videoCopy=true encode, and if the audio/sub pipeline has nothing to change either,
             // running ffmpeg just produces a near-identical output. Skip it instead.
-            if (!bypassSkip && WouldEncodeBeNoOp(
+            if (!forceProfileTranscode && !bypassSkip && WouldEncodeBeNoOp(
                     effectiveOptions, bitrate, isHevc, videoStream?.Height ?? 0, FfprobeService.IsHdr(probe),
                     ProjectAudioSummaries(probe), ProjectSubtitleSummaries(probe)))
             {
@@ -849,7 +926,8 @@ public class TranscodingService
                 return workItem.Id;
             }
 
-            Log.Information($"Queuing {workItem.FileName}: {sourceCodec} {bitrate}kbps {(isHighDef ? "4K" : "HD")}");
+            Log.Information($"Queuing {workItem.FileName}: {sourceCodec} {bitrate}kbps {(isHighDef ? "4K" : "HD")}" +
+                            (policy.Plan.ProfileName == null ? "" : $" → profile {policy.Plan.ProfileName}"));
 
             if (FindWorkItemByPath(normalizedPath) is { Status: WorkItemStatus.Pending
                     or WorkItemStatus.Processing or WorkItemStatus.Uploading
@@ -1401,6 +1479,25 @@ public class TranscodingService
             result.Height = height;
             result.Duration = length;
 
+            bool sourceHdr = probe != null ? FfprobeService.IsHdr(probe) : dbFile?.IsHdr ?? false;
+            // Use the same projection as scan/re-evaluation/dispatch so derived
+            // bit depth, codec aliases, resolution classes, HDR, and unknown-value
+            // semantics cannot drift in Analyze mode.
+            var sourceFacts = probe != null
+                ? VideoSourceFacts.From(probe, fileInfo.Length, bitrate, length)
+                : VideoSourceFacts.From(dbFile!);
+            var policy = VideoPolicyResolver.Resolve(
+                options,
+                ResolveFolderOverride(filePath),
+                null,
+                sourceFacts);
+            options = policy.Options;
+            result.VideoPolicyAction = policy.Plan.Action;
+            result.MatchedRule        = policy.Plan.RuleName;
+            result.SelectedProfile    = policy.Plan.ProfileName;
+            result.VideoPlanWarnings  = new List<string>(policy.Plan.Warnings);
+            result.VideoPlanSummary   = DescribeVideoPlan(policy.Plan, options);
+
             // Resolve original language up front so the skip ladder predicts using the same
             // effective keep lists ConvertVideoAsync would use. Reads the cached value when
             // the row already has one (eg. AddFileAsync ran earlier), otherwise hits the
@@ -1484,6 +1581,23 @@ public class TranscodingService
                 }
             }
 
+            if (!string.IsNullOrEmpty(policy.Plan.BlockingReason))
+            {
+                result.Decision = "Queue";
+                result.Reason = $"Waiting for valid advanced video settings: {policy.Plan.BlockingReason}";
+                return result;
+            }
+            if (policy.Plan.Action == AdvancedVideoAction.Skip)
+            {
+                result.Decision = "Skip";
+                result.Reason = policy.Plan.RuleName == null
+                    ? "Skipped by the advanced video default action."
+                    : $"Skipped by advanced video rule '{policy.Plan.RuleName}'.";
+                return result;
+            }
+
+            bool forceProfileTranscode = policy.Plan.Action == AdvancedVideoAction.TranscodeWithProfile;
+
             // EncodingMode/MuxStreams gates — must precede the bitrate/codec ladder so a
             // Hybrid+muxable file shows as Mux instead of Skip. We need stream summaries to
             // answer HasMuxableWork; build them from probe (or from the cached DB blob when
@@ -1501,16 +1615,19 @@ public class TranscodingService
                 subtitleStreams = MuxStreamSummary.DeserializeSubtitle(dbFile?.SubtitleStreams);
             }
             bool hasMuxableWork = HasMuxableWork(options, audioStreams, subtitleStreams);
-            bool bypassSkip     = options.EncodingMode != EncodingMode.Transcode && hasMuxableWork;
+            bool advancedMuxContainerWork = policy.Plan.Action == AdvancedVideoAction.MuxOnly
+                                            && NeedsContainerChange(options, filePath);
+            bool bypassSkip = options.EncodingMode != EncodingMode.Transcode
+                              && (hasMuxableWork || advancedMuxContainerWork);
 
-            if (options.EncodingMode == EncodingMode.MuxOnly && !hasMuxableWork)
+            if (options.EncodingMode == EncodingMode.MuxOnly && !hasMuxableWork && !advancedMuxContainerWork)
             {
                 result.Decision = "Skip";
-                result.Reason   = "MuxOnly mode and no audio/subtitle work to do.";
+                result.Reason   = "MuxOnly mode and no container, audio, or subtitle work to do.";
                 return result;
             }
 
-            if (options.Skip4K && isHighDef)
+            if (!forceProfileTranscode && options.Skip4K && isHighDef)
             {
                 result.Decision = "Skip";
                 result.Reason   = $"4K video ({width}×{height}) — Skip 4K enabled.";
@@ -1523,14 +1640,14 @@ public class TranscodingService
             int skipCeilingHd = (int)(options.TargetBitrate * skipMultiplier);
             int skipCeiling4K = (int)(fourKTarget * skipMultiplier);
 
-            if (alreadyTargetCodec && bitrate > 0 && bitrate <= skipCeilingHd && !isHighDef && !bypassSkip)
+            if (!forceProfileTranscode && alreadyTargetCodec && bitrate > 0 && bitrate <= skipCeilingHd && !isHighDef && !bypassSkip)
             {
                 result.Decision = "Skip";
                 result.Reason   = $"Already {sourceCodecLabel} · {bitrate}kbps ≤ {skipCeilingHd}kbps{tolLabel}.";
                 return result;
             }
 
-            if (alreadyTargetCodec && isHighDef && bitrate > 0 && bitrate <= skipCeiling4K && !bypassSkip)
+            if (!forceProfileTranscode && alreadyTargetCodec && isHighDef && bitrate > 0 && bitrate <= skipCeiling4K && !bypassSkip)
             {
                 result.Decision = "Skip";
                 result.Reason   = $"Already {sourceCodecLabel} 4K · {bitrate}kbps ≤ {skipCeiling4K}kbps (4K target {fourKTarget}kbps).";
@@ -1540,7 +1657,7 @@ public class TranscodingService
             bool isVaapiMode = IsVaapiAcceleration(options.HardwareAcceleration) ||
                 (options.HardwareAcceleration.Equals("auto", StringComparison.OrdinalIgnoreCase) &&
                  _detectedHardware != null && IsVaapiAcceleration(_detectedHardware));
-            if (isVaapiMode && ((targetIsHevc && !isHevc) || (targetIsAv1 && !isAv1))
+            if (!forceProfileTranscode && isVaapiMode && ((targetIsHevc && !isHevc) || (targetIsAv1 && !isAv1))
                 && bitrate > 0 && bitrate <= options.TargetBitrate && !isHighDef && !bypassSkip)
             {
                 result.Decision = "Skip";
@@ -1554,13 +1671,21 @@ public class TranscodingService
             // treat HDR sources as SDR — a tonemap-on user would see analyze report Skip while
             // AddFileAsync would queue for transcode (active filter forces re-encode).
             int sourceHeight = height;
-            bool isHdr = probe != null
-                ? FfprobeService.IsHdr(probe)
-                : dbFile?.IsHdr ?? false;
-            if (!bypassSkip && WouldEncodeBeNoOp(options, bitrate, isHevc, sourceHeight, isHdr, audioStreams, subtitleStreams))
+            bool isHdr = sourceHdr;
+            if (!forceProfileTranscode && !bypassSkip && WouldEncodeBeNoOp(options, bitrate, isHevc, sourceHeight, isHdr, audioStreams, subtitleStreams))
             {
                 result.Decision = "Skip";
                 result.Reason   = $"Already {sourceCodecLabel} at {bitrate}kbps · no audio/subtitle changes · no filters — nothing to do.";
+                return result;
+            }
+
+            if (forceProfileTranscode)
+            {
+                result.Decision = "Queue";
+                result.EncodeTargetKbps = policy.Plan.Profile?.RateControl.Mode == VideoRateControlMode.Bitrate
+                    ? policy.Plan.Profile.RateControl.TargetKbps
+                    : 0;
+                result.Reason = $"Advanced profile '{policy.Plan.ProfileName}' forces video re-encoding. {result.VideoPlanSummary}";
                 return result;
             }
 
@@ -1569,14 +1694,15 @@ public class TranscodingService
             // MuxOnly), the encoder runs with -c:v copy. Otherwise replicate CalculateBitrates.
             bool meetsBitrateTarget = alreadyTargetCodec && bitrate > 0
                 && bitrate <= (isHighDef ? skipCeiling4K : skipCeilingHd);
-            bool isMuxPass = options.EncodingMode != EncodingMode.Transcode && hasMuxableWork
+            bool isMuxPass = options.EncodingMode != EncodingMode.Transcode
+                && (hasMuxableWork || advancedMuxContainerWork)
                 && (options.EncodingMode == EncodingMode.MuxOnly || meetsBitrateTarget);
             if (isMuxPass)
             {
                 result.EncodeTargetKbps = 0;
                 result.Decision = "Mux";
                 result.Reason   = options.EncodingMode == EncodingMode.MuxOnly
-                    ? $"MuxOnly · {targetCodecLabel} {bitrate}kbps — copy video, mux audio/subs."
+                    ? $"MuxOnly · {targetCodecLabel} {bitrate}kbps — copy video, apply container/audio/subtitle work."
                     : $"Hybrid mux pass · already {targetCodecLabel} at {bitrate}kbps — copy video, mux audio/subs.";
                 return result;
             }
@@ -1635,6 +1761,23 @@ public class TranscodingService
             result.Reason   = $"Probe failed: {ex.Message}";
             return result;
         }
+    }
+
+    private static string DescribeVideoPlan(VideoJobPlan plan, EncoderOptions options)
+    {
+        if (plan.Action == AdvancedVideoAction.UseSimpleSettings) return "Simple video settings";
+        if (plan.Action == AdvancedVideoAction.Skip) return "Skip";
+        if (plan.Action == AdvancedVideoAction.MuxOnly) return "Mux only (copy video)";
+        var profile = plan.Profile;
+        if (profile == null) return "Invalid advanced profile";
+        var encoder = plan.ExplicitEncoder ?? $"Automatic {options.Codec}";
+        var rate = profile.RateControl.Mode switch
+        {
+            VideoRateControlMode.Quality => $"{VideoEncoderRegistry.Describe(plan.ExplicitEncoder ?? options.Encoder, profile.Codec).QualityLabel} {profile.RateControl.Quality:0.###}",
+            VideoRateControlMode.Bitrate => $"{profile.RateControl.TargetKbps} kb/s",
+            _ => "custom rate control",
+        };
+        return $"{encoder} · {rate} · {profile.OutputRetention}";
     }
 
     /// <summary>Returns the work item with the specified ID, or <c>null</c> if not found.</summary>
@@ -1903,6 +2046,11 @@ public class TranscodingService
                     Bitrate  = row.Bitrate,
                     Length   = row.Duration,
                     IsHevc   = row.IsHevc,
+                    SourceCodec = row.Codec,
+                    SourceWidth = row.Width,
+                    SourceHeight = row.Height,
+                    SourcePixelFormat = row.PixelFormat,
+                    SourceIsHdr = row.IsHdr,
                     Is4K     = row.Is4K,
                     Kind     = row.Kind,
                     Priority = row.Priority,
@@ -2272,7 +2420,8 @@ public class TranscodingService
         try
         {
             var encodedSize = workItem.OutputSize ?? 0;
-            var noSavings   = encodedSize == 0 || encodedSize >= workItem.Size;
+            var alwaysKeep  = workItem.VideoPlan?.OutputRetention == VideoOutputRetention.AlwaysKeep;
+            var noSavings   = encodedSize == 0 || (!alwaysKeep && encodedSize >= workItem.Size);
             var encodeStart = workItem.StartedAt ?? workItem.CreatedAt;
             bool isMusic    = workItem.Kind == MediaKind.Music;
             var srcStream   = workItem.Probe?.Streams?.FirstOrDefault(s =>
@@ -2307,8 +2456,15 @@ public class TranscodingService
                 StartedAt           = encodeStart,
                 CompletedAt         = DateTime.UtcNow,
                 Outcome             = noSavings ? "NoSavings" : "Completed",
+                AdvancedProfileId   = workItem.VideoPlan?.ProfileId,
+                AdvancedProfileName = workItem.VideoPlan?.ProfileName,
+                AdvancedRuleName    = workItem.VideoPlan?.RuleName,
             };
             await _encodeHistoryRepo.RecordAsync(record);
+            _log?.LogInformation(
+                "EncodeHistoryVideoPolicy jobId={JobId} rule={Rule} profile={Profile} encoder={Encoder} retention={Retention}",
+                workItem.Id, workItem.VideoPlan?.RuleName, workItem.VideoPlan?.ProfileName,
+                workItem.VideoEncoderName, workItem.VideoPlan?.OutputRetention.ToString() ?? "SmallerOnly");
             await _hubContext.Clients.All.SendAsync("EncodeHistoryAdded", record);
         }
         catch (Exception ex)
@@ -2724,7 +2880,34 @@ public class TranscodingService
                     continue;
                 }
 
-                var deviceId = TryReserveLocalDeviceSlot(workItem, current);
+                // Resolve Advanced rules/profile before reserving a slot. The old order
+                // routed using global codec/HW values and only applied the folder override
+                // afterwards, which made exact encoders and folder profiles unschedulable.
+                var policy = ResolveVideoPolicyForWorkItem(workItem, current);
+                if (!string.IsNullOrEmpty(policy.Plan.BlockingReason))
+                {
+                    lock (_queueLock)
+                    {
+                        _workQueue.Add(workItem);
+                        _workQueue.Sort((a, b) => CompareQueueOrder(a, b, _queueNewestFirst));
+                    }
+                    try { await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem); } catch { }
+                    if (!dispatched) await WaitForSchedulerProgressAsync(inflight);
+                    continue;
+                }
+                if (policy.Plan.Action == AdvancedVideoAction.Skip)
+                {
+                    await MarkDispatchSkippedAsync(workItem,
+                        policy.Plan.RuleName == null ? "advanced video policy" : $"advanced video rule '{policy.Plan.RuleName}'");
+                    continue;
+                }
+
+                var perJobOptions = policy.Options;
+                if (workItem.ForceMux && policy.Plan.Action == AdvancedVideoAction.UseSimpleSettings
+                                      && perJobOptions.EncodingMode == EncodingMode.Transcode)
+                    perJobOptions.EncodingMode = EncodingMode.Hybrid;
+
+                var deviceId = TryReserveLocalDeviceSlot(workItem, perJobOptions);
                 if (deviceId == null)
                 {
                     // No master slot fits this item (capacity full, codec
@@ -2744,15 +2927,6 @@ public class TranscodingService
                 // Item left the window — flag it so refill tops up from the DB.
                 Interlocked.Exchange(ref _queueWindowDirty, 1);
 
-                // Resolve any per-folder override and merge it into the per-job options.
-                // Cluster dispatch already does this via ClusterService.ResolveOptionsForJob;
-                // local dispatch was the one path that wasn't applying overrides — without
-                // this, a folder configured to encode at h264 (say) was queued under those
-                // settings (the scan-phase skip ladder ran correctly) but the local encoder
-                // ran at the global codec. Three-tier merge: global → folder → (no node
-                // override on the local path).
-                var folderOverride = ResolveFolderOverride(workItem.Path);
-                var perJobOptions = EncoderOptionsOverride.ApplyOverrides(current, folderOverride, null);
                 perJobOptions.HardwareAcceleration = deviceId == "cpu" ? "none" : deviceId;
                 perJobOptions.HardwareDevicePath   = deviceId == "cpu" ? null : GetDevicePathForDeviceId(deviceId);
 
@@ -2760,7 +2934,8 @@ public class TranscodingService
                 // when the global mode is Transcode, so an at-target file is mux-passed instead of
                 // being dropped by the pre-dispatch skip gate below. The upgraded mode flows into
                 // the encode (ConvertVideoAsync), giving a video-copy remux to the target container.
-                if (workItem.ForceMux && perJobOptions.EncodingMode == EncodingMode.Transcode)
+                if (workItem.ForceMux && policy.Plan.Action == AdvancedVideoAction.UseSimpleSettings
+                                      && perJobOptions.EncodingMode == EncodingMode.Transcode)
                     perJobOptions.EncodingMode = EncodingMode.Hybrid;
 
                 // Pre-dispatch finalisation: resolve any missing OriginalLanguage live,
@@ -2869,6 +3044,7 @@ public class TranscodingService
         var devices = GetDetectedDevices();
         if (devices.Count == 0) return null;
 
+        var exactEncoder = workItem.VideoPlan?.ExplicitEncoder;
         var hwPref = (options.HardwareAcceleration ?? "auto").ToLowerInvariant();
         bool hasHardwareThatCanEncode = devices.Any(d =>
             d.DeviceId != "cpu" && DeviceCanEncode(d.DeviceId, workItem, options));
@@ -2883,7 +3059,11 @@ public class TranscodingService
 
         foreach (var device in devices)
         {
-            if (!IsDeviceEligibleUnderHwPref(device.DeviceId, hwPref, hasHardwareThatCanEncode, selectedVendorCanEncode)) continue;
+            if (!string.IsNullOrWhiteSpace(exactEncoder))
+            {
+                if (!device.Encoders.Contains(exactEncoder, StringComparer.OrdinalIgnoreCase)) continue;
+            }
+            else if (!IsDeviceEligibleUnderHwPref(device.DeviceId, hwPref, hasHardwareThatCanEncode, selectedVendorCanEncode)) continue;
 
             // Skip devices that can't encode this item's target codec —
             // the ledger only cares about capacity, not codec compatibility.
@@ -2894,6 +3074,7 @@ public class TranscodingService
             // or disabled (resolver returns 0).
             if (_slotLedger.TryReserve(_localNodeId, device.DeviceId, workItem.Id, workItem.FileName))
             {
+                workItem.WaitReason = null;
                 // Surface a warning when a job lands on CPU because the selected (or
                 // auto) hardware can't encode the codec — under "auto" no detected device
                 // does the codec, under an explicit vendor that vendor can't (absent, or
@@ -2905,7 +3086,7 @@ public class TranscodingService
                 // which Serilog never captured. Route it through the structured logger so
                 // it lands in the log file the user actually reads, and emit a per-item
                 // TranscodingLog line so the reason shows on that item in the UI.
-                if (device.DeviceId == "cpu" && hwPref != "none")
+                if (string.IsNullOrWhiteSpace(exactEncoder) && device.DeviceId == "cpu" && hwPref != "none")
                 {
                     var codec = (options.Codec ?? "").ToLowerInvariant();
                     var fallbackEncoder = GetSoftwareFallbackEncoder(options);
@@ -2929,6 +3110,11 @@ public class TranscodingService
                 return device.DeviceId;
             }
         }
+        if (!string.IsNullOrWhiteSpace(exactEncoder)
+            && !devices.Any(d => d.Encoders.Contains(exactEncoder, StringComparer.OrdinalIgnoreCase)))
+            workItem.WaitReason = $"Waiting for exact encoder {exactEncoder}; it is not available on any local device.";
+        else if (workItem.VideoPlan is { IsAdvanced: true })
+            workItem.WaitReason = $"Waiting for an available local encoder/device slot supporting {VideoSourceFacts.NormalizeCodec(options.Codec)}.";
         return null;
     }
 
@@ -3390,6 +3576,22 @@ public class TranscodingService
         if (workItem.Probe == null)
             throw new Exception("No probe data available");
 
+        var advancedProfile = workItem.VideoPlan?.Action == AdvancedVideoAction.TranscodeWithProfile
+            ? workItem.VideoPlan.Profile
+            : null;
+        var exactEncoder = workItem.VideoPlan?.ExplicitEncoder;
+        if (!string.IsNullOrEmpty(workItem.VideoPlan?.BlockingReason))
+            throw new InvalidOperationException(workItem.VideoPlan.BlockingReason);
+        if (workItem.VideoPlan is { IsAdvanced: true } resolvedPlan)
+        {
+            await LogAsync(workItem.Id,
+                $"Advanced video plan: action={resolvedPlan.Action}, " +
+                $"rule={resolvedPlan.RuleName ?? "(default)"}, profile={resolvedPlan.ProfileName ?? "(none)"}, " +
+                $"retention={resolvedPlan.OutputRetention}, protocol={resolvedPlan.ProtocolVersion}");
+            foreach (var warning in resolvedPlan.Warnings ?? [])
+                await LogAsync(workItem.Id, $"Advanced video warning: {warning}");
+        }
+
         // WebM only allows AV1/VP8/VP9 video and Opus/Vorbis audio. If the user picked
         // a non-AV1 codec alongside Format=webm, coerce the per-job clone to AV1 here so
         // the rest of the pipeline (encoder resolution, MapAudio, BuildFfmpegCommand) sees
@@ -3399,11 +3601,15 @@ public class TranscodingService
         await CoerceForWebmAsync(workItem, options);
 
         // Resolve "auto" to a concrete hardware type before building the command
-        await ResolveHardwareAccelerationAsync(options);
+        if (string.IsNullOrWhiteSpace(exactEncoder))
+            await ResolveHardwareAccelerationAsync(options);
+        else if (VideoEncoderRegistry.InferDevice(exactEncoder) == "cpu")
+            options.HardwareAcceleration = "none";
         await LogAsync(workItem.Id, $"Hardware acceleration: {options.HardwareAcceleration}");
         await LogAsync(workItem.Id, $"Video Bitrate: {workItem.Bitrate}kbps");
 
         var (targetBitrate, minBitrate, maxBitrate, videoCopy) = CalculateBitrates(workItem, options);
+        if (advancedProfile != null) videoCopy = false;
 
         // Mux pass: copy the video stream and only touch the stream types selected by
         // MuxStreams. Requires actual muxable work — otherwise re-encode normally (or, for
@@ -3414,7 +3620,8 @@ public class TranscodingService
         //             already force-skipped upstream; video is never re-encoded).
         bool isMuxPass = options.EncodingMode != EncodingMode.Transcode &&
             (HasMuxableWork(options, workItem.Probe!)
-                || (workItem.ForceMux && NeedsContainerChange(options, workItem.Path))) &&
+                || ((workItem.ForceMux || workItem.VideoPlan?.Action == AdvancedVideoAction.MuxOnly)
+                    && NeedsContainerChange(options, workItem.Path))) &&
             (options.EncodingMode == EncodingMode.MuxOnly || MeetsBitrateTarget(workItem, options));
         bool doAudioWork    = !isMuxPass || options.MuxStreams is MuxStreams.Audio     or MuxStreams.Both;
         bool doSubtitleWork = !isMuxPass || options.MuxStreams is MuxStreams.Subtitles or MuxStreams.Both;
@@ -3425,13 +3632,15 @@ public class TranscodingService
         }
 
         // Resolve the actual encoder — verify it works, fall back to software if not
-        string encoder = videoCopy ? "copy" : GetEncoder(options);
+        string encoder = videoCopy ? "copy" : exactEncoder ?? GetEncoder(options);
         string hwAccel = options.HardwareAcceleration;
-        if (!videoCopy && !encoder.StartsWith("lib") && encoder != "copy")
+        if (!videoCopy && VideoEncoderRegistry.Describe(encoder, options.Codec).DeviceId != "cpu" && encoder != "copy")
         {
             string testHwFlags = GetInitFlags(hwAccel, options.HardwareDevicePath);
             if (!await TestEncoderAsync(testHwFlags, encoder))
             {
+                if (!string.IsNullOrWhiteSpace(exactEncoder))
+                    throw new InvalidOperationException($"Exact encoder {exactEncoder} is not available on the assigned device; no fallback is permitted.");
                 string swEncoder = GetSoftwareFallbackEncoder(options);
                 await LogAsync(workItem.Id,
                     $"{encoder} not available — falling back to {swEncoder}");
@@ -3445,10 +3654,19 @@ public class TranscodingService
         // CQP is content-dependent — same QP gives wildly different bitrates per content.
         // Do a 30-second test encode to measure actual output, then adjust QP to hit target.
         string compressionFlags;
+        IReadOnlyList<string>? advancedVideoArguments = null;
         bool useLowPower = true;
         int gop = ComputeGop(workItem);
         if (videoCopy)
             compressionFlags = "";
+        else if (advancedProfile != null)
+        {
+            var commandProfile = advancedProfile.Clone();
+            if (commandProfile.GopSize <= 0) commandProfile.GopSize = gop;
+            advancedVideoArguments = VideoEncoderRegistry.BuildProfileArguments(commandProfile, encoder);
+            compressionFlags = "";
+            useLowPower = false;
+        }
         else if (useVaapi)
         {
             long targetKbps = long.Parse(targetBitrate.TrimEnd('k'));
@@ -3534,7 +3752,8 @@ public class TranscodingService
             : ComputeFixedFrameFilter(options) ?? ComputeScaleExpr(workItem, options);
         string? fpsExpr = isMuxPass ? null : ComputeFpsCapExpr(workItem, options);
         bool tonemap = options.TonemapHdrToSdr && !isMuxPass && FfprobeService.IsHdr(workItem.Probe!);
-        bool hasFilter = cropExpr != null || scaleExpr != null || fpsExpr != null || tonemap;
+        bool hasFilter = cropExpr != null || scaleExpr != null || fpsExpr != null || tonemap
+                         || advancedProfile?.AdditionalVideoFilters is { Count: > 0 };
 
         // Any active filter forces a re-encode even if bitrate logic chose videoCopy.
         if (videoCopy && hasFilter)
@@ -3542,12 +3761,14 @@ public class TranscodingService
             await LogAsync(workItem.Id,
                 "Active filter (crop/downscale/tonemap) — re-encoding despite videoCopy eligibility.");
             videoCopy = false;
-            encoder = GetEncoder(options);
-            if (!encoder.StartsWith("lib") && encoder != "copy")
+            encoder = exactEncoder ?? GetEncoder(options);
+            if (VideoEncoderRegistry.Describe(encoder, options.Codec).DeviceId != "cpu" && encoder != "copy")
             {
                 string testHwFlags = GetInitFlags(hwAccel, options.HardwareDevicePath);
                 if (!await TestEncoderAsync(testHwFlags, encoder))
                 {
+                    if (!string.IsNullOrWhiteSpace(exactEncoder))
+                        throw new InvalidOperationException($"Exact encoder {exactEncoder} is not available on the assigned device; no fallback is permitted.");
                     string swEncoder = GetSoftwareFallbackEncoder(options);
                     await LogAsync(workItem.Id, $"{encoder} not available — falling back to {swEncoder}");
                     encoder = swEncoder;
@@ -3560,10 +3781,22 @@ public class TranscodingService
             // (VAEntrypointEncSliceLP); AMD Mesa exposes only VAEntrypointEncSlice and
             // the encoder fails to open with -low_power 1.
             useLowPower = useVaapi && hwAccel.Equals("intel", StringComparison.OrdinalIgnoreCase);
-            compressionFlags = GetForcedReencodeCompressionFlags(
-                encoder, useVaapi, encoder == "libsvtav1",
-                targetBitrate, minBitrate, maxBitrate, useConservativeHwFlags, gop);
+            if (advancedProfile != null)
+            {
+                var commandProfile = advancedProfile.Clone();
+                if (commandProfile.GopSize <= 0) commandProfile.GopSize = gop;
+                advancedVideoArguments = VideoEncoderRegistry.BuildProfileArguments(commandProfile, encoder);
+                compressionFlags = "";
+            }
+            else
+            {
+                compressionFlags = GetForcedReencodeCompressionFlags(
+                    encoder, useVaapi, encoder == "libsvtav1",
+                    targetBitrate, minBitrate, maxBitrate, useConservativeHwFlags, gop);
+            }
         }
+
+        workItem.VideoEncoderName = videoCopy ? "copy" : encoder;
 
         // forceSwDecode: external retry path when VAAPI/QSV hwaccel fails mid-stream.
         // User's chosen strategy is "SW filters + hwupload", so any active filter on a
@@ -3607,12 +3840,14 @@ public class TranscodingService
         string vaapiFormat = (is10Bit && !tonemap) ? "p010" : "nv12";
         string vfFlag = VideoFilterBuilder.Emit(
             cropExpr: cropExpr, fpsExpr: fpsExpr, tonemap: tonemap, scaleExpr: scaleExpr,
-            useVaapi: useVaapi, canHwDecode: canHwDecode, vaapiFormat: vaapiFormat);
+            useVaapi: useVaapi, canHwDecode: canHwDecode, vaapiFormat: vaapiFormat,
+            additionalFilters: advancedProfile?.AdditionalVideoFilters);
         bool isSvtAv1 = encoder == "libsvtav1";
         bool isAmf    = encoder.Contains("amf");
         bool isVideoToolbox = encoder.Contains("videotoolbox");
         bool isNvenc  = encoder.Contains("nvenc");
-        string presetFlag = useVaapi
+        string presetFlag = advancedProfile != null ? ""
+            : useVaapi
             ? (useLowPower ? "-low_power 1 " : "")
             // VideoToolbox has no -preset option at all — passing one fails the encode
             // before the encoder opens (masked by TestEncoderAsync, which never sends
@@ -3626,7 +3861,7 @@ public class TranscodingService
         // Hardware encoders (NVENC/VAAPI/QSV/AMF) accept different profile value sets,
         // so we gate to the lib* path to avoid passing incompatible values.
         string profileLevel = "";
-        if (!videoCopy && encoder.StartsWith("lib"))
+        if (advancedProfile == null && !videoCopy && encoder.StartsWith("lib"))
         {
             if (!string.IsNullOrWhiteSpace(options.VideoProfile))
             {
@@ -3645,7 +3880,23 @@ public class TranscodingService
         }
         string videoFlags = videoCopy ?
             $"{_ffprobeService.MapVideo(workItem.Probe!)} -c:v copy " :
-            $"{_ffprobeService.MapVideo(workItem.Probe!)} -c:v {encoder} {presetFlag}{profileLevel}{vfFlag}";
+            $"{_ffprobeService.MapVideo(workItem.Probe!)} -c:v {encoder} {presetFlag}{profileLevel}";
+
+        // Keep the complete filter graph as one literal ArgumentList token. In
+        // particular, drawtext expressions and Unicode labels may contain spaces;
+        // feeding the generated -vf fragment back through a command-line tokenizer
+        // would split those into positional arguments even though no shell is used.
+        var literalVideoArguments = new List<string>();
+        if (!string.IsNullOrWhiteSpace(vfFlag))
+        {
+            const string filterPrefix = "-vf ";
+            if (!vfFlag.StartsWith(filterPrefix, StringComparison.Ordinal))
+                throw new InvalidOperationException("Generated video filter did not use the expected -vf form.");
+            literalVideoArguments.Add("-vf");
+            literalVideoArguments.Add(vfFlag[filterPrefix.Length..].TrimEnd());
+        }
+        if (advancedVideoArguments != null)
+            literalVideoArguments.AddRange(advancedVideoArguments);
 
         // On a mux pass that excludes audio (MuxStreams.Subtitles), keep every audio track as-is:
         // empty language list = keep all, preserve-only profile = no re-encode.
@@ -3745,7 +3996,7 @@ public class TranscodingService
         }
 
         string subtitleFlags;
-        string extraInputs = "";
+        var literalExtraInputPaths = new List<string>();
 
         if (stripSubtitles)
         {
@@ -3812,7 +4063,7 @@ public class TranscodingService
 
             for (int i = 0; i < ocrMuxSrts.Count; i++)
             {
-                extraInputs += $"-i \"{ocrMuxSrts[i].SrtPath}\" ";
+                literalExtraInputPaths.Add(ocrMuxSrts[i].SrtPath);
                 maps        += $"-map {i + 1}:0 ";
                 codecs      += $"-c:s:{outSubIndex} {ocrCodec} ";
                 var tag = LanguageMatcher.ToThreeLetterB(ocrMuxSrts[i].Lang) ?? ocrMuxSrts[i].Lang;
@@ -3869,9 +4120,10 @@ public class TranscodingService
 
         // -analyzeduration and -probesize handle files with many streams (e.g. 30+ PGS subtitle tracks)
         string analyzeFlags = "-analyzeduration 10M -probesize 50M ";
-        string command = BuildFfmpegCommand(
-            options.Format, initFlags, analyzeFlags, inputPath, extraInputs,
-            videoFlags, compressionFlags, audioFlags, subtitleFlags, outputPath);
+        var command = BuildFfmpegArguments(
+            options.Format, initFlags, analyzeFlags, inputPath, "",
+            videoFlags, compressionFlags, audioFlags, subtitleFlags, outputPath,
+            literalVideoArguments, literalExtraInputPaths);
 
         await LogAsync(workItem.Id, $"Converting {workItem.FileName}");
         await LogAsync(workItem.Id, $"Command: ffmpeg {command}");
@@ -4418,11 +4670,12 @@ public class TranscodingService
             // silently marked Skipped.
             Kind            = workItem.Kind,
             Bitrate         = workItem.Bitrate,
-            Codec           = videoStream?.CodecName ?? (workItem.IsHevc ? "hevc" : "unknown"),
-            Width           = videoStream?.Width  ?? 0,
-            Height          = videoStream?.Height ?? 0,
+            Codec           = videoStream?.CodecName ?? workItem.SourceCodec ?? (workItem.IsHevc ? "hevc" : "unknown"),
+            Width           = videoStream?.Width  ?? workItem.SourceWidth,
+            Height          = videoStream?.Height ?? workItem.SourceHeight,
+            PixelFormat     = videoStream?.PixFmt ?? workItem.SourcePixelFormat,
             IsHevc          = workItem.IsHevc,
-            IsHdr           = workItem.Probe != null && FfprobeService.IsHdr(workItem.Probe),
+            IsHdr           = workItem.Probe != null ? FfprobeService.IsHdr(workItem.Probe) : workItem.SourceIsHdr,
             Is4K            = workItem.Is4K,
             AudioStreams    = workItem.Probe != null
                                 ? MuxStreamSummary.Serialize(ProjectAudioSummaries(workItem.Probe))
@@ -4532,6 +4785,17 @@ public class TranscodingService
         {
             skipMf = SyntheticMediaFile(workItem, originalLanguage);
         }
+
+        if (workItem.VideoPlan != null)
+        {
+            if (!string.IsNullOrEmpty(workItem.VideoPlan.BlockingReason)) return false;
+            if (workItem.VideoPlan.Action == AdvancedVideoAction.Skip) return false;
+            if (workItem.VideoPlan.Action == AdvancedVideoAction.TranscodeWithProfile) return true;
+            if (workItem.VideoPlan.Action == AdvancedVideoAction.MuxOnly
+                && NeedsContainerChange(perJobOptions, workItem.Path)) return true;
+            // MuxOnly intentionally falls through to the legacy mux-work predicate under
+            // the resolver's EncodingMode.MuxOnly effective options.
+        }
         return !WouldSkipUnderOptions(skipMf, perJobOptions, workItem.ForceMux);
     }
 
@@ -4618,6 +4882,26 @@ public class TranscodingService
         return false;
     }
 
+    /// <summary>Advanced-aware counterpart used by re-evaluation and queue cleanup.</summary>
+    public bool WouldSkipUnderPolicy(MediaFile mediaFile, EncoderOptions globalOptions, bool forceMux = false,
+        EncoderOptionsOverride? nodeOverride = null)
+    {
+        if (mediaFile.Kind == MediaKind.Music) return WouldSkipUnderOptions(mediaFile, globalOptions, forceMux);
+        var resolution = VideoPolicyResolver.Resolve(
+            globalOptions,
+            ResolveFolderOverride(mediaFile.FilePath),
+            nodeOverride,
+            VideoSourceFacts.From(mediaFile));
+        if (!string.IsNullOrEmpty(resolution.Plan.BlockingReason)) return false;
+        return resolution.Plan.Action switch
+        {
+            AdvancedVideoAction.Skip                 => true,
+            AdvancedVideoAction.TranscodeWithProfile => false,
+            AdvancedVideoAction.MuxOnly               => WouldSkipUnderOptions(mediaFile, resolution.Options, forceMux: true),
+            _ => WouldSkipUnderOptions(mediaFile, resolution.Options, forceMux),
+        };
+    }
+
     /// <summary>
     ///     Decides whether an encoded output should be kept (placed at the destination) or
     ///     discarded as a no-savings encode. Shared by the local <see cref="ConvertVideoAsync"/>
@@ -4635,6 +4919,9 @@ public class TranscodingService
     internal static (bool Keep, string Reason) ShouldKeepEncodedOutput(
         EncoderOptions options, WorkItem workItem, long sourceSize, long outputSize, bool? videoCopyHint = null)
     {
+        if (workItem.VideoPlan?.OutputRetention == VideoOutputRetention.AlwaysKeep)
+            return (true, "profile retention policy");
+
         if (outputSize < sourceSize) return (true, "savings");
 
         bool userConfiguredGrowth = options.AudioOutputs is { Count: > 0 };
@@ -4656,7 +4943,8 @@ public class TranscodingService
         options.EncodingMode != EncodingMode.Transcode
         && workItem.Probe != null
         && (HasMuxableWork(options, workItem.Probe)
-            || (workItem.ForceMux && NeedsContainerChange(options, workItem.Path)))
+            || ((workItem.ForceMux || workItem.VideoPlan?.Action == AdvancedVideoAction.MuxOnly)
+                && NeedsContainerChange(options, workItem.Path)))
         && (options.EncodingMode == EncodingMode.MuxOnly || MeetsBitrateTarget(workItem, options));
 
     /// <summary>
@@ -4750,6 +5038,36 @@ public class TranscodingService
         string subtitleFlags,
         string outputPath)
     {
+        // Keep the long-standing diagnostic/snapshot representation stable for
+        // Simple mode. Execution does not consume this string; it uses the literal
+        // argument vector built by BuildFfmpegArguments below.
+        bool isMp4 = FfprobeService.IsMp4(format);
+        string varFlags = isMp4
+            ? "-movflags +faststart -max_muxing_queue_size 9999 "
+            : "-max_muxing_queue_size 9999 ";
+        string muxer = FormatMuxer(format);
+        return $"{initFlags} {analyzeFlags}-i \"{inputPath}\" {extraInputs}{videoFlags}{compressionFlags}{audioFlags}{subtitleFlags}{varFlags}-f {muxer} \"{outputPath}\"";
+    }
+
+    /// <summary>
+    ///     Builds the executable argument vector. Paths and advanced profile options are
+    ///     inserted as literal tokens; legacy internally-generated fragments are tokenized
+    ///     during the gradual migration away from string flag builders.
+    /// </summary>
+    internal static FfmpegArgumentList BuildFfmpegArguments(
+        string format,
+        string initFlags,
+        string analyzeFlags,
+        string inputPath,
+        string extraInputs,
+        string videoFlags,
+        string compressionFlags,
+        string audioFlags,
+        string subtitleFlags,
+        string outputPath,
+        IEnumerable<string>? literalVideoArguments = null,
+        IEnumerable<string>? literalExtraInputPaths = null)
+    {
         bool isMp4 = FfprobeService.IsMp4(format);
         // MP4 alone needs +faststart for progressive playback; MKV and WebM don't.
         string varFlags = isMp4
@@ -4757,7 +5075,32 @@ public class TranscodingService
             : "-max_muxing_queue_size 9999 ";
         string muxer = FormatMuxer(format);
 
-        return $"{initFlags} {analyzeFlags}-i \"{inputPath}\" {extraInputs}{videoFlags}{compressionFlags}{audioFlags}{subtitleFlags}{varFlags}-f {muxer} \"{outputPath}\"";
+        var arguments = new FfmpegArgumentList()
+            .AddLegacyFragment(initFlags)
+            .AddLegacyFragment(analyzeFlags)
+            .Add("-i", inputPath);
+
+        if (literalExtraInputPaths != null)
+        {
+            foreach (var path in literalExtraInputPaths) arguments.Add("-i", path);
+        }
+        else
+        {
+            arguments.AddLegacyFragment(extraInputs);
+        }
+
+        arguments
+            .AddLegacyFragment(videoFlags)
+            .AddLegacyFragment(compressionFlags);
+
+        if (literalVideoArguments != null) arguments.AddRange(literalVideoArguments);
+
+        return arguments
+            .AddLegacyFragment(audioFlags)
+            .AddLegacyFragment(subtitleFlags)
+            .AddLegacyFragment(varFlags)
+            .Add("-f", muxer)
+            .Add(outputPath);
     }
 
     /// <summary> Maps an output container token to its ffmpeg <c>-f</c> muxer name. </summary>
@@ -5014,15 +5357,22 @@ public class TranscodingService
     ///     on the dashboard. Auto-fallback when an HW encoder fails is a
     ///     separate path inside ffmpeg invocation; no UI surface needed.
     /// </summary>
-    private static HardwareDevice MakeCpuDevice() => new()
+    private async Task<HardwareDevice> MakeCpuDeviceAsync()
     {
-        DeviceId           = "cpu",
-        DisplayName        = "CPU",
-        SupportedCodecs    = new() { "h264", "h265", "av1" },
-        Encoders           = new() { "libx264", "libx265", "libsvtav1" },
-        DefaultConcurrency = DefaultConcurrencyFor("cpu"),
-        IsHardware         = true,
-    };
+        var inventory = await _ffmpegCapabilities.GetVideoEncodersAsync();
+        var software = inventory.Where(e => e.DeviceId == "cpu").ToList();
+        var encoders = software.Select(e => e.Encoder).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        var codecs = software.Select(e => e.Codec).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        return new HardwareDevice
+        {
+            DeviceId           = "cpu",
+            DisplayName        = "CPU",
+            SupportedCodecs    = codecs,
+            Encoders           = encoders,
+            DefaultConcurrency = DefaultConcurrencyFor("cpu"),
+            IsHardware         = true,
+        };
+    }
 
     /// <summary>
     ///     Detects available hardware acceleration by testing encoders.
@@ -5317,7 +5667,7 @@ public class TranscodingService
 
         // Always add a CPU device so the master has a fallback slot pool — every
         // worker can software-encode regardless of GPU presence.
-        devices.Add(MakeCpuDevice());
+        devices.Add(await MakeCpuDeviceAsync());
 
         _detectedDevices = devices;
 
@@ -6452,7 +6802,10 @@ public class TranscodingService
         return $"crop={mostCommonCrop}";
     }
 
-    private async Task RunFfmpegAsync(string command, WorkItem workItem, CancellationToken cancellationToken = default)
+    private Task RunFfmpegAsync(string command, WorkItem workItem, CancellationToken cancellationToken = default) =>
+        RunFfmpegAsync(new FfmpegArgumentList().AddLegacyFragment(command), workItem, cancellationToken);
+
+    private async Task RunFfmpegAsync(FfmpegArgumentList command, WorkItem workItem, CancellationToken cancellationToken = default)
     {
         // On Linux, FFmpeg's stderr switches to block-buffered when piped, which delays
         // progress reporting for minutes. Wrap with stdbuf to force line buffering.
@@ -6460,12 +6813,17 @@ public class TranscodingService
             && File.Exists("/usr/bin/stdbuf");
         var processStartInfo = new ProcessStartInfo(usesStdbuf ? "/usr/bin/stdbuf" : _ffmpegPath)
         {
-            Arguments = usesStdbuf ? $"-eL {_ffmpegPath} {command}" : command,
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             CreateNoWindow = true
         };
+        if (usesStdbuf)
+        {
+            processStartInfo.ArgumentList.Add("-eL");
+            processStartInfo.ArgumentList.Add(_ffmpegPath);
+        }
+        command.ApplyTo(processStartInfo);
 
         var process = new Process { StartInfo = processStartInfo };
         // Publish the process under the work item's ID so cancel/stop can
@@ -6779,7 +7137,8 @@ public class TranscodingService
         // Check the actual resolved encoder, not options.Encoder (which is the user's base preference
         // like "libsvtav1" that GetEncoder() maps to hardware variants like "av1_nvenc")
         bool isAlreadySoftware = options.HardwareAcceleration.Equals("none", StringComparison.OrdinalIgnoreCase);
-        if (options.RetryOnFail && !isAlreadySoftware)
+        bool exactEncoderPinned = !string.IsNullOrWhiteSpace(workItem.VideoPlan?.ExplicitEncoder);
+        if (options.RetryOnFail && !isAlreadySoftware && !exactEncoderPinned)
         {
             await LogAsync(workItem.Id, "Retrying with software encoding...");
             workItem.Progress = 0;
@@ -6973,7 +7332,7 @@ public class TranscodingService
                 catch { /* lookup failures fall back to the configured keep lists, matching ConvertVideoAsync */ }
             }
 
-            if (WouldSkipUnderOptions(mf, newOptions)) idsToRemove.Add(id);
+            if (WouldSkipUnderPolicy(mf, newOptions)) idsToRemove.Add(id);
         }
         if (idsToRemove.Count == 0) return 0;
 
@@ -7018,7 +7377,7 @@ public class TranscodingService
         try
         {
             backlogFlipped = await _mediaFileRepo.ReevaluateQueuedAsync(mf =>
-                WouldSkipUnderOptions(mf, newOptions));
+                WouldSkipUnderPolicy(mf, newOptions));
         }
         catch (Exception ex)
         {
@@ -7192,6 +7551,8 @@ public class TranscodingService
         {
             try { callback(); }
             catch (Exception ex) { Log.Warning($"HardwareDetected callback error: {ex.Message}"); }
+            MarkQueueWindowDirty();
+            try { _onWorkItemQueued?.Invoke(); } catch { }
         }
     }
 

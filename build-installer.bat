@@ -78,6 +78,27 @@ if not exist "electron-app\ffmpeg\ffprobe.exe" (
     exit /b 1
 )
 echo FFmpeg found.
+node scripts\validate-ffmpeg-inventory.mjs electron-app\ffmpeg\ffmpeg.exe
+if %errorlevel% neq 0 (
+    echo.
+    echo ERROR: FFmpeg is missing a required baseline video encoder.
+    pause
+    exit /b 1
+)
+node scripts\validate-advanced-templates.mjs
+if %errorlevel% neq 0 (
+    echo.
+    echo ERROR: Advanced Video quick-start templates failed validation.
+    pause
+    exit /b 1
+)
+node scripts\test-advanced-video-ui.mjs
+if %errorlevel% neq 0 (
+    echo.
+    echo ERROR: Advanced Video UI logic tests failed.
+    pause
+    exit /b 1
+)
 echo.
 
 REM Step 5: Install npm dependencies

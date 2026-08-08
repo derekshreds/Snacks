@@ -2025,3 +2025,304 @@ footer a.text-muted:hover {
 .env-locked-note {
     color: var(--text-secondary, #9ca3af);
 }
+
+/* ===========================
+   Advanced Video: decision flow, recipes, library impact
+   =========================== */
+.av-section-head {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin-bottom: 0.75rem;
+}
+
+.av-step {
+    flex: 0 0 auto;
+    width: 1.75rem;
+    height: 1.75rem;
+    border-radius: 50%;
+    background: var(--primary-glow);
+    color: var(--primary);
+    border: 1px solid var(--primary);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 700;
+    font-size: 0.9rem;
+}
+
+.av-flow {
+    position: relative;
+    padding-left: 1.25rem;
+}
+
+/* The rail: the literal path a file falls down. */
+.av-flow::before {
+    content: "";
+    position: absolute;
+    left: 0.55rem;
+    top: 0.75rem;
+    bottom: 0.75rem;
+    width: 2px;
+    background: linear-gradient(var(--primary), var(--border-color-light));
+}
+
+.av-flow-node {
+    position: relative;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-color);
+    border-radius: var(--border-radius);
+    padding: 0.6rem 0.9rem;
+    margin: 0.5rem 0;
+    color: var(--text-secondary);
+}
+
+.av-flow-node::before,
+.av-rule-card::before {
+    content: "";
+    position: absolute;
+    left: -0.98rem;
+    top: 50%;
+    width: 0.65rem;
+    height: 2px;
+    background: var(--border-color-light);
+}
+
+.av-flow-source {
+    color: var(--text-primary);
+    border-style: dashed;
+}
+
+.av-flow-default {
+    border-left: 3px solid var(--gray-400);
+}
+
+.av-flow-empty {
+    border-style: dashed;
+}
+
+.av-rule-card {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-color);
+    border-left: 3px solid var(--primary);
+    border-radius: var(--border-radius);
+    padding: 0.5rem 0.75rem;
+    margin: 0.5rem 0;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.av-rule-card:hover {
+    border-color: var(--primary);
+}
+
+.av-rule-card.selected {
+    border-color: var(--primary);
+    box-shadow: 0 0 0 0.15rem var(--primary-glow);
+}
+
+.av-rule-card.paused {
+    opacity: 0.55;
+    border-left-color: var(--gray-400);
+}
+
+.av-flow-num {
+    flex: 0 0 auto;
+    width: 1.4rem;
+    height: 1.4rem;
+    border-radius: 50%;
+    background: var(--primary);
+    color: #fff;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.75rem;
+    font-weight: 700;
+}
+
+.av-rule-card.paused .av-flow-num {
+    background: var(--gray-400);
+}
+
+.av-rule-main {
+    flex: 1 1 auto;
+    min-width: 0;
+    background: none;
+    border: none;
+    text-align: left;
+    padding: 0;
+    color: var(--text-primary);
+    cursor: pointer;
+}
+
+.av-rule-name {
+    display: block;
+    font-weight: 600;
+}
+
+.av-rule-sentence {
+    display: block;
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+}
+
+.av-rule-actions {
+    flex: 0 0 auto;
+    display: inline-flex;
+    gap: 0.25rem;
+}
+
+.av-count-badge {
+    background: var(--primary-glow);
+    color: var(--primary);
+    border: 1px solid var(--primary);
+    font-variant-numeric: tabular-nums;
+}
+
+.av-editor-panel {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-color);
+    border-left: 3px solid var(--primary);
+    border-radius: var(--border-radius);
+    padding: 0.9rem;
+}
+
+.av-args-strip {
+    background: var(--bg-input);
+    border: 1px solid var(--border-color);
+    border-radius: var(--border-radius);
+    padding: 0.5rem 0.75rem;
+}
+
+.av-args-strip pre {
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: 0.8rem;
+    color: var(--success);
+}
+
+.av-impact-bar {
+    display: flex;
+    height: 1.6rem;
+    border-radius: var(--border-radius);
+    overflow: hidden;
+    border: 1px solid var(--border-color);
+}
+
+.av-impact-seg {
+    display: block;
+    min-width: 4px;
+}
+
+.av-impact-row {
+    display: flex;
+    align-items: baseline;
+    gap: 0.6rem;
+    padding: 0.25rem 0;
+}
+
+.av-impact-swatch {
+    flex: 0 0 auto;
+    width: 0.8rem;
+    height: 0.8rem;
+    border-radius: 3px;
+    align-self: center;
+}
+
+.av-impact-count {
+    flex: 0 0 auto;
+    min-width: 3rem;
+    text-align: right;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+}
+
+.av-impact-samples ul {
+    list-style: none;
+    padding-left: 1.4rem;
+    margin: 0.25rem 0 0;
+}
+
+/* Impact recalculating: keep old content readable but visibly stale. */
+.av-impact-pending {
+    opacity: 0.55;
+    transition: opacity 0.2s ease;
+}
+
+/* Reorder affordance: the card a dragged rule would land on. */
+.av-rule-card.av-drop-target {
+    border-top: 3px solid var(--primary);
+}
+
+/* Hypothetical-tester result: the card (or default node) the sample landed on. */
+.av-rule-card.matched,
+.av-flow-default.matched {
+    border-color: var(--success);
+    box-shadow: 0 0 0 0.15rem rgba(16, 185, 129, 0.25);
+}
+
+.av-matched-badge {
+    font-size: 0.65rem;
+    vertical-align: middle;
+}
+
+/* Statically unreachable rule: warning tone without killing readability. */
+.av-rule-card.shadowed {
+    border-left-color: var(--warning);
+}
+
+.av-rule-shadowed {
+    display: block;
+    color: var(--warning);
+    font-size: 0.8rem;
+    margin-top: 0.15rem;
+}
+
+.av-user-template {
+    position: relative;
+}
+
+.av-user-template .av-user-template-delete {
+    position: absolute;
+    right: 0.35rem;
+    bottom: 0.35rem;
+    padding: 0.05rem 0.4rem;
+    line-height: 1.2;
+}
+
+.av-impact-matches ul {
+    list-style: none;
+    padding-left: 0;
+    margin: 0;
+}
+
+/* Phone-width pass: cards stack their controls instead of crowding one row. */
+@media (max-width: 576px) {
+    .av-rule-card {
+        flex-wrap: wrap;
+    }
+
+    .av-rule-main {
+        flex-basis: calc(100% - 2.2rem);
+    }
+
+    .av-rule-actions {
+        margin-left: 2rem;
+    }
+
+    .av-count-badge {
+        order: 5;
+        margin-left: 2rem;
+    }
+
+    .av-section-head {
+        flex-wrap: wrap;
+    }
+
+    .av-impact-row {
+        flex-wrap: wrap;
+    }
+}

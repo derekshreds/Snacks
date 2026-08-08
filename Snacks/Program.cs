@@ -214,6 +214,7 @@ builder.Services.AddSingleton<Snacks.Services.Ocr.NativeOcrService>();
 builder.Services.AddSingleton<SubtitleExtractionService>();
 builder.Services.AddSingleton<AuthService>();
 builder.Services.AddSingleton<TranscodingService>();
+builder.Services.AddSingleton<FfmpegCapabilityService>();
 builder.Services.AddSingleton<LibraryAnalysisJobService>();
 builder.Services.AddSingleton<FileHealthService>();
 builder.Services.AddHostedService<RollingVerificationService>();

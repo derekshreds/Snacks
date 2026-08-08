@@ -278,6 +278,42 @@ public sealed class EncoderOptionsJsonContractTests
         parsed.TargetBitrate.Should().Be(3500);
         parsed.PreserveOriginalAudio.Should().BeTrue();
         parsed.AudioOutputs.Should().BeEmpty();
+        parsed.AdvancedVideo.Enabled.Should().BeFalse();
+    }
+
+    [Fact]
+    public void Advanced_video_round_trip_uses_camel_case_and_string_enums()
+    {
+        var profile = new VideoEncodingProfile
+        {
+            Name = "Portable AV1",
+            Codec = "av1",
+            EncoderSelection = VideoEncoderSelectionMode.Explicit,
+            Encoder = "libaom-av1",
+            RateControl = new VideoRateControlOptions { Mode = VideoRateControlMode.Quality, Quality = 35 },
+            OutputRetention = VideoOutputRetention.AlwaysKeep,
+            CustomOptions = [new CustomVideoOption { Option = "-aom-params", Values = ["tune=ssim"] }],
+        };
+        var original = new EncoderOptions
+        {
+            AdvancedVideo = new AdvancedVideoOptions { Enabled = true, Profiles = [profile] },
+        };
+        var camel = new JsonSerializerOptions
+        {
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+            PropertyNameCaseInsensitive = true,
+        };
+
+        var json = JsonSerializer.Serialize(original, camel);
+        var parsed = JsonSerializer.Deserialize<EncoderOptions>(json, camel)!;
+
+        json.Should().Contain("\"advancedVideo\"");
+        json.Should().Contain("\"version\":1");
+        json.Should().Contain("\"encoderSelection\":\"Explicit\"");
+        json.Should().Contain("\"mode\":\"Quality\"");
+        parsed.AdvancedVideo.Enabled.Should().BeTrue();
+        parsed.AdvancedVideo.Version.Should().Be(1);
+        parsed.AdvancedVideo.Profiles.Single().CustomOptions.Single().Values.Should().Equal("tune=ssim");
     }
 
 

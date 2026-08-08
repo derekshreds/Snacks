@@ -89,6 +89,14 @@ public sealed class ClusterNode
 /// </summary>
 public sealed class WorkerCapabilities
 {
+    /// <summary>
+    ///     Advanced-video wire protocol understood by this worker. Missing on older
+    ///     workers and therefore deserializes as zero; current workers advertise 1.
+    /// </summary>
+    // Deliberately defaults to 0: payloads from pre-advanced workers omit this
+    // property and must not be mistaken for protocol-v1 peers.
+    public int AdvancedVideoProtocolVersion { get; set; }
+
     /// <summary> Detected GPU vendor: "nvidia", "intel", "amd", or "none". </summary>
     public string? GpuVendor { get; set; }
 

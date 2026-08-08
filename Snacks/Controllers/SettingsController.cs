@@ -20,6 +20,10 @@ public sealed class SettingsController : ControllerBase
     private readonly FileService         _fileService;
     private readonly MediaFileRepository _mediaFileRepo;
     private readonly ILogger<SettingsController>? _log;
+    private readonly FfmpegCapabilityService _ffmpegCapabilities;
+    private readonly ClusterService? _clusterService;
+    private readonly AutoScanService? _autoScanService;
+    private readonly EncodeHistoryRepository? _encodeHistoryRepo;
 
     private static readonly JsonSerializerOptions _jsonOptions = new()
     {
@@ -31,7 +35,11 @@ public sealed class SettingsController : ControllerBase
         TranscodingService transcodingService,
         FileService fileService,
         MediaFileRepository mediaFileRepo,
-        ILogger<SettingsController>? logger = null)
+        ILogger<SettingsController>? logger = null,
+        FfmpegCapabilityService? ffmpegCapabilities = null,
+        ClusterService? clusterService = null,
+        AutoScanService? autoScanService = null,
+        EncodeHistoryRepository? encodeHistoryRepo = null)
     {
         ArgumentNullException.ThrowIfNull(transcodingService);
         ArgumentNullException.ThrowIfNull(fileService);
@@ -40,6 +48,10 @@ public sealed class SettingsController : ControllerBase
         _fileService        = fileService;
         _mediaFileRepo      = mediaFileRepo;
         _log                = logger;
+        _ffmpegCapabilities = ffmpegCapabilities ?? new FfmpegCapabilityService();
+        _clusterService     = clusterService;
+        _autoScanService    = autoScanService;
+        _encodeHistoryRepo  = encodeHistoryRepo;
     }
 
     /******************************************************************
@@ -166,6 +178,36 @@ public sealed class SettingsController : ControllerBase
             // silently deleted on the first auto-save.
             var json = MergeWithExistingSettings(path, settings);
 
+            var parsed = JsonSerializer.Deserialize<EncoderOptions>(json, _jsonOptions)
+                         ?? throw new JsonException("Settings must deserialize to an EncoderOptions object.");
+            parsed.AdvancedVideo ??= new AdvancedVideoOptions();
+            var validation = AdvancedVideoValidator.Validate(parsed.AdvancedVideo);
+            if (_autoScanService != null)
+            {
+                foreach (var folder in _autoScanService.GetConfig().Directories)
+                {
+                    var folderOptions = folder.EncodingOverrides;
+                    if (folderOptions?.AdvancedVideoPolicy != AdvancedVideoFolderPolicy.Profile) continue;
+                    if (folderOptions.AdvancedVideoProfileId.HasValue
+                        && parsed.AdvancedVideo.Profiles?.Any(p => p != null && p.Id == folderOptions.AdvancedVideoProfileId.Value) == true) continue;
+
+                    validation.Diagnostics.Add(new AdvancedVideoDiagnostic(
+                        "advancedVideo.profiles",
+                        "folder_profile_reference_missing",
+                        $"Watched folder {folder.Path} references a profile that is not present. Reassign the folder before deleting the profile.",
+                        AdvancedVideoDiagnosticSeverity.Error));
+                }
+            }
+            if (!validation.IsValid)
+            {
+                return BadRequest(new
+                {
+                    success = false,
+                    error = "Advanced video settings are invalid.",
+                    diagnostics = validation.Diagnostics,
+                });
+            }
+
             System.IO.File.WriteAllText(temp, json);
             if (System.IO.File.Exists(path))
                 System.IO.File.Copy(path, backup, overwrite: true);
@@ -173,15 +215,12 @@ public sealed class SettingsController : ControllerBase
 
             try
             {
-                var parsed = JsonSerializer.Deserialize<EncoderOptions>(json, _jsonOptions);
-                if (parsed != null)
-                {
-                    MigrateLegacyAudioIfNeeded(parsed, json);
-                    // Env overrides beat whatever was just persisted — the in-memory
-                    // options must always reflect the env-effective configuration.
-                    EnvConfigOverrides.Apply(parsed, EnvConfigOverrides.SettingsPrefix);
-                    _transcodingService.UpdateOptions(parsed);
-                }
+                MigrateLegacyAudioIfNeeded(parsed, json);
+                // Env overrides beat whatever was just persisted — the in-memory
+                // options must always reflect the env-effective configuration.
+                EnvConfigOverrides.Apply(parsed, EnvConfigOverrides.SettingsPrefix);
+                _transcodingService.UpdateOptions(parsed);
+                _ffmpegCapabilities.Invalidate();
             }
             catch
             {
@@ -194,6 +233,370 @@ public sealed class SettingsController : ControllerBase
         {
             return BadRequest(ex.Message);
         }
+    }
+
+    /******************************************************************
+     *  Advanced video catalog and validation
+     ******************************************************************/
+
+    public sealed class AdvancedVideoValidationRequest
+    {
+        public AdvancedVideoOptions AdvancedVideo { get; set; } = new();
+        public Guid? ProfileId { get; set; }
+        public VideoSourceFacts? SourceFacts { get; set; }
+
+        /// <summary>Impact only: resolve files whose name contains this and report their decision.</summary>
+        public string? FileQuery { get; set; }
+    }
+
+    /// <summary>Returns every H.264/HEVC/AV1 encoder detected locally plus worker availability.</summary>
+    [HttpGet("video-encoders")]
+    public async Task<IActionResult> GetVideoEncoders([FromQuery] bool refresh = false, CancellationToken cancellationToken = default)
+    {
+        var localEncoders = await _ffmpegCapabilities.GetVideoEncodersAsync(refresh, cancellationToken);
+        var localDevices = _transcodingService.GetDetectedDevices();
+        var localHardware = localDevices.Where(d => d.IsHardware)
+            .SelectMany(d => d.Encoders)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var nodes = _clusterService?.GetNodes() ?? Array.Empty<ClusterNode>();
+        var localNames = localEncoders.Select(e => e.Encoder).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        // A coordinator's FFmpeg build can be narrower than a connected worker's.
+        // Build the public catalog from the union so worker-only encoders remain
+        // selectable instead of disappearing merely because the coordinator lacks them.
+        var encoderMap = localEncoders.ToDictionary(e => e.Encoder, StringComparer.OrdinalIgnoreCase);
+        foreach (var encoderName in nodes
+                     .SelectMany(node => node.Capabilities?.SupportedEncoders ?? [])
+                     .Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            if (encoderMap.ContainsKey(encoderName)) continue;
+            var codec = VideoEncoderRegistry.EncoderCodec(encoderName);
+            if (codec is not ("h264" or "h265" or "av1")) continue;
+            var descriptor = VideoEncoderRegistry.Describe(encoderName, codec);
+            encoderMap[encoderName] = new VideoEncoderCapability
+            {
+                Encoder = encoderName,
+                Codec = codec,
+                Family = descriptor.Family,
+                DeviceId = descriptor.DeviceId,
+                QualityLabel = descriptor.QualityLabel,
+                QualityMin = descriptor.QualityMin,
+                QualityMax = descriptor.QualityMax,
+                SupportsTypedQuality = descriptor.SupportsTypedQuality,
+                SupportsQualityConstraints = descriptor.SupportsQualityConstraints,
+                RateControlModes = descriptor.SupportsTypedQuality ? ["Bitrate", "Quality", "Custom"] : ["Custom"],
+                Presets = descriptor.Presets,
+                PixelFormats = descriptor.PixelFormats,
+                SupportedOptions = Array.Empty<string>(),
+            };
+        }
+
+        // Registry-known encoders nobody advertises yet stay authorable: a recipe
+        // written today for a VAAPI or NVENC worker that joins tomorrow is the
+        // documented portability contract, not an error state.
+        foreach (var encoderName in VideoEncoderRegistry.KnownEncoders)
+        {
+            if (encoderMap.ContainsKey(encoderName)) continue;
+            var codec = VideoEncoderRegistry.EncoderCodec(encoderName)!;
+            var descriptor = VideoEncoderRegistry.Describe(encoderName, codec);
+            encoderMap[encoderName] = new VideoEncoderCapability
+            {
+                Encoder = encoderName,
+                Codec = codec,
+                Family = descriptor.Family,
+                DeviceId = descriptor.DeviceId,
+                QualityLabel = descriptor.QualityLabel,
+                QualityMin = descriptor.QualityMin,
+                QualityMax = descriptor.QualityMax,
+                SupportsTypedQuality = descriptor.SupportsTypedQuality,
+                SupportsQualityConstraints = descriptor.SupportsQualityConstraints,
+                RateControlModes = descriptor.SupportsTypedQuality ? ["Bitrate", "Quality", "Custom"] : ["Custom"],
+                Presets = descriptor.Presets,
+                PixelFormats = descriptor.PixelFormats,
+                SupportedOptions = Array.Empty<string>(),
+            };
+        }
+
+        var catalog = encoderMap.Values.OrderBy(encoder => encoder.Codec).ThenBy(encoder => encoder.Encoder).Select(encoder => new
+        {
+            encoder.Encoder,
+            encoder.Codec,
+            encoder.Family,
+            encoder.DeviceId,
+            encoder.QualityLabel,
+            encoder.QualityMin,
+            encoder.QualityMax,
+            encoder.SupportsTypedQuality,
+            encoder.SupportsQualityConstraints,
+            encoder.RateControlModes,
+            encoder.Presets,
+            encoder.PixelFormats,
+            encoder.SupportedOptions,
+            localAvailable = localNames.Contains(encoder.Encoder)
+                             && (encoder.DeviceId == "cpu" || localHardware.Contains(encoder.Encoder)),
+            detected = localNames.Contains(encoder.Encoder)
+                       || nodes.Any(n => n.Capabilities?.SupportedEncoders.Contains(encoder.Encoder, StringComparer.OrdinalIgnoreCase) == true),
+            workers = nodes.Where(n => n.Capabilities?.SupportedEncoders.Contains(encoder.Encoder, StringComparer.OrdinalIgnoreCase) == true)
+                .Select(n => new
+                {
+                    n.NodeId,
+                    n.Hostname,
+                    protocolVersion = n.Capabilities!.AdvancedVideoProtocolVersion,
+                    protocolSupported = n.Capabilities.AdvancedVideoProtocolVersion >= VideoJobPlan.CurrentProtocolVersion,
+                }),
+        });
+
+        return Ok(new
+        {
+            protocolVersion = VideoJobPlan.CurrentProtocolVersion,
+            encoders = catalog,
+            devices = localDevices,
+            folderReferences = _autoScanService?.GetConfig().Directories
+                .Where(folder => folder.EncodingOverrides?.AdvancedVideoPolicy == AdvancedVideoFolderPolicy.Profile)
+                .Select(folder => new
+                {
+                    folder.Path,
+                    profileId = folder.EncodingOverrides!.AdvancedVideoProfileId,
+                }) ?? Enumerable.Empty<object>(),
+        });
+    }
+
+    /// <summary>Validates a staged advanced editor state and returns an exact video argument preview.</summary>
+    [HttpPost("advanced-video/validate")]
+    public async Task<IActionResult> ValidateAdvancedVideo(
+        [FromBody] AdvancedVideoValidationRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        if (request == null)
+            return BadRequest(new { error = "A validation request body is required." });
+
+        var advanced = request.AdvancedVideo;
+        var validation = AdvancedVideoValidator.Validate(advanced);
+        if (advanced == null)
+        {
+            return Ok(new
+            {
+                valid = false,
+                diagnostics = validation.Diagnostics,
+                plan = (VideoJobPlan?)null,
+                encoder = (string?)null,
+                arguments = Array.Empty<string>(),
+                preview = "",
+            });
+        }
+
+        var profiles = advanced.Profiles ?? [];
+        VideoEncodingProfile? profile = request.ProfileId.HasValue
+            ? profiles.FirstOrDefault(p => p != null && p.Id == request.ProfileId.Value)
+            : null;
+        VideoJobPlan? plan = null;
+
+        if (request.SourceFacts != null && validation.IsValid)
+        {
+            var candidate = new EncoderOptions { AdvancedVideo = advanced.Clone() };
+            candidate.AdvancedVideo.Enabled = true;
+            var resolution = VideoPolicyResolver.Resolve(candidate, null, null, request.SourceFacts);
+            plan = resolution.Plan;
+            profile ??= plan.Profile;
+        }
+
+        if (profile != null && profile.EncoderSelection == VideoEncoderSelectionMode.Explicit)
+        {
+            var available = await _ffmpegCapabilities.GetVideoEncodersAsync(false, cancellationToken);
+            var localCapability = available.FirstOrDefault(e =>
+                string.Equals(e.Encoder, profile.Encoder, StringComparison.OrdinalIgnoreCase));
+            bool localAvailable = localCapability != null
+                                  && (localCapability.DeviceId == "cpu"
+                                      || _transcodingService.GetDetectedDevices().Any(device =>
+                                          device.Encoders.Contains(profile.Encoder!, StringComparer.OrdinalIgnoreCase)));
+            bool workerAvailable = (_clusterService?.GetNodes() ?? Array.Empty<ClusterNode>()).Any(node =>
+                node.Capabilities?.AdvancedVideoProtocolVersion >= VideoJobPlan.CurrentProtocolVersion
+                && node.Capabilities.SupportedEncoders.Contains(profile.Encoder!, StringComparer.OrdinalIgnoreCase));
+            if (!localAvailable && !workerAvailable)
+            {
+                validation.Diagnostics.Add(new AdvancedVideoDiagnostic(
+                    $"advancedVideo.profiles[{profiles.IndexOf(profile)}].encoder",
+                    "encoder_unavailable",
+                    $"{profile.Encoder} is not available on this host or a compatible connected worker. The portable profile may be saved, but matching jobs will wait.",
+                    AdvancedVideoDiagnosticSeverity.Warning));
+            }
+        }
+
+        var encoder = profile == null ? null : profile.EncoderSelection == VideoEncoderSelectionMode.Explicit
+            ? profile.Encoder
+            : VideoEncoderRegistry.DefaultSoftwareEncoder(profile.Codec);
+        var arguments = profile != null && encoder != null && validation.IsValid
+            ? VideoEncoderRegistry.BuildProfileArguments(profile, encoder)
+            : Array.Empty<string>();
+
+        return Ok(new
+        {
+            valid = validation.IsValid,
+            diagnostics = validation.Diagnostics,
+            plan,
+            encoder,
+            arguments,
+            preview = FfmpegArgumentList.FormatForDisplay(arguments),
+        });
+    }
+
+    /// <summary>
+    ///     Previews what a staged (unsaved) Advanced Video policy would decide for
+    ///     every tracked video file, using the shared resolver and the same
+    ///     longest-prefix folder overrides the scan and dispatch paths apply.
+    ///     Read-only: nothing is queued, re-evaluated, or persisted.
+    /// </summary>
+    [HttpPost("advanced-video/impact")]
+    public async Task<IActionResult> AdvancedVideoImpact([FromBody] AdvancedVideoValidationRequest request)
+    {
+        if (request?.AdvancedVideo == null)
+            return BadRequest(new { error = "A staged advancedVideo block is required." });
+
+        var validation = AdvancedVideoValidator.Validate(request.AdvancedVideo);
+        if (!validation.IsValid)
+            return Ok(new { valid = false, diagnostics = validation.Diagnostics });
+
+        var candidate = new EncoderOptions { AdvancedVideo = request.AdvancedVideo.Clone() };
+        candidate.AdvancedVideo.Enabled = true;
+
+        // Pages keep memory flat on large libraries; the cap keeps a pathological
+        // catalog from pinning a request thread. Beyond the cap the preview uses a
+        // uniform random sample — first-N-by-Id would bias toward the oldest scans.
+        const int pageSize = 5000;
+        const int maxAnalyzed = 20000;
+        var rows = new List<(MediaFile File, EncoderOptionsOverride? Folder)>();
+        var (firstPage, total) = await _mediaFileRepo.GetVideoFilesPageAsync(0, pageSize);
+        if (total > maxAnalyzed)
+        {
+            foreach (var file in await _mediaFileRepo.GetVideoFilesSampleAsync(maxAnalyzed))
+                rows.Add((file, _autoScanService?.FindFolderOverride(file.FilePath)));
+        }
+        else
+        {
+            foreach (var file in firstPage)
+                rows.Add((file, _autoScanService?.FindFolderOverride(file.FilePath)));
+            for (var skip = pageSize; skip < total; skip += pageSize)
+            {
+                var (page, _) = await _mediaFileRepo.GetVideoFilesPageAsync(skip, pageSize);
+                foreach (var file in page)
+                    rows.Add((file, _autoScanService?.FindFolderOverride(file.FilePath)));
+                if (page.Count < pageSize) break;
+            }
+        }
+
+        var impact = AdvancedVideoImpactService.Aggregate(candidate, rows);
+        var rules = candidate.AdvancedVideo.Rules ?? [];
+        var shadowed = AdvancedVideoRuleAnalysis.FindShadowedRules(rules)
+            .Where(s => rules[s.RuleIndex] != null && rules[s.ByRuleIndex] != null)
+            .Select(s => new { ruleId = rules[s.RuleIndex]!.Id, byRuleName = rules[s.ByRuleIndex]!.Name });
+        var fileMatches = string.IsNullOrWhiteSpace(request.FileQuery)
+            ? []
+            : AdvancedVideoImpactService.FindFiles(candidate, rows, request.FileQuery);
+
+        return Ok(new
+        {
+            valid = true,
+            totalVideoFiles = total,
+            analyzed = impact.Analyzed,
+            truncated = total > impact.Analyzed,
+            sampled = total > maxAnalyzed,
+            buckets = impact.Buckets,
+            ruleCounts = impact.RuleCounts,
+            unmatchedCount = impact.UnmatchedCount,
+            shadowed,
+            fileMatches,
+        });
+    }
+
+    /// <summary>
+    ///     Measured Advanced Video results from the encode-history ledger, grouped
+    ///     by profile — the reality check that sits next to the impact forecast.
+    /// </summary>
+    [HttpGet("advanced-video/measured")]
+    public async Task<IActionResult> AdvancedVideoMeasured()
+    {
+        var rows = _encodeHistoryRepo == null
+            ? []
+            : await _encodeHistoryRepo.GetAdvancedLabeledAsync();
+        return Ok(new { profiles = AdvancedVideoMeasuredService.Aggregate(rows) });
+    }
+
+    /******************************************************************
+     *  Advanced Video user templates
+     ******************************************************************/
+
+    public sealed class AdvancedVideoTemplateSaveRequest
+    {
+        public string Name { get; set; } = "";
+        public AdvancedVideoOptions AdvancedVideo { get; set; } = new();
+    }
+
+    private sealed class AdvancedVideoTemplateStore
+    {
+        public List<AdvancedVideoTemplateSaveRequest> Templates { get; set; } = new();
+    }
+
+    private static readonly JsonSerializerOptions _templateJson = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        PropertyNameCaseInsensitive = true,
+        WriteIndented = true,
+    };
+
+    [HttpGet("advanced-video/templates")]
+    public IActionResult GetAdvancedVideoTemplates() =>
+        Ok(new { templates = ReadAdvancedTemplates().Templates });
+
+    /// <summary>Upserts by name. Only policies that validate clean may be saved.</summary>
+    [HttpPost("advanced-video/templates")]
+    public IActionResult SaveAdvancedVideoTemplate([FromBody] AdvancedVideoTemplateSaveRequest request)
+    {
+        var name = request?.Name?.Trim() ?? "";
+        if (name.Length is 0 or > 60)
+            return BadRequest(new { error = "Template names must be 1–60 characters." });
+        var validation = AdvancedVideoValidator.Validate(request!.AdvancedVideo);
+        if (!validation.IsValid)
+            return BadRequest(new { error = "Only valid policies can be saved as templates.", diagnostics = validation.Errors });
+
+        var store = ReadAdvancedTemplates();
+        store.Templates.RemoveAll(t => string.Equals(t.Name, name, StringComparison.OrdinalIgnoreCase));
+        if (store.Templates.Count >= 20)
+            return BadRequest(new { error = "Template limit reached (20). Delete one first." });
+        store.Templates.Add(new AdvancedVideoTemplateSaveRequest { Name = name, AdvancedVideo = request.AdvancedVideo.Clone() });
+        WriteAdvancedTemplates(store);
+        return Ok(new { templates = store.Templates });
+    }
+
+    [HttpDelete("advanced-video/templates/{name}")]
+    public IActionResult DeleteAdvancedVideoTemplate(string name)
+    {
+        var store = ReadAdvancedTemplates();
+        store.Templates.RemoveAll(t => string.Equals(t.Name, name, StringComparison.OrdinalIgnoreCase));
+        WriteAdvancedTemplates(store);
+        return Ok(new { templates = store.Templates });
+    }
+
+    private AdvancedVideoTemplateStore ReadAdvancedTemplates()
+    {
+        try
+        {
+            var path = GetAdvancedTemplatesPath();
+            if (!System.IO.File.Exists(path)) return new AdvancedVideoTemplateStore();
+            return JsonSerializer.Deserialize<AdvancedVideoTemplateStore>(
+                System.IO.File.ReadAllText(path), _templateJson) ?? new AdvancedVideoTemplateStore();
+        }
+        catch
+        {
+            return new AdvancedVideoTemplateStore();
+        }
+    }
+
+    private void WriteAdvancedTemplates(AdvancedVideoTemplateStore store)
+    {
+        var path = GetAdvancedTemplatesPath();
+        var tmp = path + ".tmp";
+        System.IO.File.WriteAllText(tmp, JsonSerializer.Serialize(store, _templateJson));
+        System.IO.File.Move(tmp, path, overwrite: true);
     }
 
     /// <summary>
@@ -309,12 +712,12 @@ public sealed class SettingsController : ControllerBase
             // next scan re-probes them.
             int requeued = await _mediaFileRepo.ReevaluateSkippedAsync(mf =>
                 mf.AudioStreams != null || mf.SubtitleStreams != null
-                    ? TranscodingService.WouldSkipUnderOptions(mf, options)
+                    ? _transcodingService.WouldSkipUnderPolicy(mf, options)
                     : false);
 
             // Direction B: files no longer eligible (Unseen → Skipped).
             int reskipped = await _mediaFileRepo.ReevaluateUnseenAsync(mf =>
-                TranscodingService.WouldSkipUnderOptions(mf, options));
+                _transcodingService.WouldSkipUnderPolicy(mf, options));
 
             // Drop pending queue items that current settings would skip.
             int dequeued = await _transcodingService.RemoveSettingsObsoletedQueueItemsAsync(options);
@@ -427,6 +830,20 @@ public sealed class SettingsController : ControllerBase
         var name = (request.Name ?? "").Trim();
         if (name.Length is 0 or > 80) return BadRequest("Preset name must be 1–80 characters");
         if (request.Options.ValueKind != JsonValueKind.Object) return BadRequest("Preset options must be an object");
+        try
+        {
+            var parsed = request.Options.Deserialize<EncoderOptions>(_jsonOptions);
+            if (parsed?.AdvancedVideo != null)
+            {
+                var validation = AdvancedVideoValidator.Validate(parsed.AdvancedVideo);
+                if (!validation.IsValid)
+                    return BadRequest(new { error = "Preset contains invalid advanced video settings.", diagnostics = validation.Diagnostics });
+            }
+        }
+        catch (JsonException ex)
+        {
+            return BadRequest($"Preset options are invalid: {ex.Message}");
+        }
 
         lock (_presetsLock)
         {
@@ -543,5 +960,12 @@ public sealed class SettingsController : ControllerBase
         var configDir = Path.Combine(_fileService.GetWorkingDirectory(), "config");
         if (!Directory.Exists(configDir)) Directory.CreateDirectory(configDir);
         return Path.Combine(configDir, "presets.json");
+    }
+
+    private string GetAdvancedTemplatesPath()
+    {
+        var configDir = Path.Combine(_fileService.GetWorkingDirectory(), "config");
+        if (!Directory.Exists(configDir)) Directory.CreateDirectory(configDir);
+        return Path.Combine(configDir, "advanced-video-templates.json");
     }
 }

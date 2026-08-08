@@ -27,6 +27,7 @@ import {
     getEncoderOptions,
     retryRestoreEncoderOptionsIfNeeded,
 } from './encoder-form.js';
+import { disableAdvancedVideoForSimplePreset, getAdvancedVideoOptions } from './advanced-video.js';
 
 const PREFIX = 'settings';
 
@@ -173,6 +174,7 @@ function audioOutputsMatch(a, b) {
 
 /** True when every field the preset takes a position on matches the form. */
 function presetMatchesForm(preset) {
+    if (getAdvancedVideoOptions().enabled) return false;
     return Object.entries(preset.options).every(([key, val]) => {
         if (key === 'AudioOutputs') return audioOutputsMatch(formAudioOutputs(), val);
         const fv = formValue(key);
@@ -244,19 +246,20 @@ function renderUserPresets() {
  * settings, so a stray click on a card shouldn't silently wipe a hand-tuned
  * config. Proceeds to {@link applyPreset} only when the user accepts.
  */
-async function confirmAndApplyPreset(options, label) {
+async function confirmAndApplyPreset(options, label, builtIn = false) {
     const ok = await showConfirmModal(
         'Apply Preset',
         `Apply the "${label}" preset? This overwrites your current encoder settings.`,
         'Apply');
-    if (ok) applyPreset(options, label);
+    if (ok) applyPreset(options, label, builtIn);
 }
 
 /** Applies an options object to the form, persists, and re-runs the UI syncs. */
-function applyPreset(options, label) {
+function applyPreset(options, label, builtIn = false) {
     // Layer over the reset floor so any "sticky" field the preset doesn't carry —
     // a built-in's unlisted fields, or a field newer than a saved user preset — falls
     // back to its default instead of lingering from a previously applied profile.
+    if (builtIn) disableAdvancedVideoForSimplePreset();
     applyEncoderOptionsToForm(PREFIX, { ...PRESET_BASELINE, ...options });
 
     // Persist via the normal auto-save path, then let main.js's sync handlers
@@ -353,7 +356,7 @@ export function initPresets() {
         // blocked (and the user's click silently lost) after a failed restore.
         retryRestoreEncoderOptionsIfNeeded(PREFIX);
         const preset = BUILTIN_PRESETS.find(p => p.key === card.dataset.presetKey);
-        if (preset) confirmAndApplyPreset(preset.options, preset.name);
+        if (preset) confirmAndApplyPreset(preset.options, preset.name, true);
     });
 
     document.getElementById('presetUserList')?.addEventListener('click', (e) => {

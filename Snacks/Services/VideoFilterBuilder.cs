@@ -23,7 +23,8 @@ namespace Snacks.Services;
 ///             followed by <c>format=…|vaapi,hwupload</c> when VAAPI is the target.
 ///         </item>
 ///         <item>
-///             Filter order: crop → fps → tonemap → scale → hwupload-terminator.
+    ///             Filter order: crop → fps → tonemap → scale → additional filters →
+    ///             final pixel format → hwupload terminator.
 ///             Cropping and dropping frames first reduces the pixels/frames the
 ///             rest of the chain has to process.
 ///         </item>
@@ -46,10 +47,12 @@ public static class VideoFilterBuilder
         bool    useVaapi,
         bool    canHwDecode,
         string  vaapiFormat,
-        string? fpsExpr = null)
+        string? fpsExpr = null,
+        IReadOnlyList<string>? additionalFilters = null)
     {
         bool hasFilter = !string.IsNullOrEmpty(cropExpr) || !string.IsNullOrEmpty(fpsExpr)
-                      || tonemap || !string.IsNullOrEmpty(scaleExpr);
+                      || tonemap || !string.IsNullOrEmpty(scaleExpr)
+                      || additionalFilters is { Count: > 0 };
 
         // No user-requested filters — preserve pre-refactor behavior byte-for-byte.
         if (!hasFilter)
@@ -61,8 +64,15 @@ public static class VideoFilterBuilder
         var parts = new List<string>(5);
         if (!string.IsNullOrEmpty(cropExpr))  parts.Add(cropExpr);
         if (!string.IsNullOrEmpty(fpsExpr))   parts.Add(fpsExpr);
-        if (tonemap)                          parts.Add(TonemapSwChain);
+        bool hasAdditional = additionalFilters is { Count: > 0 };
+        if (tonemap) parts.Add(hasAdditional ? TonemapSwChainBeforeOutputFormat : TonemapSwChain);
         if (!string.IsNullOrEmpty(scaleExpr)) parts.Add(scaleExpr);
+        if (hasAdditional)
+            parts.AddRange((additionalFilters ?? []).Where(f => !string.IsNullOrWhiteSpace(f)).Select(f => f.Trim()));
+        // Tonemap's normal recipe includes this terminal conversion. When custom
+        // filters follow, defer it until after them so their negotiated formats are
+        // not prematurely pinned and the documented insertion point stays stable.
+        if (tonemap && hasAdditional)         parts.Add("format=yuv420p");
         if (useVaapi)                         parts.Add($"format={vaapiFormat}|vaapi,hwupload");
 
         return $"-vf {string.Join(",", parts)} ";
@@ -75,6 +85,9 @@ public static class VideoFilterBuilder
     /// </summary>
     public const string TonemapSwChain =
         "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p";
+
+    private const string TonemapSwChainBeforeOutputFormat =
+        "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv";
 
     /// <summary>
     ///     Fallback tonemap chain using <c>colorspace</c>+<c>tonemap</c>. Lossier

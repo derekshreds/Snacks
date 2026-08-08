@@ -125,9 +125,9 @@ See the [complete Docker/NAS guide](https://snacksvideo.com/docs/#quick-start) o
 ## How it works
 
 1. **Scan** — FFprobe inventories codec, bitrate, resolution, streams, and duration.
-2. **Decide** — the selected preset determines whether each file should be skipped, remuxed, or encoded. Analyze mode previews those decisions without queueing work.
+2. **Decide** — the selected preset determines whether each file should be skipped, remuxed, or encoded. The opt-in Advanced Video layer can instead select reusable profiles with ordered source-property rules. Analyze mode previews those decisions without queueing work.
 3. **Process** — FFmpeg uses hardware acceleration when available and software when it is not.
-4. **Verify** — Snacks checks the result and rejects invalid or larger outputs rather than silently replacing good media.
+4. **Verify** — Snacks checks every result. The default Smaller Only policy rejects larger outputs; an Advanced quality profile can explicitly use Always Keep when predictable quality matters more than final size.
 5. **Repeat** — watch folders, integrations, notifications, and the API keep the workflow moving as the library changes.
 
 > [!IMPORTANT]
@@ -137,6 +137,7 @@ See the [complete Docker/NAS guide](https://snacksvideo.com/docs/#quick-start) o
 
 - Video and music pipelines with independent settings
 - H.264, HEVC/H.265, and AV1 output
+- Opt-in Advanced Video profiles with codec/resolution/bitrate rules, CRF/CQ/QP modes, exact runtime-detected encoders, guarded FFmpeg options, and cluster-aware routing
 - MKV and MP4 containers
 - Quality presets plus detailed video, audio, subtitle, crop, and file-handling controls
 - NVIDIA NVENC, Intel QSV/VAAPI, AMD AMF/VAAPI, and Apple VideoToolbox support
@@ -149,6 +150,14 @@ See the [complete Docker/NAS guide](https://snacksvideo.com/docs/#quick-start) o
 - Sonarr, Radarr, TMDb, and TheTVDB connectivity
 - Webhook, Discord, ntfy, and Apprise notifications
 - API-key authentication, environment-variable configuration, OpenAPI, and health endpoints
+
+Advanced Video is disabled after upgrade, so existing settings and decisions remain unchanged. The settings panel shows the decision flow as plain-language cards and previews what a staged policy would do to your entire library — per-rule file counts, disk usage, and measured results from completed encodes included — before you apply anything. Policies export and import as plain JSON files for sharing. See the [in-app Advanced Video guide](https://snacksvideo.com/docs/#advanced-video) and the [AV1 quality-policy example](examples/advanced-video-policy.json).
+
+<p align="center">
+  <img src="docs/images/advanced-flow.png" alt="Advanced Video decision flow: plain-language rule cards with live per-rule file counts" width="720">
+  <br>
+  <img src="docs/images/advanced-impact.png" alt="Library impact preview with per-outcome counts, disk usage, and measured results" width="720">
+</p>
 
 <details>
 <summary><strong>Hardware acceleration matrix</strong></summary>

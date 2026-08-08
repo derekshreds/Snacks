@@ -80,6 +80,12 @@ public sealed class EncoderOptions
     /// </summary>
     public string? VideoLevel { get; set; }
 
+    /// <summary>
+    ///     Optional advanced policy/profile layer. Disabled by default so existing
+    ///     installations retain the legacy Simple behavior until explicitly enabled.
+    /// </summary>
+    public AdvancedVideoOptions AdvancedVideo { get; set; } = new();
+
     /******************************************************************
      *  Audio
      ******************************************************************/
@@ -326,6 +332,7 @@ public sealed class EncoderOptions
         FfmpegQualityPreset        = FfmpegQualityPreset,
         VideoProfile               = VideoProfile,
         VideoLevel                 = VideoLevel,
+        AdvancedVideo              = AdvancedVideo?.Clone() ?? new AdvancedVideoOptions(),
         TwoChannelAudio            = TwoChannelAudio,
         AudioLanguagesToKeep       = new List<string>(AudioLanguagesToKeep),
         KeepOriginalLanguage       = KeepOriginalLanguage,

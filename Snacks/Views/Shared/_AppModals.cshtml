@@ -153,6 +153,7 @@
                         @await Html.PartialAsync("_MuxSettings", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })
                         <div class="settings-section-title mt-4"><i class="fas fa-film me-2"></i>Video Processing</div>
                         @await Html.PartialAsync("_VideoSettings", null, new ViewDataDictionary(ViewData) { {"FormPrefix", "settings"} })
+                        @await Html.PartialAsync("_AdvancedVideoSettings")
                     </div>
 
                     <div class="tab-pane fade" id="audioTab" role="tabpanel" data-role-visible="master standalone">
@@ -243,6 +244,25 @@
             </div>
             <div id="nodeDeviceList" class="mb-3">
                 <div class="text-muted small"><em>Detected devices appear here once capabilities are reported.</em></div>
+            </div>
+            <hr>
+        </div>
+        <div id="overrideAdvancedVideoPolicy" style="display: none;">
+            <h6 class="fw-bold mb-2"><i class="fas fa-code-branch me-1"></i> Advanced Video Policy</h6>
+            <div class="row g-2 mb-3">
+                <div class="col-md-6">
+                    <label class="form-label" for="ovrAdvancedVideoPolicy">Policy for this folder</label>
+                    <select class="form-select form-select-sm" id="ovrAdvancedVideoPolicy">
+                        <option value="Inherit">Inherit global advanced rules</option>
+                        <option value="Simple">Force Simple behavior</option>
+                        <option value="Profile">Always use selected profile</option>
+                    </select>
+                </div>
+                <div class="col-md-6">
+                    <label class="form-label" for="ovrAdvancedVideoProfileId">Global profile</label>
+                    <select class="form-select form-select-sm" id="ovrAdvancedVideoProfileId" disabled></select>
+                </div>
+                <div class="col-12"><div class="form-text">Scalar overrides below apply after policy/profile selection. A codec or encoder conflict blocks the job instead of silently changing an exact encoder.</div></div>
             </div>
             <hr>
         </div>

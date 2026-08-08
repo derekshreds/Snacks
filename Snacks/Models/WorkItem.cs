@@ -92,6 +92,21 @@ public sealed class WorkItem
     /// </summary>
     public bool IsHevc { get; set; } = false;
 
+    /// <summary>Normalized source codec retained when the full probe is released.</summary>
+    public string? SourceCodec { get; set; }
+
+    /// <summary>Source raster width retained for advanced rule evaluation.</summary>
+    public int SourceWidth { get; set; }
+
+    /// <summary>Source raster height retained for advanced rule evaluation.</summary>
+    public int SourceHeight { get; set; }
+
+    /// <summary>Source pixel format retained for advanced rule evaluation.</summary>
+    public string? SourcePixelFormat { get; set; }
+
+    /// <summary>Whether the persisted/probed source is HDR.</summary>
+    public bool SourceIsHdr { get; set; }
+
     /// <summary> Whether the source video is 4K (any video stream wider than 1920px). </summary>
     public bool Is4K { get; set; } = false;
 
@@ -174,6 +189,25 @@ public sealed class WorkItem
 
     /// <summary> Human-readable error message if the job failed. </summary>
     public string? ErrorMessage { get; set; }
+
+    /// <summary>Why an otherwise pending job currently has no eligible encoder/worker.</summary>
+    public string? WaitReason { get; set; }
+
+    /// <summary>Resolved advanced action shown by queue clients.</summary>
+    public AdvancedVideoAction VideoPolicyAction { get; set; } = AdvancedVideoAction.UseSimpleSettings;
+
+    /// <summary>Matched advanced rule name, when one selected this job.</summary>
+    public string? VideoRuleName { get; set; }
+
+    /// <summary>Selected advanced profile name, when applicable.</summary>
+    public string? VideoProfileName { get; set; }
+
+    /// <summary>Exact or runtime-resolved FFmpeg video encoder, when known.</summary>
+    public string? VideoEncoderName { get; set; }
+
+    /// <summary>Full resolved plan used locally and attached to cluster metadata.</summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public VideoJobPlan? VideoPlan { get; set; }
 
     /// <summary> UTC timestamp when this work item was created. </summary>
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;

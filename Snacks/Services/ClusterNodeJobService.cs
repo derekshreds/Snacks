@@ -330,12 +330,39 @@ public sealed class ClusterNodeJobService
         if (_nodePaused)
             return (false, "Node is paused");
 
+        var resolvedPlanError = VideoPolicyResolver.ValidateResolvedPlan(metadata.VideoPlan, metadata.Options);
+        if (resolvedPlanError != null)
+            return (false, resolvedPlanError);
+
+        if (metadata.VideoPlan?.Profile is { } receivedProfile)
+        {
+            var receivedValidation = AdvancedVideoValidator.Validate(new AdvancedVideoOptions
+            {
+                Enabled = true,
+                // Validate the wire object before Clone() normalizes nullable
+                // collections. Malformed hand-crafted cluster payloads must be
+                // rejected at receipt rather than repaired into executable defaults.
+                Profiles = [receivedProfile],
+            });
+            if (!receivedValidation.IsValid)
+                return (false, "Invalid advanced video profile: "
+                    + string.Join(" ", receivedValidation.Errors.Select(error => $"{error.Path}: {error.Message}")));
+        }
+
         // Resolve which device slot the master assigned. A null DeviceId means
         // the master is older than this build — fall back to whichever device
         // we'd pick by default (primary detected hardware, else CPU).
         var deviceId = ResolveDeviceId(metadata.DeviceId);
         if (deviceId == null)
             return (false, $"Device {metadata.DeviceId} is not available on this worker");
+
+        if (!string.IsNullOrWhiteSpace(metadata.VideoPlan?.ExplicitEncoder))
+        {
+            var device = _transcodingService.GetDetectedDevices()
+                .FirstOrDefault(d => string.Equals(d.DeviceId, deviceId, StringComparison.OrdinalIgnoreCase));
+            if (device == null || !device.Encoders.Contains(metadata.VideoPlan.ExplicitEncoder, StringComparer.OrdinalIgnoreCase))
+                return (false, $"Exact encoder {metadata.VideoPlan.ExplicitEncoder} is not available on device {deviceId}");
+        }
 
         // Re-running the same job (e.g. master crash + recovery) shouldn't
         // queue behind itself — we already hold the slot.
@@ -404,9 +431,18 @@ public sealed class ClusterNodeJobService
                 Bitrate   = metadata.Bitrate,
                 Length    = metadata.Duration,
                 IsHevc    = metadata.IsHevc,
+                SourceCodec = metadata.Probe?.Streams.FirstOrDefault(s => s.CodecType == "video")?.CodecName,
+                SourceWidth = metadata.Probe?.Streams.FirstOrDefault(s => s.CodecType == "video")?.Width ?? 0,
+                SourceHeight = metadata.Probe?.Streams.FirstOrDefault(s => s.CodecType == "video")?.Height ?? 0,
+                SourcePixelFormat = metadata.Probe?.Streams.FirstOrDefault(s => s.CodecType == "video")?.PixFmt,
+                SourceIsHdr = metadata.Probe != null && FfprobeService.IsHdr(metadata.Probe),
                 Is4K      = metadata.Is4K,
                 Kind      = metadata.Kind,
                 Probe     = metadata.Probe,
+                VideoPlan = metadata.VideoPlan?.Clone(),
+                VideoPolicyAction = metadata.VideoPlan?.Action ?? AdvancedVideoAction.UseSimpleSettings,
+                VideoRuleName = metadata.VideoPlan?.RuleName,
+                VideoProfileName = metadata.VideoPlan?.ProfileName,
                 Status    = WorkItemStatus.Processing,
                 StartedAt = DateTime.UtcNow,
             };

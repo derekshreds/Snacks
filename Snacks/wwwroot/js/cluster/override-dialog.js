@@ -20,6 +20,7 @@ import { escapeHtml }                               from '../utils/dom.js';
 import { openModal, closeModal, showConfirmModal }  from '../utils/modal-controller.js';
 import { defaultBitrateForCodec }                   from '../settings/encoder-form.js';
 import { initChipInput, getChipValues, setChipValues } from '../settings/chip-input.js';
+import { getAdvancedVideoProfileChoices }           from '../settings/advanced-video.js';
 
 
 // ---------------------------------------------------------------------------
@@ -238,6 +239,8 @@ export class OverrideDialog {
         this._getLastAutoScan = getLastAutoScanConfig;
         this._onFolderSaved   = onFolderSaved ?? (() => {});
         this._activeFields    = FOLDER_OVERRIDE_FIELDS;   // set per-open
+        document.addEventListener('snacks:advanced-video-profiles-changed', () =>
+            this._refreshFolderProfileChoices());
     }
 
     /** Closes the dialog if it is currently open. */
@@ -263,6 +266,8 @@ export class OverrideDialog {
      * @param {{standalone?: boolean}} [opts]
      */
     async openNode(nodeId, hostname, opts = {}) {
+        const policySection = document.getElementById('overrideAdvancedVideoPolicy');
+        if (policySection) policySection.style.display = 'none';
         const standalone = opts.standalone === true;
         this._activeFields = NODE_OVERRIDE_FIELDS;
         this._applyContextVisibility('node');
@@ -502,6 +507,12 @@ export class OverrideDialog {
         this._applyContextVisibility('folder');
         this._resetForm();
 
+        const policySection = document.getElementById('overrideAdvancedVideoPolicy');
+        if (policySection) policySection.style.display = '';
+        const policySelect = document.getElementById('ovrAdvancedVideoPolicy');
+        if (policySelect) policySelect.value = 'Inherit';
+        this._refreshFolderProfileChoices(null);
+
         const config = this._getLastAutoScan?.();
         if (config?.directories) {
             const folder = config.directories.find(d =>
@@ -509,8 +520,13 @@ export class OverrideDialog {
 
             if (folder && typeof folder === 'object' && folder.encodingOverrides) {
                 this._populateForm(folder.encodingOverrides);
+                const policy = folder.encodingOverrides.advancedVideoPolicy ?? 'Inherit';
+                if (policySelect) policySelect.value = policy;
+                this._refreshFolderProfileChoices(folder.encodingOverrides.advancedVideoProfileId ?? null);
             }
         }
+
+        if (policySelect) policySelect.onchange = () => this._refreshFolderProfileChoices();
 
         this._initToggles();
 
@@ -533,6 +549,16 @@ export class OverrideDialog {
      */
     async _saveFolder(path) {
         const overrides    = this._readForm();
+        const policy = document.getElementById('ovrAdvancedVideoPolicy')?.value ?? 'Inherit';
+        const selectedProfile = document.getElementById('ovrAdvancedVideoProfileId')?.value || null;
+        if (policy === 'Profile' && !selectedProfile) {
+            if (typeof showToast === 'function') showToast('Select a global Advanced Video profile for this folder.', 'warning');
+            return;
+        }
+        overrides.advancedVideoPolicy = policy === 'Inherit' ? null : policy;
+        overrides.advancedVideoProfileId = policy === 'Profile'
+            ? selectedProfile
+            : null;
         const hasOverrides = Object.values(overrides).some(v => v !== null);
 
         try {
@@ -567,6 +593,20 @@ export class OverrideDialog {
         } catch (err) {
             showToast('Error resetting folder settings: ' + err.message, 'danger');
         }
+    }
+
+    /** Rebuilds the folder's global-profile selector without maintaining a second catalog. */
+    _refreshFolderProfileChoices(selectedId = undefined) {
+        const policy = document.getElementById('ovrAdvancedVideoPolicy');
+        const select = document.getElementById('ovrAdvancedVideoProfileId');
+        if (!select) return;
+
+        const selected = selectedId === undefined ? select.value : (selectedId ?? '');
+        const profiles = getAdvancedVideoProfileChoices();
+        select.innerHTML = '<option value="">Select a global profile…</option>'
+            + profiles.map(profile => `<option value="${escapeHtml(profile.id)}">${escapeHtml(profile.name)}</option>`).join('');
+        if (profiles.some(profile => String(profile.id) === String(selected))) select.value = selected;
+        select.disabled = policy?.value !== 'Profile';
     }
 
 

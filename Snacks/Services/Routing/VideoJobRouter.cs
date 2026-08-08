@@ -45,7 +45,16 @@ public sealed class VideoJobRouter : IJobKindRouter
         }
 
         var caps = node.Capabilities;
-        if (caps == null) return 1;
+        if (caps == null) return item.VideoPlan is { IsAdvanced: true } ? -100 : 1;
+
+        if (item.VideoPlan is { IsAdvanced: true } plan
+            && caps.AdvancedVideoProtocolVersion < plan.ProtocolVersion)
+            return -100;
+
+        var exactEncoder = item.VideoPlan?.ExplicitEncoder;
+        if (!string.IsNullOrWhiteSpace(exactEncoder)
+            && !device.Encoders.Contains(exactEncoder, StringComparer.OrdinalIgnoreCase))
+            return -100;
 
         if (caps.AvailableDiskSpaceBytes < item.Size * 2.5)
             return -100;
@@ -89,14 +98,18 @@ public sealed class VideoJobRouter : IJobKindRouter
             && ctx.IsDeviceEnabled(node, d.DeviceId)
             && d.SupportedCodecs.Any(c => c.Equals(codecKey, StringComparison.OrdinalIgnoreCase))) == true;
 
-        if (hw == "none" && !isCpu) return -50;                                          // software-only ⇒ CPU only
-        if (hw != "none" && hw != "auto" && isCpu && selectedVendorUsable) return -50;   // specific vendor (usable) ⇒ never CPU; otherwise CPU is the software fallback
-        if (hw == "auto" && isCpu && nodeHasUsableHardware) return -50;                  // auto + usable HW ⇒ never CPU
-        if (hw != "none" && !isCpu && !string.Equals(device.DeviceId, hw, StringComparison.OrdinalIgnoreCase)
-            && hw != "auto") return -50;                                                 // specific vendor ⇒ wrong family
+        if (string.IsNullOrWhiteSpace(exactEncoder))
+        {
+            if (hw == "none" && !isCpu) return -50;                                          // software-only ⇒ CPU only
+            if (hw != "none" && hw != "auto" && isCpu && selectedVendorUsable) return -50;   // specific vendor (usable) ⇒ never CPU; otherwise CPU is the software fallback
+            if (hw == "auto" && isCpu && nodeHasUsableHardware) return -50;                  // auto + usable HW ⇒ never CPU
+            if (hw != "none" && !isCpu && !string.Equals(device.DeviceId, hw, StringComparison.OrdinalIgnoreCase)
+                && hw != "auto") return -50;                                                 // specific vendor ⇒ wrong family
+        }
 
         int score = 1;
-        if (hw == "none")                                                                  score += 6;
+        if (!string.IsNullOrWhiteSpace(exactEncoder))                                       score += 20;
+        else if (hw == "none")                                                             score += 6;
         else if (hw == "auto")                                                             score += isCpu ? 5 : 8;
         else if (string.Equals(device.DeviceId, hw, StringComparison.OrdinalIgnoreCase))   score += 12;
 
