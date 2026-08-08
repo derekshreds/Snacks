@@ -38,11 +38,20 @@
 
 Point Snacks at a video or music library, choose a preset, and let it do the repetitive work. It evaluates each file against the selected targets, skips media that is already suitable, and remuxes or transcodes everything else using the best available hardware path.
 
-| | |
-|---|---|
-| **Automate the library**<br>Watch folders, configurable scans, change detection, and transfer-safe processing keep new media moving without babysitting. | **Use the hardware already there**<br>NVIDIA, Intel, AMD, Apple VideoToolbox, and software encoders are detected and selected automatically. |
-| **Choose intent, not FFmpeg flags**<br>Start with Space Saver, Balanced, Quality First, Max Compatibility, or a custom preset. | **See the entire pipeline**<br>Live progress, queue controls, savings analytics, health checks, and per-file logs stay in one interface. |
-| **Recover instead of giving up**<br>Snacks validates outputs and can retry through progressively safer decode, subtitle, and software fallbacks. | **Scale beyond one machine**<br>Run standalone or distribute jobs across an authenticated cluster with automatic node discovery. |
+<table>
+  <tr>
+    <td><b>Automate the library</b><br>Watch folders, configurable scans, change detection, and transfer-safe processing keep new media moving without babysitting.</td>
+    <td><b>Use the hardware already there</b><br>NVIDIA, Intel, AMD, Apple VideoToolbox, and software encoders are detected and selected automatically.</td>
+  </tr>
+  <tr>
+    <td><b>Choose intent, not FFmpeg flags</b><br>Start with Space Saver, Balanced, Quality First, Max Compatibility, or a custom preset.</td>
+    <td><b>See the entire pipeline</b><br>Live progress, queue controls, savings analytics, health checks, and per-file logs stay in one interface.</td>
+  </tr>
+  <tr>
+    <td><b>Recover instead of giving up</b><br>Snacks validates outputs and can retry through progressively safer decode, subtitle, and software fallbacks.</td>
+    <td><b>Scale beyond one machine</b><br>Run standalone or distribute jobs across an authenticated cluster with automatic node discovery.</td>
+  </tr>
+</table>
 
 <details>
 <summary><strong>Take a closer look at the interface</strong></summary>
