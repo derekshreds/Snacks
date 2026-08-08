@@ -1,523 +1,211 @@
 <p align="center">
-  <img src="snacks.ico" alt="Snacks" width="80">
+  <a href="https://snacksvideo.com/">
+    <img src="snacks.ico" alt="Snacks" width="88">
+  </a>
 </p>
 
 <h1 align="center">Snacks</h1>
-<p align="center"><strong>Automated Media Library Transcoder</strong></p>
+
+<p align="center"><strong>Locally hosted. Lightly toasted.</strong></p>
+
 <p align="center">
-  Batch transcode your entire video <em>and</em> music library with hardware acceleration.<br>
-  Runs on your NAS via Docker or locally on Windows as a desktop app.
+  An open-source, self-hosted transcoder for video and music libraries.<br>
+  Scan, analyze, remux, encode, verify, and automate from one polished interface.
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-2.17.0-8b5cf6?style=flat-square" alt="Version">
-  <img src="https://img.shields.io/badge/.NET-10.0-512bd4?style=flat-square" alt=".NET 10">
-  <img src="https://img.shields.io/badge/Electron-43-47848f?style=flat-square" alt="Electron">
-  <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License">
+  <a href="https://github.com/derekshreds/Snacks/releases/latest"><img src="https://img.shields.io/github/v/release/derekshreds/Snacks?style=flat-square&color=8b5cf6" alt="Latest release"></a>
+  <a href="https://github.com/derekshreds/Snacks/actions/workflows/ci.yml"><img src="https://github.com/derekshreds/Snacks/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
+  <a href="https://hub.docker.com/r/derekshreds/snacks-docker"><img src="https://img.shields.io/docker/pulls/derekshreds/snacks-docker?style=flat-square&logo=docker&logoColor=white" alt="Docker pulls"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/derekshreds/Snacks?style=flat-square" alt="MIT License"></a>
+  <a href="https://discord.com/invite/DT3nWdq4av"><img src="https://img.shields.io/badge/Discord-Join%20the%20community-5865f2?style=flat-square&logo=discord&logoColor=white" alt="Join the Snacks Discord"></a>
 </p>
 
 <p align="center">
-  <a href="https://discord.gg/3uVGGJtB"><img src="https://img.shields.io/badge/Discord-Join%20Chat-5865f2?style=flat-square&logo=discord&logoColor=white" alt="Discord"></a>
+  <a href="https://snacksvideo.com/">Website</a> ·
+  <a href="https://snacksvideo.com/docs/">Documentation</a> ·
+  <a href="https://github.com/derekshreds/Snacks/releases/latest">Downloads</a> ·
+  <a href="https://discord.com/invite/DT3nWdq4av">Discord</a>
 </p>
 
----
+<p align="center">
+  <a href="https://snacksvideo.com/">
+    <img src="docs/images/dashboard.jpg" alt="Snacks encode dashboard showing storage savings, files encoded, encode time, compression, workload, and recent encodes" width="100%">
+  </a>
+</p>
 
-## Features
+## The library handles itself
 
-- **Hardware accelerated encoding** -- NVIDIA NVENC, Intel QSV/VAAPI, AMD AMF/VAAPI
-- **H.265, H.264, and AV1** -- encode to any modern codec with hardware or software
-- **Smart filtering** -- skips files that already meet your quality targets
-- **Persistent database** -- SQLite tracks all files across restarts, no re-scanning needed
-- **Retry with fallback** -- strips subtitles, tries software decode + HW encode, then full software
-- **Real-time progress** -- live encoding progress via SignalR WebSockets
-- **Batch processing** -- process individual files, folders, or entire libraries
-- **NAS-friendly** -- designed for QNAP, Synology, and other Docker-capable NAS devices
-- **Desktop app** -- native Windows installer with local GPU support
-- **Automatic scanning** -- watch directories for automatic re-scanning on a configurable interval
-- **4K controls** -- configurable bitrate multiplier or skip 4K content entirely
-- **Per-file logging** -- every encode writes a log file to disk, viewable in the app or on the NAS
-- **Stop vs Cancel** -- stop an encode for later, or cancel it permanently
-- **Change detection** -- replaced files are automatically detected and re-queued
-- **Transfer-safe scanning** -- files modified within the last 30 minutes are skipped to avoid mid-transfer processing
-- **Settings backup** -- atomic writes with `.bak` fallback for crash resilience
-- **Distributed encoding** -- cluster multiple Snacks instances to distribute encoding across your network
-- **Automatic node discovery** -- nodes find each other automatically, no manual IP configuration needed
-- **Dark mode UI** -- clean, responsive interface that works on desktop, tablet, and mobile
+Point Snacks at a video or music library, choose a preset, and let it do the repetitive work. It evaluates each file against the selected targets, skips media that is already suitable, and remuxes or transcodes everything else using the best available hardware path.
 
----
+| | |
+|---|---|
+| **Automate the library**<br>Watch folders, configurable scans, change detection, and transfer-safe processing keep new media moving without babysitting. | **Use the hardware already there**<br>NVIDIA, Intel, AMD, Apple VideoToolbox, and software encoders are detected and selected automatically. |
+| **Choose intent, not FFmpeg flags**<br>Start with Space Saver, Balanced, Quality First, Max Compatibility, or a custom preset. | **See the entire pipeline**<br>Live progress, queue controls, savings analytics, health checks, and per-file logs stay in one interface. |
+| **Recover instead of giving up**<br>Snacks validates outputs and can retry through progressively safer decode, subtitle, and software fallbacks. | **Scale beyond one machine**<br>Run standalone or distribute jobs across an authenticated cluster with automatic node discovery. |
 
-## Installation
+<details>
+<summary><strong>Take a closer look at the interface</strong></summary>
 
-### Option 1: QNAP / Synology NAS (Docker)
+<br>
 
-Snacks runs as a Docker container with your video library mounted as a volume.
+<table>
+  <tr>
+    <td width="50%">
+      <img src="docs/images/queue.jpg" alt="Snacks queue with cluster status and first-run guidance" width="100%"><br>
+      <sub><strong>Queue and onboarding.</strong> Current work, node status, and the next useful action.</sub>
+    </td>
+    <td width="50%">
+      <img src="docs/images/presets.jpg" alt="Snacks quality preset selection in the settings interface" width="100%"><br>
+      <sub><strong>Presets with an escape hatch.</strong> Start simple, then tune codecs, audio, subtitles, and file handling.</sub>
+    </td>
+  </tr>
+  <tr>
+    <td colspan="2">
+      <img src="docs/images/cluster.jpg" alt="Snacks distributed encoding and cluster security settings" width="100%"><br>
+      <sub><strong>Distributed encoding.</strong> Configure standalone, coordinator, and worker nodes from the same interface.</sub>
+    </td>
+  </tr>
+</table>
 
-**1. Pull the image:**
+</details>
 
-```bash
-docker pull derekshreds/snacks-docker:latest
-```
+## Install Snacks
 
-**2. Create the application** in Container Station (QNAP) or Docker (Synology) using this compose config:
+| Docker / NAS | Windows | macOS |
+|---|---|---|
+| QNAP, Synology, Unraid, and Linux hosts | Native installer for Windows 10/11 | Native Apple silicon DMG for macOS 11+ |
+| [Docker Hub](https://hub.docker.com/r/derekshreds/snacks-docker) · [Setup guide](https://snacksvideo.com/docs/#quick-start) | [Download latest](https://github.com/derekshreds/Snacks/releases/latest) | [Download latest](https://github.com/derekshreds/Snacks/releases/latest) |
+
+<details>
+<summary><strong>Docker Compose quick start</strong></summary>
 
 ```yaml
 services:
   snacks:
     image: derekshreds/snacks-docker:latest
     container_name: snacks
-    ## Host networking required for cluster UDP broadcast discovery to reach the LAN.
-    ## Bridge mode only forwards unicast traffic, so broadcasts never arrive.
     network_mode: host
     volumes:
-      ## CHANGE THIS to your actual media folder on the NAS
-      - /share/Public/Media:/app/work/uploads
-      ## Transcoding logs
-      - /share/CACHEDEV1_DATA/snacks/logs:/app/work/logs
-      ## Persist settings and database across container updates
-      - /share/CACHEDEV1_DATA/snacks/config:/app/work/config
+      - /path/to/media:/app/work/uploads
+      - ./snacks/config:/app/work/config
+      - ./snacks/logs:/app/work/logs
     environment:
       - ASPNETCORE_ENVIRONMENT=Production
       - SNACKS_WORK_DIR=/app/work
       - FFMPEG_PATH=/usr/lib/jellyfin-ffmpeg/ffmpeg
       - FFPROBE_PATH=/usr/lib/jellyfin-ffmpeg/ffprobe
-      ## VAAPI driver — auto-detection tries iHD then i965. Override here if needed:
-      #- LIBVA_DRIVER_NAME=iHD
     devices:
-      ## Intel QSV hardware acceleration (TS-453E J6412)
       - /dev/dri:/dev/dri
-    ## QNAP lacks standard video/render groups — privileged grants /dev/dri access
-    privileged: true
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6767/api/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
 ```
 
-**3. Update the volume path** to point to your actual media library:
+Then open `http://YOUR-SERVER-IP:6767`.
 
-| NAS | Typical Path |
-|-----|-------------|
-| QNAP | `/share/CACHEDEV1_DATA/Multimedia` or `/share/Public/Media` |
-| Synology | `/volume1/video` or `/volume1/Media` |
+- Change `/path/to/media` to the library path on the host.
+- Remove `devices` when no Intel or AMD GPU is being passed through.
+- QNAP commonly requires `privileged: true` for `/dev/dri` access.
+- NVIDIA in Docker requires the NVIDIA Container Toolkit and runtime configuration.
+- Host networking allows automatic cluster discovery across the LAN.
 
-**4. Access Snacks** at `http://YOUR-NAS-IP:6767`
+See the [complete Docker/NAS guide](https://snacksvideo.com/docs/#quick-start) or the included [`deploy-compose.yml`](deploy-compose.yml). Unraid users can start with [`unraid/snacks.xml`](unraid/snacks.xml).
 
----
+</details>
 
-### Option 1b: Unraid
+## How it works
 
-An Unraid Community Applications template ships in [`unraid/snacks.xml`](unraid/snacks.xml).
+1. **Scan** — FFprobe inventories codec, bitrate, resolution, streams, and duration.
+2. **Decide** — the selected preset determines whether each file should be skipped, remuxed, or encoded. Analyze mode previews those decisions without queueing work.
+3. **Process** — FFmpeg uses hardware acceleration when available and software when it is not.
+4. **Verify** — Snacks checks the result and rejects invalid or larger outputs rather than silently replacing good media.
+5. **Repeat** — watch folders, integrations, notifications, and the API keep the workflow moving as the library changes.
 
-In Unraid: **Docker** → **Add Container** → paste this URL into the **Template** field at the top:
+> [!IMPORTANT]
+> Originals are not replaced unless **Replace Original Files** is explicitly enabled. For a first run, use **Analyze**, keep replacement disabled, and write to a separate output directory.
 
-```
-https://raw.githubusercontent.com/derekshreds/Snacks/master/unraid/snacks.xml
-```
+## What is included
 
-Adjust the *Media Library* path (default `/mnt/user/Media`) and apply. Web UI at `http://YOUR-UNRAID-IP:6767`. See [`unraid/README.md`](unraid/README.md) for NVIDIA setup.
+- Video and music pipelines with independent settings
+- H.264, HEVC/H.265, and AV1 output
+- MKV and MP4 containers
+- Quality presets plus detailed video, audio, subtitle, crop, and file-handling controls
+- NVIDIA NVENC, Intel QSV/VAAPI, AMD AMF/VAAPI, and Apple VideoToolbox support
+- Automatic scanning, exclusions, change detection, and interrupted-transfer protection
+- Persistent SQLite state across scans and restarts
+- Live SignalR progress, queue management, encode analytics, diagnostics, and logs
+- Dry-run directory analysis before anything is queued
+- Distributed encoding with coordinator and worker roles
+- Plex and Jellyfin library rescans
+- Sonarr, Radarr, TMDb, and TheTVDB connectivity
+- Webhook, Discord, ntfy, and Apprise notifications
+- API-key authentication, environment-variable configuration, OpenAPI, and health endpoints
 
----
+<details>
+<summary><strong>Hardware acceleration matrix</strong></summary>
 
-### Option 2: Windows Desktop App
+| Encoder | Docker / Linux | Windows | macOS |
+|---|:---:|:---:|:---:|
+| NVIDIA NVENC | CUDA | CUDA | — |
+| Intel | VAAPI | QSV | — |
+| AMD | VAAPI | AMF | — |
+| Apple VideoToolbox | — | — | H.264 / HEVC |
+| Software | x264, x265, SVT-AV1 | x264, x265, SVT-AV1 | x264, x265, SVT-AV1 |
 
-Snacks can run as a standalone desktop app with native GPU acceleration.
+Apple silicon can use VideoToolbox for AV1 decoding where supported, but FFmpeg does not currently expose an AV1 VideoToolbox encoder. Snacks therefore pairs hardware decoding with SVT-AV1 software encoding for that path.
 
-**Prerequisites:**
-- Windows 10/11
-- A supported GPU (NVIDIA, Intel, or AMD) with up-to-date drivers
-- [FFmpeg](https://www.gyan.dev/ffmpeg/builds/) (`ffmpeg-release-full` build)
+For NVIDIA containers, install the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) on the host and use the NVIDIA runtime. Intel and AMD hosts can pass `/dev/dri` into the container.
 
-**Building from source:**
+</details>
 
-1. Clone the repository
-2. Download FFmpeg from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) (release full build)
-3. Place `ffmpeg.exe` and `ffprobe.exe` in `electron-app/ffmpeg/`
-4. Run `build-installer.bat`
-5. Install from `electron-app/dist/Snacks Setup 2.2.4.exe`
+<details>
+<summary><strong>Automation, integrations, and API</strong></summary>
 
-**For development:**
+Everything needed for unattended operation is configurable from the UI, environment variables, or HTTP:
 
-```cmd
-run-electron-dev.bat
-```
+- Pin encoder settings with `SNACKS_SET_*`
+- Configure auto-scan with `SNACKS_SCAN_*`
+- Configure integrations with `SNACKS_INTEG_*`
+- Pause and resume the queue, trigger scans, analyze directories, and enqueue media through the API
+- Authenticate automation with `X-Api-Key` or a bearer token when sign-in is enabled
+- Subscribe to real-time state through SignalR
 
-This publishes the backend and launches Snacks in dev mode without creating an installer.
+Use the [operations and API guide](https://snacksvideo.com/docs/#api-basics) for examples, or inspect the hosted [OpenAPI specification](https://snacksvideo.com/openapi/v1.json).
 
----
+</details>
 
-### Option 3: macOS Desktop App (Apple Silicon)
+<details>
+<summary><strong>Build and contribute</strong></summary>
 
-Snacks runs natively on Apple Silicon Macs with VideoToolbox hardware encoding.
-
-**Prerequisites for the developer building from source** (end users of the resulting DMG don't need any of these — the build script bundles everything in):
-- macOS 11 (Big Sur) or later, Apple Silicon
-- [.NET 10 SDK](https://dotnet.microsoft.com/download)
-- Node.js 18+
-- Homebrew with `tesseract`, `leptonica`, and `ffmpeg` installed:
-  ```bash
-  brew install tesseract leptonica ffmpeg
-  ```
-  The build script copies these dylibs into the app bundle (with all transitive paths rewritten to `@loader_path/...`), so the resulting `.app` is self-contained.
-
-**Building from source:**
-
-1. Clone the repository
-2. Copy ffmpeg + ffprobe into the app:
-   ```bash
-   mkdir -p electron-app/ffmpeg
-   cp "$(brew --prefix ffmpeg)/bin/ffmpeg"  electron-app/ffmpeg/
-   cp "$(brew --prefix ffmpeg)/bin/ffprobe" electron-app/ffmpeg/
-   ```
-3. `./build-mac.sh` — publishes the .NET backend, bundles OCR libs (libtesseract + libleptonica + transitive deps, paths rewritten to `@loader_path`), and produces the DMG
-4. Open the resulting DMG from `electron-app/dist/` and drag Snacks to Applications
-
-**Code-signing & notarization (optional, for distribution):**
-
-The build is unsigned by default. To produce a signed and notarized DMG, create
-`electron-app/.env.mac.local` (gitignored) with:
+The backend and web interface require the [.NET 10 SDK](https://dotnet.microsoft.com/download).
 
 ```bash
-export CSC_NAME="Your Name (TEAMID)"
-export APPLE_ID="you@example.com"
-export APPLE_APP_SPECIFIC_PASSWORD="xxxx-xxxx-xxxx-xxxx"
-export APPLE_TEAM_ID="ABCD123456"
+dotnet restore Snacks.sln
+dotnet test Snacks.sln
+dotnet run --project Snacks/Snacks.csproj
 ```
 
-Setup checklist:
+Desktop packages use the Electron wrapper in `electron-app/`:
 
-1. Apple Developer Program membership ($99/year, [developer.apple.com](https://developer.apple.com))
-2. Developer ID Application certificate (Xcode → Settings → Accounts → Manage Certificates → +)
-3. App-specific password from [appleid.apple.com](https://appleid.apple.com) → App-Specific Passwords
-4. Team ID from [developer.apple.com/account](https://developer.apple.com/account) (Membership)
+- `build-installer.bat` builds the Windows installer.
+- `build-mac.sh` builds the Apple silicon DMG.
+- `run-electron-dev.bat` starts the Windows desktop development environment.
 
-`build-mac.sh` sources the env file automatically; if any of the four vars is missing, signing/notarization is skipped and the unsigned DMG path is taken (users will need to right-click → Open the first time).
+The build scripts package the backend, FFmpeg, and required runtime components into the desktop artifacts. See [development and verification](https://snacksvideo.com/docs/#development) for the repository-specific checks used before a release.
 
-Verify a signed build:
-```bash
-spctl --assess --type execute --verbose=4 electron-app/dist/mac-arm64/Snacks.app
-xcrun stapler validate electron-app/dist/Snacks-*-arm64.dmg
-```
+Bug reports and focused pull requests are welcome through [GitHub Issues](https://github.com/derekshreds/Snacks/issues).
 
----
+</details>
 
-## Usage
+## Documentation and support
 
-For a complete user guide, operations handbook, and public API reference, open
-[`Snacks/wwwroot/docs/index.html`](Snacks/wwwroot/docs/index.html) directly or
-visit `http://YOUR-SNACKS-HOST:6767/docs/index.html` on a running instance.
+- [Product website](https://snacksvideo.com/)
+- [User guide and operations handbook](https://snacksvideo.com/docs/)
+- [Latest release and desktop downloads](https://github.com/derekshreds/Snacks/releases/latest)
+- [Docker Hub](https://hub.docker.com/r/derekshreds/snacks-docker)
+- [Discord community](https://discord.com/invite/DT3nWdq4av)
 
-### Browse & Select
+## License
 
-Click **Browse Library** to open the file browser.
+Snacks is available under the [MIT License](LICENSE).
 
-- **NAS mode** -- browse within your mounted media directory
-- **Desktop mode** -- browse any drive or folder on your PC
-
-Navigate into folders, view video files, and choose what to process:
-
-- **Process This Folder** -- encode only files in the current folder
-- **Process Folder + Subfolders** -- encode everything recursively
-- **Select individual files** -- check specific files to process
-
-### Configure
-
-Click the **gear icon** to open encoding settings:
-
-| Setting | Description |
-|---------|-------------|
-| Output Format | MKV (default) or MP4 |
-| Video Codec | H.265/HEVC, H.264/AVC, or AV1 |
-| Hardware Acceleration | Auto Detect, Intel QSV, AMD VAAPI, NVIDIA NVENC, or None |
-| Target Bitrate | Default 3500 kbps -- files above this get compressed |
-| 4K Bitrate Multiplier | 2x--8x multiplier for 4K content (default 4x) |
-| Skip 4K Videos | Leave 4K content untouched |
-| English Only Audio | Remove non-English audio tracks |
-| English Only Subtitles | Keep only English subtitle tracks |
-| Remove Black Borders | Auto-detect and crop letterboxing |
-| Output Directory | Where encoded files are saved (blank = same as original) |
-| Replace Original Files | Delete original and move encoded file to its location |
-| Retry on Failure | Fall back to software encoding if hardware fails |
-
-### Automatic Scanning
-
-Snacks can watch directories and automatically re-scan them on a configurable interval.
-
-- Open the **Settings** panel and enable **Auto Scan**
-- Set the scan interval (how often Snacks checks for new or changed files)
-- Add directories to the watch list using the **Watch This Folder** button in the directory browser
-- Snacks tracks all file states in a SQLite database so previously processed files are never re-scanned
-- Failed files are tracked with failure counts and won't be endlessly retried
-- Files modified within the last 30 minutes are skipped to avoid processing mid-transfer
-- If a file is replaced with a significantly different version (>10% size change), it's automatically re-queued
-- Partial `[snacks]` files from interrupted encodes are detected, deleted, and the original is re-queued
-
-Settings are saved server-side in `settings.json` (with automatic `.bak` backup) and persist across container restarts and devices.
-
-### Distributed Encoding (Cluster)
-
-Snacks can distribute encoding work across multiple machines on your network.
-
-- Open the **Settings** panel and enable **Cluster Mode**
-- Set a **shared secret** that all nodes will use to authenticate with each other
-- Nodes on the local network discover each other automatically
-- One instance acts as the **coordinator**, assigning jobs to available **worker nodes**
-- Source files are transferred to workers before encoding and results are transferred back on completion
-- If a worker goes offline mid-encode, the job is automatically reassigned to another node
-- Job state transitions (queued, assigned, transferring, encoding, completed, failed) are tracked in the database
-- The cluster status panel shows discovered nodes with health indicators and active jobs
-
-### Monitor
-
-The main dashboard shows:
-- **Now Processing** -- current file with live progress bar (always visible regardless of page)
-- **Queue** -- upcoming files sorted by bitrate (highest first), with filter tabs for All, Pending, Completed, and Failed
-- **Stats** -- pending, processing, completed, and failed counts
-- **Pagination** -- first/prev/next/last page navigation
-
-Click the terminal icon on any item to view detailed FFmpeg logs -- logs are persisted to disk and viewable even after a restart.
-
-### Queue Management
-
-- **Stop (Encode Later)** -- removes an item from the queue with a yellow "Stopped" badge. It will be re-queued on the next auto-scan.
-- **Cancel (Don't Reprocess)** -- permanently cancels an item. It will not be re-queued unless you manually select it again.
-- **Process Selected override** -- explicitly selecting a file in the browser always queues it, regardless of its database status (failed, cancelled, completed).
-- **Pause/Resume** -- pause state is saved across restarts. If the queue was paused when the container stopped, it stays paused.
-
-### API Access & Automation
-
-Everything the pause button and scan trigger do is also available over HTTP, so orchestrators
-(Komodo, cron, CI, Home Assistant, ...) can drive Snacks — e.g. pause encoding while backups run.
-
-If sign-in is enabled, authenticate with an API key sent as an `X-Api-Key` header or an
-`Authorization: Bearer` token. Generate a key under **Settings → Security → API Access**, or
-supply one via the `SNACKS_API_KEY` environment variable (both work at the same time; the env
-key is never shown in the UI). With sign-in disabled, no key is needed.
-
-```bash
-# Pause the queue (the current encode finishes, nothing new starts)
-curl -H "X-Api-Key: $SNACKS_API_KEY" -X POST http://nas:6767/api/queue/paused \
-     -H 'Content-Type: application/json' -d '{"paused":true}'
-
-# Resume
-curl -H "X-Api-Key: $SNACKS_API_KEY" -X POST http://nas:6767/api/queue/paused \
-     -H 'Content-Type: application/json' -d '{"paused":false}'
-
-# Current pause state
-curl -H "X-Api-Key: $SNACKS_API_KEY" http://nas:6767/api/queue/paused
-
-# Trigger a library scan immediately
-curl -H "X-Api-Key: $SNACKS_API_KEY" -X POST http://nas:6767/api/auto-scan/trigger
-
-# Queue stats
-curl -H "X-Api-Key: $SNACKS_API_KEY" http://nas:6767/api/queue/stats
-```
-
-Pause state persists across restarts, so a paused container comes back up paused.
-
-### Configuration via Environment Variables
-
-Any encoder, auto-scan, or integration setting can be pinned from your compose file instead of
-the GUI — handy for version-controlling config and recreating nodes. Env-pinned settings show a
-lock icon in the GUI and always win: they are applied on every load, never written into the
-config files, and removing the variable reverts to whatever is in the file.
-
-| Prefix | Targets | Example |
-|---|---|---|
-| `SNACKS_SET_<Property>` | Encoder settings (`settings.json`), nested fields via `__` | `SNACKS_SET_Codec=av1`, `SNACKS_SET_Music__BitrateKbps=256` |
-| `SNACKS_SCAN_<Property>` | Auto-scan (`autoscan.json`) | `SNACKS_SCAN_Enabled=true`, `SNACKS_SCAN_IntervalMinutes=30` |
-| `SNACKS_INTEG_<Section>__<Property>` | Integrations (`integrations.json`) | `SNACKS_INTEG_Plex__Token=abc` |
-
-Property names match the JSON keys in the config files, case-insensitively. Values parse by type:
-
-- **Booleans**: `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`
-- **Numbers / enums**: plain values (`2500`, `MuxOnly`)
-- **String lists**: comma-separated (`en,ja`) or a JSON array (`["en","ja"]`)
-- **Complex values**: JSON (`SNACKS_SET_AudioOutputs=[{"Codec":"aac","Layout":"Stereo","BitrateKbps":192}]`,
-  `SNACKS_SCAN_Directories=["/media/tv","/media/movies"]`)
-
-Invalid names or values are logged as warnings and skipped — a typo never prevents startup.
-The queue pause state and other runtime fields (`QueuePaused`, `LastScanTime`) can't be pinned;
-use the API above for pausing. On cluster nodes, per-job settings shipped from the master are
-authoritative — node-local `SNACKS_SET_*` only affects encodes the node queues itself.
-
-```yaml
-environment:
-  - SNACKS_API_KEY=change-me
-  - SNACKS_SET_Codec=av1
-  - SNACKS_SET_TargetBitrate=2500
-  - SNACKS_SET_Music__BitrateKbps=256
-  - SNACKS_SET_AudioLanguagesToKeep=en,ja
-  - SNACKS_SCAN_Enabled=true
-  - SNACKS_SCAN_IntervalMinutes=30
-  - SNACKS_INTEG_Plex__BaseUrl=http://plex:32400
-  - SNACKS_INTEG_Plex__Token=xxxx
-  - SNACKS_INTEG_Plex__RescanOnComplete=true
-  - SNACKS_INTEG_Plex__Enabled=true
-```
-
-### Logs
-
-- Every encode writes a log file to the `logs` directory (e.g., `The Matrix (1999)_a3f2b1c4.log`)
-- Logs are viewable in the app by clicking the terminal icon on any queue item
-- On NAS deployments, logs are accessible via the mounted logs volume
-
----
-
-## How It Works
-
-1. **Scan** -- Snacks probes each file with FFprobe to determine codec, bitrate, and resolution
-2. **Filter** -- Files already meeting your quality targets are skipped automatically
-3. **Encode** -- FFmpeg encodes with hardware acceleration when available, falling back to software
-4. **Validate** -- Output is verified by comparing duration to the original
-5. **Retry** -- On failure, retries without subtitles, then software decode + HW encode, then full software
-6. **Clean up** -- Original files are never modified; encoded files get a `[snacks]` tag
-
-### File Naming
-
-- Encoded files are saved as `Movie Name [snacks].mkv` alongside the original (or in the output directory if configured)
-- If **Replace Original Files** is enabled, the original is deleted and the encoded file is moved to the original's location without the `[snacks]` tag
-- Original files are never modified during encoding
-
-### Smart Filtering
-
-Files are automatically skipped if they already meet requirements:
-
-- Already target codec and below target bitrate (1080p: 1.2x target, 4K: configurable multiplier)
-- Already encoded (filename contains `[snacks]`)
-
----
-
-## Hardware Acceleration
-
-### Supported Platforms
-
-| Platform | NAS (Docker) | Desktop (Windows) | Desktop (macOS) |
-|----------|:---:|:---:|:---:|
-| NVIDIA NVENC | CUDA | CUDA | -- |
-| Intel | VAAPI (CQP) | QSV (VBR) | -- |
-| AMD | VAAPI (CQP) | AMF (VBR) | -- |
-| Apple VideoToolbox | -- | -- | H.264 / HEVC (VBR) + AV1 hw decode |
-| Software (x265/SVT-AV1) | Always available | Always available | Always available |
-
-> **Mac AV1 caveat**: M3+ Macs have AV1 encode silicon, but ffmpeg doesn't yet expose an `av1_videotoolbox` encoder — so when you pick `apple` + AV1, Snacks runs **hardware AV1 decode** (VideoToolbox) on the input and **software AV1 encode** (`libsvtav1`) on the output. Decode is free; encode still costs CPU. HEVC at the same bitrate is fully hardware on both ends.
-
-### NAS Notes
-
-- **QNAP TS-453E (J6412)**: Uses VAAPI with CQP rate control. VBR is not supported on Elkhart Lake.
-- **Software decode fallback**: Codecs that VAAPI can't decode (e.g., AV1 on older Intel hardware) are automatically decoded in software while still using VAAPI for hardware encoding.
-- The container uses [jellyfin-ffmpeg](https://github.com/jellyfin/jellyfin-ffmpeg) which includes full VAAPI/QSV support.
-- `privileged: true` is required on QNAP for `/dev/dri` access.
-- Hardware detection runs automatically on first encode and caches the result.
-- **Hybrid GPU laptops (NVIDIA + iGPU)**: Snacks walks every `/dev/dri/renderD*` node so the iGPU is found even when the NVIDIA card claims `renderD128`. No extra config needed — pass `/dev/dri` through and both render nodes are enumerated.
-
-### NVIDIA in Docker (Linux)
-
-VAAPI/QSV passthrough only covers Intel and AMD. For NVENC inside a Linux container you also need the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) installed on the host (`nvidia-ctk`) and the nvidia runtime requested in compose. Append to your Snacks service in `docker-compose.gpu.yml`:
-
-```yaml
-    runtime: nvidia
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=all
-      - NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
-```
-
-Adding `privileged: true` or `--cap-add` is **not** a substitute — without the nvidia runtime the container has no path to libcuda.so. Unraid users get the same outcome via the Nvidia-Driver plugin and `--runtime=nvidia` extra parameter (see [`unraid/snacks.xml`](unraid/snacks.xml) and [`unraid/README.md`](unraid/README.md)).
-
-### Desktop Notes
-
-- NVIDIA GPUs use NVENC with VBR for precise bitrate control.
-- Intel/AMD use QSV/AMF respectively with proper bitrate targeting.
-- Auto-detect tests each encoder at startup and picks the best available.
-
----
-
-## Troubleshooting
-
-**No directories in browser (NAS)**
-```bash
-docker exec snacks ls -la /app/work/uploads/
-```
-Verify your volume mount points to a directory with video files.
-
-**Hardware acceleration not detected**
-```bash
-# Check GPU access inside the container
-docker exec snacks vainfo
-docker exec snacks ls -la /dev/dri/
-```
-
-**Encoding produces larger files (NAS/VAAPI)**
-
-VAAPI CQP mode doesn't have precise bitrate control. The quality parameter is automatically scaled based on the target, but results vary by content. Files that end up larger than the original are automatically discarded.
-
-**Progress bar not updating**
-
-Check that the backend is running and SignalR is connected (green dot in the navbar). Progress updates are throttled to every 2 seconds.
-
----
-
-## Project Structure
-
-```
-Snacks/
-  Snacks/                 ASP.NET Core 10.0 backend + web UI
-    Controllers/           API endpoints
-    Services/              Transcoding, file handling, FFprobe, AutoScan, cluster services
-    Data/                  SQLite database context, migrations, repository
-    Models/                WorkItem, MediaFile, EncoderOptions, ClusterConfig, JobAssignment
-    Hubs/                  SignalR real-time communication
-    Views/                 Razor pages
-    wwwroot/               Static assets (JS, CSS, fonts)
-      docs/index.html       User guide, operations handbook, and public API reference
-  release-notes/          Per-version release notes
-  electron-app/           Electron desktop wrapper
-    main.js               Electron main process
-    backend/              Published .NET backend (gitignored)
-    ffmpeg/               Bundled FFmpeg binaries (gitignored)
-  docker-compose.gpu.yml  GPU overlay for Linux NAS (VAAPI/QSV)
-  build-and-export.bat    Build & push Docker image
-  build-installer.bat     Build Windows installer
-  build-electron.bat      Build Electron app
-  build-mac.sh            Build macOS DMG (Apple Silicon)
-  run-electron-dev.bat    Run desktop app in dev mode
-  deploy-compose.yml      Docker Compose for NAS deployment
-  start-snacks.bat     Start backend (Windows)
-  start-snacks.sh      Start backend (Linux/Docker)
-```
-
----
-
-## Building
-
-### Docker Image (for NAS)
-
-```cmd
-build-and-export.bat
-```
-
-Builds the Docker image and pushes to Docker Hub as both `derekshreds/snacks-docker:latest` and `derekshreds/snacksweb:latest`.
-
-### Windows Installer
-
-```cmd
-build-installer.bat
-```
-
-Creates a self-contained Windows installer at `electron-app/dist/` with the .NET runtime, FFmpeg, and desktop shortcuts bundled.
-
-### macOS DMG (Apple Silicon)
-
-```bash
-./build-mac.sh
-```
-
-Creates a self-contained `.dmg` at `electron-app/dist/` with the .NET runtime, FFmpeg, and the `.app` bundle. Signing and notarization activate automatically when `electron-app/.env.mac.local` is present (see [Option 3](#option-3-macos-desktop-app-apple-silicon)).
-
----
-
-<p align="center">
-  <strong>Snacks</strong> v2.17.0 &copy; 2026 Derek Morris
-</p>
+<p align="center"><strong>Locally hosted. Lightly toasted.</strong></p>
