@@ -95,6 +95,38 @@ public sealed class VideoFilterTests
     }
 
 
+    [Fact]
+    public void Emit_places_fps_after_crop_and_before_scale()
+    {
+        var result = VideoFilterBuilder.Emit(
+            cropExpr: "crop=1920:800:0:140",
+            tonemap:  false,
+            scaleExpr: "scale=min(iw\\,640):min(ih\\,480):force_original_aspect_ratio=decrease",
+            useVaapi:  false,
+            canHwDecode: false,
+            vaapiFormat: "nv12",
+            fpsExpr:   "fps=30");
+
+        result.Should().Contain("fps=30");
+        // Order: crop → fps → scale.
+        result.IndexOf("crop=", StringComparison.Ordinal)
+            .Should().BeLessThan(result.IndexOf("fps=30", StringComparison.Ordinal));
+        result.IndexOf("fps=30", StringComparison.Ordinal)
+            .Should().BeLessThan(result.IndexOf("scale=", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Emit_with_only_fps_cap_emits_vf_chain()
+    {
+        var result = VideoFilterBuilder.Emit(
+            cropExpr: null, tonemap: false, scaleExpr: null,
+            useVaapi: false, canHwDecode: false, vaapiFormat: "nv12",
+            fpsExpr: "fps=30");
+
+        result.Should().Be("-vf fps=30 ");
+    }
+
+
     /// <summary>Rows: (color_transfer string, expected IsHdr).</summary>
     public static IEnumerable<object?[]> HdrTransferRows() => new[]
     {

@@ -54,6 +54,15 @@ public class SnacksDbContext : DbContext
             // Composite index covers directory-scoped base-name lookups used for format-change detection.
             entity.HasIndex(e => new { e.Directory, e.BaseName });
 
+            // The pending queue IS "Queued rows ordered by Priority desc, Bitrate desc".
+            // This index makes the scheduler's window query and the queue UI's paging
+            // O(log n) at 500k rows instead of sorting the whole status bucket per call.
+            entity.HasIndex(e => new { e.Status, e.Priority, e.Bitrate })
+                  .IsDescending(false, true, true);
+
+            // Rolling health verifier walks oldest-verified-first.
+            entity.HasIndex(e => e.LastVerifiedAt);
+
             entity.Property(e => e.FilePath).IsRequired().HasMaxLength(1024);
             entity.Property(e => e.Directory).IsRequired().HasMaxLength(1024);
             entity.Property(e => e.FileName).IsRequired().HasMaxLength(512);
@@ -72,6 +81,8 @@ public class SnacksDbContext : DbContext
             // payload is ~30 B/audio track and ~20 B/subtitle track; 4 KB holds ~100 tracks.
             entity.Property(e => e.AudioStreams).HasMaxLength(4096);
             entity.Property(e => e.SubtitleStreams).HasMaxLength(4096);
+
+            entity.Property(e => e.LastVerifyResult).HasMaxLength(2048);
         });
 
 

@@ -171,7 +171,7 @@ public sealed class ClusterNodeJobService
     public void SetNodePaused(bool paused)
     {
         _nodePaused = paused;
-        Console.WriteLine($"Cluster: Node {(paused ? "paused" : "resumed")}");
+        Log.Information($"Cluster: Node {(paused ? "paused" : "resumed")}");
         _ = _hubContext.Clients.All.SendAsync("ClusterNodePaused", paused);
     }
 
@@ -287,8 +287,12 @@ public sealed class ClusterNodeJobService
             if (kv.Value > cutoff)              continue;             // recent activity
             if (_receivingJobIds.TryRemove(kv.Key, out _))
             {
-                _receivingDeviceIds.TryRemove(kv.Key, out _);
-                Console.WriteLine($"Cluster: Cleared stale receiving state for job {kv.Key} (no activity for {timeout.TotalSeconds:0}s)");
+                // Full per-job teardown (lock + CTS too) — a master that crashed
+                // mid-upload never sends the cleanup DELETE, and each abandoned
+                // job otherwise leaks a SemaphoreSlim and an undisposed CTS for
+                // the worker's process lifetime.
+                RemoveReceiveLock(kv.Key);
+                Log.Information($"Cluster: Cleared stale receiving state for job {kv.Key} (no activity for {timeout.TotalSeconds:0}s)");
             }
             // Master owns lifecycle messaging — no synthetic completion broadcast.
         }
@@ -364,7 +368,7 @@ public sealed class ClusterNodeJobService
             var existingOutput = GetOutputFileForJob(jobId);
             if (existingOutput != null && !File.Exists(Path.Combine(GetNodeTempDirectory(jobId), "_shared.json")))
             {
-                Console.WriteLine($"Cluster: Output already exists for {metadata.FileName} — skipping encode, ready for download");
+                Log.Information($"Cluster: Output already exists for {metadata.FileName} — skipping encode, ready for download");
                 _completedJobIds[jobId] = 0;
                 _receivingJobIds.TryRemove(jobId, out _);
                 return (true, null);
@@ -386,7 +390,10 @@ public sealed class ClusterNodeJobService
                     return (false, $"File corrupt — first 4 bytes are 0x00000000 (expected container header). " +
                         $"Size on disk: {actualSize}, expected: {metadata.FileSize}");
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "Could not validate the uploaded header for cluster job {JobId}", jobId);
+            }
 
             var workItem = new WorkItem
             {
@@ -544,7 +551,7 @@ public sealed class ClusterNodeJobService
             options.EncodeDirectory     = tempDir;
             options.DeleteOriginalFile  = false;
 
-            Console.WriteLine($"Cluster: Encoding {workItem.FileName} on {active.DeviceId} — " +
+            Log.Information($"Cluster: Encoding {workItem.FileName} on {active.DeviceId} — " +
                 $"EncodingMode={options.EncodingMode}, MuxStreams={options.MuxStreams}, " +
                 $"Is4K={workItem.Is4K}, IsHevc={workItem.IsHevc}, Bitrate={workItem.Bitrate}kbps");
 
@@ -614,7 +621,7 @@ public sealed class ClusterNodeJobService
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Cluster: Remote job encoding failed for {workItem.Id}: {ex.Message}");
+            Log.Warning($"Cluster: Remote job encoding failed for {workItem.Id}: {ex.Message}");
 
             // Tear down per-job state BEFORE reporting failure to master — the
             // master reacts immediately by freeing this slot and dispatching new
@@ -642,7 +649,7 @@ public sealed class ClusterNodeJobService
         // skips the download phase.
         var noSavings = encodingSucceeded && GetOutputFileForJob(workItem.Id) == null;
         if (noSavings)
-            Console.WriteLine($"Cluster: Encoding succeeded for {workItem.FileName} but no savings — will notify master to skip download");
+            Log.Information($"Cluster: Encoding succeeded for {workItem.FileName} but no savings — will notify master to skip download");
 
         // Shared-storage mode: move the encoded output from the scratch directory
         // to the master's pre-agreed shared location so the master can read it
@@ -665,11 +672,11 @@ public sealed class ClusterNodeJobService
                 File.Move(src, tmp);
                 if (File.Exists(sharedTarget)) File.Delete(sharedTarget);
                 File.Move(tmp, sharedTarget);
-                Console.WriteLine($"Cluster: Placed shared output at {sharedTarget}");
+                Log.Information($"Cluster: Placed shared output at {sharedTarget}");
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Cluster: Failed to place shared output for {workItem.FileName}: {ex.Message}");
+                Log.Warning($"Cluster: Failed to place shared output for {workItem.FileName}: {ex.Message}");
                 encodingSucceeded = false;
                 if (masterUrl != null)
                 {
@@ -734,7 +741,7 @@ public sealed class ClusterNodeJobService
                         JsonSerializer.Serialize(new { completion, nodeBaseUrl = selfUrl }, _jsonOptions),
                         Encoding.UTF8, "application/json");
                     await client.PostAsync($"{masterUrl}/api/cluster/jobs/{workItem.Id}/complete", content);
-                    Console.WriteLine($"Cluster: Reported {(noSavings ? "no-savings" : "completion")} for {workItem.FileName} to master");
+                    Log.Information($"Cluster: Reported {(noSavings ? "no-savings" : "completion")} for {workItem.FileName} to master");
 
                     if (!noSavings)
                         await RemoveCompletedJobAsync(workItem.Id);
@@ -742,7 +749,7 @@ public sealed class ClusterNodeJobService
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"Cluster: Failed to report completion (attempt {attempt + 1}): {ex.Message}");
+                    Log.Warning($"Cluster: Failed to report completion (attempt {attempt + 1}): {ex.Message}");
                     if (attempt < 9)
                         await Task.Delay(TimeSpan.FromSeconds(10));
                 }
@@ -767,7 +774,7 @@ public sealed class ClusterNodeJobService
     {
         if (_activeJobs.TryGetValue(jobId, out var active))
         {
-            Console.WriteLine($"Cluster: Cancelling remote job {jobId} on {active.DeviceId}");
+            Log.Information($"Cluster: Cancelling remote job {jobId} on {active.DeviceId}");
             try { active.Cts.Cancel(); } catch { }
         }
     }
@@ -780,13 +787,21 @@ public sealed class ClusterNodeJobService
     /// </summary>
     private void ReleaseJobState(string jobId, DeviceSlotPool slotPool)
     {
-        if (_activeJobs.TryRemove(jobId, out var active))
+        bool wasActive = _activeJobs.TryRemove(jobId, out var active);
+        if (wasActive)
         {
-            try { active.Cts.Dispose(); } catch { }
+            try { active!.Cts.Dispose(); } catch { }
         }
         _transcodingService.SetProgressCallback(jobId, null);
         _transcodingService.SetLogCallback(jobId, null);
-        ReleaseSlot(slotPool);
+
+        // Release the device slot ONLY on the call that actually removed the
+        // job. ExecuteRemoteJobAsync calls this from both the failure path and
+        // the unconditional epilogue — an unconditional ReleaseSlot here would
+        // decrement the pool twice per failed encode, silently freeing a slot
+        // a CONCURRENT job still holds and letting the master over-dispatch.
+        if (wasActive)
+            ReleaseSlot(slotPool);
     }
 
     /******************************************************************
@@ -823,12 +838,12 @@ public sealed class ClusterNodeJobService
                 };
                 var json = JsonSerializer.Serialize(completions.Values, _jsonOptions);
                 await File.WriteAllTextAsync(_pendingCompletionsPath, json);
-                Console.WriteLine($"Cluster: Persisted completed job {jobId} for retry");
+                Log.Information($"Cluster: Persisted completed job {jobId} for retry");
             }
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Cluster: Failed to persist completed job {jobId}: {ex.Message}");
+            Log.Warning($"Cluster: Failed to persist completed job {jobId}: {ex.Message}");
         }
         finally
         {
@@ -850,12 +865,12 @@ public sealed class ClusterNodeJobService
             {
                 var json = JsonSerializer.Serialize(completions.Values, _jsonOptions);
                 await File.WriteAllTextAsync(_pendingCompletionsPath, json);
-                Console.WriteLine($"Cluster: Removed acknowledged job {jobId} from pending completions");
+                Log.Information($"Cluster: Removed acknowledged job {jobId} from pending completions");
             }
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Cluster: Failed to remove completed job {jobId}: {ex.Message}");
+            Log.Warning($"Cluster: Failed to remove completed job {jobId}: {ex.Message}");
         }
         finally
         {
@@ -878,7 +893,10 @@ public sealed class ClusterNodeJobService
                 var list = JsonSerializer.Deserialize<List<PendingCompletion>>(json, _jsonOptions);
                 return list?.ToDictionary(c => c.JobId, c => c) ?? new();
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "Could not load persisted pending cluster completions from {Path}", _pendingCompletionsPath);
+            }
         }
         return new();
     }
@@ -963,14 +981,14 @@ public sealed class ClusterNodeJobService
                 }
                 catch (Exception probeEx)
                 {
-                    Console.WriteLine($"Cluster: Probe of {completion.JobId} failed: {probeEx.Message} — will retry on next heartbeat.");
+                    Log.Warning($"Cluster: Probe of {completion.JobId} failed: {probeEx.Message} — will retry on next heartbeat.");
                     continue;
                 }
 
                 if (masterTracksJob == false)
                 {
                     var ageMin = (DateTime.UtcNow - completion.Timestamp).TotalMinutes;
-                    Console.WriteLine($"Cluster: Master has no record of {completion.JobId} ({ageMin:0}min old) — dropping orphan locally.");
+                    Log.Information($"Cluster: Master has no record of {completion.JobId} ({ageMin:0}min old) — dropping orphan locally.");
                     await RemoveCompletedJobAsync(completion.JobId);
                     try
                     {
@@ -979,7 +997,7 @@ public sealed class ClusterNodeJobService
                     }
                     catch (Exception cleanupEx)
                     {
-                        Console.WriteLine($"Cluster: Cleanup of orphaned {completion.JobId} temp dir failed: {cleanupEx.Message}");
+                        Log.Warning($"Cluster: Cleanup of orphaned {completion.JobId} temp dir failed: {cleanupEx.Message}");
                     }
                     CleanupJobFiles(completion.JobId);
                     continue;
@@ -1007,13 +1025,13 @@ public sealed class ClusterNodeJobService
                     $"{completion.MasterUrl}/api/cluster/jobs/{completion.JobId}/complete", content);
                 if (response.IsSuccessStatusCode)
                 {
-                    Console.WriteLine($"Cluster: Retried completion for {completion.JobId} — acknowledged by master");
+                    Log.Information($"Cluster: Retried completion for {completion.JobId} — acknowledged by master");
                     await RemoveCompletedJobAsync(completion.JobId);
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Cluster: Pending completion retry failed for {completion.JobId}: {ex.Message}");
+                Log.Warning($"Cluster: Pending completion retry failed for {completion.JobId}: {ex.Message}");
             }
         }
     }
@@ -1052,7 +1070,7 @@ public sealed class ClusterNodeJobService
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Cluster: Failed to read shared sentinel for {jobId}: {ex.Message}");
+            Log.Warning($"Cluster: Failed to read shared sentinel for {jobId}: {ex.Message}");
             return null;
         }
     }
@@ -1113,7 +1131,7 @@ public sealed class ClusterNodeJobService
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Cluster: Cleanup failed for job {jobId}: {ex.Message}");
+            Log.Warning($"Cluster: Cleanup failed for job {jobId}: {ex.Message}");
         }
     }
 
@@ -1144,7 +1162,10 @@ public sealed class ClusterNodeJobService
                     foreach (var pc in list)
                         pendingJobIds.Add(pc.JobId);
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "Could not inspect persisted cluster completions during remote-job cleanup");
+            }
         }
 
         try
@@ -1167,7 +1188,7 @@ public sealed class ClusterNodeJobService
                 }
                 catch (IOException ex)
                 {
-                    Console.WriteLine($"Cluster: Could not delete {dir}: {ex.Message} — trying individual files");
+                    Log.Information($"Cluster: Could not delete {dir}: {ex.Message} — trying individual files");
                     foreach (var file in Directory.GetFiles(dir))
                     {
                         try { File.Delete(file); } catch { }
@@ -1175,13 +1196,13 @@ public sealed class ClusterNodeJobService
                 }
             }
             if (cleaned > 0)
-                Console.WriteLine($"Cluster: Cleaned up {cleaned} orphaned remote job directories");
+                Log.Information($"Cluster: Cleaned up {cleaned} orphaned remote job directories");
             if (preserved > 0)
-                Console.WriteLine($"Cluster: Preserved {preserved} directories with pending completions");
+                Log.Information($"Cluster: Preserved {preserved} directories with pending completions");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Cluster: Cleanup error: {ex.Message}");
+            Log.Warning($"Cluster: Cleanup error: {ex.Message}");
         }
     }
 
@@ -1216,12 +1237,12 @@ public sealed class ClusterNodeJobService
             }
             catch (IOException ex)
             {
-                Console.WriteLine($"Cluster: Could not delete {dir}: {ex.Message}");
+                Log.Information($"Cluster: Could not delete {dir}: {ex.Message}");
             }
         }
 
         if (cleaned > 0)
-            Console.WriteLine($"Cluster: Cleaned up {cleaned} remote job directories older than {ttlHours}h");
+            Log.Information($"Cluster: Cleaned up {cleaned} remote job directories older than {ttlHours}h");
     }
 
     /******************************************************************
@@ -1293,7 +1314,7 @@ public sealed class ClusterNodeJobService
             if (!resp.IsSuccessStatusCode)
             {
                 LastIntegrationSyncStatus = $"Failed: HTTP {(int)resp.StatusCode}";
-                Console.WriteLine($"Cluster: Integration pull failed (HTTP {(int)resp.StatusCode}); using cached config.");
+                Log.Warning($"Cluster: Integration pull failed (HTTP {(int)resp.StatusCode}); using cached config.");
                 return;
             }
 
@@ -1302,20 +1323,20 @@ public sealed class ClusterNodeJobService
             if (pulled == null)
             {
                 LastIntegrationSyncStatus = "Failed: empty payload";
-                Console.WriteLine("Cluster: Integration pull returned empty payload; using cached config.");
+                Log.Information("Cluster: Integration pull returned empty payload; using cached config.");
                 return;
             }
 
             _integrationService.SaveConfig(pulled);
             LastIntegrationSyncAt     = DateTime.UtcNow;
             LastIntegrationSyncStatus = "OK";
-            Console.WriteLine("Cluster: Integration config synced from master.");
+            Log.Information("Cluster: Integration config synced from master.");
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex)
         {
             LastIntegrationSyncStatus = $"Failed: {ex.Message}";
-            Console.WriteLine($"Cluster: Integration pull error ({ex.Message}); using cached config.");
+            Log.Warning($"Cluster: Integration pull error ({ex.Message}); using cached config.");
         }
     }
 }

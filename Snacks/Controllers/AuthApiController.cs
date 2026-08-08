@@ -63,38 +63,25 @@ public sealed class AuthApiController : ControllerBase
     }
 
     /******************************************************************
-     *  API Key (public read-only /api/v1/* surface)
+     *  API Key
      ******************************************************************/
 
     /// <summary>
-    ///     Returns whether an API key is currently configured. The key value itself is
-    ///     never returned by this endpoint — it is only surfaced once at the moment of
-    ///     generation via <see cref="GenerateApiKey"/>.
+    ///     Returns the stored API key for the Security panel's reveal button.
+    ///     A key set via the SNACKS_API_KEY env var is never exposed here.
     /// </summary>
-    [HttpGet("api-key")]
-    public IActionResult GetApiKey()
-    {
-        var cfg = _auth.GetConfig();
-        return new JsonResult(new { hasKey = !string.IsNullOrEmpty(cfg.ApiKey) });
-    }
+    [HttpGet("apikey")]
+    public IActionResult GetApiKey() => new JsonResult(new { apiKey = _auth.GetStoredApiKey() });
 
-    /// <summary>
-    ///     Generates a fresh API key, persists it to <c>auth.json</c>, and returns the
-    ///     plaintext value. The caller must surface the key immediately — subsequent
-    ///     <see cref="GetApiKey"/> calls only return <c>hasKey: true</c>.
-    /// </summary>
-    [HttpPost("api-key")]
-    public IActionResult GenerateApiKey()
-    {
-        var key = _auth.GenerateApiKey();
-        return new JsonResult(new { hasKey = true, key });
-    }
+    /// <summary> Generates and persists a new stored API key, replacing any previous one. </summary>
+    [HttpPost("apikey/generate")]
+    public IActionResult GenerateApiKey() => new JsonResult(new { success = true, apiKey = _auth.GenerateApiKey() });
 
-    /// <summary> Clears the stored API key, immediately revoking any external clients using it. </summary>
-    [HttpDelete("api-key")]
+    /// <summary> Removes the stored API key. A key set via SNACKS_API_KEY stays valid. </summary>
+    [HttpDelete("apikey")]
     public IActionResult DeleteApiKey()
     {
         _auth.ClearApiKey();
-        return new JsonResult(new { hasKey = false });
+        return new JsonResult(new { success = true });
     }
 }

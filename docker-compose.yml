@@ -30,6 +30,15 @@ services:
       # - PGID=1000
       # Set to skip the startup chown entirely (e.g. host manages all perms).
       # - SNACKS_DISABLE_CHOWN=true
+      # API key for automation (pause/resume queue, trigger scans) when
+      # sign-in is enabled. See README "API Access & Automation".
+      # - SNACKS_API_KEY=change-me
+      # Pin any encoder / auto-scan / integration setting from compose —
+      # pinned settings show a lock in the GUI and always win over it.
+      # See README "Configuration via Environment Variables".
+      # - SNACKS_SET_Codec=av1
+      # - SNACKS_SET_TargetBitrate=2500
+      # - SNACKS_SCAN_Enabled=true
     # GPU passthrough is configured in docker-compose.gpu.yml (Linux NAS only)
     privileged: false
     restart: unless-stopped

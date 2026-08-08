@@ -41,7 +41,7 @@ public sealed class NetworkingController : ControllerBase
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Networking: save failed: {ex.Message}");
+            Log.Warning($"Networking: save failed: {ex.Message}");
             return StatusCode(500, new { error = ex.Message });
         }
     }

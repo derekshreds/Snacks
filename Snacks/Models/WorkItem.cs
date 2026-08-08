@@ -19,8 +19,26 @@ public sealed class WorkItem
     /// <summary> Display name of the file being processed (e.g., "Movie.mkv"). </summary>
     public string FileName { get; set; } = "";
 
+    private string _path = "";
+
     /// <summary> Absolute path to the source file on the master's filesystem. </summary>
-    public string Path { get; set; } = "";
+    public string Path
+    {
+        get => _path;
+        set { _path = value; _normalizedPath = null; }
+    }
+
+    private string? _normalizedPath;
+
+    /// <summary>
+    ///     <see cref="Path"/> normalized via <c>Path.GetFullPath</c>, computed once and
+    ///     cached (invalidated if <see cref="Path"/> changes). Duplicate-detection scans
+    ///     used to call <c>GetFullPath</c> per item per lookup — O(n²) normalizations
+    ///     across a large library rescan.
+    /// </summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public string NormalizedPath =>
+        _normalizedPath ??= string.IsNullOrEmpty(_path) ? "" : System.IO.Path.GetFullPath(_path);
 
     /// <summary> File size in bytes of the source file. </summary>
     public long Size { get; set; } = 0;
@@ -39,8 +57,34 @@ public sealed class WorkItem
     /// </summary>
     public long Bitrate { get; set; } = 0;
 
+    /// <summary>
+    ///     User-assigned queue priority. 0 for everything by default; "move to
+    ///     front" sets it above the current maximum so the item dispatches next.
+    ///     Sorts before <see cref="Bitrate"/> in every queue ordering.
+    /// </summary>
+    public int Priority { get; set; }
+
+    /// <summary>
+    ///     When the file entered the queue (the DB row's CreatedAt, stamped at
+    ///     hydration). The newest-first policy's tiebreaker — kept separate from
+    ///     <see cref="CreatedAt"/>, which records when THIS in-memory object was
+    ///     built and feeds encode-history timing fallbacks.
+    /// </summary>
+    public DateTime QueuedAt { get; set; } = DateTime.UtcNow;
+
     /// <summary> Duration of the video in seconds. </summary>
     public double Length { get; set; } = 0;
+
+    /// <summary>
+    ///     Set when this item was enqueued by an explicit user action ("Process Item" /
+    ///     "Process Directory"). Such items are treated as <see cref="EncodingMode.Hybrid"/>
+    ///     at dispatch regardless of the global encoding mode — already-at-target files get a
+    ///     video-copy mux pass (audio/subs re-applied, container normalized to the configured
+    ///     <see cref="EncoderOptions.Format"/>) instead of being skipped, while above-target or
+    ///     wrong-codec files still re-encode. Hydrated from <see cref="MediaFile.ForceMux"/>
+    ///     so the intent survives the item falling out of the in-memory working window.
+    /// </summary>
+    public bool ForceMux { get; set; }
 
     /// <summary>
     ///     Whether the source video is already encoded in HEVC/H.265.
@@ -62,8 +106,18 @@ public sealed class WorkItem
 
     /// <summary>
     ///     Full ffprobe analysis of the source file, including stream details.
-    ///     Used to build FFmpeg command lines and validate output.
+    ///     Used to build FFmpeg command lines and validate output. Populated lazily
+    ///     when processing starts (every encode path re-probes when this is null)
+    ///     and released once the item reaches a terminal state — at 10–30 KB per
+    ///     probe, retaining it on thousands of queued/finished items was the
+    ///     dominant cost of the multi-GB blowups reported on large library sweeps.
     /// </summary>
+    /// <remarks>
+    ///     Excluded from JSON on purpose: the queue API and SignalR broadcasts
+    ///     serialize whole <see cref="WorkItem"/>s, and no client reads the probe.
+    ///     Cluster dispatch sends probes via its own <c>JobMetadata.Probe</c>.
+    /// </remarks>
+    [System.Text.Json.Serialization.JsonIgnore]
     public ProbeResult? Probe { get; set; }
 
     private WorkItemStatus _status = WorkItemStatus.Pending;

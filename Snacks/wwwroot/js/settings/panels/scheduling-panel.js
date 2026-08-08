@@ -382,6 +382,22 @@ function updateSummary(section) {
     const summaryEl = section.querySelector('[data-schedule-summary]');
     if (!summaryEl) return;
 
+    // Rows with no selected days are excluded from the save payload — mark
+    // them so the user can tell a half-configured row isn't taking effect.
+    section.querySelectorAll('[data-window-row]').forEach(row => {
+        const hasDays = !!row.querySelector('.day-chip.active');
+        let warn = row.querySelector('[data-no-days-warning]');
+        if (!hasDays && !warn) {
+            warn = document.createElement('div');
+            warn.setAttribute('data-no-days-warning', '');
+            warn.className = 'small text-warning mt-1';
+            warn.innerHTML = '<i class="fas fa-exclamation-triangle me-1"></i>Pick at least one day — this window is not saved until you do.';
+            row.appendChild(warn);
+        } else if (hasDays && warn) {
+            warn.remove();
+        }
+    });
+
     const windows = readWindows(section).filter(w => w.Days.length > 0);
     if (windows.length === 0) {
         summaryEl.textContent = 'Always available';

@@ -4,7 +4,7 @@ namespace Snacks.Services;
 
 /// <summary>
 ///     Gates the UI behind cookie-based login when <see cref="AuthConfig.Enabled"/> is true.
-///     Login page, static files, SignalR hub, and cluster (master↔node) traffic are always allowed.
+///     Login page, static files, health checks, and cluster (master↔node) traffic are always allowed.
 ///     Cluster nodes authenticate via the shared secret handled separately by ClusterAuthMiddleware.
 /// </summary>
 public sealed class AuthMiddleware
@@ -12,7 +12,6 @@ public sealed class AuthMiddleware
     private static readonly string[] AllowlistPrefixes =
     {
         "/Auth/",             // login form
-        "/transcodingHub",    // SignalR
         "/api/cluster/",      // inter-node RPC (secret-authenticated)
         "/api/health",        // liveness probe
         "/iframe/",           // embed-friendly HTML tiles — browser can't send X-Api-Key in <iframe>
@@ -61,11 +60,11 @@ public sealed class AuthMiddleware
             return;
         }
 
-        // Public-API path: accept the key via X-Api-Key header or ?apiKey= query string.
-        // Mirrors the Sonarr/Radarr convention; either form is sufficient.
-        var apiKey = ctx.Request.Headers["X-Api-Key"].FirstOrDefault()
-                     ?? ctx.Request.Query["apiKey"].FirstOrDefault();
-        if (auth.ValidateApiKey(apiKey))
+        // API key (X-Api-Key header, Bearer token, or ?apiKey= query string) — the
+        // automation path for orchestrators and dashboards that can't do cookie login.
+        // API routes only; browser navigation still goes through the login form.
+        if (path.StartsWith("/api/", StringComparison.OrdinalIgnoreCase)
+            && auth.ValidateApiKey(ExtractApiKey(ctx)))
         {
             await _next(ctx);
             return;
@@ -88,8 +87,28 @@ public sealed class AuthMiddleware
      *  Helpers
      ******************************************************************/
 
-    private static bool IsAllowlisted(string path)
+    private static string? ExtractApiKey(HttpContext ctx)
     {
+        var headerKey = ctx.Request.Headers["X-Api-Key"].FirstOrDefault();
+        if (!string.IsNullOrEmpty(headerKey)) return headerKey;
+
+        var authorization = ctx.Request.Headers.Authorization.FirstOrDefault();
+        const string bearer = "Bearer ";
+        if (authorization?.StartsWith(bearer, StringComparison.OrdinalIgnoreCase) == true)
+            return authorization[bearer.Length..];
+
+        // ?apiKey= query string — the Sonarr/Radarr convention, for external
+        // dashboards (Homarr, Glance, …) that can only configure a URL.
+        return ctx.Request.Query["apiKey"].FirstOrDefault();
+    }
+
+    internal static bool IsAllowlisted(string path)
+    {
+        // Prometheus scrape — aggregate counters only, no file paths or credentials;
+        // scrapers can't do cookie login. Exact match (not a prefix) so a future
+        // "/metrics/..." management route can't silently ship unauthenticated.
+        if (string.Equals(path, "/metrics", StringComparison.OrdinalIgnoreCase)) return true;
+
         foreach (var prefix in AllowlistPrefixes)
             if (path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) return true;
 

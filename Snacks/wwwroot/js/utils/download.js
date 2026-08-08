@@ -13,6 +13,10 @@
  * @param {string}      [fallbackName]
  */
 export async function streamDownload(url, button, fallbackName = 'download.bin') {
+    // Re-entry guard: a second click while in flight would capture the spinner
+    // as `original` and permanently restore it in its finally block.
+    if (button.getAttribute('aria-busy') === 'true') return;
+
     const original = button.innerHTML;
     button.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
     button.setAttribute('aria-busy', 'true');

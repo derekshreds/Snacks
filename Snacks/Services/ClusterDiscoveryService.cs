@@ -41,7 +41,7 @@ public sealed class ClusterDiscoveryService
     };
 
     /// <summary> Protocol version for cluster inter-node communication. </summary>
-    internal const string ClusterVersion = "2.12.0";
+    internal static readonly string ClusterVersion = AppVersion.Current;
 
     private volatile ClusterConfig       _config;
     private UdpClient?                   _udpListener;
@@ -127,7 +127,7 @@ public sealed class ClusterDiscoveryService
 
         var localIp = GetLocalIpAddress();
         var port    = GetListeningPort();
-        Console.WriteLine($"ClusterDiscovery: Started — localIp={localIp}, port={port}, udp={needsDiscovery}");
+        Log.Information($"ClusterDiscovery: Started — localIp={localIp}, port={port}, udp={needsDiscovery}");
     }
 
     /// <summary> Stops all discovery operations, closes the UDP socket, and awaits pending tasks. </summary>
@@ -165,7 +165,7 @@ public sealed class ClusterDiscoveryService
         _linkedCts?.Dispose();
         _linkedCts = null;
 
-        Console.WriteLine("ClusterDiscovery: Stopped");
+        Log.Information("ClusterDiscovery: Stopped");
     }
 
     /******************************************************************
@@ -183,7 +183,7 @@ public sealed class ClusterDiscoveryService
             _udpListener.Client.Bind(new IPEndPoint(IPAddress.Any, 6768));
             _udpListener.EnableBroadcast = true;
 
-            Console.WriteLine("ClusterDiscovery: UDP listening on port 6768");
+            Log.Information("ClusterDiscovery: UDP listening on port 6768");
 
             var broadcastTask = BroadcastLoopAsync(ct);
             var listenTask    = ListenLoopAsync(ct);
@@ -192,7 +192,7 @@ public sealed class ClusterDiscoveryService
         catch (OperationCanceledException) { }
         catch (Exception ex)
         {
-            Console.WriteLine($"ClusterDiscovery: Discovery error: {ex.Message}");
+            Log.Warning($"ClusterDiscovery: Discovery error: {ex.Message}");
         }
     }
 
@@ -210,14 +210,20 @@ public sealed class ClusterDiscoveryService
         {
             try
             {
+                // secretToken (not secretHash): never broadcast a direct hash of
+                // the shared secret — see ComputeDiscoveryToken. Older peers that
+                // only understand secretHash won't verify this announcement, but
+                // newer nodes still accept THEIR legacy announcements, and the
+                // resulting handshake registers both sides, so mixed-version
+                // discovery still converges.
                 var announcement = new
                 {
-                    proto      = "snacks-v1",
-                    nodeId     = _config.NodeId,
-                    role       = _config.Role,
-                    port       = GetListeningPort(),
-                    version    = ClusterVersion,
-                    secretHash = HashSecret(_config.SharedSecret)
+                    proto       = "snacks-v1",
+                    nodeId      = _config.NodeId,
+                    role        = _config.Role,
+                    port        = GetListeningPort(),
+                    version     = ClusterVersion,
+                    secretToken = ComputeDiscoveryToken(_config.SharedSecret, _config.NodeId, CurrentDiscoveryBucket())
                 };
 
                 var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(announcement, _jsonOptions));
@@ -240,7 +246,7 @@ public sealed class ClusterDiscoveryService
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                Console.WriteLine($"ClusterDiscovery: Broadcast error: {ex.Message}");
+                Log.Warning($"ClusterDiscovery: Broadcast error: {ex.Message}");
             }
 
             await Task.Delay(TimeSpan.FromSeconds(15), ct);
@@ -254,7 +260,7 @@ public sealed class ClusterDiscoveryService
     /// <param name="ct">Cancelled when the cluster is stopping.</param>
     private async Task ListenLoopAsync(CancellationToken ct)
     {
-        Console.WriteLine("ClusterDiscovery: Listening for UDP announcements on port 6768");
+        Log.Information("ClusterDiscovery: Listening for UDP announcements on port 6768");
 
         while (!ct.IsCancellationRequested)
         {
@@ -280,10 +286,25 @@ public sealed class ClusterDiscoveryService
                 if (nodeId == _config.NodeId)
                     continue;
 
-                var secretHash = announcement.GetProperty("secretHash").GetString();
-                if (secretHash != HashSecret(_config.SharedSecret))
+                // Prefer the HMAC token; fall back to the legacy bare-hash field so
+                // announcements from older nodes are still accepted during upgrades.
+                bool secretOk;
+                if (announcement.TryGetProperty("secretToken", out var tokenProp))
                 {
-                    Console.WriteLine($"ClusterDiscovery: Ignored announcement from {result.RemoteEndPoint} — secret mismatch");
+                    secretOk = VerifyDiscoveryToken(tokenProp.GetString(), nodeId ?? "");
+                }
+                else if (announcement.TryGetProperty("secretHash", out var hashProp))
+                {
+                    secretOk = hashProp.GetString() == HashSecret(_config.SharedSecret);
+                }
+                else
+                {
+                    secretOk = false;
+                }
+
+                if (!secretOk)
+                {
+                    Log.Warning($"ClusterDiscovery: Ignored announcement from {result.RemoteEndPoint} — secret mismatch");
                     continue;
                 }
 
@@ -294,7 +315,7 @@ public sealed class ClusterDiscoveryService
 
                 if (!IsVersionCompatible(remoteVersion))
                 {
-                    Console.WriteLine($"ClusterDiscovery: Ignored announcement from {senderIp} — incompatible version {remoteVersion ?? "unknown"} (ours: {ClusterVersion})");
+                    Log.Information($"ClusterDiscovery: Ignored announcement from {senderIp} — incompatible version {remoteVersion ?? "unknown"} (ours: {ClusterVersion})");
                     continue;
                 }
 
@@ -307,18 +328,18 @@ public sealed class ClusterDiscoveryService
                 // Reject second master via discovery
                 if (role == "master" && (_config.Role == "master" || _nodes.Values.Any(n => n.Role == "master")))
                 {
-                    Console.WriteLine($"ClusterDiscovery: Ignoring master announcement from {senderIp}:{port} — a master already exists in the cluster");
+                    Log.Information($"ClusterDiscovery: Ignoring master announcement from {senderIp}:{port} — a master already exists in the cluster");
                     continue;
                 }
 
-                Console.WriteLine($"ClusterDiscovery: Discovered {role} at {senderIp}:{port} — performing handshake");
+                Log.Information($"ClusterDiscovery: Discovered {role} at {senderIp}:{port} — performing handshake");
                 var scheme = _config.UseHttps ? "https" : "http";
                 _ = Task.Run(() => PerformHandshakeAsync($"{scheme}://{senderIp}:{port}", ct));
             }
             catch (OperationCanceledException) { break; }
             catch (Exception ex)
             {
-                Console.WriteLine($"ClusterDiscovery: Listen error: {ex.Message}");
+                Log.Warning($"ClusterDiscovery: Listen error: {ex.Message}");
             }
         }
     }
@@ -356,7 +377,7 @@ public sealed class ClusterDiscoveryService
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"ClusterDiscovery: Error enumerating network interfaces: {ex.Message}");
+            Log.Warning($"ClusterDiscovery: Error enumerating network interfaces: {ex.Message}");
         }
         return addresses;
     }
@@ -378,7 +399,7 @@ public sealed class ClusterDiscoveryService
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"ClusterDiscovery: Manual node connect to {node.Name} failed: {ex.Message}");
+                Log.Warning($"ClusterDiscovery: Manual node connect to {node.Name} failed: {ex.Message}");
             }
         }
     }
@@ -397,24 +418,37 @@ public sealed class ClusterDiscoveryService
         {
             try
             {
-                await PerformHandshakeAsync(_config.MasterUrl!, ct);
-                if (!registered)
+                // PerformHandshakeAsync swallows network errors internally and
+                // reports success via its return value — keying off exceptions
+                // here would flip `registered` to true on the very first attempt
+                // even when the master is unreachable.
+                bool ok = await PerformHandshakeAsync(_config.MasterUrl!, ct);
+                if (ok && !registered)
                 {
                     registered = true;
-                    Console.WriteLine("ClusterDiscovery: Registered with master — switching to periodic re-handshake");
+                    Log.Information("ClusterDiscovery: Registered with master — switching to periodic re-handshake");
                 }
-                await Task.Delay(TimeSpan.FromSeconds(30), ct);
+                else if (!ok && registered)
+                {
+                    Log.Information("ClusterDiscovery: Lost contact with master — retrying at the fast cadence");
+                    registered = false;
+                }
+                await Task.Delay(TimeSpan.FromSeconds(registered ? 30 : 10), ct);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
             }
             catch (Exception ex)
             {
                 if (registered)
                 {
-                    Console.WriteLine($"ClusterDiscovery: Lost contact with master — {ex.Message}");
+                    Log.Information($"ClusterDiscovery: Lost contact with master — {ex.Message}");
                     registered = false;
                 }
                 else
                 {
-                    Console.WriteLine($"ClusterDiscovery: Failed to register with master: {ex.Message}");
+                    Log.Warning($"ClusterDiscovery: Failed to register with master: {ex.Message}");
                 }
                 await Task.Delay(TimeSpan.FromSeconds(10), ct);
             }
@@ -427,11 +461,14 @@ public sealed class ClusterDiscoveryService
 
     /// <summary>
     ///     Posts this node's info to the remote node's handshake endpoint and registers
-    ///     the remote node's response locally.
+    ///     the remote node's response locally. Returns <see langword="true"/> only when
+    ///     the handshake actually succeeded — network failures are logged and swallowed,
+    ///     so callers that need to know (e.g. the register-with-master loop) must check
+    ///     the return value rather than relying on the absence of an exception.
     /// </summary>
     /// <param name="baseUrl">Base URL of the remote node (e.g. <c>http://192.168.1.5:6767</c>).</param>
     /// <param name="ct">Cancelled when the cluster is stopping.</param>
-    public async Task PerformHandshakeAsync(string baseUrl, CancellationToken ct)
+    public async Task<bool> PerformHandshakeAsync(string baseUrl, CancellationToken ct)
     {
         var url = $"{baseUrl.TrimEnd('/')}/api/cluster/handshake";
         try
@@ -448,16 +485,16 @@ public sealed class ClusterDiscoveryService
             if (response.StatusCode == System.Net.HttpStatusCode.Conflict)
             {
                 var body = await response.Content.ReadAsStringAsync(ct);
-                Console.WriteLine($"ClusterDiscovery: Handshake rejected by {baseUrl} — {body}");
-                Console.WriteLine("ClusterDiscovery: Another master exists in the cluster. Reconfigure this node as 'node' or 'standalone'.");
-                return;
+                Log.Warning($"ClusterDiscovery: Handshake rejected by {baseUrl} — {body}");
+                Log.Information("ClusterDiscovery: Another master exists in the cluster. Reconfigure this node as 'node' or 'standalone'.");
+                return false;
             }
 
             if (!response.IsSuccessStatusCode)
             {
                 var body = await response.Content.ReadAsStringAsync(ct);
-                Console.WriteLine($"ClusterDiscovery: Handshake with {baseUrl} failed — {response.StatusCode}: {body}");
-                return;
+                Log.Warning($"ClusterDiscovery: Handshake with {baseUrl} failed — {response.StatusCode}: {body}");
+                return false;
             }
 
             var responseBody = await response.Content.ReadAsStringAsync(ct);
@@ -475,7 +512,7 @@ public sealed class ClusterDiscoveryService
                     {
                         if (!string.Equals(uri.Host, remoteNode.IpAddress, StringComparison.OrdinalIgnoreCase))
                         {
-                            Console.WriteLine(
+                            Log.Information(
                                 $"ClusterDiscovery: Overriding self-reported IP {remoteNode.IpAddress} " +
                                 $"with {uri.Host} from handshake URL");
                             remoteNode.IpAddress = uri.Host;
@@ -486,12 +523,15 @@ public sealed class ClusterDiscoveryService
                 catch { }
 
                 RegisterOrUpdateNode(remoteNode, fromHandshake: true);
-                Console.WriteLine($"ClusterDiscovery: Handshake with {remoteNode.Hostname} ({baseUrl}) successful");
+                Log.Information($"ClusterDiscovery: Handshake with {remoteNode.Hostname} ({baseUrl}) successful");
+                return true;
             }
+            return false;
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"ClusterDiscovery: Handshake with {baseUrl} failed — {ex.Message}");
+            Log.Warning($"ClusterDiscovery: Handshake with {baseUrl} failed — {ex.Message}");
+            return false;
         }
     }
 
@@ -516,14 +556,14 @@ public sealed class ClusterDiscoveryService
         {
             if (_config.Role == "master")
             {
-                Console.WriteLine($"ClusterDiscovery: Rejecting master {node.Hostname} ({node.IpAddress}:{node.Port}) — this node is already a master");
+                Log.Information($"ClusterDiscovery: Rejecting master {node.Hostname} ({node.IpAddress}:{node.Port}) — this node is already a master");
                 return (false, "A master already exists in the cluster");
             }
 
             var existingMaster = _nodes.Values.FirstOrDefault(n => n.Role == "master");
             if (existingMaster != null && existingMaster.NodeId != node.NodeId)
             {
-                Console.WriteLine($"ClusterDiscovery: Rejecting master {node.Hostname} — master {existingMaster.Hostname} already in cluster");
+                Log.Information($"ClusterDiscovery: Rejecting master {node.Hostname} — master {existingMaster.Hostname} already in cluster");
                 return (false, $"A master already exists in the cluster: {existingMaster.Hostname}");
             }
         }
@@ -547,7 +587,7 @@ public sealed class ClusterDiscoveryService
 
         if (isNew)
         {
-            Console.WriteLine($"ClusterDiscovery: Node joined — {node.Hostname} ({node.IpAddress}:{node.Port}) [{node.Role}]");
+            Log.Information($"ClusterDiscovery: Node joined — {node.Hostname} ({node.IpAddress}:{node.Port}) [{node.Role}]");
             _ = _hubContext.Clients.All.SendAsync("WorkerConnected", node);
         }
         else
@@ -708,6 +748,46 @@ public sealed class ClusterDiscoveryService
         if (string.IsNullOrEmpty(secret)) return "";
         var hash = SHA256.HashData(Encoding.UTF8.GetBytes(secret));
         return Convert.ToHexString(hash).ToLower();
+    }
+
+    /// <summary>
+    ///     Length of the discovery-token time bucket, in minutes. Receivers accept
+    ///     the current bucket ±1 so modest clock skew between nodes is tolerated.
+    /// </summary>
+    private const long DiscoveryTokenBucketMinutes = 10;
+
+    /// <summary> The current discovery-token time bucket. </summary>
+    private static long CurrentDiscoveryBucket() =>
+        DateTimeOffset.UtcNow.ToUnixTimeSeconds() / (DiscoveryTokenBucketMinutes * 60);
+
+    /// <summary>
+    ///     Time-bucketed HMAC discovery token. Replaces broadcasting a bare
+    ///     SHA-256 of the shared secret: that gave any passive LAN listener a
+    ///     fast, unsalted hash to brute-force offline. An HMAC over a rotating,
+    ///     non-secret payload proves knowledge of the secret without exposing
+    ///     anything attackable, and a captured token expires within minutes.
+    /// </summary>
+    public static string ComputeDiscoveryToken(string secret, string nodeId, long bucket)
+    {
+        if (string.IsNullOrEmpty(secret)) return "";
+        using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(secret));
+        var payload = $"snacks-discovery|{nodeId}|{bucket}";
+        return Convert.ToHexString(hmac.ComputeHash(Encoding.UTF8.GetBytes(payload))).ToLower();
+    }
+
+    /// <summary> Verifies a received discovery token against the current bucket ±1 (clock-skew tolerance). </summary>
+    private bool VerifyDiscoveryToken(string? token, string nodeId)
+    {
+        if (string.IsNullOrEmpty(token) || string.IsNullOrEmpty(_config.SharedSecret)) return false;
+        var bucket = CurrentDiscoveryBucket();
+        for (long b = bucket - 1; b <= bucket + 1; b++)
+        {
+            var expected = ComputeDiscoveryToken(_config.SharedSecret, nodeId, b);
+            if (CryptographicOperations.FixedTimeEquals(
+                    Encoding.UTF8.GetBytes(expected), Encoding.UTF8.GetBytes(token)))
+                return true;
+        }
+        return false;
     }
 
     /// <summary>

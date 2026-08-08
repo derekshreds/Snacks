@@ -50,7 +50,8 @@ import { OverrideDialog }       from './cluster/override-dialog.js';
 import { initAllChipInputs }    from './settings/chip-input.js';
 import { initFolderPicker }     from './settings/folder-picker.js';
 import { initSettingsTabs, applySettingsRoleVisibility } from './settings/settings-tabs.js';
-import { restoreEncoderOptions, getEncoderOptions } from './settings/encoder-form.js';
+import { restoreEncoderOptions, getEncoderOptions, retryRestoreEncoderOptionsIfNeeded } from './settings/encoder-form.js';
+import { initPresets } from './settings/presets.js';
 
 import { AutoScanPanel }                                  from './settings/panels/auto-scan-panel.js';
 import { initIntegrationsPanel,  loadIntegrationsPanel }  from './settings/panels/integrations-panel.js';
@@ -67,6 +68,7 @@ import { initNetworkingPanel }                             from './settings/pane
 // (or navigates to) /dashboard.
 import './dashboard/dashboard.js';
 import './cluster-logs/cluster-logs.js';
+import './health/library-health.js';
 
 
 // ---------------------------------------------------------------------------
@@ -166,6 +168,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initNodeSyncPanel();
     initSchedulingPanel();
     initNetworkingPanel();
+    initPresets();
 
 
     // 4. Initial data loads (shared — not page-specific).
@@ -183,6 +186,11 @@ document.addEventListener('DOMContentLoaded', () => {
         settingsModal.classList.add('open');
         autoScan.load();
         clusterSettings.load();
+
+        // If the startup restore failed (auth redirect, transient 500), the
+        // form still holds HTML defaults and auto-save is disarmed — retry
+        // here so the user sees (and edits) their real settings.
+        retryRestoreEncoderOptionsIfNeeded('settings');
 
         // Load the secondary panels lazily on first open — they each hit an
         // auth-gated endpoint and we don't want to 401 on initial page load.
@@ -208,17 +216,63 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!settingsModal.classList.contains('open')) nodeOverride.close();
     }).observe(settingsModal, { attributes: true, attributeFilter: ['class'] });
 
-    // Auto-save encoder settings on any input change in the main settings
-    // (exclude auto-scan fields + the override dialog, which have their own
-    // save paths).
+    // Auto-save encoder settings on changes in the main settings modal.
+    // Excluded: every panel with its own save path (auto-scan, exclusions,
+    // cluster, networking, scheduling, security, notifications, integrations,
+    // the override dialog). Without these exclusions, typing in e.g. the
+    // cluster secret or a Plex token fired a full encoder-settings POST per
+    // keystroke.
+    const NON_ENCODER_ID_PREFIXES = [
+        'autoScan', 'exclusion', 'auth', 'cluster', 'manualNode',
+        'notif', 'newNotif', 'plex', 'jellyfin', 'sonarr', 'radarr',
+        'tvdb', 'tmdb', 'settingsNet', 'settingsScheduling', 'preset',
+    ];
     const isMainSettingsField = (e) =>
-        !e.target.id.startsWith('autoScan') && !e.target.closest('#overrideDialog');
+        !NON_ENCODER_ID_PREFIXES.some((p) => e.target.id.startsWith(p))
+        && !e.target.closest('#overrideDialog');
+
+    // Debounce so typing "8000" into Target Bitrate doesn't live-apply the
+    // intermediate "8" — the backend applies saved options to the NEXT
+    // dispatched job immediately, so per-keystroke saves were genuinely
+    // dangerous, not just chatty.
+    let encoderSaveTimer = null;
+    const scheduleEncoderSave = () => {
+        clearTimeout(encoderSaveTimer);
+        encoderSaveTimer = setTimeout(() => getEncoderOptions('settings'), 600);
+    };
 
     settingsModal.addEventListener('change', (e) => {
-        if (isMainSettingsField(e)) getEncoderOptions('settings');
+        if (isMainSettingsField(e)) scheduleEncoderSave();
     });
     settingsModal.addEventListener('input', (e) => {
-        if (isMainSettingsField(e)) getEncoderOptions('settings');
+        if (isMainSettingsField(e)) scheduleEncoderSave();
+    });
+
+    // "Replace Original Files" deletes sources after each successful encode
+    // and (like every encoder setting) applies the moment it's saved — the
+    // single most destructive toggle in the app should not flip on silently.
+    const replaceOriginalsToggle = document.getElementById('settingsDeleteOriginalFile');
+    replaceOriginalsToggle?.addEventListener('change', async () => {
+        if (!replaceOriginalsToggle.checked) return;
+
+        // Revert BEFORE awaiting the dialog: the same change event already
+        // scheduled a debounced auto-save, which would otherwise persist (and
+        // immediately apply) the destructive setting while the dialog is still
+        // open. With the box unchecked, that pending save persists `false`;
+        // only an explicit confirm re-checks it and saves `true`.
+        replaceOriginalsToggle.checked = false;
+
+        const ok = await showConfirmModal(
+            'Replace original files?',
+            'After each successful encode, Snacks will permanently delete the '
+            + 'original file and move the encoded file into its place. '
+            + 'Deleted originals cannot be recovered. Continue?',
+            'Replace originals',
+        );
+        if (ok) {
+            replaceOriginalsToggle.checked = true;
+            scheduleEncoderSave();
+        }
     });
 
     // The sidecar format dropdown is always visible so users can see the
@@ -233,6 +287,39 @@ document.addEventListener('DOMContentLoaded', () => {
     };
     sidecarToggle?.addEventListener('change', syncSidecar);
     setTimeout(syncSidecar, 200);
+
+    // WebM forces AV1 + Opus server-side; lock the codec select so the UI
+    // doesn't claim H.265 while the encoder actually produces AV1.
+    const formatSelect = document.getElementById('settingsFormat');
+    const codecSelect  = document.getElementById('settingsCodec');
+    const syncCodecForFormat = () => {
+        const isWebm = formatSelect?.value === 'webm';
+        if (!codecSelect) return;
+        codecSelect.disabled = isWebm;
+        codecSelect.title    = isWebm ? 'WebM always uses AV1 video + Opus audio.' : '';
+        codecSelect.style.opacity = isWebm ? '0.55' : '';
+    };
+    formatSelect?.addEventListener('change', syncCodecForFormat);
+    setTimeout(syncCodecForFormat, 200);
+
+    // Mux Only mode never re-encodes video, which silently neuters the whole
+    // Video tab — surface that on the tab itself instead of leaving users to
+    // wonder why their downscale/tonemap settings do nothing.
+    const encodingModeSelect = document.getElementById('settingsEncodingMode');
+    const muxOnlyNotice      = document.getElementById('settingsVideoMuxOnlyNotice');
+    const syncMuxOnlyNotice  = () => {
+        muxOnlyNotice?.classList.toggle('d-none', encodingModeSelect?.value !== 'MuxOnly');
+    };
+    encodingModeSelect?.addEventListener('change', syncMuxOnlyNotice);
+    setTimeout(syncMuxOnlyNotice, 200);
+
+    // Re-sync the derived UI states whenever the modal opens — the async
+    // settings restore may have landed after the startup setTimeout(200)s.
+    document.getElementById('openSettingsBtn')?.addEventListener('click', () => {
+        syncSidecar();
+        syncCodecForFormat();
+        syncMuxOnlyNotice();
+    });
 
 
     // 6. Page lifecycle registration.
@@ -274,6 +361,13 @@ document.addEventListener('DOMContentLoaded', () => {
         clusterDashboard.onWorkItemUpdated?.(wi);
     });
     signalR.on('WorkItemRemoved',   (id)      => queueManager.removeItem(id));
+    // Lightweight "the pending queue changed" signal — pending tiles are
+    // DB-sourced, so the server pushes no per-item payload; we just refetch.
+    signalR.on('QueueChanged',      ()        => queueManager.queueChanged());
+    // Aggregate sweep progress (one event per directory chunk, never per file).
+    // The queue page's throttled refresh keeps the pending count/tiles live
+    // through a multi-hour first sweep without a 500k-event flood.
+    signalR.on('ScanProgress',      ()        => queueManager.queueChanged());
     signalR.on('TranscodingLog',    (id, msg) => logViewer.appendLine(id, msg));
 
     signalR.on('AutoScanCompleted', (newFiles) => {

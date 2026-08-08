@@ -15,7 +15,8 @@ internal sealed class ProbeBuilder
         string  codec         = "h264",
         string? colorTransfer = null,
         int     width         = 1920,
-        int     height        = 1080)
+        int     height        = 1080,
+        string? frameRate     = null)
     {
         _streams.Add(new Stream
         {
@@ -25,6 +26,8 @@ internal sealed class ProbeBuilder
             ColorTransfer = colorTransfer,
             Width         = width,
             Height        = height,
+            AvgFrameRate  = frameRate,
+            RFrameRate    = frameRate,
         });
         return this;
     }

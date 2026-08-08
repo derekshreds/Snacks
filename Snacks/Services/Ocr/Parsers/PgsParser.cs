@@ -71,18 +71,12 @@ internal static class PgsParser
                     // byte   frameRate  = seg[4];
                     // ushort compNumber = BinaryPrimitives.ReadUInt16BigEndian(seg.Slice(5, 2));
                     byte compState = seg[7];
-                    // byte   palUpdate  = seg[8];
+                    byte palUpdate = seg[8];
                     byte palId     = seg[9];
                     byte nComp     = seg[10];
 
-                    if (compState == 0x80 /* epoch start */ || compState == 0x40 /* acquisition */)
-                    {
-                        // Start of a new state — the catalog of previously decoded objects is
-                        // only guaranteed valid within an epoch, so clear it.
-                        objects.Clear();
-                        palettes.Clear();
-                    }
-
+                    // Parse the composition list BEFORE any yield — `seg` is a Span and
+                    // cannot live across a yield boundary.
                     var comps = new CompositionObject[nComp];
                     int o = 11;
                     for (int i = 0; i < nComp; i++)
@@ -101,6 +95,39 @@ internal static class PgsParser
                             o += 8;
                         }
                         comps[i] = new CompositionObject(objId, x, y);
+                    }
+
+                    // Palette-update-only PCS (fade in/out, karaoke highlight steps):
+                    // the composition on screen hasn't changed, only its colors. Don't
+                    // close/reopen the cue — that would emit one duplicate SRT line per
+                    // palette step. Just track the new palette id and keep rolling.
+                    if (palUpdate != 0 && nComp > 0 && cueStart is not null)
+                    {
+                        cuePaletteId = palId;
+                        break;
+                    }
+
+                    // A non-empty PCS can directly REPLACE the on-screen cue without an
+                    // intervening "hide everything" — back-to-back dialogue streams do
+                    // this constantly. Emit the in-progress cue first (using this PCS's
+                    // PTS as its end time) or it is silently dropped. Must run before
+                    // the epoch clear below, which would discard its objects.
+                    if (nComp > 0 && cueStart is not null && cueObjects.Length > 0 && palettes.ContainsKey(cuePaletteId))
+                    {
+                        var prevEnd = Pts(pts90);
+                        var prevEv  = Render(cueObjects, objects, palettes[cuePaletteId], cueStart.Value, prevEnd);
+                        if (prevEv is not null)
+                            yield return prevEv;
+                        cueStart   = null;
+                        cueObjects = Array.Empty<CompositionObject>();
+                    }
+
+                    if (compState == 0x80 /* epoch start */ || compState == 0x40 /* acquisition */)
+                    {
+                        // Start of a new state — the catalog of previously decoded objects is
+                        // only guaranteed valid within an epoch, so clear it.
+                        objects.Clear();
+                        palettes.Clear();
                     }
 
                     if (nComp == 0)

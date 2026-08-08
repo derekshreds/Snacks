@@ -302,11 +302,16 @@ public sealed class FileService
 
     /// <summary>
     ///     Returns the application working directory, creating it if needed.
-    ///     Resolves from the <c>SNACKS_WORK_DIR</c> environment variable, defaulting to <c>/app/work</c>.
+    ///     Resolves from the <c>SNACKS_WORK_DIR</c> environment variable, falling back to
+    ///     the same per-user data directory the rest of the app uses (Program.cs, OCR,
+    ///     tessdata). The old fallback here was <c>/app/work</c>, which diverged from
+    ///     everything else: on a bare-metal run, configs landed in an unwritable
+    ///     <c>/app</c> while the DB and logs went to the per-user directory.
     /// </summary>
     public string GetWorkingDirectory()
     {
-        var baseDir = Environment.GetEnvironmentVariable("SNACKS_WORK_DIR") ?? "/app/work";
+        var baseDir = Environment.GetEnvironmentVariable("SNACKS_WORK_DIR")
+            ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Snacks", "work");
 
         if (!Directory.Exists(baseDir))
             Directory.CreateDirectory(baseDir);
@@ -338,7 +343,7 @@ public sealed class FileService
     /// <param name="output"> Destination file path. </param>
     /// <param name="onRetry">
     ///     Optional async callback invoked once per retry attempt with the formatted retry message.
-    ///     When supplied, retry messages are routed here instead of <see cref="Console.WriteLine(string)"/>
+    ///     When supplied, retry messages are routed here instead of the persistent operations log
     ///     so callers (e.g. the placement step in TranscodingService) can surface them in the work-item log.
     /// </param>
     public async Task FileMoveAsync(string input, string output, Func<string, Task>? onRetry = null)
@@ -367,7 +372,7 @@ public sealed class FileService
     /// <param name="path"> The path of the file to delete. </param>
     /// <param name="onRetry">
     ///     Optional async callback invoked once per retry attempt with the formatted retry message.
-    ///     When supplied, retry messages are routed here instead of <see cref="Console.WriteLine(string)"/>
+    ///     When supplied, retry messages are routed here instead of the persistent operations log
     ///     so callers (e.g. the placement step in TranscodingService) can surface them in the work-item log.
     /// </param>
     public async Task FileDeleteAsync(string path, Func<string, Task>? onRetry = null)
@@ -391,7 +396,7 @@ public sealed class FileService
     /// <param name="description">Human-readable description for logging retry attempts.</param>
     /// <param name="onRetry">
     ///     Optional async callback invoked once per retry attempt with the formatted retry message.
-    ///     When supplied, retry messages are routed here instead of <see cref="Console.WriteLine(string)"/>.
+    ///     When supplied, retry messages are routed here instead of the persistent operations log.
     /// </param>
     private async Task RetryAsync(Func<Task> operation, string description, Func<string, Task>? onRetry = null)
     {
@@ -420,11 +425,11 @@ public sealed class FileService
         if (onRetry != null)
         {
             try { await onRetry(message); }
-            catch { Console.WriteLine(message); }
+            catch { Log.Information(message); }
         }
         else
         {
-            Console.WriteLine(message);
+            Log.Information(message);
         }
     }
 

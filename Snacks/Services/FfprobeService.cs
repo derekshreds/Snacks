@@ -38,17 +38,18 @@ public class FfprobeService
     {
         ArgumentNullException.ThrowIfNull(fileInput);
 
-        string flags = "-v quiet -print_format json -show_streams -show_format";
-        string command = $"{flags} \"{fileInput}\"";
-
+        // ArgumentList (not a quoted Arguments string) so filenames containing
+        // double quotes can't split the argument or inject extra ffprobe options.
         var processStartInfo = new ProcessStartInfo(_ffprobePath)
         {
-            Arguments = command,
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             CreateNoWindow = true
         };
+        foreach (var flag in new[] { "-v", "quiet", "-print_format", "json", "-show_streams", "-show_format" })
+            processStartInfo.ArgumentList.Add(flag);
+        processStartInfo.ArgumentList.Add(fileInput);
 
         using var process = new Process { StartInfo = processStartInfo };
 
@@ -71,22 +72,36 @@ public class FfprobeService
         process.BeginOutputReadLine();
         process.BeginErrorReadLine();
 
+        // Hard watchdog on top of the caller's token: ffprobe is known to hang on
+        // damaged containers, and several callers (notably the auto-scan loop) pass
+        // tokens that are never cancelled. A hung probe used to hold the scan lock
+        // forever — every future scan tick silently no-oped until restart.
+        using var watchdog = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        watchdog.CancelAfter(TimeSpan.FromMinutes(5));
+
         try
         {
-            await process.WaitForExitAsync(cancellationToken);
+            await process.WaitForExitAsync(watchdog.Token);
         }
         catch (OperationCanceledException)
         {
             try { if (!process.HasExited) process.Kill(entireProcessTree: true); } catch { }
-            throw;
+            // Only propagate cancellation the caller asked for. A watchdog kill
+            // must THROW, not return an empty ProbeResult — an empty result is
+            // indistinguishable from a real probe of a broken file, and callers
+            // like the auto-scan companion validator would treat duration=0 as
+            // "encode didn't match the original" and delete valid outputs.
+            if (cancellationToken.IsCancellationRequested) throw;
+            throw new TimeoutException($"ffprobe timed out after 5 minutes: {fileInput}");
         }
         process.WaitForExit(); // Ensures async OutputDataReceived/ErrorDataReceived events have finished firing
 
         // ffprobe writes JSON to stdout, but some builds redirect it to stderr.
-        // Use whichever stream captured more content.
-        string correctOutput = outputBuilder.Length > errorBuilder.Length
-            ? outputBuilder.ToString()
-            : errorBuilder.ToString();
+        // Prefer stdout whenever it actually contains JSON — "whichever is longer"
+        // picked stderr when a valid probe was accompanied by many warning lines,
+        // returning an empty ProbeResult for a perfectly probeable file.
+        string stdout = outputBuilder.ToString();
+        string correctOutput = stdout.IndexOf('{') >= 0 ? stdout : errorBuilder.ToString();
 
         try
         {
@@ -126,7 +141,8 @@ public class FfprobeService
         AudioBitrateStyle BitrateStyle,
         int    DefaultBitrateKbps,
         int    MaxChannels,
-        bool   AllowedInMp4);
+        bool   AllowedInMp4,
+        bool   AllowedInWebm);
 
     private enum AudioBitrateStyle { Cbr, OpusVbr, None }
 
@@ -137,10 +153,10 @@ public class FfprobeService
     /// </summary>
     private static readonly Dictionary<string, AudioCodecSpec> _codecSpecs = new(StringComparer.OrdinalIgnoreCase)
     {
-        ["aac"]  = new("aac",      AudioBitrateStyle.Cbr,     192, 8, true),
-        ["ac3"]  = new("ac3",      AudioBitrateStyle.Cbr,     448, 6, true),
-        ["eac3"] = new("eac3",     AudioBitrateStyle.Cbr,     384, 8, true),
-        ["opus"] = new("libopus",  AudioBitrateStyle.OpusVbr, 192, 8, false),
+        ["aac"]  = new("aac",      AudioBitrateStyle.Cbr,     192, 8, AllowedInMp4: true,  AllowedInWebm: false),
+        ["ac3"]  = new("ac3",      AudioBitrateStyle.Cbr,     448, 6, AllowedInMp4: true,  AllowedInWebm: false),
+        ["eac3"] = new("eac3",     AudioBitrateStyle.Cbr,     384, 8, AllowedInMp4: true,  AllowedInWebm: false),
+        ["opus"] = new("libopus",  AudioBitrateStyle.OpusVbr, 192, 8, AllowedInMp4: false, AllowedInWebm: true),
     };
 
     /// <summary>
@@ -191,9 +207,10 @@ public class FfprobeService
     ///     any encoded variants in <paramref name="audioOutputs"/>.
     /// </param>
     /// <param name="audioOutputs">Encoded variants to emit per kept language, or <see langword="null"/>/empty for none.</param>
-    /// <param name="isMatroska">
-    ///     When <see langword="false"/> (MP4 output), codecs that can't be muxed into MP4 fall back to AAC,
-    ///     and source tracks the container can't carry are re-encoded rather than copied.
+    /// <param name="container">
+    ///     Output container token ("mkv", "mp4", or "webm"). MP4 forces non-MP4-safe codecs to AAC and
+    ///     re-encodes copy sources the container can't carry. WebM forces non-WebM-safe codecs to Opus
+    ///     and only stream-copies Opus / Vorbis sources. Matroska is permissive.
     /// </param>
     /// <param name="warnings">Receives one entry per fallback/clamp/skipped-profile event so callers can surface them in the per-job log.</param>
     /// <param name="autoSetDefault">
@@ -208,7 +225,7 @@ public class FfprobeService
         IReadOnlyList<string>?            languagesToKeep,
         bool                              preserveOriginalAudio,
         IReadOnlyList<AudioOutputProfile>? audioOutputs,
-        bool                              isMatroska,
+        string                            container,
         out List<string>                  warnings,
         bool                              autoSetDefault = false)
     {
@@ -250,7 +267,25 @@ public class FfprobeService
             }
         }
 
-        if (buckets.Count == 0) return "";
+        // Whole-file audio safeguard: the language / commentary filtering matched nothing,
+        // but the source DOES have audio. Never silently produce a file with no audio — keep
+        // the source tracks instead. Prefer real tracks; if the source is commentary-only,
+        // keep those too (still better than an audio-less output). Forcing preserve here routes
+        // the fallback through the copy-emit path below, which also handles container-copy
+        // compatibility (e.g. a foreign DTS track into MP4 falls back to an AAC re-encode).
+        if (buckets.Count == 0)
+        {
+            var fallbackSources = audioStreams.Where(s => !IsCommentary(s)).ToList();
+            if (fallbackSources.Count == 0) fallbackSources = audioStreams;
+
+            var keepDesc = keepList is { Count: > 0 } ? string.Join(", ", keepList) : "(all)";
+            warnings.Add(
+                $"Audio: no source track matched the configured language(s) [{keepDesc}] — keeping " +
+                $"{fallbackSources.Count} source audio track(s) so the output isn't left without audio.");
+
+            buckets.Add(("und", fallbackSources));
+            preserveOriginalAudio = true;
+        }
 
         var profiles = (audioOutputs ?? Array.Empty<AudioOutputProfile>())
             .Where(p => !string.IsNullOrWhiteSpace(p.Codec))
@@ -268,7 +303,7 @@ public class FfprobeService
             // phase writes copies before re-encodes so output stream order matches user
             // expectation ("the original is the default").
             var copySourceIndices = new HashSet<int>();
-            var reencodes         = new List<(int srcIndex, string codec, int channels, int bitrateKbps)>();
+            var reencodes         = new List<(int srcIndex, string codec, int channels, int bitrateKbps, int sampleRateHz)>();
 
             foreach (var profile in profiles)
             {
@@ -306,8 +341,8 @@ public class FfprobeService
                 }
 
                 int encodeCh = targetCh ?? candidate.Channels;
-                var resolved = ResolveAudioCodec(profile.Codec, encodeCh, isMatroska, warnings);
-                reencodes.Add((candidate.Index, resolved.codec, resolved.channels, profile.BitrateKbps));
+                var resolved = ResolveAudioCodec(profile.Codec, encodeCh, container, warnings);
+                reencodes.Add((candidate.Index, resolved.codec, resolved.channels, profile.BitrateKbps, profile.SampleRateHz));
             }
 
             // PreserveOriginal: every kept source not already covered by a dedup is copied.
@@ -330,13 +365,14 @@ public class FfprobeService
             {
                 var src = sources.First(s => s.Index == srcIndex);
 
-                if (!isMatroska && !ContainerCanCopySource(src.CodecName))
+                if (!ContainerCanCopySource(src.CodecName, container))
                 {
+                    string reencTarget = IsWebm(container) ? "opus" : "aac";
                     warnings.Add(
-                        $"Audio: source track #{src.Index} ({src.CodecName}) cannot be copied to MP4 — re-encoding to AAC.");
-                    var fallback = ResolveAudioCodec("aac", src.Channels, isMatroska, warnings);
+                        $"Audio: source track #{src.Index} ({src.CodecName}) cannot be copied to {container.ToUpperInvariant()} — re-encoding to {reencTarget.ToUpperInvariant()}.");
+                    var fallback = ResolveAudioCodec(reencTarget, src.Channels, container, warnings);
                     maps.Append($"-map 0:{src.Index} ");
-                    codecArgs.Append(BuildAudioCodecArgs(fallback.codec, fallback.channels, 0, outIndex)).Append(' ');
+                    codecArgs.Append(BuildAudioCodecArgs(fallback.codec, fallback.channels, 0, 0, outIndex)).Append(' ');
                     AppendAudioMeta(meta, outIndex, bucket, fallback.codec, fallback.channels);
                 }
                 else
@@ -354,7 +390,7 @@ public class FfprobeService
             foreach (var re in reencodes)
             {
                 maps.Append($"-map 0:{re.srcIndex} ");
-                codecArgs.Append(BuildAudioCodecArgs(re.codec, re.channels, re.bitrateKbps, outIndex)).Append(' ');
+                codecArgs.Append(BuildAudioCodecArgs(re.codec, re.channels, re.bitrateKbps, re.sampleRateHz, outIndex)).Append(' ');
                 AppendAudioMeta(meta, outIndex, bucket, re.codec, re.channels);
                 outIndex++;
             }
@@ -431,23 +467,32 @@ public class FfprobeService
     private static (string codec, int channels) ResolveAudioCodec(
         string                  requested,
         int                     channels,
-        bool                    isMatroska,
+        string                  container,
         List<string>            warnings)
     {
         var codec = (requested ?? "").Trim().ToLowerInvariant();
+        bool webm = IsWebm(container);
+        bool mp4  = IsMp4(container);
 
         if (!_codecSpecs.TryGetValue(codec, out var spec))
         {
-            warnings.Add($"Audio: unknown codec '{requested}' — falling back to AAC.");
-            codec = "aac";
-            spec  = _codecSpecs["aac"];
+            string unknownFallback = webm ? "opus" : "aac";
+            warnings.Add($"Audio: unknown codec '{requested}' — falling back to {unknownFallback.ToUpperInvariant()}.");
+            codec = unknownFallback;
+            spec  = _codecSpecs[codec];
         }
 
-        if (!isMatroska && !spec.AllowedInMp4)
+        if (mp4 && !spec.AllowedInMp4)
         {
             warnings.Add($"Audio: codec '{codec}' is not supported in MP4 — falling back to AAC.");
             codec = "aac";
             spec  = _codecSpecs["aac"];
+        }
+        else if (webm && !spec.AllowedInWebm)
+        {
+            warnings.Add($"Audio: codec '{codec}' is not supported in WebM — falling back to Opus.");
+            codec = "opus";
+            spec  = _codecSpecs["opus"];
         }
 
         if (channels > spec.MaxChannels)
@@ -464,7 +509,7 @@ public class FfprobeService
     ///     The output-stream index is baked into <c>-c:a:N</c>, <c>-b:a:N</c>, etc., so
     ///     callers can interleave many audio outputs in a single command.
     /// </summary>
-    private static string BuildAudioCodecArgs(string codec, int channels, int bitrateKbps, int outIndex)
+    private static string BuildAudioCodecArgs(string codec, int channels, int bitrateKbps, int sampleRateHz, int outIndex)
     {
         if (!_codecSpecs.TryGetValue(codec, out var spec)) spec = _codecSpecs["aac"];
 
@@ -485,6 +530,7 @@ public class FfprobeService
         }
 
         if (channels > 0) sb.Append($" -ac:a:{outIndex} {channels}");
+        if (sampleRateHz > 0) sb.Append($" -ar:a:{outIndex} {sampleRateHz}");
         return sb.ToString();
     }
 
@@ -499,18 +545,40 @@ public class FfprobeService
     internal static bool IsCommentaryTitle(string? title) =>
         title != null && title.ToLowerInvariant().Contains("comm");
 
+    /// <summary> True when <paramref name="container"/> is the WebM container. </summary>
+    internal static bool IsWebm(string? container) =>
+        string.Equals(container, "webm", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary> True when <paramref name="container"/> is the MP4 container. </summary>
+    internal static bool IsMp4(string? container) =>
+        string.Equals(container, "mp4", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary> True when <paramref name="container"/> is the Matroska container. </summary>
+    internal static bool IsMatroska(string? container) =>
+        string.Equals(container, "mkv", StringComparison.OrdinalIgnoreCase);
+
     /// <summary>
-    ///     Whether MP4 can stream-copy a source audio codec. Used during pass-through to
-    ///     decide between <c>-c:a copy</c> and a re-encode fallback. Matroska is permissive
-    ///     enough that we don't gate copies for it.
+    ///     Whether <paramref name="container"/> can stream-copy a source audio codec. Used during
+    ///     pass-through to decide between <c>-c:a copy</c> and a re-encode fallback. Matroska is
+    ///     permissive enough that we don't gate copies for it; MP4 and WebM both have strict
+    ///     allowed-codec lists.
     /// </summary>
-    internal static bool ContainerCanCopySource(string? sourceCodec) =>
-        (sourceCodec ?? "").ToLowerInvariant() switch
+    internal static bool ContainerCanCopySource(string? sourceCodec, string container)
+    {
+        var c = (sourceCodec ?? "").ToLowerInvariant();
+        if (IsWebm(container))
         {
-            "aac" or "ac3" or "eac3" or "mp3" or "alac" => true,
+            // WebM officially allows only Opus and Vorbis audio.
+            return c is "opus" or "vorbis";
+        }
+        if (IsMp4(container))
+        {
+            return c is "aac" or "ac3" or "eac3" or "mp3" or "alac";
             // truehd, dts, dtshd, flac, opus, pcm_*: not safe to copy into MP4
-            _ => false,
-        };
+        }
+        // Matroska (or unknown): permissive — copy anything.
+        return true;
+    }
 
     /// <summary> Bitmap subtitle codecs that can cause FFmpeg to hang — always excluded. </summary>
     internal static readonly HashSet<string> _bitmapSubCodecs = new(StringComparer.OrdinalIgnoreCase)
@@ -541,7 +609,10 @@ public class FfprobeService
     ///     2-letter ISO codes to retain. Empty or null keeps every (non-bitmap) subtitle stream. Matching
     ///     accepts the track's tag in any of its common forms (2-letter, 3-letter, or English name).
     /// </param>
-    /// <param name="isMatroska">When <c>false</c>, subtitles are always stripped (<c>-sn</c>).</param>
+    /// <param name="container">
+    ///     Output container token ("mkv", "mp4", or "webm"). Only Matroska preserves text subtitles;
+    ///     MP4 and WebM both emit <c>-sn</c> to strip all subs.
+    /// </param>
     /// <param name="includeBitmaps">
     ///     When <c>true</c> AND the container is Matroska, bitmap subs (PGS/VOBSUB/DVB) are passed through
     ///     instead of dropped. <c>-c:s copy</c> handles them without re-decoding.
@@ -559,14 +630,15 @@ public class FfprobeService
     public string MapSub(
         ProbeResult            probe,
         IReadOnlyList<string>? languagesToKeep,
-        bool                   isMatroska,
+        string                 container,
         bool                   includeBitmaps = false,
         bool                   excludeSdh     = false,
         bool                   autoSetDefault = false)
     {
         ArgumentNullException.ThrowIfNull(probe);
 
-        if (!isMatroska)
+        // Only Matroska preserves text subtitles. MP4 and WebM both strip everything.
+        if (!IsMatroska(container))
             return "-sn";
 
         var subtitleStreams = probe.Streams.Where(s => s.CodecType == "subtitle").ToList();
@@ -784,19 +856,23 @@ public class FfprobeService
         if (tailSeconds <= 0) return (0, 0, false);
         double clampedEnd = startSec + tailSeconds;
 
-        string args =
-            $"-v info -nostats -ss {startSec.ToString("0.###", CultureInfo.InvariantCulture)} " +
-            $"-to {clampedEnd.ToString("0.###", CultureInfo.InvariantCulture)} " +
-            $"-i \"{sourcePath}\" -map 0:v:0 -vf blackdetect=d=0.1:pic_th=0.98 -an -sn -f null -";
-
         var psi = new ProcessStartInfo(_ffmpegPath)
         {
-            Arguments              = args,
             UseShellExecute        = false,
             RedirectStandardOutput = true,
             RedirectStandardError  = true,
             CreateNoWindow         = true,
         };
+        foreach (var flag in new[]
+        {
+            "-v", "info", "-nostats",
+            "-ss", startSec.ToString("0.###", CultureInfo.InvariantCulture),
+            "-to", clampedEnd.ToString("0.###", CultureInfo.InvariantCulture),
+            "-i", sourcePath,
+            "-map", "0:v:0", "-vf", "blackdetect=d=0.1:pic_th=0.98",
+            "-an", "-sn", "-f", "null", "-",
+        })
+            psi.ArgumentList.Add(flag);
 
         using var proc = new Process { StartInfo = psi };
         var stderr = new StringBuilder();
@@ -899,19 +975,20 @@ public class FfprobeService
 
         // 99999%+#100 seeks ffprobe to EOF and reads only the last 100 packets, so this
         // stays fast on multi-GB files while still surfacing the real last-frame PTS.
-        string args =
-            "-v error -select_streams v:0 -read_intervals \"99999%+#100\" " +
-            "-show_entries packet=pts_time,duration_time -of json " +
-            $"\"{filePath}\"";
-
         var psi = new ProcessStartInfo(_ffprobePath)
         {
-            Arguments              = args,
             UseShellExecute        = false,
             RedirectStandardOutput = true,
             RedirectStandardError  = true,
             CreateNoWindow         = true,
         };
+        foreach (var flag in new[]
+        {
+            "-v", "error", "-select_streams", "v:0", "-read_intervals", "99999%+#100",
+            "-show_entries", "packet=pts_time,duration_time", "-of", "json",
+        })
+            psi.ArgumentList.Add(flag);
+        psi.ArgumentList.Add(filePath);
 
         var stdout = new StringBuilder();
         using var proc = new Process { StartInfo = psi };

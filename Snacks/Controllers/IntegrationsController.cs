@@ -24,9 +24,26 @@ public sealed class IntegrationsController : ControllerBase
      *  Integration Config
      ******************************************************************/
 
-    /// <summary> Returns the current integration configuration. </summary>
+    /// <summary>
+    ///     Returns the current integration configuration with an <c>_envLocked</c> metadata
+    ///     array (e.g. <c>"plex.token"</c>) so the panel can render env-driven fields
+    ///     read-only. Self-serialized camelCase — MVC's naming policy does not rename
+    ///     JsonNode keys.
+    /// </summary>
     [HttpGet("config")]
-    public IActionResult Get() => new JsonResult(_integrations.GetConfig());
+    public IActionResult Get()
+    {
+        var node = System.Text.Json.JsonSerializer.SerializeToNode(_integrations.GetConfig(), _responseJsonOptions)!.AsObject();
+        node["_envLocked"] = new System.Text.Json.Nodes.JsonArray(
+            EnvConfigOverrides.LockedPaths(EnvConfigOverrides.IntegrationsPrefix, typeof(IntegrationConfig))
+                .Select(p => (System.Text.Json.Nodes.JsonNode)p).ToArray());
+        return new JsonResult(node);
+    }
+
+    private static readonly System.Text.Json.JsonSerializerOptions _responseJsonOptions = new()
+    {
+        PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase,
+    };
 
     /// <summary> Saves updated integration configuration and persists it to disk. </summary>
     /// <param name="config"> The new integration configuration to apply. </param>

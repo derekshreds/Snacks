@@ -21,7 +21,7 @@
                 </select>
                 <div class="form-text">
                     <strong>Transcode</strong> &mdash; standard behavior. Files above the bitrate
-                    target are re-encoded per the Video tab; files already at or below the target
+                    target are re-encoded per the Video Processing settings below; files already at or below the target
                     are skipped. Audio and subtitles are processed per their tabs on any file
                     that gets re-encoded.<br>
                     <strong>Hybrid</strong> &mdash; same as Transcode for above-target files, but
@@ -55,10 +55,10 @@
             <ul class="mb-0 small">
                 <li><strong>Video</strong> &mdash; always stream-copied. Crop, downscale, and tonemap
                     are disabled during a mux pass.</li>
-                <li><strong>Audio</strong> &mdash; processed per the Audio tab when <em>Mux Touches</em>
+                <li><strong>Audio</strong> &mdash; processed per the Audio settings when <em>Mux Touches</em>
                     is <em>Audio</em> or <em>Audio + Subtitles</em>; otherwise copied through with
                     every track preserved.</li>
-                <li><strong>Subtitles</strong> &mdash; processed per the Subtitles tab (sidecar
+                <li><strong>Subtitles</strong> &mdash; processed per the Subtitle settings (sidecar
                     extraction, OCR, language filter) when <em>Mux Touches</em> is
                     <em>Subtitles</em> or <em>Audio + Subtitles</em>; otherwise copied through
                     with every track preserved.</li>

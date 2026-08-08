@@ -100,7 +100,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
         if (_config.QueuePaused)
         {
             _transcodingService.SetPaused(true);
-            Console.WriteLine("Queue was paused when app last shut down — staying paused.");
+            Log.Information("Queue was paused when app last shut down — staying paused.");
         }
 
         _ = Task.Run(async () =>
@@ -200,7 +200,17 @@ public sealed class AutoScanService : IHostedService, IDisposable
         WatchedFolder? best = null;
         int bestLen = -1;
 
-        foreach (var folder in _config.Directories)
+        // Snapshot under the config lock — this is called from scan/dispatch
+        // threads while AddDirectory/RemoveDirectory mutate the list on request
+        // threads; enumerating the live list races a concurrent add/remove and
+        // throws "Collection was modified", failing that dispatch.
+        WatchedFolder[] directories;
+        lock (_configLock)
+        {
+            directories = _config.Directories.ToArray();
+        }
+
+        foreach (var folder in directories)
         {
             var folderPath = folder.Path.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
             if (fullPath.StartsWith(folderPath, StringComparison.OrdinalIgnoreCase) && folderPath.Length > bestLen)
@@ -301,10 +311,15 @@ public sealed class AutoScanService : IHostedService, IDisposable
     /// </summary>
     public async Task ClearHistoryAsync()
     {
-        Console.WriteLine("ClearHistory: Starting full state reset...");
+        Log.Information("ClearHistory: Starting full state reset...");
 
         // Cancel any in-flight scan before acquiring the lock to avoid deadlock.
-        _scanCts?.Cancel();
+        // RunScanAsync disposes/replaces _scanCts under _scanLock, which we don't
+        // hold yet — guard against cancelling a just-disposed CTS, otherwise the
+        // ObjectDisposedException propagates to the controller as a 500 AND the
+        // in-flight scan keeps running, blocking the WaitAsync below.
+        try { _scanCts?.Cancel(); }
+        catch (ObjectDisposedException) { }
 
         await _scanLock.WaitAsync();
         try
@@ -323,13 +338,22 @@ public sealed class AutoScanService : IHostedService, IDisposable
             }
             catch { }
 
-            _config.LastScanTime     = null;
-            _config.LastScanNewFiles = 0;
-            SaveConfig();
+            lock (_configLock)
+            {
+                _config.LastScanTime     = null;
+                _config.LastScanNewFiles = 0;
+                SaveConfig();
+            }
+
+            // Drop the interrupted-sweep checkpoint too — the user just asked for
+            // a from-scratch rescan, so resuming mid-tree would silently skip the
+            // portion the cancelled sweep had already covered.
+            _scanCheckpoint = null;
+            try { File.Delete(ScanCheckpointPath); } catch { }
 
             await _hubContext.Clients.All.SendAsync("HistoryCleared");
 
-            Console.WriteLine("ClearHistory: Full state reset complete");
+            Log.Information("ClearHistory: Full state reset complete");
         }
         finally
         {
@@ -342,56 +366,37 @@ public sealed class AutoScanService : IHostedService, IDisposable
      ******************************************************************/
 
     /// <summary>
-    ///     Immediately restores local (non-remote) queue items on startup. Runs without
-    ///     waiting for cluster recovery so the UI shows the pending queue right away.
+    ///     Resumes the local queue on startup. The pending queue lives in the DB now,
+    ///     so there is no per-item restore loop — Queued rows hydrate into the
+    ///     scheduler's working window on demand. The only real work here is flipping
+    ///     rows a crashed run left in Processing back to Queued, then kicking the
+    ///     scheduler. Instant regardless of backlog depth (a 500k-row queue used to
+    ///     replay one restore per row before any encode could start).
     /// </summary>
     private async Task ResumeLocalQueueItemsAsync()
     {
         if (_clusterService.IsNodeMode)
         {
-            Console.WriteLine("Node mode: Skipping queue resume from database");
+            Log.Information("Node mode: Skipping queue resume from database");
             return;
         }
 
         try
         {
-            var options    = LoadEncoderOptions();
-            var queued     = await _mediaFileRepo.GetFilesWithStatusAsync(MediaFileStatus.Queued);
-            var processing = await _mediaFileRepo.GetFilesWithStatusAsync(MediaFileStatus.Processing);
-            var localItems = queued.Concat(processing)
-                .Where(f => string.IsNullOrEmpty(f.AssignedNodeId))
-                .ToList();
-
-            if (localItems.Count == 0)
+            int requeued = await _mediaFileRepo.RequeueOrphanedLocalProcessingAsync();
+            int pending  = await _mediaFileRepo.CountQueuedLocalAsync();
+            if (requeued > 0)
+                Log.Information($"Resume: {requeued} interrupted local encode(s) returned to the queue");
+            if (pending == 0)
                 return;
 
-            Console.WriteLine($"Resume: Immediately restoring {localItems.Count} local item(s) to queue (no re-probe)");
-
-            foreach (var file in localItems)
-            {
-                if (!File.Exists(file.FilePath))
-                {
-                    await _mediaFileRepo.SetStatusAsync(file.FilePath, MediaFileStatus.Unseen);
-                    continue;
-                }
-
-                try
-                {
-                    var id = await _transcodingService.RestoreToQueueAsync(file, options);
-                    if (id == null)
-                        await _mediaFileRepo.SetStatusAsync(file.FilePath, MediaFileStatus.Unseen);
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"Resume: Failed to re-add {file.FileName}: {ex.Message}");
-                }
-            }
-
-            Console.WriteLine("Resume: Local queue restore complete");
+            Log.Information($"Resume: {pending} pending item(s) in the DB queue — hydrating on demand");
+            _transcodingService.MarkQueueWindowDirty();
+            await _transcodingService.KickQueueAsync(LoadEncoderOptions());
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Resume: Error restoring local queue: {ex.Message}");
+            Log.Warning($"Resume: Error resuming local queue: {ex.Message}");
         }
     }
 
@@ -412,7 +417,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
             }
             catch (TimeoutException)
             {
-                Console.WriteLine("Resume: Cluster recovery timed out after 3 minutes — checking for orphaned remote items");
+                Log.Warning("Resume: Cluster recovery timed out after 3 minutes — checking for orphaned remote items");
             }
 
             var options       = LoadEncoderOptions();
@@ -425,7 +430,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
             if (remoteOrphans.Count == 0)
                 return;
 
-            Console.WriteLine($"Resume: Checking {remoteOrphans.Count} remote item(s) not recovered by cluster");
+            Log.Information($"Resume: Checking {remoteOrphans.Count} remote item(s) not recovered by cluster");
 
             foreach (var file in remoteOrphans)
             {
@@ -435,26 +440,20 @@ public sealed class AutoScanService : IHostedService, IDisposable
                     continue;
                 }
 
-                Console.WriteLine($"Resume: Orphaned remote item {file.FileName} — clearing assignment and re-queuing");
-                await _mediaFileRepo.ClearRemoteAssignmentAsync(file.FilePath, MediaFileStatus.Unseen);
-
-                try
-                {
-                    var id = await _transcodingService.RestoreToQueueAsync(file, options);
-                    if (id == null)
-                        await _mediaFileRepo.SetStatusAsync(file.FilePath, MediaFileStatus.Unseen);
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"Resume: Failed to re-add {file.FileName}: {ex.Message}");
-                }
+                // Clearing the assignment back to Queued returns the row to the DB
+                // pending queue — the scheduler hydrates it when it reaches the top.
+                Log.Information($"Resume: Orphaned remote item {file.FileName} — clearing assignment and re-queuing");
+                await _mediaFileRepo.ClearRemoteAssignmentAsync(file.FilePath, MediaFileStatus.Queued);
             }
 
-            Console.WriteLine("Resume: Remote orphan check complete");
+            _transcodingService.MarkQueueWindowDirty();
+            await _transcodingService.KickQueueAsync(options);
+
+            Log.Information("Resume: Remote orphan check complete");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Resume: Error checking remote orphans: {ex.Message}");
+            Log.Warning($"Resume: Error checking remote orphans: {ex.Message}");
         }
     }
 
@@ -500,185 +499,379 @@ public sealed class AutoScanService : IHostedService, IDisposable
 
             var globalOptions = LoadEncoderOptions();
 
-            var allMediaFiles = new List<string>();
-            foreach (var dir in _config.Directories)
+            // Snapshot the exclusion rules and directory list once per scan — using
+            // the same rules for every file in a pass keeps behavior predictable
+            // even if the user edits config mid-scan.
+            ExclusionRules exclusions;
+            List<WatchedFolder> watched;
+            lock (_configLock)
             {
-                var directories = _fileService.RecursivelyFindDirectories(dir.Path);
-                var files       = _fileService.GetAllMediaFiles(directories).Select(t => t.Path);
-                allMediaFiles.AddRange(files);
+                exclusions = _config.ExclusionRules;
+                watched    = _config.Directories.ToList();
             }
 
-            var scannedDirs = allMediaFiles
-                .Select(f => Path.GetDirectoryName(f) ?? "")
-                .Distinct()
-                .ToList();
-            var knownPaths     = await _mediaFileRepo.GetFileInfoBatchAsync(scannedDirs);
-            var knownBaseNames = await _mediaFileRepo.GetBaseNameStatusBatchAsync(scannedDirs);
+            // The sweep walks each watched tree in deterministic subdirectory chunks
+            // and checkpoints after every chunk, so an interrupted first sweep of a
+            // 500k-file library resumes where it stopped instead of re-walking and
+            // re-filtering everything. Chunking also bounds memory: only one chunk's
+            // file list and DB lookup dictionaries are alive at a time.
+            const int DirChunkSize = 200;
+            var checkpoint   = LoadScanCheckpoint();
+            int newFileCount = 0, totalSeen = 0;
 
-            // Snapshot the exclusion rules once per scan — using the same rules for every file
-            // in a pass keeps behavior predictable even if the user edits exclusions mid-scan.
-            ExclusionRules exclusions;
-            lock (_configLock) { exclusions = _config.ExclusionRules; }
-
-            var newFiles = new List<string>();
-            foreach (var file in allMediaFiles)
+            foreach (var dirEntry in watched)
             {
                 ct.ThrowIfCancellationRequested();
-                var normalizedPath = Path.GetFullPath(file);
 
-                // Cheap exclusion filter — filename and size are available without probing.
-                // Resolution-based exclusion is applied downstream in AddFileAsync (needs probe).
-                long? earlySize = null;
-                try { earlySize = new FileInfo(normalizedPath).Length; } catch { }
-                if (exclusions.IsExcluded(Path.GetFileName(normalizedPath), earlySize, resolutionLabel: null))
+                var subdirs = _fileService.RecursivelyFindDirectories(dirEntry.Path);
+                subdirs.Sort(StringComparer.Ordinal); // deterministic order across restarts
+
+                int startOffset = 0;
+                if (checkpoint != null
+                    && checkpoint.CompletedDirs.TryGetValue(dirEntry.Path, out var done)
+                    && done > 0 && done < subdirs.Count)
                 {
-                    Console.WriteLine($"AutoScan: Excluded by library rules: {Path.GetFileName(file)}");
-                    continue;
+                    startOffset = done;
+                    Log.Information($"AutoScan: Resuming {dirEntry.Path} at subdirectory {done:N0}/{subdirs.Count:N0} (interrupted-sweep checkpoint)");
                 }
 
-                if (knownPaths.TryGetValue(normalizedPath, out var info) &&
-                    info.Status is not MediaFileStatus.Unseen)
+                for (int offset = startOffset; offset < subdirs.Count; offset += DirChunkSize)
                 {
-                    try
-                    {
-                        var fi        = new FileInfo(normalizedPath);
-                        double sizeDelta = info.FileSize > 0
-                            ? Math.Abs(1.0 - (double)fi.Length / info.FileSize)
-                            : 0;
+                    ct.ThrowIfCancellationRequested();
 
-                        if (sizeDelta > 0.10)
+                    var chunk      = subdirs.GetRange(offset, Math.Min(DirChunkSize, subdirs.Count - offset));
+                    var chunkFiles = _fileService.GetAllMediaFiles(chunk).Select(t => t.Path).ToList();
+                    totalSeen     += chunkFiles.Count;
+
+                    if (chunkFiles.Count > 0)
+                    {
+                        var chunkDirs      = chunkFiles.Select(f => Path.GetDirectoryName(f) ?? "").Distinct().ToList();
+                        var knownPaths     = await _mediaFileRepo.GetFileInfoBatchAsync(chunkDirs);
+                        var knownBaseNames = await _mediaFileRepo.GetBaseNameStatusBatchAsync(chunkDirs);
+
+                        var newFiles = new List<string>();
+                        foreach (var file in chunkFiles)
                         {
-                            Console.WriteLine(
-                                $"AutoScan: File changed on disk: {Path.GetFileName(file)} ({sizeDelta:P0} size change) — re-queuing");
-                            await _mediaFileRepo.ResetFileAsync(normalizedPath);
+                            ct.ThrowIfCancellationRequested();
+                            var normalizedPath = Path.GetFullPath(file);
+
+                            // Cheap exclusion filter — filename and size are available without probing.
+                            // Resolution-based exclusion is applied downstream in AddFileAsync (needs probe).
+                            long? earlySize = null;
+                            try { earlySize = new FileInfo(normalizedPath).Length; } catch { }
+                            if (exclusions.IsExcluded(Path.GetFileName(normalizedPath), earlySize, resolutionLabel: null))
+                            {
+                                Log.Information($"AutoScan: Excluded by library rules: {Path.GetFileName(file)}");
+                                continue;
+                            }
+
+                            if (knownPaths.TryGetValue(normalizedPath, out var info) &&
+                                info.Status is not MediaFileStatus.Unseen)
+                            {
+                                try
+                                {
+                                    var fi        = new FileInfo(normalizedPath);
+                                    double sizeDelta = info.FileSize > 0
+                                        ? Math.Abs(1.0 - (double)fi.Length / info.FileSize)
+                                        : 0;
+
+                                    if (sizeDelta > 0.10)
+                                    {
+                                        Log.Information(
+                                            $"AutoScan: File changed on disk: {Path.GetFileName(file)} ({sizeDelta:P0} size change) — re-queuing");
+                                        await _mediaFileRepo.ResetFileAsync(normalizedPath);
+                                        newFiles.Add(file);
+                                    }
+                                }
+                                catch { }
+                                continue;
+                            }
+
+                            var dir      = Path.GetDirectoryName(normalizedPath) ?? "";
+                            var baseName = Path.GetFileNameWithoutExtension(normalizedPath);
+                            var baseKey  = $"{dir}|{baseName}".ToLowerInvariant();
+                            if (knownBaseNames.TryGetValue(baseKey, out var baseStatus) &&
+                                baseStatus is not MediaFileStatus.Unseen)
+                            {
+                                continue;
+                            }
+
                             newFiles.Add(file);
                         }
-                    }
-                    catch { }
-                    continue;
-                }
 
-                var dir      = Path.GetDirectoryName(normalizedPath) ?? "";
-                var baseName = Path.GetFileNameWithoutExtension(normalizedPath);
-                var baseKey  = $"{dir}|{baseName}".ToLowerInvariant();
-                if (knownBaseNames.TryGetValue(baseKey, out var baseStatus) &&
-                    baseStatus is not MediaFileStatus.Unseen)
-                {
-                    continue;
-                }
-
-                newFiles.Add(file);
-            }
-
-            int newFileCount = 0;
-            foreach (var file in newFiles)
-            {
-                try
-                {
-                    var lastWrite = File.GetLastWriteTimeUtc(file);
-                    if (DateTime.UtcNow - lastWrite < TimeSpan.FromMinutes(30))
-                    {
-                        Console.WriteLine(
-                            $"AutoScan: Skipping {Path.GetFileName(file)}: " +
-                            $"modified {(int)(DateTime.UtcNow - lastWrite).TotalMinutes}m ago, may still be transferring");
-                        continue;
-                    }
-                }
-                catch { continue; }
-
-                var dir         = Path.GetDirectoryName(file) ?? "";
-                var baseName    = Path.GetFileNameWithoutExtension(file);
-                // Recognize a [snacks] companion of either kind: a music source's
-                // companion is in a music container (.m4a/.mp3/...), a video
-                // source's is a video container (.mkv/.mp4/...). The IsVideoFile/
-                // IsMusicFile helpers both reject [snacks]-suffixed paths, so
-                // probe the extension via GetMediaKind directly here.
-                var snacksFiles = Directory.Exists(dir)
-                    ? Directory.GetFiles(dir, $"{baseName} [snacks].*")
-                        .Where(f =>
-                        {
-                            var ext = Path.GetExtension(f).TrimStart('.').ToLowerInvariant();
-                            // Mirror the FileService extension lists. We can't call IsVideoFile/
-                            // IsMusicFile because those reject the [snacks] suffix outright.
-                            return ext is "mkv" or "mp4" or "ts" or "wmv" or "avi" or "m4v"
-                                          or "mpeg" or "mov" or "3gp" or "webm" or "flv"
-                                          or "mp3" or "m4a" or "flac" or "aac" or "ogg" or "opus"
-                                          or "wav" or "wma" or "alac" or "ape" or "aiff" or "dsf"
-                                          or "dff" or "mka" or "mp2";
-                        })
-                        .ToList()
-                    : new List<string>();
-
-                if (snacksFiles.Count > 0)
-                {
-                    bool validSnacksExists = false;
-                    foreach (var snacksFile in snacksFiles)
-                    {
-                        try
-                        {
-                            var originalProbe = await _ffprobeService.ProbeAsync(file, ct);
-                            var snacksProbe   = await _ffprobeService.ProbeAsync(snacksFile, ct);
-                            if (_ffprobeService.ConvertedSuccessfully(originalProbe, snacksProbe))
+                        // Probe-bound per-file work runs with bounded parallelism (same
+                        // policy as the dry-run analyzer): each new file costs at least
+                        // one ffprobe, and a sequential first sweep of a big library
+                        // took days. Companion-completed marks are collected and flushed
+                        // as one batched write per chunk instead of a row-trip each.
+                        var companionCompleted = new System.Collections.Concurrent.ConcurrentBag<string>();
+                        int chunkAdded = 0;
+                        await Parallel.ForEachAsync(
+                            newFiles,
+                            new ParallelOptions
                             {
-                                validSnacksExists = true;
-                                break;
-                            }
-                            else
+                                MaxDegreeOfParallelism = Math.Clamp(Environment.ProcessorCount / 2, 2, 8),
+                                CancellationToken = ct,
+                            },
+                            async (file, token) =>
                             {
-                                Console.WriteLine($"AutoScan: Partial [snacks] file detected, deleting: {snacksFile}");
-                                try { File.Delete(snacksFile); } catch { }
-                            }
-                        }
-                        catch
-                        {
-                            Console.WriteLine($"AutoScan: Corrupt [snacks] file detected, deleting: {snacksFile}");
-                            try { File.Delete(snacksFile); } catch { }
-                        }
+                                if (await ProcessDiscoveredFileAsync(file, globalOptions, companionCompleted, token))
+                                    Interlocked.Increment(ref chunkAdded);
+                            });
+                        newFileCount += chunkAdded;
+
+                        if (!companionCompleted.IsEmpty)
+                            await _mediaFileRepo.SetStatusBatchAsync(companionCompleted, MediaFileStatus.Completed);
                     }
 
-                    if (validSnacksExists)
+                    SaveScanCheckpoint(dirEntry.Path, offset + chunk.Count);
+
+                    // Aggregate progress for the UI — one event per chunk, not per file.
+                    try
                     {
-                        await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(file), MediaFileStatus.Completed);
-                        continue;
+                        await _hubContext.Clients.All.SendAsync("ScanProgress", new
+                        {
+                            directory     = dirEntry.Path,
+                            processedDirs = Math.Min(offset + chunk.Count, subdirs.Count),
+                            totalDirs     = subdirs.Count,
+                            queued        = newFileCount,
+                            seen          = totalSeen,
+                        }, ct);
                     }
+                    catch { /* SignalR failures are non-fatal */ }
                 }
 
-                try
-                {
-                    var folderOverride = FindFolderOverride(file);
-                    var fileOptions    = EncoderOptionsOverride.ApplyOverrides(globalOptions, folderOverride, null);
-                    await _transcodingService.AddFileAsync(file, fileOptions, cancellationToken: ct);
-                    newFileCount++;
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"AutoScan: Failed to add {file}: {ex.Message}");
-                }
+                ClearScanCheckpoint(dirEntry.Path);
             }
 
             await _mediaFileRepo.PruneDeletedFilesAsync();
 
-            _config.LastScanTime     = DateTime.UtcNow;
-            _config.LastScanNewFiles = newFileCount;
-            SaveConfig();
+            // Mirror the DB prune into the live work queue: PruneDeletedFiles only
+            // touches the database, so a queued/failed WorkItem whose source has
+            // since vanished would otherwise linger in memory (and in the queue UI)
+            // until the next app restart. Skips active encodes — those have their
+            // own missing-source handling on the encode path.
+            try { await _transcodingService.PruneMissingWorkItemsAsync(); }
+            catch (Exception ex) { Log.Warning($"AutoScan: PruneMissingWorkItems failed: {ex.Message}"); }
 
-            await _hubContext.Clients.All.SendAsync("AutoScanCompleted", newFileCount, allMediaFiles.Count);
+            lock (_configLock)
+            {
+                _config.LastScanTime     = DateTime.UtcNow;
+                _config.LastScanNewFiles = newFileCount;
+                SaveConfig();
+            }
+
+            await _hubContext.Clients.All.SendAsync("AutoScanCompleted", newFileCount, totalSeen);
 
             // Auto-scan only runs on the master, so this is naturally master-only.
             _ = _notificationService.NotifyScanCompletedAsync(newFileCount);
         }
         catch (OperationCanceledException)
         {
-            Console.WriteLine("AutoScan: Scan cancelled");
+            Log.Information("AutoScan: Scan cancelled");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"AutoScan: Error during scan: {ex.Message}");
+            Log.Warning($"AutoScan: Error during scan: {ex.Message}");
         }
         finally
         {
             _scanLock.Release();
         }
+    }
+
+    /******************************************************************
+     *  Per-file sweep processing + scan checkpoint
+     ******************************************************************/
+
+    /// <summary>
+    ///     Processes one newly-discovered file: recently-modified guard, [snacks]
+    ///     companion validation (collecting completed marks into
+    ///     <paramref name="companionCompleted"/> for a batched write), then
+    ///     AddFileAsync under the folder's overrides. Returns true when the file
+    ///     was queued. Runs on parallel sweep workers — everything here must be
+    ///     safe for concurrent invocation on distinct files.
+    /// </summary>
+    private async Task<bool> ProcessDiscoveredFileAsync(
+        string file, EncoderOptions globalOptions,
+        System.Collections.Concurrent.ConcurrentBag<string> companionCompleted,
+        CancellationToken ct)
+    {
+        try
+        {
+            var lastWrite = File.GetLastWriteTimeUtc(file);
+            if (DateTime.UtcNow - lastWrite < TimeSpan.FromMinutes(30))
+            {
+                Log.Information(
+                    $"AutoScan: Skipping {Path.GetFileName(file)}: " +
+                    $"modified {(int)(DateTime.UtcNow - lastWrite).TotalMinutes}m ago, may still be transferring");
+                return false;
+            }
+        }
+        catch { return false; }
+
+        var dir      = Path.GetDirectoryName(file) ?? "";
+        var baseName = Path.GetFileNameWithoutExtension(file);
+        // Recognize a [snacks] companion of either kind: a music source's
+        // companion is in a music container (.m4a/.mp3/...), a video
+        // source's is a video container (.mkv/.mp4/...). The IsVideoFile/
+        // IsMusicFile helpers both reject [snacks]-suffixed paths, so
+        // probe the extension via GetMediaKind directly here.
+        var snacksFiles = Directory.Exists(dir)
+            ? Directory.GetFiles(dir, $"{baseName} [snacks].*")
+                .Where(f =>
+                {
+                    var ext = Path.GetExtension(f).TrimStart('.').ToLowerInvariant();
+                    // Mirror the FileService extension lists. We can't call IsVideoFile/
+                    // IsMusicFile because those reject the [snacks] suffix outright.
+                    return ext is "mkv" or "mp4" or "ts" or "wmv" or "avi" or "m4v"
+                                  or "mpeg" or "mov" or "3gp" or "webm" or "flv"
+                                  or "mp3" or "m4a" or "flac" or "aac" or "ogg" or "opus"
+                                  or "wav" or "wma" or "alac" or "ape" or "aiff" or "dsf"
+                                  or "dff" or "mka" or "mp2";
+                })
+                .ToList()
+            : new List<string>();
+
+        if (snacksFiles.Count > 0)
+        {
+            // Probe the original ONCE — re-probing it per companion both wasted
+            // an ffprobe spawn per file and, worse, meant a failed probe of the
+            // ORIGINAL deleted a perfectly good [snacks] companion below.
+            ProbeResult? originalProbe = null;
+            try
+            {
+                originalProbe = await _ffprobeService.ProbeAsync(file, ct);
+                // ProbeAsync returns an EMPTY result (not an exception) when
+                // ffprobe produced unparsable output. For video, duration 0
+                // would fail the companion tolerance check and delete valid
+                // encodes — treat it the same as an unreadable original.
+                // (Music probes legitimately have no video duration; their
+                // companion check passes through a duration-agnostic path.)
+                if (_fileService.GetMediaKind(file) == MediaKind.Video
+                    && _ffprobeService.GetVideoDuration(originalProbe) <= 0)
+                    originalProbe = null;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch { /* original unreadable — leave companions alone, fall through to AddFile */ }
+
+            bool validSnacksExists = false;
+            if (originalProbe != null)
+            {
+                foreach (var snacksFile in snacksFiles)
+                {
+                    try
+                    {
+                        var snacksProbe = await _ffprobeService.ProbeAsync(snacksFile, ct);
+                        if (_ffprobeService.ConvertedSuccessfully(originalProbe, snacksProbe))
+                        {
+                            validSnacksExists = true;
+                            break;
+                        }
+                        else
+                        {
+                            Log.Information($"AutoScan: Partial [snacks] file detected, deleting: {snacksFile}");
+                            try { File.Delete(snacksFile); } catch { }
+                        }
+                    }
+                    catch (OperationCanceledException) { throw; }
+                    catch
+                    {
+                        Log.Warning($"AutoScan: Corrupt [snacks] file detected, deleting: {snacksFile}");
+                        try { File.Delete(snacksFile); } catch { }
+                    }
+                }
+            }
+
+            if (validSnacksExists)
+            {
+                companionCompleted.Add(Path.GetFullPath(file));
+                return false;
+            }
+        }
+
+        try
+        {
+            var folderOverride = FindFolderOverride(file);
+            var fileOptions    = EncoderOptionsOverride.ApplyOverrides(globalOptions, folderOverride, null);
+            await _transcodingService.AddFileAsync(file, fileOptions, cancellationToken: ct);
+            return true;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (Exception ex)
+        {
+            Log.Warning($"AutoScan: Failed to add {file}: {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    ///     Per-watched-directory sweep checkpoint: how many (ordinally sorted)
+    ///     subdirectories have been fully processed. Persisted after every chunk so
+    ///     an interrupted first sweep resumes instead of re-walking the whole tree.
+    /// </summary>
+    private sealed class ScanCheckpoint
+    {
+        public DateTime SavedAt { get; set; } = DateTime.UtcNow;
+        public Dictionary<string, int> CompletedDirs { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+    }
+
+    private ScanCheckpoint? _scanCheckpoint;
+
+    private string ScanCheckpointPath =>
+        Path.Combine(Path.GetDirectoryName(_configPath)!, "scan-checkpoint.json");
+
+    /// <summary> Loads the persisted checkpoint; null when missing, corrupt, or stale (>24h — directory trees drift). </summary>
+    private ScanCheckpoint? LoadScanCheckpoint()
+    {
+        try
+        {
+            if (!File.Exists(ScanCheckpointPath)) return _scanCheckpoint = null;
+            var parsed = JsonSerializer.Deserialize<ScanCheckpoint>(File.ReadAllText(ScanCheckpointPath), _jsonOptions);
+            if (parsed == null || DateTime.UtcNow - parsed.SavedAt > TimeSpan.FromHours(24))
+                return _scanCheckpoint = null;
+            return _scanCheckpoint = parsed;
+        }
+        catch
+        {
+            return _scanCheckpoint = null;
+        }
+    }
+
+    /// <summary> Records that the first <paramref name="completedDirs"/> subdirectories of a watched root are done. </summary>
+    private void SaveScanCheckpoint(string watchedPath, int completedDirs)
+    {
+        try
+        {
+            _scanCheckpoint ??= new ScanCheckpoint();
+            _scanCheckpoint.SavedAt = DateTime.UtcNow;
+            _scanCheckpoint.CompletedDirs[watchedPath] = completedDirs;
+            File.WriteAllText(ScanCheckpointPath, JsonSerializer.Serialize(_scanCheckpoint, _jsonOptions));
+        }
+        catch (Exception ex)
+        {
+            Log.Warning($"AutoScan: failed to persist scan checkpoint: {ex.Message}");
+        }
+    }
+
+    /// <summary> Clears a watched root's checkpoint after its sweep completes; deletes the file when empty. </summary>
+    private void ClearScanCheckpoint(string watchedPath)
+    {
+        try
+        {
+            if (_scanCheckpoint == null) return;
+            _scanCheckpoint.CompletedDirs.Remove(watchedPath);
+            if (_scanCheckpoint.CompletedDirs.Count == 0)
+            {
+                _scanCheckpoint = null;
+                File.Delete(ScanCheckpointPath);
+            }
+            else
+            {
+                File.WriteAllText(ScanCheckpointPath, JsonSerializer.Serialize(_scanCheckpoint, _jsonOptions));
+            }
+        }
+        catch { /* best-effort — a stale checkpoint expires after 24h anyway */ }
     }
 
     /******************************************************************
@@ -713,15 +906,15 @@ public sealed class AutoScanService : IHostedService, IDisposable
 
             if (seenFiles.Count > 0)
             {
-                Console.WriteLine($"AutoScan: Migrating {seenFiles.Count} SeenFiles entries to database...");
+                Log.Information($"AutoScan: Migrating {seenFiles.Count} SeenFiles entries to database...");
                 await _mediaFileRepo.BulkInsertSeenFilesAsync(seenFiles);
-                Console.WriteLine("AutoScan: Migration complete.");
+                Log.Information("AutoScan: Migration complete.");
                 SaveConfig();
             }
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"AutoScan: SeenFiles migration failed (non-fatal): {ex.Message}");
+            Log.Warning($"AutoScan: SeenFiles migration failed (non-fatal): {ex.Message}");
         }
     }
 
@@ -735,16 +928,17 @@ public sealed class AutoScanService : IHostedService, IDisposable
         {
             try
             {
-                var json = File.ReadAllText(_settingsPath);
-                return JsonSerializer.Deserialize<EncoderOptions>(json, _jsonOptions) ?? new EncoderOptions();
+                var json   = File.ReadAllText(_settingsPath);
+                var parsed = JsonSerializer.Deserialize<EncoderOptions>(json, _jsonOptions) ?? new EncoderOptions();
+                return EnvConfigOverrides.Apply(parsed, EnvConfigOverrides.SettingsPrefix);
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"AutoScan: Failed to load settings: {ex.Message}");
+                Log.Warning($"AutoScan: Failed to load settings: {ex.Message}");
             }
         }
 
-        return new EncoderOptions();
+        return EnvConfigOverrides.Apply(new EncoderOptions(), EnvConfigOverrides.SettingsPrefix);
     }
 
     /// <summary>
@@ -761,23 +955,43 @@ public sealed class AutoScanService : IHostedService, IDisposable
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"AutoScan: Failed to load config: {ex.Message}");
+                Log.Warning($"AutoScan: Failed to load config: {ex.Message}");
                 _config = new AutoScanConfig();
             }
         }
+
+        EnvConfigOverrides.Apply(_config, EnvConfigOverrides.AutoScanPrefix);
     }
 
-    /// <summary> Serializes the current auto-scan config to <c>autoscan.json</c>. </summary>
+    /// <summary>
+    ///     Serializes the current auto-scan config to <c>autoscan.json</c>. Properties driven
+    ///     by SNACKS_SCAN_* env vars are restored from the on-disk file first (via a deep
+    ///     copy, so the live config keeps its env values) — unsetting a var reverts cleanly.
+    /// </summary>
     private void SaveConfig()
     {
         try
         {
-            var json = JsonSerializer.Serialize(_config, _jsonOptions);
-            File.WriteAllText(_configPath, json);
+            var copy = JsonSerializer.Deserialize<AutoScanConfig>(
+                JsonSerializer.Serialize(_config, _jsonOptions), _jsonOptions) ?? _config;
+
+            var fileState = new AutoScanConfig();
+            if (File.Exists(_configPath))
+            {
+                try
+                {
+                    fileState = JsonSerializer.Deserialize<AutoScanConfig>(
+                        File.ReadAllText(_configPath), _jsonOptions) ?? fileState;
+                }
+                catch { /* corrupt file — locked keys fall back to defaults */ }
+            }
+            EnvConfigOverrides.RestoreLockedValues(copy, fileState, EnvConfigOverrides.AutoScanPrefix);
+
+            File.WriteAllText(_configPath, JsonSerializer.Serialize(copy, _jsonOptions));
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"AutoScan: Failed to save config: {ex.Message}");
+            Log.Warning($"AutoScan: Failed to save config: {ex.Message}");
         }
     }
 }

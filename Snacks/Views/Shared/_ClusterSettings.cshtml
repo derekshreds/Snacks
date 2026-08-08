@@ -187,11 +187,15 @@
 
                 <div class="col-md-12">
                     <details>
-                        <summary class="form-label fw-semibold">Path rewrite (advanced)</summary>
+                        <summary class="form-label fw-semibold">Path rewrites (advanced)</summary>
                         <div class="mt-2">
-                            <input type="text" class="form-control mb-2" id="clusterSharedRewriteFrom" placeholder="From (master path prefix, e.g. /app/work/uploads)">
-                            <input type="text" class="form-control" id="clusterSharedRewriteTo" placeholder="To (this node's prefix, e.g. /mnt/nas/movies)">
-                            <div class="form-text mt-1">If the master sees the share at a different path than this node, translate it before validating. Set the per-node scratch location with the existing <em>Temporary Encode Directory</em> field above.</div>
+                            <textarea class="form-control" id="clusterSharedRewrites" rows="3" placeholder="/shared/movies => /mnt/nas/movies&#10;/shared/tv => /mnt/nas2/tv"></textarea>
+                            <div class="form-text mt-1">
+                                One <code>master-prefix =&gt; node-prefix</code> pair per line. If the master sees a share
+                                at a different path than this node, translate it before validating — nodes mounting
+                                several shares need one line per share. Set the per-node scratch location with the
+                                existing <em>Temporary Encode Directory</em> field above.
+                            </div>
                         </div>
                     </details>
                 </div>

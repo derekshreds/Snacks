@@ -36,7 +36,7 @@ public sealed class LocalNetworkOnlyFilter : IActionFilter
         var remote = context.HttpContext.Connection.RemoteIpAddress;
         if (remote == null || !IsLocalNetwork(remote))
         {
-            Console.WriteLine($"LocalNetworkOnly: rejected request from non-LAN source {remote}");
+            Log.Warning($"LocalNetworkOnly: rejected request from non-LAN source {remote}");
             context.Result = new ObjectResult(null) { StatusCode = 403 };
             return;
         }
@@ -52,7 +52,7 @@ public sealed class LocalNetworkOnlyFilter : IActionFilter
 
         if (hit == null)
         {
-            Console.WriteLine($"LocalNetworkOnly: rejected request from {remoteStr} — not a currently-connected node");
+            Log.Warning($"LocalNetworkOnly: rejected request from {remoteStr} — not a currently-connected node");
             context.Result = new ObjectResult(null) { StatusCode = 403 };
             return;
         }

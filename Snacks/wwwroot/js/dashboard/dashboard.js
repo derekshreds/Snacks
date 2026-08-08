@@ -439,8 +439,10 @@ function renderRecentTable(rows) {
         return `
             <tr>
                 <td class="dash-file">
-                    <span class="dash-fileicon"><i class="fas ${(r.kind === 'Music' || r.kind === 1) ? 'fa-music' : 'fa-film'}"></i></span>
-                    <div class="dash-filename" title="${escapeHtml(r.fileName)}">${escapeHtml(r.fileName)}</div>
+                    <div class="dash-file-inner">
+                        <span class="dash-fileicon"><i class="fas ${(r.kind === 'Music' || r.kind === 1) ? 'fa-music' : 'fa-film'}"></i></span>
+                        <div class="dash-filename" title="${escapeHtml(r.fileName)}">${escapeHtml(r.fileName)}</div>
+                    </div>
                 </td>
                 <td class="dash-codec">
                     <span class="codec-pill">${escapeHtml(codecBefore)}</span>
@@ -473,8 +475,10 @@ function renderTopSavingsTable(rows) {
     tbody.innerHTML = rows.map(r => `
         <tr>
             <td class="dash-file">
-                <span class="dash-fileicon"><i class="fas fa-film"></i></span>
-                <div class="dash-filename" title="${escapeHtml(r.fileName)}">${escapeHtml(r.fileName)}</div>
+                <div class="dash-file-inner">
+                    <span class="dash-fileicon"><i class="fas fa-film"></i></span>
+                    <div class="dash-filename" title="${escapeHtml(r.fileName)}">${escapeHtml(r.fileName)}</div>
+                </div>
             </td>
             <td class="dash-saved" style="color: var(--success)">
                 <strong>${fmtBytes(r.bytesSaved)}</strong>
@@ -660,5 +664,8 @@ registerPage('dashboard', {
             clearTimeout(refreshTimer);
             refreshTimer = null;
         }
+        // The chart tooltip is appended to document.body (so it can escape the
+        // SVG's overflow), which means the page-content swap doesn't remove it.
+        document.getElementById('dashTooltip')?.remove();
     },
 });

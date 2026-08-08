@@ -29,55 +29,43 @@
     </div>
 
     <div class="col-md-6">
+        <div class="encoder-panel rounded mb-4">
+            <h6 class="fw-bold mb-3"><i class="fas fa-key me-2 text-primary"></i>API Access</h6>
+            <p class="small text-muted">
+                Lets scripts, orchestrators, and external dashboards (Homarr, Glance, …) call the API when
+                sign-in is enabled — e.g. pause/resume the queue, trigger a scan, or read status via the
+                read-only <code>/api/v1/*</code> endpoints. Send the key as an <code>X-Api-Key</code> header,
+                an <code>Authorization: Bearer</code> token, or a <code>?apiKey=</code> query string
+                (Sonarr/Radarr-compatible).
+            </p>
+
+            <div class="input-group mb-2">
+                <input type="password" class="form-control" id="apiKeyValue" readonly placeholder="No API key generated" autocomplete="off">
+                <button class="btn btn-outline-secondary" id="revealApiKeyBtn" type="button" title="Show / hide"><i class="fas fa-eye"></i></button>
+                <button class="btn btn-outline-secondary" id="copyApiKeyBtn" type="button" title="Copy to clipboard"><i class="fas fa-copy"></i></button>
+            </div>
+
+            <div class="d-flex gap-2 mb-2">
+                <button class="btn btn-primary btn-sm" id="generateApiKeyBtn"><i class="fas fa-sync me-1"></i>Generate new key</button>
+                <button class="btn btn-outline-danger btn-sm" id="deleteApiKeyBtn"><i class="fas fa-trash me-1"></i>Remove</button>
+            </div>
+
+            <div class="form-text" id="envApiKeyHint" style="display:none;">
+                <i class="fas fa-lock me-1"></i>An additional API key is configured via the <code>SNACKS_API_KEY</code> environment variable.
+            </div>
+            <div class="form-text">
+                Example: <code>curl -H "X-Api-Key: KEY" -X POST http://host:6767/api/queue/paused -H "Content-Type: application/json" -d '{"paused":true}'</code>
+            </div>
+        </div>
+
         <div class="encoder-panel rounded">
             <h6 class="fw-bold mb-3"><i class="fas fa-shield-alt me-2 text-warning"></i>Notes</h6>
             <ul class="small text-muted mb-0">
                 <li>When enabled, every browser request must present a valid session cookie.</li>
                 <li>Cluster traffic between master and nodes uses the shared secret configured in the Cluster tab — it is independent of this login.</li>
                 <li>Disabling auth rotates the session secret, invalidating all existing cookies.</li>
+                <li>API keys grant full API access — treat them like a password.</li>
             </ul>
-        </div>
-    </div>
-
-    <div class="col-12">
-        <div class="encoder-panel rounded">
-            <h6 class="fw-bold mb-3"><i class="fas fa-key me-2 text-info"></i>API Key — Homarr &amp; other external dashboards</h6>
-
-            <p class="small text-muted">
-                Generate an API key to let external dashboards (Homarr, Glance, Dashy, etc.) read Snacks's status via the
-                read-only <code>/api/v1/*</code> endpoints. Present it as either an <code>X-Api-Key</code> header or a
-                <code>?apiKey=</code> query string — Sonarr/Radarr-compatible. The key is only shown once at generation;
-                generate a new one to rotate.
-            </p>
-
-            <div class="mb-3" id="apiKeyDisplayRow" style="display:none;">
-                <label for="apiKeyValue" class="form-label">Your new API key</label>
-                <div class="input-group">
-                    <input type="text" class="form-control font-monospace" id="apiKeyValue" readonly>
-                    <button class="btn btn-outline-secondary" type="button" id="copyApiKeyBtn">
-                        <i class="fas fa-copy me-1"></i>Copy
-                    </button>
-                </div>
-                <div class="form-text text-warning">
-                    <i class="fas fa-exclamation-triangle me-1"></i>
-                    Copy this now — it cannot be displayed again. Generate a new key to rotate.
-                </div>
-            </div>
-
-            <div class="d-flex gap-2 align-items-center">
-                <button class="btn btn-primary" id="generateApiKeyBtn" type="button">
-                    <i class="fas fa-key me-1"></i><span id="generateApiKeyBtnLabel">Generate API key</span>
-                </button>
-                <button class="btn btn-outline-danger" id="revokeApiKeyBtn" type="button" style="display:none;">
-                    <i class="fas fa-trash me-1"></i>Revoke
-                </button>
-                <span class="small text-muted ms-2" id="apiKeyStatus"></span>
-            </div>
-
-            <div class="form-text mt-2">
-                The key only matters while sign-in is enabled above. With sign-in disabled, the public API is open to
-                anyone who can reach this server.
-            </div>
         </div>
     </div>
 </div>

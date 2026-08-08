@@ -41,6 +41,12 @@ public sealed class EncoderOptionsOverride
     /// <summary> Overrides <see cref="EncoderOptions.FfmpegQualityPreset"/> when non-<see langword="null"/>. </summary>
     public string? FfmpegQualityPreset { get; set; }
 
+    /// <summary> Overrides <see cref="EncoderOptions.VideoProfile"/> when non-<see langword="null"/>. </summary>
+    public string? VideoProfile { get; set; }
+
+    /// <summary> Overrides <see cref="EncoderOptions.VideoLevel"/> when non-<see langword="null"/>. </summary>
+    public string? VideoLevel { get; set; }
+
     /******************************************************************
      *  Audio
      ******************************************************************/
@@ -111,8 +117,26 @@ public sealed class EncoderOptionsOverride
     /// <summary> Overrides <see cref="EncoderOptions.DownscaleTarget"/> when non-<see langword="null"/>. </summary>
     public string? DownscaleTarget { get; set; }
 
+    /// <summary> Overrides <see cref="EncoderOptions.FixedFrameSize"/> when non-<see langword="null"/>. </summary>
+    public string? FixedFrameSize { get; set; }
+
+    /// <summary> Overrides <see cref="EncoderOptions.MaxFrameRate"/> when non-<see langword="null"/>. </summary>
+    public int? MaxFrameRate { get; set; }
+
     /// <summary> Overrides <see cref="EncoderOptions.TonemapHdrToSdr"/> when non-<see langword="null"/>. </summary>
     public bool? TonemapHdrToSdr { get; set; }
+
+    /******************************************************************
+     *  Queue
+     ******************************************************************/
+
+    /// <summary>
+    ///     Base queue priority stamped onto every file queued from this folder.
+    ///     Higher dispatches first (before the bitrate/recency tiebreaker). Lets a
+    ///     "new downloads" folder jump a months-deep backlog without per-file
+    ///     clicking. <see langword="null"/> = 0 (no boost).
+    /// </summary>
+    public int? QueuePriority { get; set; }
 
     /******************************************************************
      *  Output and Scratch
@@ -175,6 +199,17 @@ public sealed class EncoderOptionsOverride
         if (over.Format != null)                      target.Format                     = over.Format;
         if (over.Codec != null)                       target.Codec                      = over.Codec;
         if (over.Encoder != null)                     target.Encoder                    = over.Encoder;
+        // The pipeline branches on Encoder, not Codec (GetEncoder, skip logic, cluster
+        // routing). The settings form keeps the pair consistent, but the override dialog
+        // only writes Codec — without re-deriving, a folder's "AV1" override still
+        // encoded with the global libx265.
+        if (over.Codec != null && over.Encoder == null)
+            target.Encoder = over.Codec.ToLowerInvariant() switch
+            {
+                "av1"  => "libsvtav1",
+                "h264" => "libx264",
+                _      => "libx265",
+            };
         if (over.TargetBitrate.HasValue)              target.TargetBitrate              = over.TargetBitrate.Value;
         if (over.StrictBitrate.HasValue)              target.StrictBitrate              = over.StrictBitrate.Value;
         if (over.FourKBitrateMultiplier.HasValue)     target.FourKBitrateMultiplier     = over.FourKBitrateMultiplier.Value;
@@ -187,7 +222,11 @@ public sealed class EncoderOptionsOverride
         if (over.EncodeDirectory != null)             target.EncodeDirectory            = over.EncodeDirectory;
         if (over.HardwareAcceleration != null)        target.HardwareAcceleration       = over.HardwareAcceleration;
         if (over.SkipPercentAboveTarget.HasValue)     target.SkipPercentAboveTarget     = over.SkipPercentAboveTarget.Value;
-        if (over.AudioLanguagesToKeep != null)        target.AudioLanguagesToKeep       = over.AudioLanguagesToKeep;
+        // Copy, don't alias: the override object is the LIVE persisted config
+        // (WatchedFolder.EncodingOverrides). Aliasing its lists into per-job
+        // options lets dispatch-time merges (eg. KeepOriginalLanguage appending
+        // the resolved language) mutate the user's saved configuration.
+        if (over.AudioLanguagesToKeep != null)        target.AudioLanguagesToKeep       = new List<string>(over.AudioLanguagesToKeep);
         if (over.KeepOriginalLanguage.HasValue)       target.KeepOriginalLanguage       = over.KeepOriginalLanguage.Value;
         if (over.OriginalLanguageProvider != null)    target.OriginalLanguageProvider   = over.OriginalLanguageProvider;
         // Audio: a non-null AudioOutputs/PreserveOriginalAudio override is the new shape and
@@ -213,15 +252,19 @@ public sealed class EncoderOptionsOverride
         }
         if (over.EncodingMode.HasValue)               target.EncodingMode               = over.EncodingMode.Value;
         if (over.MuxStreams.HasValue)                 target.MuxStreams                 = over.MuxStreams.Value;
-        if (over.SubtitleLanguagesToKeep != null)     target.SubtitleLanguagesToKeep    = over.SubtitleLanguagesToKeep;
+        if (over.SubtitleLanguagesToKeep != null)     target.SubtitleLanguagesToKeep    = new List<string>(over.SubtitleLanguagesToKeep);
         if (over.ExtractSubtitlesToSidecar.HasValue)  target.ExtractSubtitlesToSidecar  = over.ExtractSubtitlesToSidecar.Value;
         if (over.SidecarSubtitleFormat != null)       target.SidecarSubtitleFormat      = over.SidecarSubtitleFormat;
         if (over.ConvertImageSubtitlesToSrt.HasValue)   target.ConvertImageSubtitlesToSrt   = over.ConvertImageSubtitlesToSrt.Value;
         if (over.PassThroughImageSubtitlesMkv.HasValue) target.PassThroughImageSubtitlesMkv = over.PassThroughImageSubtitlesMkv.Value;
         if (over.DownscalePolicy != null)             target.DownscalePolicy            = over.DownscalePolicy;
         if (over.DownscaleTarget != null)             target.DownscaleTarget            = over.DownscaleTarget;
+        if (over.FixedFrameSize != null)             target.FixedFrameSize             = over.FixedFrameSize;
+        if (over.MaxFrameRate.HasValue)              target.MaxFrameRate               = over.MaxFrameRate.Value;
         if (over.TonemapHdrToSdr.HasValue)            target.TonemapHdrToSdr            = over.TonemapHdrToSdr.Value;
         if (over.FfmpegQualityPreset != null)         target.FfmpegQualityPreset        = over.FfmpegQualityPreset;
+        if (over.VideoProfile != null)               target.VideoProfile               = over.VideoProfile;
+        if (over.VideoLevel != null)                 target.VideoLevel                 = over.VideoLevel;
         over.MusicOverride?.ApplyTo(target.Music);
     }
 }

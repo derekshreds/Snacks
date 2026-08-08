@@ -53,10 +53,11 @@ public sealed class AuthService
         {
             return new
             {
-                enabled     = _config.Enabled,
-                username    = _config.Username,
-                hasPassword = !string.IsNullOrEmpty(_config.PasswordHash),
-                hasApiKey   = !string.IsNullOrEmpty(_config.ApiKey),
+                enabled      = _config.Enabled,
+                username     = _config.Username,
+                hasPassword  = !string.IsNullOrEmpty(_config.PasswordHash),
+                hasApiKey    = !string.IsNullOrEmpty(_config.ApiKey),
+                envApiKeySet = HasEnvApiKey,
             };
         }
     }
@@ -76,8 +77,10 @@ public sealed class AuthService
             {
                 Enabled       = enabled,
                 Username      = username ?? "",
-                PasswordHash  = _config.PasswordHash,
-                SessionSecret = _config.SessionSecret,
+                PasswordHash         = _config.PasswordHash,
+                SessionSecret        = _config.SessionSecret,
+                ApiKey               = _config.ApiKey,
+                IframeAllowedOrigins = _config.IframeAllowedOrigins,
             };
 
             if (!string.IsNullOrEmpty(newPassword))
@@ -171,16 +174,37 @@ public sealed class AuthService
      *  API Key
      ******************************************************************/
 
+    /// <summary> Whether an API key is configured via the SNACKS_API_KEY environment variable. </summary>
+    public bool HasEnvApiKey =>
+        !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("SNACKS_API_KEY"));
+
     /// <summary>
-    ///     Generates a fresh 32-byte random key, base64url-encoded (no padding), persists
-    ///     it to <c>auth.json</c>, and returns it once. Caller is expected to surface the
-    ///     value to the user immediately — it is not retrievable after this call.
+    ///     Validates a presented API key against the SNACKS_API_KEY env var and the stored
+    ///     key, both via constant-time comparison. Empty presented or configured keys never
+    ///     match — an unconfigured key must not accept an empty header.
+    /// </summary>
+    /// <param name="presented"> The key from the X-Api-Key header, Bearer token, or ?apiKey= query. </param>
+    public bool ValidateApiKey(string? presented)
+    {
+        if (string.IsNullOrEmpty(presented)) return false;
+
+        var envKey = Environment.GetEnvironmentVariable("SNACKS_API_KEY");
+        if (!string.IsNullOrEmpty(envKey) && SecretCompare.ConstantTimeEquals(envKey, presented))
+            return true;
+
+        string stored;
+        lock (_lock) stored = _config.ApiKey;
+        return !string.IsNullOrEmpty(stored) && SecretCompare.ConstantTimeEquals(stored, presented);
+    }
+
+    /// <summary>
+    ///     Generates, persists, and returns a new stored API key, replacing any previous one.
+    ///     An env-provided SNACKS_API_KEY is unaffected and stays valid alongside it.
     /// </summary>
     public string GenerateApiKey()
     {
-        var bytes = RandomNumberGenerator.GetBytes(32);
-        var key   = Convert.ToBase64String(bytes).Replace("+", "-").Replace("/", "_").TrimEnd('=');
-
+        var key = "snk_" + Convert.ToBase64String(RandomNumberGenerator.GetBytes(32))
+            .Replace("+", "-").Replace("/", "_").TrimEnd('=');
         lock (_lock)
         {
             _config.ApiKey = key;
@@ -189,38 +213,20 @@ public sealed class AuthService
         return key;
     }
 
-    /// <summary>
-    ///     Clears the stored API key. Subsequent <see cref="ValidateApiKey"/> calls will
-    ///     reject every candidate until <see cref="GenerateApiKey"/> is called again.
-    /// </summary>
+    /// <summary> Returns the stored API key ("" when none). The env key is never exposed. </summary>
+    public string GetStoredApiKey()
+    {
+        lock (_lock) return _config.ApiKey;
+    }
+
+    /// <summary> Removes the stored API key. An env-provided SNACKS_API_KEY is unaffected. </summary>
     public void ClearApiKey()
     {
         lock (_lock)
         {
-            _config.ApiKey = null;
+            _config.ApiKey = "";
             _configFileService.Save("auth.json", _config);
         }
-    }
-
-    /// <summary>
-    ///     Constant-time compare of <paramref name="key"/> against the stored API key.
-    ///     Returns <see langword="false"/> when no key is configured server-side, when the
-    ///     candidate is empty, or when the lengths differ — the key path is opt-in and
-    ///     never grants implicit access.
-    /// </summary>
-    /// <param name="key"> The candidate key from the <c>X-Api-Key</c> header or <c>?apiKey=</c> query. </param>
-    public bool ValidateApiKey(string? key)
-    {
-        if (string.IsNullOrEmpty(key)) return false;
-
-        string? stored;
-        lock (_lock) stored = _config.ApiKey;
-        if (string.IsNullOrEmpty(stored)) return false;
-
-        var candidateBytes = Encoding.UTF8.GetBytes(key);
-        var storedBytes    = Encoding.UTF8.GetBytes(stored);
-        if (candidateBytes.Length != storedBytes.Length) return false;
-        return CryptographicOperations.FixedTimeEquals(candidateBytes, storedBytes);
     }
 
     /// <summary>

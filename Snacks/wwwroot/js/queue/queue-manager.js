@@ -13,7 +13,7 @@
  * poll) or in the wrong one after a status transition.
  */
 
-import { queueApi } from '../api.js';
+import { queueApi, autoScanApi } from '../api.js';
 import {
     TRANSFER_STATUSES,
     getStatusString,
@@ -61,6 +61,9 @@ export class QueueManager {
         /** Handle for the throttled refresh timer. */
         this._refreshTimer   = null;
 
+        /** Which refresh the pending timer should run: 'full' | 'queue' | null. */
+        this._pendingRefreshKind = null;
+
         this._stopCancel   = stopCancelDialog;
         this._logViewer    = logViewer;
         this._pauseControl = pauseControl;
@@ -93,8 +96,27 @@ export class QueueManager {
                     const path = this._workItems.get(itemId)?.path;
                     if (path) this.retry(itemId, path);
                 }
+                if (btn.dataset.action === 'prioritize') {
+                    this.prioritize(itemId);
+                }
             });
         }
+
+        // First-run onboarding hero buttons (rendered into the empty queue
+        // container — delegated here because the hero comes and goes).
+        document.getElementById('workItemsContainer')?.addEventListener('click', (e) => {
+            const btn = e.target.closest('[data-onboard]');
+            if (!btn) return;
+            if (btn.dataset.onboard === 'library') {
+                document.getElementById('openLibraryBtn')?.click();
+            } else if (btn.dataset.onboard === 'preset') {
+                document.getElementById('openSettingsBtn')?.click();
+                document.querySelector('[data-bs-target="#generalTab"]')?.click();
+            } else if (btn.dataset.onboard === 'watch') {
+                document.getElementById('openSettingsBtn')?.click();
+                document.querySelector('[data-bs-target="#libraryTab"]')?.click();
+            }
+        });
 
         // Pagination buttons (event-delegated).
         document.getElementById('queuePagination')?.addEventListener('click', (e) => {
@@ -217,12 +239,11 @@ export class QueueManager {
 
     /** Schedules a full refresh, throttled to at most once every {@link REFRESH_THROTTLE_MS}. */
     _scheduleRefresh() {
-        if (this._refreshTimer) return;
-
-        this._refreshTimer = setTimeout(() => {
-            this._refreshTimer = null;
-            this.loadItems();
-        }, REFRESH_THROTTLE_MS);
+        // A full refresh supersedes a pending queue-only refresh — upgrade in
+        // place rather than first-wins on the shared handle, otherwise the full
+        // reconcile is silently dropped and stale "Now Processing" cards linger.
+        this._pendingRefreshKind = 'full';
+        this._armRefreshTimer();
     }
 
     /**
@@ -231,14 +252,24 @@ export class QueueManager {
      * the next pending item, but reconciling the processing container
      * would tear down and rebuild in-flight transfer cards (cancelling
      * their progress bars). Throttled on the same handle so a burst of
-     * dispatches collapses into one fetch.
+     * dispatches collapses into one fetch; a pending FULL refresh keeps
+     * its priority (full ⊃ queue-only).
      */
     _scheduleQueueRefresh() {
+        if (this._pendingRefreshKind !== 'full') this._pendingRefreshKind = 'queue';
+        this._armRefreshTimer();
+    }
+
+    /** Arms the shared throttle timer; on fire, dispatches by pending kind. */
+    _armRefreshTimer() {
         if (this._refreshTimer) return;
 
         this._refreshTimer = setTimeout(() => {
             this._refreshTimer = null;
-            this._refreshQueueOnly();
+            const kind = this._pendingRefreshKind;
+            this._pendingRefreshKind = null;
+            if (kind === 'full') this.loadItems();
+            else this._refreshQueueOnly();
         }, REFRESH_THROTTLE_MS);
     }
 
@@ -263,12 +294,18 @@ export class QueueManager {
 
             this._reconcileQueueContainer(queueItems);
 
+            // Prune DB-sourced pending entries ("mf-…") that left the current
+            // page. Only the full loadItems() reconciles deletions, and during a
+            // multi-hour sweep this queue-only path runs thousands of times —
+            // without pruning, every tile that ever crossed page 1 stays in the
+            // map for the session.
+            const fetchedIds = new Set(queueItems.map((i) => i.id));
+            for (const id of [...this._workItems.keys()]) {
+                if (id.startsWith('mf-') && !fetchedIds.has(id)) this._workItems.delete(id);
+            }
+
             if (queueItems.length === 0) {
-                const queueContainer = document.getElementById('workItemsContainer');
-                const msg = this._filter
-                    ? `No ${this._filter.toLowerCase()} items`
-                    : 'No files in queue';
-                queueContainer.innerHTML = `<div class="text-muted text-center py-4"><i class="fas fa-inbox fa-2x mb-2"></i><br>${msg}</div>`;
+                this._renderEmptyQueue(stats);
             }
 
             this._updateStatCounters(stats);
@@ -277,6 +314,86 @@ export class QueueManager {
         } catch (err) {
             console.error('Error refreshing queue:', err);
         }
+    }
+
+    /**
+     * Renders the empty-queue state. Three flavors:
+     *  - a status-filter with no matches → plain "no X items" line,
+     *  - an established library with nothing queued → plain "no files" line,
+     *  - a true first run (nothing known to Snacks at all, no watched folders)
+     *    → a "get started" hero walking through preset → library → auto-scan.
+     *
+     * @param {{ total: number }} stats Aggregate counters from /api/queue/stats.
+     */
+    async _renderEmptyQueue(stats) {
+        const queueContainer = document.getElementById('workItemsContainer');
+        if (!queueContainer) return;
+
+        if (this._filter) {
+            queueContainer.innerHTML = `<div class="text-muted text-center py-4"><i class="fas fa-inbox fa-2x mb-2"></i><br>No ${this._filter.toLowerCase()} items</div>`;
+            return;
+        }
+
+        // Generation guard: this method awaits a config fetch below, and a
+        // newer load may render real cards (or a newer empty state) in the
+        // meantime — a stale resolve must not overwrite them.
+        const gen = (this._emptyQueueGen = (this._emptyQueueGen || 0) + 1);
+
+        let watchedDirs = 0;
+        if (stats.total === 0) {
+            try {
+                const cfg = await autoScanApi.getConfig();
+                watchedDirs = (cfg.directories || []).length;
+            } catch { /* treat as configured — never block the simple message on an error */ watchedDirs = 1; }
+            if (gen !== this._emptyQueueGen) return;
+            // Items may have arrived while we awaited — never paint over them.
+            if (queueContainer.querySelector('.work-item')) return;
+        }
+
+        // Show the onboarding hero ONLY on a genuine first run. A queue can be empty for
+        // mundane reasons (everything already encoded, in-memory counters reset on restart),
+        // so `stats.total` alone isn't enough — `knownFiles` reflects every row the DB has
+        // ever recorded. If anything has been scanned/processed before, or a folder is being
+        // watched, fall back to the plain "No files in queue" message.
+        if (stats.total > 0 || watchedDirs > 0 || (stats.knownFiles || 0) > 0) {
+            queueContainer.innerHTML = '<div class="text-muted text-center py-4"><i class="fas fa-inbox fa-2x mb-2"></i><br>No files in queue</div>';
+            return;
+        }
+
+        queueContainer.innerHTML = `
+            <div class="text-center py-4 onboarding-hero">
+                <h4 class="mb-1">Welcome to Snacks <span aria-hidden="true">🍿</span></h4>
+                <p class="text-muted mb-4">Three steps to a smaller, cleaner media library.</p>
+                <div class="row g-3 justify-content-center text-start">
+                    <div class="col-12 col-md-4">
+                        <div class="card h-100">
+                            <div class="card-body">
+                                <div class="fw-bold mb-1"><span class="badge bg-primary me-2">1</span>Pick a preset</div>
+                                <div class="small text-muted mb-3">Choose a quality profile — "Balanced" is great for Plex libraries.</div>
+                                <button type="button" class="btn btn-sm btn-outline-primary" data-onboard="preset"><i class="fas fa-wand-magic-sparkles me-1"></i>Choose preset</button>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-12 col-md-4">
+                        <div class="card h-100">
+                            <div class="card-body">
+                                <div class="fw-bold mb-1"><span class="badge bg-primary me-2">2</span>Add your media</div>
+                                <div class="small text-muted mb-3">Browse to a folder and queue it — or dry-run "Analyze" first to preview what would happen.</div>
+                                <button type="button" class="btn btn-sm btn-primary" data-onboard="library"><i class="fas fa-folder-plus me-1"></i>Browse library</button>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-12 col-md-4">
+                        <div class="card h-100">
+                            <div class="card-body">
+                                <div class="fw-bold mb-1"><span class="badge bg-primary me-2">3</span>Automate it</div>
+                                <div class="small text-muted mb-3">Watch folders so new downloads are scanned and converted automatically.</div>
+                                <button type="button" class="btn btn-sm btn-outline-primary" data-onboard="watch"><i class="fas fa-folder-tree me-1"></i>Watch folders</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>`;
     }
 
 
@@ -307,7 +424,17 @@ export class QueueManager {
             const processingItems = data.processing || [];
             this._total = data.total;
 
-            this._workItems.clear();
+            // Reconcile the map additively instead of clear()-then-refill: a
+            // SignalR update that landed during the awaits above would be wiped
+            // by clear(), leaving stale data behind the retry/stop/log buttons.
+            const fetchedIds = new Set(
+                [...processingItems, ...queueItems].map((i) => i.id));
+            for (const id of [...this._workItems.keys()]) {
+                if (!fetchedIds.has(id)) this._workItems.delete(id);
+            }
+            for (const item of [...processingItems, ...queueItems]) {
+                this._workItems.set(item.id, item);
+            }
 
             this._reconcileProcessingContainer(processingItems);
             this._reconcileQueueContainer(queueItems);
@@ -315,11 +442,7 @@ export class QueueManager {
             this._updateStatCounters(stats);
 
             if (queueItems.length === 0) {
-                const queueContainer = document.getElementById('workItemsContainer');
-                const msg = this._filter
-                    ? `No ${this._filter.toLowerCase()} items`
-                    : 'No files in queue';
-                queueContainer.innerHTML = `<div class="text-muted text-center py-4"><i class="fas fa-inbox fa-2x mb-2"></i><br>${msg}</div>`;
+                this._renderEmptyQueue(stats);
             }
 
             this._renderPagination();
@@ -548,6 +671,30 @@ export class QueueManager {
         } catch (err) {
             showToast('Error retrying item: ' + err.message, 'danger');
         }
+    }
+
+    /**
+     * Moves a pending item to the front of the queue, then refreshes so the
+     * card jumps to its new position. A 404 means the item started processing
+     * (or finished) between render and click — the refresh resolves that too.
+     */
+    async prioritize(id) {
+        try {
+            await queueApi.prioritize(id);
+            showToast('Moved to front of queue', 'info');
+        } catch {
+            showToast('Item is no longer pending', 'warning');
+        }
+        this.loadItems();
+    }
+
+    /**
+     * Called on SignalR `QueueChanged` — the server-side pending queue changed
+     * (add, cancel, prioritize, bulk reset). Pending tiles are fetch-driven, so
+     * a throttled queued-container refresh is all that's needed.
+     */
+    queueChanged() {
+        this._scheduleQueueRefresh();
     }
 
     /** Called on SignalR `WorkItemRemoved`. Drops the card from the in-memory map and DOM. */

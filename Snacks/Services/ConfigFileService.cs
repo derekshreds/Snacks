@@ -64,7 +64,7 @@ public sealed class ConfigFileService
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Config file corrupted ({candidate}): {ex.Message}");
+                Log.Warning($"Config file corrupted ({candidate}): {ex.Message}");
             }
         }
         return new T();

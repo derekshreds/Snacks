@@ -74,6 +74,8 @@ xattr -d com.apple.quarantine electron-app/ffmpeg/ffmpeg  2>/dev/null || true
 xattr -d com.apple.quarantine electron-app/ffmpeg/ffprobe 2>/dev/null || true
 chmod +x electron-app/ffmpeg/ffmpeg electron-app/ffmpeg/ffprobe
 echo "FFmpeg found."
+echo "  bundling ffmpeg/ffprobe dylib deps (so end users don't need Homebrew)..."
+bash electron-app/scripts/bundle-ffmpeg-mac.sh electron-app/ffmpeg
 echo
 
 # ---------------------------------------------------------------------------
@@ -89,7 +91,7 @@ bash electron-app/scripts/bundle-ocr-mac.sh electron-app/backend
 echo "Backend published."
 echo
 
-# SkiaSharp 2.88.8 ships macOS arm64 natives in the base package, so nothing to do
+# SkiaSharp currently ships macOS arm64 natives in the base package, so nothing to do
 # here for image rendering. If a future SDK bump drops them, libSkiaSharp.dylib will
 # be missing from the publish output and the app will fail at runtime.
 if ! ls electron-app/backend/libSkiaSharp*.dylib >/dev/null 2>&1; then

@@ -58,6 +58,26 @@ public sealed class HardwareEncoderTests
 
 
     /// <summary>
+    ///     The iPod Classic preset pins <c>HardwareAcceleration = "none"</c> precisely so
+    ///     H.264 resolves to <c>libx264</c> — the only encoder path that emits the
+    ///     <c>-profile:v baseline -level 3.0</c> flags the old devices require. Left on a
+    ///     HW setting (e.g. Apple VideoToolbox), the same request resolves to a hardware
+    ///     encoder whose default High profile the devices can't decode; this test guards
+    ///     that the pin is what makes the preset work.
+    /// </summary>
+    [Fact]
+    public void GetEncoder_ipod_preset_pins_libx264_for_baseline_support()
+    {
+        var pinned = new EncoderOptions { HardwareAcceleration = "none", Encoder = "libx264" };
+        TranscodingService.GetEncoder(pinned, isWindows: false, linuxIntelQsv: false).Should().Be("libx264");
+
+        // Contrast: without the pin, an Apple host would drop to a HW encoder (no baseline).
+        var unpinned = new EncoderOptions { HardwareAcceleration = "apple", Encoder = "libx264" };
+        TranscodingService.GetEncoder(unpinned, isWindows: false, linuxIntelQsv: false).Should().Be("h264_videotoolbox");
+    }
+
+
+    /// <summary>
     ///     Linux Intel with the QSV preference set picks QSV encoders instead of VAAPI.
     ///     Uses the pure overload so this runs on any host — VAAPI vs QSV here depends
     ///     on detection, not the test process's OS.
@@ -341,6 +361,33 @@ public sealed class HardwareEncoderTests
     }
 
 
+    /// <summary>
+    ///     Rows: (UI preset, expected AMF quality preset). AMF only exposes three steps
+    ///     — speed / balanced / quality — so the five UI presets collapse onto that
+    ///     ladder. Anything unrecognised lands on "balanced", which is AMF's own
+    ///     default and matches the UI's default of "medium".
+    /// </summary>
+    public static IEnumerable<object[]> AmfPresetRows() => new[]
+    {
+        new object[] { "veryslow",  "quality"  },
+        new object[] { "slow",      "quality"  },
+        new object[] { "medium",    "balanced" },
+        new object[] { "fast",      "speed"    },
+        new object[] { "veryfast",  "speed"    },
+        new object[] { "VERYSLOW",  "quality"  }, // case-insensitive
+        new object[] { "",          "balanced" }, // unknown → default
+        new object[] { "garbage",   "balanced" },
+        new object[] { "ultrafast", "balanced" }, // not in the ladder → default
+    };
+
+    [Theory]
+    [MemberData(nameof(AmfPresetRows))]
+    public void MapAmfPreset_handles_known_and_unknown_inputs(string preset, string expected)
+    {
+        TranscodingService.MapAmfPreset(preset).Should().Be(expected);
+    }
+
+
     /// <summary>Rows: (target string, expected height). Unknown targets fall back to 1080p.</summary>
     public static IEnumerable<object[]> DownscaleTargetRows() => new[]
     {
@@ -350,6 +397,7 @@ public sealed class HardwareEncoderTests
         new object[] { "1080p",   1080 },
         new object[] { "720p",    720  },
         new object[] { "480p",    480  },
+        new object[] { "240p",    240  },
         new object[] { "garbage", 1080 },
     };
 
@@ -394,5 +442,19 @@ public sealed class HardwareEncoderTests
     public void GetNvidiaInputDecoder_maps_codec_to_cuvid_flag(string? sourceCodec, string expected)
     {
         TranscodingService.GetNvidiaInputDecoder(sourceCodec).Should().Be(expected);
+    }
+
+
+    /// <summary>
+    ///     The render-node vendor probe must never throw and must return null for a node
+    ///     whose sysfs vendor file is absent (Windows/macOS, a container without GPU
+    ///     passthrough, or a bogus path) — callers fall back to the historical Intel/VAAPI
+    ///     probe on null. The 0x1002→amd / 0x8086→intel / 0x10de→nvidia mapping needs real
+    ///     sysfs files so it's exercised by the live detection path, not here.
+    /// </summary>
+    [Fact]
+    public void ReadRenderNodeVendor_missing_node_returns_null()
+    {
+        TranscodingService.ReadRenderNodeVendor("/dev/dri/renderD_does_not_exist_zzz").Should().BeNull();
     }
 }

@@ -45,7 +45,12 @@ public sealed class FullCommandScenarioTests
         command.TrimEnd().Should().EndWith($"\"{outputPath}\"");
 
         //  4. Specify the muxer with -f.
-        var expectedMuxer = format == "mkv" ? "matroska" : "mp4";
+        var expectedMuxer = format switch
+        {
+            "mkv"  => "matroska",
+            "webm" => "webm",
+            _      => "mp4",
+        };
         command.Should().Contain($"-f {expectedMuxer}");
 
         //  5. The -f muxer flag comes BEFORE the output path (ffmpeg arg order requirement).
@@ -96,9 +101,11 @@ public sealed class FullCommandScenarioTests
         // VAAPI's init flags depend on whether SW decode is forced — production lowers it
         // when filters are active. Mirror that here so scenarios with filters get the right init.
         bool isHdr     = FfprobeService.IsHdr(probe);
-        var  scaleExpr = videoCopy ? null : TranscodingService.ComputeScaleExpr(workItem, options);
+        var  scaleExpr = videoCopy ? null
+            : TranscodingService.ComputeFixedFrameFilter(options) ?? TranscodingService.ComputeScaleExpr(workItem, options);
+        var  fpsExpr   = videoCopy ? null : TranscodingService.ComputeFpsCapExpr(workItem, options);
         bool tonemap   = !videoCopy && options.TonemapHdrToSdr && isHdr;
-        bool hasFilter = cropExpr != null || scaleExpr != null || tonemap;
+        bool hasFilter = cropExpr != null || scaleExpr != null || fpsExpr != null || tonemap;
 
         string init = useVaapi && hasFilter
             ? TranscodingService.GetInitFlags(options.HardwareAcceleration, options.HardwareDevicePath, hwDecode: false)
@@ -108,14 +115,18 @@ public sealed class FullCommandScenarioTests
 
         string videoMap = _ffprobe.MapVideo(probe);
 
-        // Preset: SVT-AV1 takes a numeric preset, VAAPI takes none, others take the user string.
+        // Preset: SVT-AV1 takes a numeric preset, VAAPI takes none, AMF takes its own
+        // three-step quality ladder, others take the user string.
+        bool isAmf = encoder.Contains("amf");
         string presetFlag = videoCopy
             ? ""
             : useVaapi
                 ? ""
                 : isSvtAv1
                     ? $"-preset {TranscodingService.MapSvtAv1Preset(options.FfmpegQualityPreset)} "
-                    : $"-preset {options.FfmpegQualityPreset} ";
+                    : isAmf
+                        ? $"-quality {TranscodingService.MapAmfPreset(options.FfmpegQualityPreset)} "
+                        : $"-preset {options.FfmpegQualityPreset} ";
 
         // Build the -vf filter chain (or empty when nothing applies). This is the missing
         // wiring — without it scale/tonemap/crop wouldn't surface in the assembled command.
@@ -123,15 +134,28 @@ public sealed class FullCommandScenarioTests
             ? ""
             : VideoFilterBuilder.Emit(
                   cropExpr:    cropExpr,
+                  fpsExpr:     fpsExpr,
                   tonemap:     tonemap,
                   scaleExpr:   scaleExpr,
                   useVaapi:    useVaapi,
                   canHwDecode: useVaapi && !hasFilter,   // SW-decode when filters are active
                   vaapiFormat: tonemap ? "nv12" : "nv12");
 
+        // H.264/H.265 profile + level — software encoders only (mirrors production code,
+        // including the codec/profile validity gate).
+        string profileLevel = "";
+        if (!videoCopy && encoder.StartsWith("lib"))
+        {
+            if (!string.IsNullOrWhiteSpace(options.VideoProfile)
+                && TranscodingService.IsVideoProfileValidForEncoder(encoder, options.VideoProfile))
+                profileLevel += $"-profile:v {options.VideoProfile} ";
+            if (!string.IsNullOrWhiteSpace(options.VideoLevel))
+                profileLevel += $"-level {options.VideoLevel} ";
+        }
+
         string videoFlags = videoCopy
             ? $"{videoMap} -c:v copy "
-            : $"{videoMap} -c:v {encoder} {presetFlag}{vfFlag}";
+            : $"{videoMap} -c:v {encoder} {presetFlag}{profileLevel}{vfFlag}";
         string compressionFlags = videoCopy
             ? ""
             : TranscodingService.GetForcedReencodeCompressionFlags(
@@ -142,7 +166,7 @@ public sealed class FullCommandScenarioTests
             options.AudioLanguagesToKeep,
             options.PreserveOriginalAudio,
             options.AudioOutputs,
-            options.Format == "mkv",
+            options.Format,
             out _) + " ";
 
         string subtitleFlags = stripSubs
@@ -150,7 +174,7 @@ public sealed class FullCommandScenarioTests
             : _ffprobe.MapSub(
                   probe,
                   options.SubtitleLanguagesToKeep,
-                  options.Format == "mkv",
+                  options.Format,
                   includeBitmaps: includeBitmapSubs) + " ";
 
         return TranscodingService.BuildFfmpegCommand(
@@ -463,7 +487,7 @@ public sealed class FullCommandScenarioTests
                                   target, min, max, useConservativeHwFlags: false) + " ",
             audioFlags:       _ffprobe.MapAudio(probe, opts.AudioLanguagesToKeep,
                                   opts.PreserveOriginalAudio, opts.AudioOutputs,
-                                  isMatroska: true, out _) + " ",
+                                  container: "mkv", out _) + " ",
             subtitleFlags:    "-sn ",
             outputPath:       "/m/out.mkv");
 
@@ -476,7 +500,7 @@ public sealed class FullCommandScenarioTests
 
         // VAAPI rate-control uses CQP, not -b:v.
         cmd.Should().Contain("-rc_mode CQP");
-        cmd.Should().Contain("-global_quality 25");
+        cmd.Should().Contain("-global_quality:v 25");
     }
 
 
@@ -545,7 +569,7 @@ public sealed class FullCommandScenarioTests
         // Encoder + VAAPI-only rate-control (CQP, no -b:v).
         cmd.Should().Contain("-c:v hevc_vaapi");
         cmd.Should().Contain("-rc_mode CQP");
-        cmd.Should().Contain("-global_quality 25");
+        cmd.Should().Contain("-global_quality:v 25");
         cmd.Should().NotContain("-b:v ");
 
         // VAAPI takes no -preset.
@@ -931,5 +955,243 @@ public sealed class FullCommandScenarioTests
 
         cmd.Should().Contain("\"/path with spaces/in file.mkv\"");
         cmd.Should().Contain("\"/path with spaces/out file.mkv\"");
+    }
+
+
+    // =====================================================================
+    //  Scenario 16: WebM happy path — AV1 video + Opus audio + WebM output.
+    //  AC3 source audio is re-encoded to Opus (AC3 is not allowed in WebM).
+    //  Subtitles are always stripped for WebM regardless of source.
+    // =====================================================================
+
+    [Fact]
+    public void Scenario_AV1_Opus_WebM_emits_webm_muxer_and_strips_subs()
+    {
+        var probe = new ProbeBuilder()
+            .Video(codec: "h264", width: 1920, height: 1080)
+            .Audio(codec: "ac3", channels: 6, lang: "eng")
+            .Subtitle(codec: "subrip", lang: "eng")
+            .Build();
+
+        var opts = new EncoderOptions
+        {
+            Format                = "webm",
+            Codec                 = "av1",
+            Encoder               = "libsvtav1",
+            FfmpegQualityPreset   = "medium",
+            HardwareAcceleration  = "none",
+            TargetBitrate         = 2500,
+            PreserveOriginalAudio = true,
+            AudioOutputs          = new(),
+        };
+        var item = new WorkItem { Bitrate = 6000, IsHevc = false, Probe = probe };
+
+        var cmd = BuildScenarioCommand(probe, opts, item,
+            outputPath: "/output/out.webm");
+
+        AssertWellFormed(cmd, "webm", "/source/in.mkv", "/output/out.webm");
+
+        // Video: AV1 via libsvtav1.
+        cmd.Should().Contain("-c:v libsvtav1");
+
+        // Audio: AC3 source is not WebM-safe; the copy path falls back to a libopus re-encode.
+        cmd.Should().Contain("-c:a:0 libopus");
+        cmd.Should().NotContain("-c:a:0 copy");
+
+        // Subtitles always stripped for WebM (subrip text track is dropped).
+        cmd.Should().Contain("-sn");
+        cmd.Should().NotContain("-c:s copy");
+
+        // WebM uses the same mux-queue safeguard as MKV but no +faststart.
+        cmd.Should().NotContain("-movflags +faststart");
+    }
+
+
+    // =====================================================================
+    //  Scenario 17: Opus source into WebM passes through as -c:a copy
+    //  (Opus is the one stream-copy-safe audio codec for WebM).
+    // =====================================================================
+
+    [Fact]
+    public void Scenario_Opus_source_in_WebM_is_copied()
+    {
+        var probe = new ProbeBuilder()
+            .Video(codec: "av1", width: 1920, height: 1080)
+            .Audio(codec: "opus", channels: 2, lang: "eng")
+            .Build();
+
+        var opts = new EncoderOptions
+        {
+            Format                = "webm",
+            Codec                 = "av1",
+            Encoder               = "libsvtav1",
+            FfmpegQualityPreset   = "medium",
+            HardwareAcceleration  = "none",
+            TargetBitrate         = 2500,
+            PreserveOriginalAudio = true,
+            AudioOutputs          = new(),
+        };
+        var item = new WorkItem { Bitrate = 2000, IsHevc = false, Probe = probe };
+
+        var cmd = BuildScenarioCommand(probe, opts, item,
+            outputPath: "/output/out.webm");
+
+        AssertWellFormed(cmd, "webm", "/source/in.mkv", "/output/out.webm");
+        cmd.Should().Contain("-c:a:0 copy");
+        cmd.Should().NotContain("libopus");
+    }
+
+
+    // =====================================================================
+    //  Scenario 18: Force-mux container change ("Process Item" on an at-target
+    //  file in the wrong container). The mux-pass decision (IsMuxPass) drives a
+    //  video copy, and the output lands in the configured container (mp4) —
+    //  i.e. a remux, not a re-encode.
+    // =====================================================================
+
+    [Fact]
+    public void Scenario_force_mux_container_change_copies_video_into_mp4()
+    {
+        var probe = new ProbeBuilder()
+            .Video(codec: "hevc", width: 1920, height: 1080)
+            .Audio(codec: "aac", channels: 2, lang: "eng")
+            .Build();
+
+        var opts = new EncoderOptions
+        {
+            Format                  = "mp4",
+            Encoder                 = "libx265",
+            HardwareAcceleration    = "none",
+            TargetBitrate           = 3500,
+            SkipPercentAboveTarget  = 20,
+            EncodingMode            = EncodingMode.Hybrid,   // dispatch upgrades a force-mux item to Hybrid
+            MuxStreams              = MuxStreams.Both,
+            PreserveOriginalAudio   = true,
+            AudioOutputs            = new(),
+            AudioLanguagesToKeep    = new() { "en" },
+            SubtitleLanguagesToKeep = new() { "en" },
+        };
+        // At-target HEVC, no audio/sub work — the only thing to do is the mkv→mp4 remux.
+        var item = new WorkItem
+        {
+            Path     = "/m/in.mkv",
+            Bitrate  = 3000,
+            IsHevc   = true,
+            ForceMux = true,
+            Probe    = probe,
+        };
+
+        // The production decision: IsMuxPass must elect a video copy purely on the container change.
+        bool videoCopy = TranscodingService.IsMuxPass(opts, item);
+        videoCopy.Should().BeTrue();
+
+        var cmd = BuildScenarioCommand(probe, opts, item,
+            inputPath: "/m/in.mkv", outputPath: "/m/out.mp4", videoCopy: videoCopy);
+
+        AssertWellFormed(cmd, "mp4", "/m/in.mkv", "/m/out.mp4");
+
+        // Remux: video stream copied (no encoder, no rate-control), output is mp4.
+        cmd.Should().Contain("-c:v copy");
+        cmd.Should().NotContain("-c:v libx265");
+        cmd.Should().NotContain("-b:v");
+        cmd.Should().Contain("-f mp4");
+    }
+
+
+    [Fact]
+    public void FormatExtension_maps_each_known_container()
+    {
+        TranscodingService.FormatExtension("mkv") .Should().Be(".mkv");
+        TranscodingService.FormatExtension("mp4") .Should().Be(".mp4");
+        TranscodingService.FormatExtension("webm").Should().Be(".webm");
+        // Unknown falls back to .mp4 to match the prior ternary's default branch.
+        TranscodingService.FormatExtension("nope").Should().Be(".mp4");
+    }
+
+
+    [Fact]
+    public void FormatMuxer_maps_each_known_container()
+    {
+        TranscodingService.FormatMuxer("mkv") .Should().Be("matroska");
+        TranscodingService.FormatMuxer("mp4") .Should().Be("mp4");
+        TranscodingService.FormatMuxer("webm").Should().Be("webm");
+    }
+
+
+    // =====================================================================
+    //  Scenario: iPod Classic preset — 1080p source → 640×480 H.264
+    //  Baseline L3.0 in MP4, AAC stereo 48 kHz 160k, strict 1500 kbps.
+    //  Verifies profile/level flags, fixed-frame scale+pad+format filter,
+    //  and audio sample-rate flag all surface in the assembled command.
+    // =====================================================================
+
+    [Fact]
+    public void Scenario_iPod_Classic_1080p_to_640x480_baseline()
+    {
+        var probe = new ProbeBuilder()
+            .Video(codec: "h264", width: 1920, height: 1080, frameRate: "60/1")
+            .Audio(codec: "ac3", channels: 6, lang: "eng")
+            .Build();
+
+        var opts = new EncoderOptions
+        {
+            Format                = "mp4",
+            Codec                 = "h264",
+            Encoder               = "libx264",
+            FfmpegQualityPreset   = "medium",
+            TargetBitrate         = 1500,
+            StrictBitrate         = true,
+            FourKBitrateMultiplier = 1,
+            HardwareAcceleration  = "none",
+            FixedFrameSize        = "640x480",
+            VideoProfile          = "baseline",
+            VideoLevel            = "3.0",
+            MaxFrameRate          = 30,
+            TonemapHdrToSdr       = true,
+            PreserveOriginalAudio = false,
+            AudioOutputs          = new()
+            {
+                new AudioOutputProfile
+                {
+                    Codec        = "aac",
+                    Layout       = "Stereo",
+                    BitrateKbps  = 160,
+                    SampleRateHz = 48000,
+                },
+            },
+            AudioLanguagesToKeep    = new() { "en" },
+            SubtitleLanguagesToKeep = new() { "en" },
+        };
+        var item = new WorkItem { Bitrate = 8000, IsHevc = false, Probe = probe };
+
+        var cmd = BuildScenarioCommand(probe, opts, item,
+            inputPath: "/src/movie.mkv", outputPath: "/out/movie.mp4");
+
+        AssertWellFormed(cmd, "mp4", "/src/movie.mkv", "/out/movie.mp4");
+
+        // Video: software H.264 with Baseline profile + Level 3.0.
+        cmd.Should().Contain("-c:v libx264");
+        cmd.Should().Contain("-profile:v baseline");
+        cmd.Should().Contain("-level 3.0");
+        cmd.Should().Contain("-preset medium");
+
+        // Fixed-frame filter: scale to fit 640×480, pad to exact size, force yuv420p.
+        cmd.Should().Contain("scale=min(iw\\,640):min(ih\\,480):force_original_aspect_ratio=decrease");
+        cmd.Should().Contain("pad=640:480:(ow-iw)/2:(oh-ih)/2");
+        cmd.Should().Contain("format=yuv420p");
+
+        // Frame-rate cap: 60 fps source dropped to 30 for H.264 Level 3.0 conformance.
+        cmd.Should().Contain("fps=30");
+
+        // Strict bitrate: target = min = max = 1500k.
+        cmd.Should().Contain("-b:v 1500k");
+        cmd.Should().Contain("-minrate 1500k");
+        cmd.Should().Contain("-maxrate 1500k");
+
+        // Audio: AAC stereo, 160k, 48 kHz sample rate.
+        cmd.Should().Contain("-c:a:0 aac");
+        cmd.Should().Contain("-b:a:0 160k");
+        cmd.Should().Contain("-ac:a:0 2");
+        cmd.Should().Contain("-ar:a:0 48000");
     }
 }

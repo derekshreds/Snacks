@@ -21,13 +21,14 @@ public sealed class AuthConfig
     public string SessionSecret { get; set; } = "";
 
     /// <summary>
-    ///     Optional API key for the public read-only <c>/api/v1/*</c> surface consumed by
-    ///     external dashboards (Homarr, Glance, etc.). Matches Sonarr/Radarr conventions —
-    ///     the same key can be presented via <c>X-Api-Key</c> header or <c>?apiKey=</c>
-    ///     query string. Generated on demand from the security settings panel; absent
-    ///     until the user opts in.
+    ///     Optional API key accepted on <c>/api/*</c> via the <c>X-Api-Key</c> header, an
+    ///     <c>Authorization: Bearer</c> token, or a <c>?apiKey=</c> query string (the
+    ///     Sonarr/Radarr convention, for dashboards like Homarr that can only set a URL).
+    ///     Empty = no stored key. Plaintext, like the cluster shared secret — the config
+    ///     directory is the trust boundary. A key set via the <c>SNACKS_API_KEY</c> env var
+    ///     is honored independently of this field.
     /// </summary>
-    public string? ApiKey { get; set; }
+    public string ApiKey { get; set; } = "";
 
     /// <summary>
     ///     CSP <c>frame-ancestors</c> allowlist for the <c>/iframe/*</c> embed routes.

@@ -6,6 +6,27 @@ using Snacks.Services;
 namespace Snacks.Services.Cluster;
 
 /// <summary>
+///     Single source of truth for the transfer chunk-size envelope. The
+///     worker's ReceiveFile endpoint sizes its Kestrel request limit from
+///     <see cref="MaxChunkRequestBytes"/>, and the settings validation / UI /
+///     throttle all clamp to <see cref="MaxChunkSizeMB"/> — deriving both
+///     from one constant guarantees a user-configured chunk can never exceed
+///     what the receiving endpoint accepts (which used to 413 every chunk
+///     above ~71 MB and stall uploads in a 5-minute retry loop).
+/// </summary>
+public static class TransferLimits
+{
+    /// <summary> Smallest configurable chunk size, in MB. </summary>
+    public const int MinChunkSizeMB = 4;
+
+    /// <summary> Largest configurable chunk size, in MB. </summary>
+    public const int MaxChunkSizeMB = 256;
+
+    /// <summary> Request-body cap for the chunk-receive endpoint: max chunk + headroom for headers/encoding. </summary>
+    public const long MaxChunkRequestBytes = (long)MaxChunkSizeMB * 1024 * 1024 + 8_000_000;
+}
+
+/// <summary>
 ///     Master-side gate for cluster file transfers. Two independent layers:
 ///
 ///     <list type="bullet">
@@ -376,7 +397,8 @@ public sealed class TransferThrottle : IDisposable
     ///     The chunk size the master should use for uploads, in bytes. Lives
     ///     here so callers don't need to read settings directly.
     /// </summary>
-    public int ChunkSizeBytes => Math.Clamp(_snapshot.ChunkSizeMB, 4, 256) * 1024 * 1024;
+    public int ChunkSizeBytes => Math.Clamp(_snapshot.ChunkSizeMB,
+        TransferLimits.MinChunkSizeMB, TransferLimits.MaxChunkSizeMB) * 1024 * 1024;
 
     public void Dispose()
     {

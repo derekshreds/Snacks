@@ -125,16 +125,50 @@ public sealed class ClusterConfig
     public List<string> SharedStorageOutputPaths { get; set; } = new();
 
     /// <summary>
-    ///     Optional path translation applied on the node before
-    ///     <see cref="SharedStorageInputPaths"/> / <see cref="SharedStorageOutputPaths"/>
-    ///     allowlist checks. Lets the master see the share at one mount point while this
-    ///     node sees it at another (e.g. master mounts <c>/shared/movies</c>, node mounts
-    ///     <c>/mnt/nas/movies</c>). Single from/to pair — set both or neither.
+    ///     Legacy single-pair path translation. Superseded by
+    ///     <see cref="SharedStoragePathRewrites"/> — kept (and still honored) so
+    ///     existing configs keep working; <see cref="EffectiveRewrites"/> folds it in.
     /// </summary>
     public string? SharedStoragePathRewriteFrom { get; set; }
 
     /// <summary> Companion to <see cref="SharedStoragePathRewriteFrom"/>. </summary>
     public string? SharedStoragePathRewriteTo { get; set; }
+
+    /// <summary>
+    ///     Path translations applied on the node before the shared-storage allowlist
+    ///     checks. Lets the master see shares at one set of mount points while this
+    ///     node sees them at others (e.g. master <c>/shared/movies</c> → node
+    ///     <c>/mnt/nas/movies</c>, master <c>/shared/tv</c> → node <c>/mnt/nas2/tv</c>).
+    ///     A node mounting MULTIPLE shares needs one entry per prefix — the old single
+    ///     pair silently forced every second share back to upload mode.
+    /// </summary>
+    public List<SharedStorageRewrite> SharedStoragePathRewrites { get; set; } = new();
+
+    /// <summary>
+    ///     The rewrite list with the legacy single pair folded in (legacy last, so an
+    ///     explicit list entry for the same prefix wins). Longest prefix first so
+    ///     nested mounts resolve to the deepest match.
+    /// </summary>
+    public IReadOnlyList<SharedStorageRewrite> EffectiveRewrites()
+    {
+        var all = new List<SharedStorageRewrite>(SharedStoragePathRewrites);
+        if (!string.IsNullOrEmpty(SharedStoragePathRewriteFrom) && SharedStoragePathRewriteTo != null)
+            all.Add(new SharedStorageRewrite { From = SharedStoragePathRewriteFrom, To = SharedStoragePathRewriteTo });
+        return all
+            .Where(r => !string.IsNullOrEmpty(r.From) && r.To != null)
+            .OrderByDescending(r => r.From.Length)
+            .ToList();
+    }
+}
+
+/// <summary> One master-prefix → node-prefix translation for shared-storage dispatch. </summary>
+public sealed class SharedStorageRewrite
+{
+    /// <summary> Path prefix as the master sees it. </summary>
+    public string From { get; set; } = "";
+
+    /// <summary> Equivalent path prefix on this node. </summary>
+    public string To { get; set; } = "";
 }
 
 /// <summary>

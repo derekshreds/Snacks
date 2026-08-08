@@ -42,7 +42,7 @@ public sealed class SlotLedger
     ///     unknown / disabled / not-yet-reported devices — <see cref="TryReserve"/>
     ///     will refuse to reserve in that case.
     /// </param>
-    /// <param name="logger">Optional sink for release-reason logging. Defaults to <see cref="Console.WriteLine(string)"/>.</param>
+    /// <param name="logger">Optional sink for release-reason logging. Defaults to the persistent Serilog operations log.</param>
     public SlotLedger(Func<string, string, int> capacityResolver, Action<string>? logger = null)
     {
         _capacityResolver = capacityResolver ?? throw new ArgumentNullException(nameof(capacityResolver));
@@ -111,7 +111,7 @@ public sealed class SlotLedger
 
         var msg = $"SlotLedger: Released {jobId} on {removed.NodeId}/{removed.DeviceId} (phase={removed.Phase}, reason={reason})";
         if (_logger != null) _logger(msg);
-        else Console.WriteLine(msg);
+        else Log.Information(msg);
     }
 
     /// <summary>
@@ -240,5 +240,36 @@ public sealed class SlotLedger
     public void Clear()
     {
         lock (_writeLock) _reservations.Clear();
+    }
+
+    /// <summary>
+    ///     Atomically moves a reservation from <paramref name="oldJobId"/> to
+    ///     <paramref name="newJobId"/>. Used when dispatch reuses a previous
+    ///     job ID (upload resume) — every release path keys by the NEW ID, so
+    ///     without rekeying the old-ID reservation would occupy the slot until
+    ///     master restart. No-op if the old ID has no reservation; if the new
+    ///     ID is already reserved, the old row is dropped instead of duplicated.
+    /// </summary>
+    public void Rekey(string oldJobId, string newJobId)
+    {
+        if (string.IsNullOrEmpty(oldJobId) || string.IsNullOrEmpty(newJobId) || oldJobId == newJobId)
+            return;
+
+        lock (_writeLock)
+        {
+            if (!_reservations.TryRemove(oldJobId, out var r)) return;
+            if (_reservations.ContainsKey(newJobId)) return;
+            _reservations[newJobId] = new SlotReservation
+            {
+                JobId          = newJobId,
+                NodeId         = r.NodeId,
+                DeviceId       = r.DeviceId,
+                FileName       = r.FileName,
+                Phase          = r.Phase,
+                Progress       = r.Progress,
+                ReservedAt     = r.ReservedAt,
+                PhaseEnteredAt = r.PhaseEnteredAt,
+            };
+        }
     }
 }

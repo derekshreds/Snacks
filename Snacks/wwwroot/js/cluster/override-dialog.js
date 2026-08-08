@@ -17,7 +17,7 @@
 
 import { clusterApi, autoScanApi }                  from '../api.js';
 import { escapeHtml }                               from '../utils/dom.js';
-import { openModal, closeModal }                    from '../utils/modal-controller.js';
+import { openModal, closeModal, showConfirmModal }  from '../utils/modal-controller.js';
 import { defaultBitrateForCodec }                   from '../settings/encoder-form.js';
 import { initChipInput, getChipValues, setChipValues } from '../settings/chip-input.js';
 
@@ -29,25 +29,34 @@ import { initChipInput, getChipValues, setChipValues } from '../settings/chip-in
 const MODAL_ID = 'overrideDialog';
 
 /**
- * Folder-context fields. Mirrors what the main settings tabs expose, minus
- * HardwareAcceleration (each node auto-detects its own hardware).
+ * Folder-context fields. Mirrors what the main settings tabs expose. Nodes normally
+ * auto-detect their own hardware, but HardwareAcceleration is overridable so a folder
+ * can force software encoding — required for device profiles (e.g. iPod Classic), whose
+ * Baseline/level flags only apply on software encoders. A vendor mismatch on a given
+ * node falls back to software automatically (GetSoftwareFallbackEncoder).
  */
 const FOLDER_OVERRIDE_FIELDS = Object.freeze({
     // General
     Format:                     'select',
     Codec:                      'select',
+    HardwareAcceleration:       'select',
     TargetBitrate:              'number',
     StrictBitrate:              'bool',
     FourKBitrateMultiplier:     'select',
     Skip4K:                     'bool',
     SkipPercentAboveTarget:     'number',
+    QueuePriority:              'number',
     DeleteOriginalFile:         'bool',
     RetryOnFail:                'bool',
 
     // Video pipeline
     DownscalePolicy:            'select',
     DownscaleTarget:            'select',
+    FixedFrameSize:             'text',
+    MaxFrameRate:               'number',
     FfmpegQualityPreset:        'select',
+    VideoProfile:               'select',
+    VideoLevel:                 'select',
     TonemapHdrToSdr:            'bool',
     RemoveBlackBorders:         'bool',
 
@@ -88,7 +97,11 @@ const NODE_OVERRIDE_FIELDS = Object.freeze({
     // Video pipeline
     DownscalePolicy:            'select',
     DownscaleTarget:            'select',
+    FixedFrameSize:             'text',
+    MaxFrameRate:               'number',
     FfmpegQualityPreset:        'select',
+    VideoProfile:               'select',
+    VideoLevel:                 'select',
     TonemapHdrToSdr:            'bool',
     RemoveBlackBorders:         'bool',
 
@@ -116,6 +129,8 @@ const NUMBER_DEFAULTS = Object.freeze({
     TargetBitrate:          '3500',
     FourKBitrateMultiplier: '4',
     SkipPercentAboveTarget: '20',
+    QueuePriority:          '0',
+    MaxFrameRate:           '0',
 });
 
 
@@ -143,9 +158,11 @@ function ovrAppendAudioRow(profile = {}) {
     const codecSel  = row.querySelector('[data-field="Codec"]');
     const layoutSel = row.querySelector('[data-field="Layout"]');
     const bitrateIn = row.querySelector('[data-field="BitrateKbps"]');
+    const sampleRateSel = row.querySelector('[data-field="SampleRateHz"]');
 
     if (profile.Codec)  codecSel.value  = profile.Codec;
     if (profile.Layout) layoutSel.value = profile.Layout;
+    if (profile.SampleRateHz != null) sampleRateSel.value = String(profile.SampleRateHz);
     bitrateIn.value = (profile.BitrateKbps && profile.BitrateKbps > 0)
         ? profile.BitrateKbps
         : defaultBitrateForCodec(codecSel.value);
@@ -175,6 +192,7 @@ function ovrSetAudioOutputs(profiles) {
             Codec:       p.Codec       ?? p.codec,
             Layout:      p.Layout      ?? p.layout,
             BitrateKbps: p.BitrateKbps ?? p.bitrateKbps ?? 0,
+            SampleRateHz: p.SampleRateHz ?? p.sampleRateHz ?? 0,
         });
     }
 }
@@ -186,6 +204,7 @@ function ovrReadAudioOutputs() {
         Codec:       row.querySelector('[data-field="Codec"]')?.value       ?? 'aac',
         Layout:      row.querySelector('[data-field="Layout"]')?.value      ?? 'Source',
         BitrateKbps: parseInt(row.querySelector('[data-field="BitrateKbps"]')?.value, 10) || 0,
+        SampleRateHz: parseInt(row.querySelector('[data-field="SampleRateHz"]')?.value, 10) || 0,
     }));
 }
 
@@ -397,7 +416,9 @@ export class OverrideDialog {
                     <div class="ms-3" style="width: 110px;">
                         <label class="small text-muted mb-1" for="dev_max_${escapeHtml(d.deviceId)}">Max slots</label>
                         <input class="form-control form-control-sm device-max" type="number" min="0" max="16"
-                               id="dev_max_${escapeHtml(d.deviceId)}" value="${max}">
+                               id="dev_max_${escapeHtml(d.deviceId)}" value="${max}"
+                               data-default-concurrency="${Number.isInteger(d.defaultConcurrency) ? d.defaultConcurrency : ''}"
+                               data-had-override="${Number.isInteger(cur.maxConcurrency) ? '1' : '0'}">
                     </div>
                 </div>`;
         }).join('');
@@ -419,14 +440,25 @@ export class OverrideDialog {
         container.querySelectorAll('[data-device-id]').forEach(row => {
             const deviceId = row.dataset.deviceId;
             const enabled  = row.querySelector('.device-enabled')?.checked ?? true;
-            const maxRaw   = row.querySelector('.device-max')?.value;
+            const maxInput = row.querySelector('.device-max');
+            const maxRaw   = maxInput?.value;
             const max      = maxRaw === '' || maxRaw == null ? null : parseInt(maxRaw, 10);
 
-            // Only persist when user diverged from defaults. Anything else
-            // inherits worker-reported settings on every dispatch.
-            const diverged = !enabled || (Number.isInteger(max) && max >= 0);
-            if (diverged)
-                result[deviceId] = { enabled, maxConcurrency: Number.isInteger(max) ? max : null };
+            // Only persist when the user diverged from defaults. The slot input
+            // is PRE-FILLED with the device default, so "has any integer ≥ 0"
+            // was always true — every save pinned every device to that day's
+            // default, permanently shadowing future worker-reported changes.
+            // Compare against the rendered default instead — but an EXISTING
+            // explicit pin stays pinned even when its value matches today's
+            // default (the user pinned it on purpose; Reset to Defaults is the
+            // way to unpin).
+            const defaultMax  = parseInt(maxInput?.dataset.defaultConcurrency ?? '', 10);
+            const hadOverride = maxInput?.dataset.hadOverride === '1';
+            const maxValid    = Number.isInteger(max) && max >= 0;
+            const maxDiverged = maxValid && (!Number.isInteger(defaultMax) || max !== defaultMax);
+            const pinMax      = maxValid && (maxDiverged || hadOverride);
+            if (!enabled || pinMax)
+                result[deviceId] = { enabled, maxConcurrency: pinMax ? max : null };
         });
         return result;
     }
@@ -437,6 +469,16 @@ export class OverrideDialog {
      * @param {string} nodeId
      */
     async _deleteNode(nodeId) {
+        // One click used to wipe every override for the node with no warning —
+        // far less destructive actions (clear scan history) already confirm.
+        const ok = await showConfirmModal(
+            'Reset node settings?',
+            'All overrides for this node (encoder settings, device slots, 4K rules) '
+            + 'will be deleted and the node will inherit the global defaults. Continue?',
+            'Reset to defaults',
+        );
+        if (!ok) return;
+
         try {
             await clusterApi.deleteNodeSettings(nodeId);
             showToast('Node settings reset to defaults', 'success');
@@ -509,6 +551,14 @@ export class OverrideDialog {
      * @param {string} path
      */
     async _resetFolder(path) {
+        const ok = await showConfirmModal(
+            'Reset folder settings?',
+            'All encoding overrides for this folder will be deleted and files under it '
+            + 'will use the global settings. Continue?',
+            'Reset to defaults',
+        );
+        if (!ok) return;
+
         try {
             await clusterApi.saveFolderSettings(path, null);
             showToast('Folder settings reset to defaults', 'success');
@@ -746,9 +796,19 @@ export class OverrideDialog {
                 continue;
             }
 
-            if      (type === 'bool')   result[key] = el.checked;
-            else if (type === 'number') result[key] = parseInt(el.value) || 0;
-            else                        result[key] = el.value;
+            if (type === 'bool') {
+                result[key] = el.checked;
+            }
+            else if (type === 'number') {
+                // Blank/invalid means "no value" → null (override off), NOT 0.
+                // `|| 0` used to persist targetBitrate: 0 for an enabled-but-
+                // blank field, which Apply() happily forced onto every encode.
+                const n = parseInt(el.value, 10);
+                result[key] = Number.isNaN(n) ? null : n;
+            }
+            else {
+                result[key] = el.value;
+            }
         }
 
         return result;

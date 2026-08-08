@@ -43,7 +43,7 @@ public sealed class EncoderOptions
      *  Core Video
      ******************************************************************/
 
-    /// <summary> Output container format (e.g. "mkv", "mp4"). </summary>
+    /// <summary> Output container format ("mkv", "mp4", or "webm"). WebM coerces the video codec to AV1 and audio to Opus per the WebM spec. </summary>
     public string Format { get; set; } = "mkv";
 
     /// <summary> Logical codec name (e.g. "h265", "h264"). </summary>
@@ -66,6 +66,19 @@ public sealed class EncoderOptions
 
     /// <summary> FFmpeg quality preset string (e.g. "medium", "slow"). </summary>
     public string FfmpegQualityPreset { get; set; } = "medium";
+
+    /// <summary>
+    ///     H.264/H.265 profile (e.g. "baseline", "main", "high"). Empty/whitespace
+    ///     uses the encoder's default. Only emitted for software encoders (libx264/libx265)
+    ///     since hardware encoders have varying profile value sets.
+    /// </summary>
+    public string? VideoProfile { get; set; }
+
+    /// <summary>
+    ///     H.264/H.265 level as a decimal string (e.g. "1.3", "3.0", "4.0").
+    ///     Empty/whitespace uses the encoder's default.
+    /// </summary>
+    public string? VideoLevel { get; set; }
 
     /******************************************************************
      *  Audio
@@ -173,11 +186,31 @@ public sealed class EncoderOptions
      *  Video Pipeline
      ******************************************************************/
 
-    /// <summary> Downscale policy: "Never", "Always", or "IfLarger". </summary>
+    /// <summary>
+    ///     Downscale policy: "Never", "CapAtTarget", or "Always" (the values the UI writes).
+    ///     The legacy alias "IfLarger" is still accepted by the backend and mapped to
+    ///     "CapAtTarget" on settings restore.
+    /// </summary>
     public string DownscalePolicy { get; set; } = "Never";
 
     /// <summary> Target resolution for downscaling (e.g. "1080p", "720p"). </summary>
     public string DownscaleTarget { get; set; } = "1080p";
+
+    /// <summary>
+    ///     When set (e.g. "640x480"), scales and pads to this exact frame size with
+    ///     letterboxing and forces <c>yuv420p</c> pixel format. Overrides the normal
+    ///     downscale policy/target. Used by device-specific presets (e.g. iPod Classic
+    ///     requires a strict 640×480 frame).
+    /// </summary>
+    public string? FixedFrameSize { get; set; }
+
+    /// <summary>
+    ///     Maximum output frame rate in fps. <c>0</c> (default) means "no cap" — the
+    ///     source rate is preserved. When set, sources faster than this are dropped to
+    ///     the cap via an <c>fps=</c> filter; slower sources are left untouched. Used by
+    ///     device-specific presets (e.g. iPod Classic requires ≤30 fps for H.264 Level 3.0).
+    /// </summary>
+    public int MaxFrameRate { get; set; } = 0;
 
     /// <summary> When <see langword="true"/>, HDR content is tone-mapped to SDR before encoding. </summary>
     public bool TonemapHdrToSdr { get; set; } = false;
@@ -198,14 +231,56 @@ public sealed class EncoderOptions
     /// <summary> Percentage above target bitrate at which an already-efficient file is skipped. </summary>
     public int SkipPercentAboveTarget { get; set; } = 20;
 
+    /// <summary>
+    ///     Number of days to retain per-job FFmpeg log files in <c>{workdir}/logs/</c>.
+    ///     <c>0</c> disables the sweep (keep forever). The Serilog rolling app log
+    ///     (<c>snacks-*.log</c>) is unaffected — it has its own 7-day / 10MB cap.
+    /// </summary>
+    public int EncodingLogRetentionDays { get; set; } = 7;
+
+    /// <summary>
+    ///     Daily budget for the rolling deep-verifier (ffmpeg decode samples per file,
+    ///     oldest-verified first). <c>0</c> (default) disables it. Spread evenly across
+    ///     hourly ticks so the I/O cost is a trickle, not a nightly storm.
+    /// </summary>
+    public int VerifyFilesPerDay { get; set; } = 0;
+
+    /// <summary>
+    ///     When <see langword="true"/>, the pending-queue tiebreaker (after user/folder
+    ///     priority) is recency — newest files first — instead of bitrate descending.
+    ///     The right setting for "convert new downloads before the backlog".
+    /// </summary>
+    public bool QueueNewestFirst { get; set; } = false;
+
     /// <summary> Optional output directory override. When <see langword="null"/>, output is written beside the source. </summary>
     public string? OutputDirectory { get; set; }
 
     /// <summary> Optional intermediate encode directory. When <see langword="null"/>, the system temp directory is used. </summary>
     public string? EncodeDirectory { get; set; }
 
-    /// <summary> Hardware acceleration mode (e.g. "auto", "nvenc", "vaapi", "none"). </summary>
-    public string HardwareAcceleration { get; set; } = "auto";
+    /// <summary>
+    ///     Hardware acceleration mode: "auto", "intel", "amd", "nvidia", "apple", or "none"
+    ///     (the values the UI writes). Legacy aliases ("nvenc", "vaapi", "qsv", "amf") are
+    ///     normalized in the setter so every load path is covered — headless and cluster
+    ///     nodes deserialize settings.json without ever running the browser form, and an
+    ///     unmapped alias falls through the encoder switches to silent software encoding.
+    ///     "vaapi" is vendor-ambiguous (Intel AND AMD use VAAPI on Linux) and maps to
+    ///     "auto" so hardware detection resolves the actual vendor.
+    /// </summary>
+    public string HardwareAcceleration
+    {
+        get => _hardwareAcceleration;
+        set => _hardwareAcceleration = value?.ToLowerInvariant() switch
+        {
+            "nvenc" or "cuda" => "nvidia",
+            "qsv"             => "intel",
+            "amf"             => "amd",
+            "vaapi"           => "auto",
+            null or ""        => "auto",
+            var v             => v,
+        };
+    }
+    private string _hardwareAcceleration = "auto";
 
     /// <summary>
     ///     Linux VAAPI device node path for the GPU that should service this job
@@ -249,6 +324,8 @@ public sealed class EncoderOptions
         FourKBitrateMultiplier     = FourKBitrateMultiplier,
         Skip4K                     = Skip4K,
         FfmpegQualityPreset        = FfmpegQualityPreset,
+        VideoProfile               = VideoProfile,
+        VideoLevel                 = VideoLevel,
         TwoChannelAudio            = TwoChannelAudio,
         AudioLanguagesToKeep       = new List<string>(AudioLanguagesToKeep),
         KeepOriginalLanguage       = KeepOriginalLanguage,
@@ -268,11 +345,16 @@ public sealed class EncoderOptions
         AutoSetDefaultTrack        = AutoSetDefaultTrack,
         DownscalePolicy            = DownscalePolicy,
         DownscaleTarget            = DownscaleTarget,
+        FixedFrameSize             = FixedFrameSize,
+        MaxFrameRate               = MaxFrameRate,
         TonemapHdrToSdr            = TonemapHdrToSdr,
         RemoveBlackBorders         = RemoveBlackBorders,
         DeleteOriginalFile         = DeleteOriginalFile,
         RetryOnFail                = RetryOnFail,
         SkipPercentAboveTarget     = SkipPercentAboveTarget,
+        EncodingLogRetentionDays   = EncodingLogRetentionDays,
+        VerifyFilesPerDay          = VerifyFilesPerDay,
+        QueueNewestFirst           = QueueNewestFirst,
         OutputDirectory            = OutputDirectory,
         EncodeDirectory            = EncodeDirectory,
         HardwareAcceleration       = HardwareAcceleration,

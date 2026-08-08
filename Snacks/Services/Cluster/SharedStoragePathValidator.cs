@@ -149,13 +149,15 @@ public static class SharedStoragePathValidator
 
     private static string ApplyRewrite(string raw, ClusterConfig config)
     {
-        var from = config.SharedStoragePathRewriteFrom;
-        var to   = config.SharedStoragePathRewriteTo;
-        if (string.IsNullOrEmpty(from) || to is null) return raw;
-
-        // Match on the exact prefix only — a substring match would silently rewrite
-        // unrelated paths that happen to contain the same text.
-        if (raw.StartsWith(from, PathComparison)) return to + raw.Substring(from.Length);
+        // EffectiveRewrites is longest-prefix-first (legacy single pair folded in),
+        // so nested mounts resolve to the deepest match and the first hit wins.
+        foreach (var rewrite in config.EffectiveRewrites())
+        {
+            // Match on the exact prefix only — a substring match would silently
+            // rewrite unrelated paths that happen to contain the same text.
+            if (raw.StartsWith(rewrite.From, PathComparison))
+                return rewrite.To + raw.Substring(rewrite.From.Length);
+        }
         return raw;
     }
 

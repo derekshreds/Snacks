@@ -155,7 +155,14 @@ export class ClusterDashboard {
         // Status transitions (started, completed, failed) need a fresh
         // server-side list. Debounce to avoid storming /status on a busy queue.
         if (this._refreshHandle) clearTimeout(this._refreshHandle);
-        this._refreshHandle = setTimeout(() => this.loadStatus().then(() => this.render()), 500);
+        this._refreshHandle = setTimeout(() => {
+            // Skip the two status fetches when the cluster panel isn't mounted —
+            // this handler is wired session-long to WorkItemUpdated, so without
+            // the guard every local job tick fires background API calls while
+            // the user is on the dashboard or logs page.
+            if (!document.getElementById('clusterPanel')) return;
+            this.loadStatus().then(() => this.render());
+        }, 500);
     }
 
     /** `ClusterConfigChanged` — role / enabled flipped; repaint and notify dependents. */
@@ -501,6 +508,12 @@ export class ClusterDashboard {
     redraw() {
         this.render();
         this._updateBanner();
+        // The WorkItemUpdated debounce skips its status fetch while the panel
+        // is unmounted (no point fetching for an invisible panel), so refresh
+        // once here to catch anything the panel missed while we were away.
+        if (this._enabled || this._nodeId) {
+            this.loadStatus().then(() => this.render()).catch(() => {});
+        }
     }
 
     /**

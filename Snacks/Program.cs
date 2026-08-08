@@ -95,7 +95,10 @@ else
                     bindAllInterfaces = true;
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "Could not read cluster configuration while selecting the listen address");
+            }
         }
     }
 }
@@ -103,6 +106,14 @@ else
 // Parse the port from the resolved listen URL.
 var normalizedUrl = listenUrl.Split(';')[0].Replace("://+", "://0.0.0.0").Replace("://*", "://0.0.0.0");
 var listenPort = new Uri(normalizedUrl).Port;
+
+// The explicit Kestrel config below overrides HTTP_PORTS / DOTNET_URLS / appsettings
+// endpoints, so name the one variable that actually works while the reader is looking
+// at startup output trying to move the port.
+Log.Information(
+    $"Listening on {(bindAllInterfaces ? "0.0.0.0" : "localhost")}:{listenPort} — " +
+    "set ASPNETCORE_URLS (e.g. http://0.0.0.0:7070) to change the port; " +
+    "HTTP_PORTS and DOTNET_URLS are not honored");
 
 builder.WebHost.ConfigureKestrel(serverOptions =>
 {
@@ -135,6 +146,19 @@ builder.Services.AddControllersWithViews()
         options.JsonSerializerOptions.Converters.Add(new Snacks.Json.UtcDateTimeConverter());
         options.JsonSerializerOptions.Converters.Add(new Snacks.Json.NullableUtcDateTimeConverter());
     });
+
+// Machine-readable contract for the supported UI/public JSON API. Cluster RPC
+// routes are an internal protocol and intentionally excluded.
+builder.Services.AddOpenApi("v1", options =>
+{
+    options.ShouldInclude = description =>
+    {
+        var path = description.RelativePath ?? "";
+        return (path.StartsWith("api/", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(path, "metrics", StringComparison.OrdinalIgnoreCase))
+            && !path.StartsWith("api/cluster/", StringComparison.OrdinalIgnoreCase);
+    };
+});
 
 builder.Services.AddSignalR()
     .AddJsonProtocol(options =>
@@ -190,6 +214,9 @@ builder.Services.AddSingleton<Snacks.Services.Ocr.NativeOcrService>();
 builder.Services.AddSingleton<SubtitleExtractionService>();
 builder.Services.AddSingleton<AuthService>();
 builder.Services.AddSingleton<TranscodingService>();
+builder.Services.AddSingleton<LibraryAnalysisJobService>();
+builder.Services.AddSingleton<FileHealthService>();
+builder.Services.AddHostedService<RollingVerificationService>();
 builder.Services.AddSingleton<StateTransitionService>();
 // Per-kind dispatch routers. Adding a new MediaKind = a new IJobKindRouter
 // registration here; no other site needs touching.
@@ -212,6 +239,7 @@ builder.Services.AddScoped<ClusterAuthFilter>();
 builder.Services.AddScoped<LocalNetworkOnlyFilter>();
 builder.Services.AddSingleton<AutoScanService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<AutoScanService>());
+builder.Services.AddHostedService<LogRetentionService>();
 
 var app = builder.Build();
 
@@ -252,5 +280,13 @@ app.MapControllerRoute(
 
 app.MapControllers(); // Attribute-routed controllers (ClusterController)
 app.MapHub<TranscodingHub>("/transcodingHub");
+app.MapOpenApi("/openapi/{documentName}.json");
 
-app.Run();
+try
+{
+    app.Run();
+}
+finally
+{
+    Log.CloseAndFlush();
+}

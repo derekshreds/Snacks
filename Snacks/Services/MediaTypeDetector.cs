@@ -69,16 +69,28 @@ public static class MediaTypeDetector
     /// </summary>
     public static (string Title, int? Year) ExtractMovieTitle(string path)
     {
-        string name = Path.GetFileNameWithoutExtension(path) ?? "";
-        name = TrailingBracketsOrParens.Replace(name, " ");
+        string raw = Path.GetFileNameWithoutExtension(path) ?? "";
 
+        // Find the year BEFORE stripping brackets/parens — the Arr-standard
+        // "Title (2010)" form keeps its year inside parens, so stripping first
+        // discarded the year for the single most common naming convention and
+        // crippled TMDb disambiguation for remakes.
+        // Use the LAST year-looking token: release years follow the title, and
+        // titles can open with one ("2001 A Space Odyssey (1968)"). Never cut at
+        // index 0 — that would leave an empty title.
         int? year = null;
-        var ym = YearPattern.Match(name);
-        if (ym.Success)
+        int yearIndex = -1;
+        foreach (Match m in YearPattern.Matches(raw))
         {
-            if (int.TryParse(ym.Groups[1].Value, out int y)) year = y;
-            name = name.Substring(0, ym.Index);
+            if (m.Index > 0 && int.TryParse(m.Groups[1].Value, out int y))
+            {
+                year = y;
+                yearIndex = m.Index;
+            }
         }
+
+        string name = yearIndex > 0 ? raw.Substring(0, yearIndex) : raw;
+        name = TrailingBracketsOrParens.Replace(name, " ");
         name = name.Replace('.', ' ').Replace('_', ' ');
         name = Regex.Replace(name, @"\s+", " ").Trim();
         return (name, year);
