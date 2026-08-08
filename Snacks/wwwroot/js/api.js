@@ -94,6 +94,28 @@ export const settingsApi = {
      */
     reevaluate: ({ forceRetryNoSavings = false } = {}) =>
         postJson(`/api/settings/reevaluate?forceRetryNoSavings=${forceRetryNoSavings ? 'true' : 'false'}`),
+
+    /** Runtime-detected H.264/HEVC/AV1 encoder catalog and worker availability. */
+    getVideoEncoders: (refresh = false) =>
+        getJson(`/api/settings/video-encoders${refresh ? '?refresh=true' : ''}`),
+
+    /** Validates staged advanced-video configuration and returns literal FFmpeg preview tokens. */
+    validateAdvancedVideo: (advancedVideo, { profileId = null, sourceFacts = null } = {}) =>
+        postJson('/api/settings/advanced-video/validate', { advancedVideo, profileId, sourceFacts }),
+
+    /** Read-only preview of what a staged policy would decide for every tracked video file. */
+    impactAdvancedVideo: (advancedVideo, fileQuery = null) =>
+        postJson('/api/settings/advanced-video/impact', { advancedVideo, fileQuery }),
+
+    /** Measured per-profile results from the encode-history ledger. */
+    measuredAdvancedVideo: () => getJson('/api/settings/advanced-video/measured'),
+
+    /** User-saved Advanced Video policy templates (server-side, config dir). */
+    advancedVideoTemplates: {
+        list: () => getJson('/api/settings/advanced-video/templates'),
+        save: (name, advancedVideo) => postJson('/api/settings/advanced-video/templates', { name, advancedVideo }),
+        remove: name => deleteJson(`/api/settings/advanced-video/templates/${encodeURIComponent(name)}`),
+    },
 };
 
 

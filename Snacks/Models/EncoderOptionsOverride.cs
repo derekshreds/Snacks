@@ -7,6 +7,16 @@ namespace Snacks.Models;
 /// </summary>
 public sealed class EncoderOptionsOverride
 {
+    /// <summary>
+    ///     Watched-folder policy selection. Null/Inherit evaluates the global rules,
+    ///     Simple bypasses them, and Profile pins <see cref="AdvancedVideoProfileId"/>.
+    ///     Node dialogs intentionally do not expose these fields.
+    /// </summary>
+    public AdvancedVideoFolderPolicy? AdvancedVideoPolicy { get; set; }
+
+    /// <summary>Global video profile selected when <see cref="AdvancedVideoPolicy"/> is Profile.</summary>
+    public Guid? AdvancedVideoProfileId { get; set; }
+
     /******************************************************************
      *  Core Video
      ******************************************************************/

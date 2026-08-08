@@ -1,0 +1,502 @@
+{
+  "templates": [
+    {
+      "key": "av1-everything",
+      "name": "Convert everything to AV1",
+      "advancedVideo": {
+        "version": 1,
+        "enabled": true,
+        "profiles": [
+          {
+            "id": "00000000-0000-4000-8000-000000000001",
+            "name": "AV1 quality (CRF 32)",
+            "codec": "av1",
+            "encoderSelection": "Automatic",
+            "encoder": null,
+            "hardwareAcceleration": "none",
+            "rateControl": {
+              "mode": "Quality",
+              "targetKbps": 3500,
+              "minKbps": null,
+              "maxKbps": null,
+              "bufferKbits": null,
+              "strictBitrate": false,
+              "quality": 32
+            },
+            "preset": null,
+            "threads": 0,
+            "pixelFormat": null,
+            "gopSize": 0,
+            "videoProfile": null,
+            "videoLevel": null,
+            "downscalePolicy": "Never",
+            "downscaleTarget": "1080p",
+            "fixedFrameSize": null,
+            "maxFrameRate": 0,
+            "tonemapHdrToSdr": false,
+            "removeBlackBorders": false,
+            "additionalVideoFilters": [],
+            "customOptions": [],
+            "outputRetention": "AlwaysKeep"
+          }
+        ],
+        "rules": [
+          {
+            "id": "00000000-0000-4000-8000-0000000001f5",
+            "name": "Not AV1 yet",
+            "enabled": true,
+            "match": "All",
+            "conditions": [
+              {
+                "field": "Codec",
+                "operator": "IsNot",
+                "values": [
+                  "av1"
+                ]
+              }
+            ],
+            "action": "TranscodeWithProfile",
+            "profileId": "00000000-0000-4000-8000-000000000001"
+          },
+          {
+            "id": "00000000-0000-4000-8000-0000000001f6",
+            "name": "Already AV1 — leave alone",
+            "enabled": true,
+            "match": "All",
+            "conditions": [
+              {
+                "field": "Codec",
+                "operator": "Is",
+                "values": [
+                  "av1"
+                ]
+              }
+            ],
+            "action": "Skip",
+            "profileId": null
+          }
+        ],
+        "defaultAction": "UseSimpleSettings",
+        "defaultProfileId": null
+      }
+    },
+    {
+      "key": "av1-tiered",
+      "name": "Tiered AV1 (1080p + 4K)",
+      "advancedVideo": {
+        "version": 1,
+        "enabled": true,
+        "profiles": [
+          {
+            "id": "00000000-0000-4000-8000-0000000003e9",
+            "name": "AV1 4K (CRF 32)",
+            "codec": "av1",
+            "encoderSelection": "Automatic",
+            "encoder": null,
+            "hardwareAcceleration": "none",
+            "rateControl": {
+              "mode": "Quality",
+              "targetKbps": 3500,
+              "minKbps": null,
+              "maxKbps": null,
+              "bufferKbits": null,
+              "strictBitrate": false,
+              "quality": 32
+            },
+            "preset": null,
+            "threads": 0,
+            "pixelFormat": null,
+            "gopSize": 0,
+            "videoProfile": null,
+            "videoLevel": null,
+            "downscalePolicy": "Never",
+            "downscaleTarget": "1080p",
+            "fixedFrameSize": null,
+            "maxFrameRate": 0,
+            "tonemapHdrToSdr": false,
+            "removeBlackBorders": false,
+            "additionalVideoFilters": [],
+            "customOptions": [],
+            "outputRetention": "AlwaysKeep"
+          },
+          {
+            "id": "00000000-0000-4000-8000-0000000003ea",
+            "name": "AV1 1080p and below (CRF 35)",
+            "codec": "av1",
+            "encoderSelection": "Automatic",
+            "encoder": null,
+            "hardwareAcceleration": "none",
+            "rateControl": {
+              "mode": "Quality",
+              "targetKbps": 3500,
+              "minKbps": null,
+              "maxKbps": null,
+              "bufferKbits": null,
+              "strictBitrate": false,
+              "quality": 35
+            },
+            "preset": null,
+            "threads": 0,
+            "pixelFormat": null,
+            "gopSize": 0,
+            "videoProfile": null,
+            "videoLevel": null,
+            "downscalePolicy": "Never",
+            "downscaleTarget": "1080p",
+            "fixedFrameSize": null,
+            "maxFrameRate": 0,
+            "tonemapHdrToSdr": false,
+            "removeBlackBorders": false,
+            "additionalVideoFilters": [],
+            "customOptions": [],
+            "outputRetention": "AlwaysKeep"
+          }
+        ],
+        "rules": [
+          {
+            "id": "00000000-0000-4000-8000-0000000005dd",
+            "name": "4K sources",
+            "enabled": true,
+            "match": "All",
+            "conditions": [
+              {
+                "field": "Codec",
+                "operator": "IsNot",
+                "values": [
+                  "av1"
+                ]
+              },
+              {
+                "field": "ResolutionClass",
+                "operator": "Is",
+                "values": [
+                  "2160p+"
+                ]
+              }
+            ],
+            "action": "TranscodeWithProfile",
+            "profileId": "00000000-0000-4000-8000-0000000003e9"
+          },
+          {
+            "id": "00000000-0000-4000-8000-0000000005de",
+            "name": "Everything else",
+            "enabled": true,
+            "match": "All",
+            "conditions": [
+              {
+                "field": "Codec",
+                "operator": "IsNot",
+                "values": [
+                  "av1"
+                ]
+              }
+            ],
+            "action": "TranscodeWithProfile",
+            "profileId": "00000000-0000-4000-8000-0000000003ea"
+          },
+          {
+            "id": "00000000-0000-4000-8000-0000000005df",
+            "name": "Already AV1 — leave alone",
+            "enabled": true,
+            "match": "All",
+            "conditions": [
+              {
+                "field": "Codec",
+                "operator": "Is",
+                "values": [
+                  "av1"
+                ]
+              }
+            ],
+            "action": "Skip",
+            "profileId": null
+          }
+        ],
+        "defaultAction": "UseSimpleSettings",
+        "defaultProfileId": null
+      }
+    },
+    {
+      "key": "hevc-saver",
+      "name": "HEVC space saver",
+      "advancedVideo": {
+        "version": 1,
+        "enabled": true,
+        "profiles": [
+          {
+            "id": "00000000-0000-4000-8000-0000000007d1",
+            "name": "HEVC quality (CRF 24)",
+            "codec": "h265",
+            "encoderSelection": "Automatic",
+            "encoder": null,
+            "hardwareAcceleration": "none",
+            "rateControl": {
+              "mode": "Quality",
+              "targetKbps": 3500,
+              "minKbps": null,
+              "maxKbps": null,
+              "bufferKbits": null,
+              "strictBitrate": false,
+              "quality": 24
+            },
+            "preset": null,
+            "threads": 0,
+            "pixelFormat": null,
+            "gopSize": 0,
+            "videoProfile": null,
+            "videoLevel": null,
+            "downscalePolicy": "Never",
+            "downscaleTarget": "1080p",
+            "fixedFrameSize": null,
+            "maxFrameRate": 0,
+            "tonemapHdrToSdr": false,
+            "removeBlackBorders": false,
+            "additionalVideoFilters": [],
+            "customOptions": [],
+            "outputRetention": "AlwaysKeep"
+          }
+        ],
+        "rules": [
+          {
+            "id": "00000000-0000-4000-8000-0000000009c5",
+            "name": "Older codecs",
+            "enabled": true,
+            "match": "All",
+            "conditions": [
+              {
+                "field": "Codec",
+                "operator": "NotIn",
+                "values": [
+                  "h265",
+                  "av1"
+                ]
+              }
+            ],
+            "action": "TranscodeWithProfile",
+            "profileId": "00000000-0000-4000-8000-0000000007d1"
+          },
+          {
+            "id": "00000000-0000-4000-8000-0000000009c6",
+            "name": "Modern codecs — leave alone",
+            "enabled": true,
+            "match": "All",
+            "conditions": [
+              {
+                "field": "Codec",
+                "operator": "In",
+                "values": [
+                  "h265",
+                  "av1"
+                ]
+              }
+            ],
+            "action": "Skip",
+            "profileId": null
+          }
+        ],
+        "defaultAction": "UseSimpleSettings",
+        "defaultProfileId": null
+      }
+    },
+    {
+      "key": "libaom-expert",
+      "name": "Fine-tuned libaom-av1",
+      "advancedVideo": {
+        "version": 1,
+        "enabled": true,
+        "profiles": [
+          {
+            "id": "00000000-0000-4000-8000-000000000bb9",
+            "name": "AV1 libaom 1080p CQ 35",
+            "codec": "av1",
+            "encoderSelection": "Explicit",
+            "encoder": "libaom-av1",
+            "hardwareAcceleration": "none",
+            "rateControl": {
+              "mode": "Quality",
+              "targetKbps": 3500,
+              "minKbps": null,
+              "maxKbps": null,
+              "bufferKbits": null,
+              "strictBitrate": false,
+              "quality": 35
+            },
+            "preset": "4",
+            "threads": 8,
+            "pixelFormat": "yuv420p10le",
+            "gopSize": 300,
+            "videoProfile": null,
+            "videoLevel": null,
+            "downscalePolicy": "Never",
+            "downscaleTarget": "1080p",
+            "fixedFrameSize": null,
+            "maxFrameRate": 0,
+            "tonemapHdrToSdr": false,
+            "removeBlackBorders": false,
+            "additionalVideoFilters": [],
+            "customOptions": [
+              {
+                "option": "-aq-mode",
+                "values": [
+                  "1"
+                ]
+              },
+              {
+                "option": "-tune",
+                "values": [
+                  "ssim"
+                ]
+              },
+              {
+                "option": "-lag-in-frames",
+                "values": [
+                  "35"
+                ]
+              },
+              {
+                "option": "-arnr-max-frames",
+                "values": [
+                  "15"
+                ]
+              },
+              {
+                "option": "-arnr-strength",
+                "values": [
+                  "4"
+                ]
+              },
+              {
+                "option": "-aom-params",
+                "values": [
+                  "tune=ssim:cq-level=35:cpu-used=4:noise-sensitivity=2:tune-content=default:arnr-strength=4:arnr-maxframes=15:enable-qm=1:enable-chroma-deltaq=1:quant-b-adapt=1"
+                ]
+              }
+            ],
+            "outputRetention": "AlwaysKeep"
+          },
+          {
+            "id": "00000000-0000-4000-8000-000000000bba",
+            "name": "AV1 libaom 4K CQ 32",
+            "codec": "av1",
+            "encoderSelection": "Explicit",
+            "encoder": "libaom-av1",
+            "hardwareAcceleration": "none",
+            "rateControl": {
+              "mode": "Quality",
+              "targetKbps": 14000,
+              "minKbps": null,
+              "maxKbps": null,
+              "bufferKbits": null,
+              "strictBitrate": false,
+              "quality": 32
+            },
+            "preset": "3",
+            "threads": 12,
+            "pixelFormat": "yuv420p10le",
+            "gopSize": 300,
+            "videoProfile": null,
+            "videoLevel": null,
+            "downscalePolicy": "Never",
+            "downscaleTarget": "4K",
+            "fixedFrameSize": null,
+            "maxFrameRate": 0,
+            "tonemapHdrToSdr": false,
+            "removeBlackBorders": false,
+            "additionalVideoFilters": [],
+            "customOptions": [
+              {
+                "option": "-aq-mode",
+                "values": [
+                  "1"
+                ]
+              },
+              {
+                "option": "-tune",
+                "values": [
+                  "ssim"
+                ]
+              },
+              {
+                "option": "-lag-in-frames",
+                "values": [
+                  "35"
+                ]
+              },
+              {
+                "option": "-arnr-max-frames",
+                "values": [
+                  "15"
+                ]
+              },
+              {
+                "option": "-arnr-strength",
+                "values": [
+                  "4"
+                ]
+              },
+              {
+                "option": "-aom-params",
+                "values": [
+                  "tune=ssim:cq-level=32:cpu-used=3:noise-sensitivity=2:tune-content=default:arnr-strength=4:arnr-maxframes=15:enable-qm=1:enable-chroma-deltaq=1:quant-b-adapt=1"
+                ]
+              }
+            ],
+            "outputRetention": "AlwaysKeep"
+          }
+        ],
+        "rules": [
+          {
+            "id": "00000000-0000-4000-8000-000000000dad",
+            "name": "Non-AV1 4K sources",
+            "enabled": true,
+            "match": "All",
+            "conditions": [
+              {
+                "field": "Codec",
+                "operator": "IsNot",
+                "values": [
+                  "av1"
+                ]
+              },
+              {
+                "field": "ResolutionClass",
+                "operator": "Is",
+                "values": [
+                  "2160p+"
+                ]
+              }
+            ],
+            "action": "TranscodeWithProfile",
+            "profileId": "00000000-0000-4000-8000-000000000bba"
+          },
+          {
+            "id": "00000000-0000-4000-8000-000000000dae",
+            "name": "Other non-AV1 sources",
+            "enabled": true,
+            "match": "All",
+            "conditions": [
+              {
+                "field": "Codec",
+                "operator": "IsNot",
+                "values": [
+                  "av1"
+                ]
+              },
+              {
+                "field": "ResolutionClass",
+                "operator": "NotIn",
+                "values": [
+                  "2160p+"
+                ]
+              }
+            ],
+            "action": "TranscodeWithProfile",
+            "profileId": "00000000-0000-4000-8000-000000000bb9"
+          }
+        ],
+        "defaultAction": "UseSimpleSettings",
+        "defaultProfileId": null
+      }
+    }
+  ]
+}

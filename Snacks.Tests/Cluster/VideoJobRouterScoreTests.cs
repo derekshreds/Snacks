@@ -43,6 +43,7 @@ public sealed class VideoJobRouterScoreTests
     {
         DeviceId = "cpu",
         SupportedCodecs = new List<string> { "h264", "h265", "av1" },
+        Encoders = new List<string> { "libx264", "libx265", "libsvtav1", "libaom-av1" },
         DefaultConcurrency = 1,
         IsHardware = true,
     };
@@ -105,5 +106,66 @@ public sealed class VideoJobRouterScoreTests
         var node = NodeWith(cpu);
 
         Score(node, cpu, "amd", "av1").Should().BeGreaterThan(0);
+    }
+
+    [Fact]
+    public void Advanced_job_rejects_legacy_worker_but_simple_job_remains_eligible()
+    {
+        var cpu = Cpu();
+        var node = NodeWith(cpu); // Missing protocol field deserializes/defaults to 0.
+        var options = new EncoderOptions { Codec = "av1", HardwareAcceleration = "none" };
+        var advanced = new WorkItem
+        {
+            VideoPlan = new VideoJobPlan
+            {
+                Action = AdvancedVideoAction.TranscodeWithProfile,
+                Profile = new VideoEncodingProfile { Codec = "av1" },
+            },
+        };
+
+        Router.ScoreSlot(node, cpu, advanced, options, Ctx()).Should().BeLessThanOrEqualTo(0);
+        Router.ScoreSlot(node, cpu, new WorkItem(), options, Ctx()).Should().BeGreaterThan(0);
+    }
+
+    [Fact]
+    public void Rule_provenance_does_not_make_a_resolved_simple_job_require_protocol_v1()
+    {
+        var cpu = Cpu();
+        var node = NodeWith(cpu);
+        var options = new EncoderOptions { Codec = "av1", HardwareAcceleration = "none" };
+        var item = new WorkItem
+        {
+            VideoPlan = new VideoJobPlan
+            {
+                Action = AdvancedVideoAction.UseSimpleSettings,
+                RuleId = Guid.NewGuid(),
+                RuleName = "Keep legacy path",
+            },
+        };
+
+        item.VideoPlan.IsAdvanced.Should().BeFalse();
+        Router.ScoreSlot(node, cpu, item, options, Ctx()).Should().BeGreaterThan(0);
+    }
+
+    [Fact]
+    public void Exact_encoder_requires_the_advertised_name_and_never_substitutes()
+    {
+        var cpu = Cpu();
+        var node = NodeWith(cpu);
+        node.Capabilities!.AdvancedVideoProtocolVersion = VideoJobPlan.CurrentProtocolVersion;
+        var item = new WorkItem
+        {
+            VideoPlan = new VideoJobPlan
+            {
+                Action = AdvancedVideoAction.TranscodeWithProfile,
+                ExplicitEncoder = "libaom-av1",
+                Profile = new VideoEncodingProfile { Codec = "av1", Encoder = "libaom-av1", EncoderSelection = VideoEncoderSelectionMode.Explicit },
+            },
+        };
+        var options = new EncoderOptions { Codec = "av1", HardwareAcceleration = "none" };
+
+        Router.ScoreSlot(node, cpu, item, options, Ctx()).Should().BeGreaterThan(0);
+        cpu.Encoders.Remove("libaom-av1");
+        Router.ScoreSlot(node, cpu, item, options, Ctx()).Should().BeLessThanOrEqualTo(0);
     }
 }

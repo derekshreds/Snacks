@@ -126,6 +126,29 @@ public sealed class VideoFilterTests
         result.Should().Be("-vf fps=30 ");
     }
 
+    [Fact]
+    public void Additional_filters_are_ordered_after_typed_transforms_before_hardware_upload()
+    {
+        var result = VideoFilterBuilder.Emit(
+            cropExpr: "crop=1920:800:0:140", tonemap: false, scaleExpr: "scale=w=-2:h=1080",
+            useVaapi: true, canHwDecode: false, vaapiFormat: "p010", fpsExpr: "fps=30",
+            additionalFilters: ["hqdn3d=1.5:1.5:6:6", "unsharp=5:5:0.5"]);
+
+        result.Should().Be("-vf crop=1920:800:0:140,fps=30,scale=w=-2:h=1080,hqdn3d=1.5:1.5:6:6,unsharp=5:5:0.5,format=p010|vaapi,hwupload ");
+    }
+
+    [Fact]
+    public void Additional_filters_precede_tonemap_final_format_conversion()
+    {
+        var result = VideoFilterBuilder.Emit(
+            cropExpr: null, tonemap: true, scaleExpr: null,
+            useVaapi: false, canHwDecode: false, vaapiFormat: "nv12",
+            additionalFilters: ["hqdn3d=1.5:1.5:6:6"]);
+
+        result.IndexOf("hqdn3d", StringComparison.Ordinal)
+            .Should().BeLessThan(result.LastIndexOf("format=yuv420p", StringComparison.Ordinal));
+    }
+
 
     /// <summary>Rows: (color_transfer string, expected IsHdr).</summary>
     public static IEnumerable<object?[]> HdrTransferRows() => new[]

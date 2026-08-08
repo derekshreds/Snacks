@@ -15,13 +15,22 @@ namespace Snacks.Data.Migrations
         protected override void BuildModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
-            modelBuilder.HasAnnotation("ProductVersion", "10.0.0");
+            modelBuilder.HasAnnotation("ProductVersion", "10.0.10");
 
             modelBuilder.Entity("Snacks.Models.EncodeHistory", b =>
                 {
                     b.Property<int>("Id")
                         .ValueGeneratedOnAdd()
                         .HasColumnType("INTEGER");
+
+                    b.Property<Guid?>("AdvancedProfileId")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("AdvancedProfileName")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("AdvancedRuleName")
+                        .HasColumnType("TEXT");
 
                     b.Property<long>("BytesSaved")
                         .HasColumnType("INTEGER");

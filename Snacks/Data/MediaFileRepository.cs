@@ -300,6 +300,61 @@ public class MediaFileRepository
         }
 
         /// <summary>
+        ///     One stable page of every tracked video row regardless of status, for
+        ///     policy-impact previews. Ordered by Id so successive pages never skip
+        ///     or repeat rows while a scan inserts at the tail. Projects only the
+        ///     columns the resolver needs — full rows drag audio/subtitle JSON blobs
+        ///     through the ORM for no reason at 20k-row scale.
+        /// </summary>
+        public async Task<(List<MediaFile> Rows, int Total)> GetVideoFilesPageAsync(int skip, int take)
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            var query = context.MediaFiles.Where(f => f.Kind == MediaKind.Video);
+            var total = await query.CountAsync();
+            var rows  = await ProjectForImpact(query.OrderBy(f => f.Id).Skip(skip).Take(take));
+            return (rows, total);
+        }
+
+        /// <summary>
+        ///     A uniform random sample of tracked video rows, used when the library
+        ///     exceeds the impact-analysis cap — first-N-by-Id would bias the preview
+        ///     toward the oldest scans.
+        /// </summary>
+        public async Task<List<MediaFile>> GetVideoFilesSampleAsync(int take)
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            return await ProjectForImpact(context.MediaFiles
+                .Where(f => f.Kind == MediaKind.Video)
+                .OrderBy(_ => EF.Functions.Random())
+                .Take(take));
+        }
+
+        private static async Task<List<MediaFile>> ProjectForImpact(IQueryable<MediaFile> query)
+        {
+            var slim = await query.Select(f => new
+            {
+                f.FileName, f.FilePath, f.FileSize, f.Bitrate, f.Codec, f.Width,
+                f.Height, f.PixelFormat, f.Duration, f.IsHdr, f.Is4K, f.Status,
+            }).ToListAsync();
+            return slim.Select(f => new MediaFile
+            {
+                FileName    = f.FileName,
+                FilePath    = f.FilePath,
+                FileSize    = f.FileSize,
+                Bitrate     = f.Bitrate,
+                Codec       = f.Codec,
+                Width       = f.Width,
+                Height      = f.Height,
+                PixelFormat = f.PixelFormat,
+                Duration    = f.Duration,
+                IsHdr       = f.IsHdr,
+                Is4K        = f.Is4K,
+                Status      = f.Status,
+                Kind        = MediaKind.Video,
+            }).ToList();
+        }
+
+        /// <summary>
         ///     Moves a queued row to the front of the pending order by setting its
         ///     priority above the current queued maximum. Returns the new priority,
         ///     or null when the row is unknown or no longer queued.

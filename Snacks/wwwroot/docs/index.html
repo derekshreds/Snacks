@@ -394,6 +394,7 @@
         <a href="#quick-start">Quick start</a>
         <a href="#everyday-use">Everyday use</a>
         <a href="#settings">Settings</a>
+        <a href="#advanced-video">Advanced video policies</a>
         <a href="#processing-details">Processing &amp; file safety</a>
         <div class="group">Operations</div>
         <a href="#auto-scan">Automatic scanning</a>
@@ -626,6 +627,182 @@
         </div>
       </section>
 
+      <section id="advanced-video">
+        <div class="eyebrow">Opt-in power controls</div>
+        <h2>Advanced video policies and encoding profiles</h2>
+        <p>
+          Advanced Video is an optional layer under <strong>Settings → Video</strong>. It is off
+          after upgrade, so existing settings, presets, watched folders, skip decisions, and
+          FFmpeg behavior remain unchanged. Enable it only after creating and validating at
+          least one profile. Audio, subtitles, container, paths, and file handling continue to
+          come from the ordinary settings; profiles are deliberately video-only.
+        </p>
+
+        <p>
+          The panel is organized as three numbered steps that mirror how a decision actually
+          happens: a <strong>decision flow</strong> of plain-language rule cards every video
+          falls through top to bottom (the first match wins — visibly), the
+          <strong>encoding recipes</strong> those rules pick (recipes are the UI name for video
+          profiles), and a live <strong>library impact</strong> preview that runs the staged,
+          unsaved flow against every video Snacks knows about and shows exactly how many files
+          each rule catches and what would happen to them — before anything is applied.
+        </p>
+
+        <div class="grid">
+          <div class="card">
+            <h3>Recipes are complete</h3>
+            <p>A recipe (video profile) selects H.264, HEVC, or AV1; automatic or one exact
+              detected encoder; bitrate, quality, or custom rate control; preset/speed, threads,
+              pixel format, GOP, codec profile/level, transformations, extra filters, guarded
+              options, and output retention. The editor shows the FFmpeg video arguments the
+              recipe generates as you type.</p>
+          </div>
+          <div class="card">
+            <h3>Rules are predictable</h3>
+            <p>Enabled rules run top to bottom and the first match wins. Each card reads as a
+              sentence — <em>“If the codec is not av1 and the resolution class is 2160p+ →
+              encode with AV1 4K”</em> — with a live count of the library files it catches.
+              A rule uses a flat <strong>All</strong> or <strong>Any</strong> condition list;
+              there are no scripts, expressions, or nested condition trees.</p>
+          </div>
+        </div>
+
+        <h3>Library impact preview</h3>
+        <p>
+          The impact section is read-only: it never queues, re-evaluates, or saves anything.
+          It applies the same shared resolver used by scanning and dispatch — including
+          per-folder policies — to every tracked video and buckets the outcomes with example
+          files, current disk usage, and how many files in each bucket were already processed,
+          so a mistake is visible as a wrong-looking bar instead of a surprise batch of jobs.
+          Bitrate recipes also show an approximate output size (target × duration); quality
+          and custom recipes deliberately show no forecast, because their size genuinely
+          depends on content. A search box answers "what happens to <em>this</em> file" by
+          name, and once encodes complete, a <strong>Measured so far</strong> strip shows each
+          recipe's real jobs, savings, and average output bitrate next to the forecast. Very
+          large libraries are analyzed as a uniform random sample beyond 20,000 videos and
+          labeled as such.
+        </p>
+        <p>
+          <img src="img/advanced-flow.png" alt="Decision flow with plain-language rule cards and live per-rule file counts" style="max-width: 100%; border-radius: 8px;">
+        </p>
+        <p>
+          <img src="img/advanced-impact.png" alt="Library impact preview with counts, disk usage, and measured results" style="max-width: 100%; border-radius: 8px;">
+        </p>
+
+        <h3>Applying is not reprocessing</h3>
+        <p>
+          Applying a policy only changes future decisions. Files already in the catalog keep
+          their current status until <strong>Re-evaluate</strong> runs — the impact panel says
+          so and offers the button right after an apply. Rules the flow can never reach are
+          flagged inline ("never reached — an earlier rule always claims these files first")
+          by a conservative static analysis that only reports what it can prove.
+        </p>
+
+        <h3>Sharing policies</h3>
+        <p>
+          A policy exports as a plain <code>snacks-video-policy.json</code> file and imports on
+          any Snacks instance; imports arrive as a staged draft with fresh internal ids and
+          nothing applies until Validate &amp; Apply. The current draft can also be saved as a
+          named template that appears alongside the built-in quick-start cards. Exact-encoder
+          recipes may name any adapter-known encoder — including ones no connected node
+          advertises yet, labeled "not detected yet" — so a policy can be written today for
+          hardware that joins the cluster tomorrow.
+        </p>
+
+        <h3>Rate control and retention</h3>
+        <ul>
+          <li><strong>Bitrate</strong> uses an absolute profile target with optional min, max, buffer, and strict/constrained behavior. The Simple 4K multiplier is not applied to a profile.</li>
+          <li><strong>Quality</strong> maps to the encoder's native CRF, CQ, ICQ, global-quality, or quantizer controls. Selecting it defaults new edits to <strong>Always Keep</strong>, because final size is intentionally unpredictable.</li>
+          <li><strong>Custom</strong> emits no generated rate-control arguments. Add the required encoder-private controls in the guarded option editor.</li>
+          <li><strong>Smaller Only</strong> keeps the existing savings behavior. <strong>Always Keep</strong> retains any valid completed output, even when it is larger than its source.</li>
+        </ul>
+
+        <h3>Conditions and actions</h3>
+        <p>
+          Conditions can inspect normalized codec aliases, width, height, short-edge resolution
+          class (SD, 720p, 1080p, 1440p, or 2160p+), video bitrate, file size, duration, pixel
+          format, derived bit depth, HDR, and 4K. Unknown values match only
+          <code>IsUnknown</code>; numeric ranges include both endpoints.
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Action</th><th>Behavior</th></tr></thead>
+            <tbody>
+              <tr><td><code>UseSimpleSettings</code></td><td>Runs the established codec/bitrate/filter/mux skip ladder unchanged.</td></tr>
+              <tr><td><code>TranscodeWithProfile</code></td><td>Forces video re-encoding with the complete selected profile, even when legacy bitrate checks would skip.</td></tr>
+              <tr><td><code>MuxOnly</code></td><td>Copies video and runs only applicable container, audio, and subtitle work; files with no mux work remain skipped.</td></tr>
+              <tr><td><code>Skip</code></td><td>Skips the entire job, including mux-only work.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Exact encoders and clusters</h3>
+        <p>
+          The encoder picker is populated from the configured FFmpeg binary and connected
+          workers. An exact encoder is never remapped or replaced by a retry fallback. If no
+          local or protocol-compatible worker advertises that exact name on the assigned device,
+          the job remains Pending and shows why. Older workers can still run Simple jobs, but
+          cannot receive resolved Advanced plans.
+        </p>
+        <div class="callout warning">
+          <strong>Portable, not magical.</strong> A profile may be saved while its exact encoder
+          is unavailable so it can move between installations. Validate the availability badges
+          before queueing a large batch; Snacks will wait rather than silently substitute.
+        </div>
+
+        <h3>Guarded FFmpeg controls</h3>
+        <p>
+          Each custom row stores one option and at most one literal value token. Encoder-private
+          controls such as <code>-aom-params</code> are allowed and appended after generated video
+          settings so an intentional duplicate wins with a warning. Inputs, outputs, maps,
+          muxers, audio/subtitle controls, progress/report controls, and replacement filtergraphs
+          are rejected. Additional filters belong in the dedicated ordered single-chain field.
+          FFmpeg is started with an argument vector, never through a shell; the displayed command
+          is only a readable preview.
+        </p>
+
+        <h3>Quick-start templates</h3>
+        <p>
+          The fastest way in is the <strong>Quick start</strong> gallery at the top of the
+          Advanced Video panel. Each template stages a complete working policy — profiles,
+          rules, and default action — and immediately shows its validation result and the
+          FFmpeg arguments it would generate. Nothing is saved until you press
+          <strong>Validate &amp; Apply</strong>, so a template is also a safe way to explore
+          how profiles and rules fit together before building your own.
+        </p>
+        <ul>
+          <li><strong>Convert everything to AV1</strong> — one quality-based AV1 profile; already-AV1 sources are skipped.</li>
+          <li><strong>Tiered AV1 (1080p + 4K)</strong> — separate quality levels selected by ordered resolution rules.</li>
+          <li><strong>HEVC space saver</strong> — re-encodes older codecs to quality-based HEVC and leaves HEVC/AV1 alone.</li>
+          <li><strong>Fine-tuned libaom-av1 (expert)</strong> — the complete community-requested archival policy below, including its guarded <code>-aom-params</code> rows. Requires an FFmpeg build with libaom.</li>
+        </ul>
+
+        <h3>Suggested AV1 setup</h3>
+        <p>The expert template stages all of the following in one click; the same policy can be built by hand:</p>
+        <ol>
+          <li>Create a profile from the current Simple settings, choose AV1 and exact <code>libaom-av1</code>, then choose Quality.</li>
+          <li>Set quality 35, speed 4, threads 8, <code>yuv420p10le</code>, GOP 300, and Always Keep.</li>
+          <li>Add lag, ARNR, tune, and <code>-aom-params</code> as separate guarded rows; use Validate Preview to inspect exact tokens.</li>
+          <li>Create a first rule for <code>codec is not AV1</code> plus <code>resolutionClass is 2160p+</code> and select a 4K profile.</li>
+          <li>Create a later codec-not-AV1 rule for the 1080p profile. Analyze a test folder before processing it.</li>
+        </ol>
+        <p>
+          A complete importable block for that scenario lives at
+          <code>examples/advanced-video-policy.json</code>. Full-app user presets include this
+          block. Applying a built-in Simple preset disables Advanced Video without deleting its
+          profiles or rules, so it can be turned back on later.
+        </p>
+
+        <h3>Folders, changes, and rollout</h3>
+        <ul>
+          <li>A watched folder can inherit global rules, force Simple behavior, or always select one global profile. Existing scalar overrides apply afterward.</li>
+          <li>A profile cannot be deleted while a rule or watched folder references it.</li>
+          <li>Analyze, scanning, manual processing, re-evaluation, local dispatch, and cluster dispatch share the same resolver. Rules are checked again immediately before dispatch.</li>
+          <li>Saving settings does not walk the full library. Use the existing <strong>Re-evaluate</strong> action when a policy change should update old catalog rows.</li>
+          <li>Invalid hand-edited configuration blocks affected work with a diagnostic; it never falls back to Simple without being asked.</li>
+        </ul>
+      </section>
+
       <section id="processing-details">
         <div class="eyebrow">What happens to a file</div>
         <h2>Processing, retries, and file safety</h2>
@@ -638,9 +815,9 @@
 
         <h3>Eligibility and smart filtering</h3>
         <ul>
-          <li>Files whose codec is already at least as efficient as the target can be skipped when they sit below the configured bitrate ceiling and tolerance.</li>
-          <li>4K files use the configured 2×–8× bitrate multiplier; <strong>Skip 4K</strong> takes precedence over the remaining video rules.</li>
-          <li>Snacks does not re-encode AV1 down to HEVC or H.264, or HEVC down to H.264, merely to satisfy an exact codec-name match.</li>
+          <li>In Simple behavior, files whose codec is already at least as efficient as the target can be skipped when they sit below the configured bitrate ceiling and tolerance.</li>
+          <li>Simple behavior applies the configured 2×–8× bitrate multiplier to 4K files. Advanced profile bitrates are absolute; choose a different profile through a rule instead.</li>
+          <li>Simple behavior does not re-encode AV1 down to HEVC or H.264, or HEVC down to H.264, merely to satisfy an exact codec-name match. An explicit Advanced profile action intentionally overrides that legacy guard.</li>
           <li>Mux, audio, subtitle, container, crop, resolution, frame-rate, and HDR work can make an otherwise efficient file eligible for processing.</li>
           <li><strong>Analyze</strong> applies the same decision policy without adding work to the queue.</li>
           <li>A filename already containing <code>[snacks]</code> is treated as previously produced output and is not automatically fed back into the pipeline.</li>
@@ -662,7 +839,8 @@
           Sidecar files produced during processing move with the output. A stale tagged output
           left by an interrupted attempt is removed before FFmpeg starts again. If an ordinary
           encode is not smaller than its source, Snacks discards it as <code>NoSavings</code>;
-          intentional remuxes and explicitly configured audio-output growth are retained.
+          intentional remuxes, explicitly configured audio-output growth, and Advanced profiles
+          set to <code>AlwaysKeep</code> are retained.
         </p>
 
         <h3>Video retry ladder</h3>
@@ -681,7 +859,8 @@
           Failed partial output is cleaned between attempts. When all retries are exhausted, the
           source remains unchanged and the final reason is stored in the job log and catalog.
           The music path is deliberately simpler: it validates duration and discards empty,
-          invalid, or no-savings output instead of using the video retry ladder.
+          invalid, or no-savings output instead of using the video retry ladder. Exact Advanced
+          encoders may retry decoding/subtitle handling, but never enter the encoder-substitution step.
         </p>
       </section>
 
@@ -901,6 +1080,9 @@ environment:
   - SNACKS_SET_Music__BitrateKbps=256
   - SNACKS_SET_AudioLanguagesToKeep=en,ja
   - 'SNACKS_SET_AudioOutputs=[{"Codec":"aac","Layout":"Stereo","BitrateKbps":192}]'
+  - SNACKS_SET_AdvancedVideo__Enabled=true
+  - 'SNACKS_SET_AdvancedVideo__Profiles=[{"Id":"11111111-1111-4111-8111-111111111111","Name":"AV1 CQ 35","Codec":"av1","EncoderSelection":"Explicit","Encoder":"libaom-av1","RateControl":{"Mode":"Quality","Quality":35},"Preset":"4","Threads":8,"PixelFormat":"yuv420p10le","GopSize":300,"OutputRetention":"AlwaysKeep"}]'
+  - 'SNACKS_SET_AdvancedVideo__Rules=[{"Id":"22222222-2222-4222-8222-222222222222","Name":"Codec is not AV1","Match":"All","Conditions":[{"Field":"Codec","Operator":"IsNot","Values":["av1"]}],"Action":"TranscodeWithProfile","ProfileId":"11111111-1111-4111-8111-111111111111"}]'
   - 'SNACKS_SCAN_Directories=["/media/tv","/media/movies"]'
   - SNACKS_SCAN_Enabled=true
   - SNACKS_SCAN_IntervalMinutes=30
@@ -1202,6 +1384,8 @@ curl -fsS -b snacks.cookies \
               <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/settings</code></td><td>—</td><td>Full effective <code>EncoderOptions</code> JSON.</td></tr>
               <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/settings</code></td><td>Settings object</td><td>Saves settings atomically and applies presence-aware migration.</td></tr>
               <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/settings/reevaluate</code></td><td><code>forceRetryNoSavings=false</code></td><td>Re-evaluates catalog eligibility using current settings.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/settings/video-encoders</code></td><td><code>refresh=false</code></td><td>Runtime H.264/HEVC/AV1 encoder catalog, native rate controls, local devices, and connected-worker availability.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/settings/advanced-video/validate</code></td><td><code>{advancedVideo, profileId?, sourceFacts?}</code></td><td>Validates staged profiles/rules and returns stable diagnostics plus a literal FFmpeg video-argument preview without executing it.</td></tr>
               <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/settings/presets</code></td><td>—</td><td>Lists saved preset names and values.</td></tr>
               <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/settings/presets</code></td><td><code>{name, options}</code></td><td>Creates or replaces a named preset.</td></tr>
               <tr class="api-row"><td><span class="method delete">DELETE</span></td><td><code>/api/settings/presets/{name}</code></td><td>Preset name</td><td>Deletes one preset.</td></tr>

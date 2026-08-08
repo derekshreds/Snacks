@@ -83,6 +83,26 @@ public sealed class EncodedOutputKeepDecisionTests
     }
 
     [Fact]
+    public void Advanced_mux_only_counts_a_container_change_as_remux_work()
+    {
+        var item = MakeMuxableWorkItem();
+        item.Path = "/media/movie.mp4";
+        item.Probe!.Streams = item.Probe.Streams.Where(stream => stream.CodecType == "video").ToArray();
+        item.VideoPlan = new VideoJobPlan { Action = AdvancedVideoAction.MuxOnly };
+        var opts = new EncoderOptions
+        {
+            Format = "mkv",
+            Encoder = "libx265",
+            EncodingMode = EncodingMode.MuxOnly,
+            MuxStreams = MuxStreams.Both,
+        };
+
+        TranscodingService.IsMuxPass(opts, item).Should().BeTrue();
+        TranscodingService.ShouldKeepEncodedOutput(opts, item, item.Size, item.Size + 1024)
+            .Should().Be((true, "remux"));
+    }
+
+    [Fact]
     public void Keeps_when_user_configured_audio_outputs_grow_file()
     {
         var item = MakeMuxableWorkItem();
@@ -115,6 +135,41 @@ public sealed class EncodedOutputKeepDecisionTests
 
         keep.Should().BeFalse();
         reason.Should().Be("no savings");
+    }
+
+    [Fact]
+    public void Advanced_always_keep_accepts_valid_output_larger_than_source()
+    {
+        var item = MakeMuxableWorkItem();
+        item.VideoPlan = new VideoJobPlan
+        {
+            Action = AdvancedVideoAction.TranscodeWithProfile,
+            OutputRetention = VideoOutputRetention.AlwaysKeep,
+            Profile = new VideoEncodingProfile { OutputRetention = VideoOutputRetention.AlwaysKeep },
+        };
+
+        var (keep, reason) = TranscodingService.ShouldKeepEncodedOutput(
+            new EncoderOptions { EncodingMode = EncodingMode.Transcode },
+            item, item.Size, item.Size + 250_000_000);
+
+        keep.Should().BeTrue();
+        reason.Should().Be("profile retention policy");
+    }
+
+    [Fact]
+    public void Advanced_smaller_only_still_rejects_larger_transcode()
+    {
+        var item = MakeMuxableWorkItem();
+        item.VideoPlan = new VideoJobPlan
+        {
+            Action = AdvancedVideoAction.TranscodeWithProfile,
+            OutputRetention = VideoOutputRetention.SmallerOnly,
+            Profile = new VideoEncodingProfile { OutputRetention = VideoOutputRetention.SmallerOnly },
+        };
+
+        TranscodingService.ShouldKeepEncodedOutput(
+            new EncoderOptions { EncodingMode = EncodingMode.Transcode },
+            item, item.Size, item.Size + 1).Keep.Should().BeFalse();
     }
 
     [Fact]

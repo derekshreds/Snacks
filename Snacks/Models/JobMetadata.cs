@@ -26,6 +26,12 @@ public sealed class JobMetadata
     public EncoderOptions Options { get; set; } = new();
 
     /// <summary>
+    ///     Master-resolved advanced video decision. Workers execute this plan and do not
+    ///     evaluate global rules independently. Null denotes a legacy Simple job.
+    /// </summary>
+    public VideoJobPlan? VideoPlan { get; set; }
+
+    /// <summary>
     ///     Full ffprobe analysis of the source file.
     ///     Passed to the node so it doesn't need to re-probe.
     /// </summary>

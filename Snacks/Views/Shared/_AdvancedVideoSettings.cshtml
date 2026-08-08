@@ -1,0 +1,232 @@
+<div class="settings-section-title mt-4"><i class="fas fa-code-branch me-2"></i>Advanced Video Policies</div>
+
+<div class="encoder-panel rounded" id="advancedVideoWorkspace">
+    <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-3">
+        <div class="form-check form-switch mb-0">
+            <input class="form-check-input" type="checkbox" id="advancedVideoEnabled">
+            <label class="form-check-label fw-bold" for="advancedVideoEnabled">Enable advanced video policies</label>
+            <div class="form-text">Off by default. When disabled, the Simple settings above behave exactly as before.</div>
+        </div>
+        <div class="d-flex align-items-center gap-2">
+            <span class="badge bg-warning text-dark d-none" id="advancedVideoDirty">Unapplied changes</span>
+            <button type="button" class="btn btn-sm btn-outline-secondary d-none" id="advancedVideoRestorePrevious" title="Stage the previously applied policy (this session) as the current draft"><i class="fas fa-clock-rotate-left me-1"></i>Restore previous</button>
+            <button type="button" class="btn btn-sm btn-outline-secondary" id="advancedVideoCancel" disabled>Cancel</button>
+            <button type="button" class="btn btn-sm btn-primary" id="advancedVideoApply" disabled>
+                <i class="fas fa-check me-1"></i>Validate &amp; Apply
+            </button>
+        </div>
+    </div>
+
+    <div class="alert alert-info py-2 mb-3">
+        <i class="fas fa-shield-halved me-1"></i>
+        Policies affect video only — container, audio, subtitles, paths, and file handling stay in the normal settings.
+        Nothing below is saved until you press <strong>Validate &amp; Apply</strong>.
+    </div>
+
+    <div id="advancedVideoBody">
+        <details class="mb-4" id="advancedVideoQuickStart" open>
+            <summary class="fw-semibold"><i class="fas fa-wand-magic-sparkles me-1 text-primary"></i>Start from a template</summary>
+            <div class="d-flex flex-wrap align-items-center gap-2 mt-1 mb-2">
+                <div class="small text-muted flex-grow-1">
+                    Templates stage a complete working setup — recipes, decision flow, and default — so you can see how
+                    the pieces fit, check the library impact below, tweak, and apply.
+                </div>
+                <div class="btn-group btn-group-sm">
+                    <button type="button" class="btn btn-outline-secondary" id="advancedVideoSaveTemplate" title="Save the current draft as a reusable template"><i class="fas fa-bookmark me-1"></i>Save as template</button>
+                    <button type="button" class="btn btn-outline-secondary" id="advancedVideoExportPolicy" title="Download the current draft as a shareable policy file"><i class="fas fa-file-export"></i></button>
+                    <button type="button" class="btn btn-outline-secondary" id="advancedVideoImportPolicy" title="Import a policy file shared by another Snacks user"><i class="fas fa-file-import"></i></button>
+                </div>
+                <input type="file" id="advancedVideoImportFile" accept=".json,application/json" hidden>
+            </div>
+            <div id="advancedVideoSaveTemplateRow" class="align-items-center gap-2 mb-2" style="display: none;">
+                <input type="text" class="form-control form-control-sm" id="advancedVideoTemplateName" maxlength="60" placeholder="Template name…" style="max-width: 280px;">
+                <button type="button" class="btn btn-sm btn-primary" id="advancedVideoTemplateSaveConfirm">Save</button>
+                <button type="button" class="btn btn-sm btn-outline-secondary" id="advancedVideoTemplateSaveCancel">Cancel</button>
+            </div>
+            <div class="row g-2" id="advancedVideoTemplates"></div>
+        </details>
+
+        <!-- ============================================================ -->
+        <!-- 1. Decision flow                                             -->
+        <!-- ============================================================ -->
+        <div class="av-section-head">
+            <span class="av-step">1</span>
+            <div class="flex-grow-1">
+                <h6 class="mb-0">Decision flow</h6>
+                <div class="small text-muted">Every video falls through this list top to bottom — the first matching rule decides what happens. Drag cards or use the arrows to reorder.</div>
+            </div>
+            <button type="button" class="btn btn-sm btn-outline-primary" id="advancedVideoCreateRule"><i class="fas fa-plus me-1"></i>Add rule</button>
+        </div>
+
+        <div class="av-flow">
+            <div class="av-flow-node av-flow-source">
+                <i class="fas fa-file-video me-2"></i>A video file is scanned, analyzed, or re-evaluated
+            </div>
+            <div id="advancedVideoRuleList"></div>
+            <div class="av-flow-node av-flow-default">
+                <div class="d-flex flex-wrap align-items-center gap-2">
+                    <span class="fw-semibold me-1"><i class="fas fa-arrow-turn-down me-2"></i>Everything else</span>
+                    <select class="form-select form-select-sm w-auto" id="advancedVideoDefaultAction">
+                        <option value="UseSimpleSettings">uses the Simple settings above</option>
+                        <option value="TranscodeWithProfile">is encoded with a recipe</option>
+                        <option value="MuxOnly">is remuxed only (video copied)</option>
+                        <option value="Skip">is skipped entirely</option>
+                    </select>
+                    <select class="form-select form-select-sm w-auto" id="advancedVideoDefaultProfile"></select>
+                    <span class="badge av-count-badge d-none ms-auto" id="advancedVideoDefaultCount"></span>
+                </div>
+            </div>
+        </div>
+
+        <div id="advancedVideoRuleEmpty" class="d-none"></div>
+        <div id="advancedVideoRuleEditor" class="av-editor-panel d-none mt-2">
+            <div class="d-flex align-items-center gap-2 mb-2">
+                <i class="fas fa-pen text-primary"></i>
+                <span class="fw-semibold">Editing rule</span>
+                <span class="text-muted small">changes appear in the flow as you type</span>
+            </div>
+            <div class="row g-2 align-items-end">
+                <div class="col-md-6"><label class="form-label">Rule name</label><input class="form-control form-control-sm" id="advancedVideoRuleName" maxlength="80"></div>
+                <div class="col-md-3"><label class="form-label">File must match</label><select class="form-select form-select-sm" id="advancedVideoRuleMatch"><option value="All">every condition</option><option value="Any">any condition</option></select></div>
+                <div class="col-md-3"><div class="form-check mb-1"><input class="form-check-input" type="checkbox" id="advancedVideoRuleEnabled"><label class="form-check-label" for="advancedVideoRuleEnabled">Enabled</label></div></div>
+            </div>
+            <div class="mt-2" id="advancedVideoConditions"></div>
+            <button type="button" class="btn btn-sm btn-outline-secondary mt-1" id="advancedVideoAddCondition"><i class="fas fa-plus me-1"></i>Add condition</button>
+            <div class="row g-2 align-items-end mt-2">
+                <div class="col-md-6"><label class="form-label">Then</label><select class="form-select form-select-sm" id="advancedVideoRuleAction"><option value="TranscodeWithProfile">Encode with a recipe</option><option value="UseSimpleSettings">Use the Simple settings above</option><option value="MuxOnly">Remux only (copy video)</option><option value="Skip">Skip the file entirely</option></select></div>
+                <div class="col-md-6"><label class="form-label">Recipe</label><select class="form-select form-select-sm" id="advancedVideoRuleProfile"></select></div>
+            </div>
+            <div class="d-flex gap-2 mt-3">
+                <button type="button" class="btn btn-sm btn-outline-secondary" id="advancedVideoDuplicateRule"><i class="fas fa-copy me-1"></i>Duplicate</button>
+                <button type="button" class="btn btn-sm btn-outline-danger ms-auto" id="advancedVideoDeleteRule"><i class="fas fa-trash me-1"></i>Delete rule</button>
+            </div>
+        </div>
+
+        <hr class="my-4">
+
+        <!-- ============================================================ -->
+        <!-- 2. Encoding recipes                                          -->
+        <!-- ============================================================ -->
+        <div class="av-section-head">
+            <span class="av-step">2</span>
+            <div class="flex-grow-1">
+                <h6 class="mb-0">Encoding recipes</h6>
+                <div class="small text-muted">A recipe is a complete, reusable way to encode video. Rules in the flow above pick one.</div>
+            </div>
+            <div class="btn-group btn-group-sm">
+                <button type="button" class="btn btn-outline-primary" id="advancedVideoCreateProfile" title="Create a recipe from the current Simple settings"><i class="fas fa-plus me-1"></i>From Simple</button>
+                <button type="button" class="btn btn-outline-secondary" id="advancedVideoDuplicateProfile" title="Duplicate selected recipe" disabled><i class="fas fa-copy"></i></button>
+            </div>
+        </div>
+
+        <div class="row g-3">
+            <div class="col-lg-4">
+                <div class="list-group mb-2" id="advancedVideoProfileList"></div>
+                <button type="button" class="btn btn-sm btn-outline-danger w-100" id="advancedVideoDeleteProfile" disabled><i class="fas fa-trash me-1"></i>Delete selected recipe</button>
+                <div class="form-text mt-2" id="advancedVideoProfileReferences"></div>
+            </div>
+
+            <div class="col-lg-8">
+                <div id="advancedVideoProfileEmpty" class="text-muted text-center py-5 border rounded">
+                    Load a template, press <strong>From Simple</strong>, or select a recipe to edit it.
+                </div>
+                <div id="advancedVideoProfileEditor" class="d-none">
+                    <div class="row g-2">
+                        <div class="col-md-7"><label class="form-label">Recipe name</label><input class="form-control form-control-sm" id="advancedVideoProfileName" maxlength="80"></div>
+                        <div class="col-md-5"><label class="form-label">Output codec</label><select class="form-select form-select-sm" id="advancedVideoProfileCodec"><option value="h264">H.264 / AVC — plays everywhere</option><option value="h265">H.265 / HEVC — smaller, wide support</option><option value="av1">AV1 — smallest, newest</option></select></div>
+                        <div class="col-md-4"><label class="form-label">Size control</label><select class="form-select form-select-sm" id="advancedVideoRateMode"><option value="Bitrate">Bitrate — predictable size</option><option value="Quality">Quality — constant look (CRF/CQ)</option><option value="Custom">Custom options only</option></select></div>
+                        <div class="col-md-4" data-advanced-rate="Bitrate"><label class="form-label">Target (kb/s)</label><input class="form-control form-control-sm" type="number" min="1" id="advancedVideoTargetKbps"></div>
+                        <div class="col-md-4" data-advanced-rate="Quality"><label class="form-label" id="advancedVideoQualityLabel">Quality value</label><input class="form-control form-control-sm" type="number" step="0.1" id="advancedVideoQuality"><input type="range" class="form-range" id="advancedVideoQualitySlider" step="1" aria-label="Quality value slider"><div class="form-text" id="advancedVideoQualityHints">Lower = better quality, bigger file.</div></div>
+                        <div class="col-md-4"><label class="form-label">Keep the result</label><select class="form-select form-select-sm" id="advancedVideoRetention"><option value="SmallerOnly">Only when smaller than source</option><option value="AlwaysKeep">Always (quality-first)</option></select></div>
+                    </div>
+
+                    <div class="alert alert-warning py-2 mt-2 d-none" id="advancedVideoQualityWarning"><i class="fas fa-triangle-exclamation me-1"></i>Quality mode produces unpredictable file sizes. <strong>Always Keep</strong> is recommended.</div>
+
+                    <div class="av-args-strip mt-2">
+                        <div class="small text-muted mb-1"><i class="fas fa-terminal me-1"></i>FFmpeg video arguments this recipe generates (live)</div>
+                        <pre class="mb-0" id="advancedVideoProfileArgs">—</pre>
+                    </div>
+
+                    <details class="mt-3" id="advancedVideoEncoderDetails">
+                        <summary class="fw-semibold">Encoder &amp; performance</summary>
+                        <div class="row g-2 mt-1">
+                            <div class="col-md-4"><label class="form-label">Encoder selection</label><select class="form-select form-select-sm" id="advancedVideoEncoderSelection"><option value="Automatic">Automatic (recommended)</option><option value="Explicit">Exact encoder</option></select></div>
+                            <div class="col-md-4"><label class="form-label">Automatic hardware preference</label><select class="form-select form-select-sm" id="advancedVideoHardwarePreference"><option value="auto">Auto</option><option value="none">CPU / software</option><option value="nvidia">NVIDIA</option><option value="intel">Intel</option><option value="amd">AMD</option><option value="apple">Apple</option></select></div>
+                            <div class="col-md-4"><label class="form-label">Exact encoder</label><select class="form-select form-select-sm" id="advancedVideoEncoder"><option value="">Choose an exact detected encoder…</option></select><div class="form-text" id="advancedVideoEncoderAvailability"></div></div>
+                            <div class="col-md-3" data-advanced-rate="Bitrate"><label class="form-label">Min (optional)</label><input class="form-control form-control-sm" type="number" min="1" id="advancedVideoMinKbps"></div>
+                            <div class="col-md-3" data-advanced-rate="Bitrate,Quality"><label class="form-label">Max (optional)</label><input class="form-control form-control-sm" type="number" min="1" id="advancedVideoMaxKbps"></div>
+                            <div class="col-md-3" data-advanced-rate="Bitrate,Quality"><label class="form-label">Buffer kbits</label><input class="form-control form-control-sm" type="number" min="1" id="advancedVideoBufferKbits"></div>
+                            <div class="col-md-3" data-advanced-rate="Bitrate"><div class="form-check mt-4"><input class="form-check-input" type="checkbox" id="advancedVideoStrictBitrate"><label class="form-check-label" for="advancedVideoStrictBitrate">Strict / constrained</label></div></div>
+                            <div class="col-md-3"><label class="form-label">Preset / speed</label><input class="form-control form-control-sm" id="advancedVideoPreset" list="advancedVideoPresetChoices" placeholder="encoder native"><datalist id="advancedVideoPresetChoices"></datalist></div>
+                            <div class="col-md-3"><label class="form-label">Threads</label><input class="form-control form-control-sm" type="number" min="0" id="advancedVideoThreads" placeholder="0 = auto"></div>
+                            <div class="col-md-3"><label class="form-label">Pixel format</label><input class="form-control form-control-sm" id="advancedVideoPixelFormat" list="advancedVideoPixelFormatChoices" placeholder="automatic"><datalist id="advancedVideoPixelFormatChoices"></datalist></div>
+                            <div class="col-md-3"><label class="form-label">GOP / keyframes</label><input class="form-control form-control-sm" type="number" min="0" id="advancedVideoGop" placeholder="0 = automatic"></div>
+                            <div class="col-md-3"><label class="form-label">Codec profile</label><input class="form-control form-control-sm" id="advancedVideoCodecProfile" placeholder="automatic"></div>
+                            <div class="col-md-3"><label class="form-label">Codec level</label><input class="form-control form-control-sm" id="advancedVideoCodecLevel" placeholder="automatic"></div>
+                        </div>
+                    </details>
+
+                    <details class="mt-3">
+                        <summary class="fw-semibold">Transforms and filters</summary>
+                        <div class="row g-2 mt-1">
+                            <div class="col-md-4"><label class="form-label">Downscale policy</label><select class="form-select form-select-sm" id="advancedVideoDownscalePolicy"><option value="Never">Never</option><option value="CapAtTarget">Cap at target</option><option value="Always">Always</option></select></div>
+                            <div class="col-md-4"><label class="form-label">Downscale target</label><select class="form-select form-select-sm" id="advancedVideoDownscaleTarget"><option value="4K">4K</option><option value="1440p">1440p</option><option value="1080p">1080p</option><option value="720p">720p</option><option value="480p">480p</option><option value="240p">240p</option></select></div>
+                            <div class="col-md-4"><label class="form-label">Fixed frame</label><input class="form-control form-control-sm" id="advancedVideoFixedFrame" placeholder="e.g. 1920x1080"></div>
+                            <div class="col-md-4"><label class="form-label">Max FPS</label><input class="form-control form-control-sm" type="number" min="0" max="120" id="advancedVideoMaxFps"></div>
+                            <div class="col-md-4"><div class="form-check mt-4"><input class="form-check-input" type="checkbox" id="advancedVideoTonemap"><label class="form-check-label" for="advancedVideoTonemap">Tone map HDR → SDR</label></div></div>
+                            <div class="col-md-4"><div class="form-check mt-4"><input class="form-check-input" type="checkbox" id="advancedVideoCrop"><label class="form-check-label" for="advancedVideoCrop">Remove black borders</label></div></div>
+                            <div class="col-12"><label class="form-label">Additional single-chain filters <span class="text-muted">(one per line)</span></label><textarea class="form-control form-control-sm font-monospace" rows="3" id="advancedVideoFilters" placeholder="hqdn3d=1.5:1.5:6:6"></textarea></div>
+                        </div>
+                    </details>
+
+                    <details class="mt-3">
+                        <summary class="fw-semibold">Power user: guarded FFmpeg options</summary>
+                        <div class="small text-muted mt-1 mb-2">Each row is an option plus literal value tokens. Inputs, outputs, maps, stream replacement, mux/audio/subtitle controls, and filtergraph replacement are rejected.</div>
+                        <datalist id="advancedVideoCustomOptionChoices"></datalist>
+                        <div id="advancedVideoCustomOptions"></div>
+                        <button type="button" class="btn btn-sm btn-outline-secondary mt-1" id="advancedVideoAddOption"><i class="fas fa-plus me-1"></i>Add option</button>
+                    </details>
+                </div>
+            </div>
+        </div>
+
+        <hr class="my-4">
+
+        <!-- ============================================================ -->
+        <!-- 3. Library impact                                            -->
+        <!-- ============================================================ -->
+        <div class="av-section-head">
+            <span class="av-step">3</span>
+            <div class="flex-grow-1">
+                <h6 class="mb-0">What would happen to your library</h6>
+                <div class="small text-muted">The staged flow above, run against every video Snacks knows about — before you apply anything.</div>
+            </div>
+            <input type="search" class="form-control form-control-sm" id="advancedVideoImpactSearch" placeholder="What happens to… (file name)" style="max-width: 240px;" aria-label="Find a file in the impact preview">
+            <button type="button" class="btn btn-sm btn-outline-info" id="advancedVideoImpactRefresh"><i class="fas fa-rotate me-1"></i>Refresh</button>
+        </div>
+        <div id="advancedVideoImpact" class="av-impact" role="status" aria-live="polite"></div>
+        <div id="advancedVideoMeasured" class="mt-3"></div>
+
+        <div id="advancedVideoDiagnostics" class="mt-3"></div>
+
+        <details class="mt-3">
+            <summary class="fw-semibold text-muted">Test a hypothetical file</summary>
+            <div class="row g-2 mt-1 align-items-end">
+                <div class="col-md-3"><label class="form-label">Sample source codec</label><input class="form-control form-control-sm" id="advancedVideoSampleCodec" value="h265"></div>
+                <div class="col-md-2"><label class="form-label">Width</label><input class="form-control form-control-sm" type="number" id="advancedVideoSampleWidth" value="1920"></div>
+                <div class="col-md-2"><label class="form-label">Height</label><input class="form-control form-control-sm" type="number" id="advancedVideoSampleHeight" value="1080"></div>
+                <div class="col-md-2"><label class="form-label">Bitrate kb/s</label><input class="form-control form-control-sm" type="number" id="advancedVideoSampleBitrate" value="8000"></div>
+                <div class="col-md-3"><button type="button" class="btn btn-sm btn-outline-info w-100" id="advancedVideoValidate"><i class="fas fa-flask me-1"></i>Validate preview</button></div>
+            </div>
+            <div class="row g-2 mt-1 align-items-end">
+                <div class="col-md-2"><label class="form-label">File size (bytes)</label><input class="form-control form-control-sm" type="number" min="0" id="advancedVideoSampleFileSize" placeholder="unknown"></div>
+                <div class="col-md-2"><label class="form-label">Duration (seconds)</label><input class="form-control form-control-sm" type="number" min="0" id="advancedVideoSampleDuration" placeholder="unknown"></div>
+                <div class="col-md-2"><label class="form-label">Pixel format</label><input class="form-control form-control-sm" id="advancedVideoSamplePixelFormat" placeholder="unknown"></div>
+                <div class="col-md-2"><label class="form-label">Bit depth</label><input class="form-control form-control-sm" type="number" min="1" id="advancedVideoSampleBitDepth" placeholder="unknown"></div>
+                <div class="col-md-2"><label class="form-label">HDR</label><select class="form-select form-select-sm" id="advancedVideoSampleHdr"><option value="">Unknown</option><option value="true">True</option><option value="false">False</option></select></div>
+                <div class="col-md-2"><label class="form-label">4K flag</label><select class="form-select form-select-sm" id="advancedVideoSample4K"><option value="">Derive from width</option><option value="true">True</option><option value="false">False</option></select></div>
+            </div>
+            <pre class="bg-dark text-light rounded p-2 mt-2 mb-0 small text-wrap" id="advancedVideoPreview">Select a recipe or enter sample facts to preview.</pre>
+        </details>
+    </div>
+</div>

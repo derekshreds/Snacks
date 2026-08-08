@@ -103,6 +103,27 @@ function getMetaLineHtml(workItem) {
     return `${sizeStr} &bull; ${formatBitrate(workItem.bitrate)} &bull; ${formatDuration(workItem.length)}`;
 }
 
+/** Profile/rule/encoder context plus actionable scheduler waiting state. */
+function getVideoPolicyHtml(workItem) {
+    const labels = [];
+    if (workItem.videoProfileName)
+        labels.push(`<span class="badge bg-info text-dark"><i class="fas fa-layer-group me-1"></i>${escapeHtml(workItem.videoProfileName)}</span>`);
+    if (workItem.videoRuleName)
+        labels.push(`<span class="badge bg-light text-dark border"><i class="fas fa-code-branch me-1"></i>${escapeHtml(workItem.videoRuleName)}</span>`);
+    if (workItem.videoEncoderName)
+        labels.push(`<span class="badge bg-dark"><i class="fas fa-microchip me-1"></i>${escapeHtml(workItem.videoEncoderName)}</span>`);
+    if (!labels.length && workItem.videoPolicyAction && workItem.videoPolicyAction !== 'UseSimpleSettings')
+        labels.push(`<span class="badge bg-info text-dark">${escapeHtml(workItem.videoPolicyAction)}</span>`);
+
+    const context = labels.length
+        ? `<div class="video-policy-line d-flex flex-wrap gap-1 mt-2">${labels.join('')}</div>`
+        : '<div class="video-policy-line d-none"></div>';
+    const waiting = workItem.waitReason
+        ? `<div class="wait-reason alert alert-warning alert-sm mb-0 mt-2"><i class="fas fa-hourglass-half me-2"></i>${escapeHtml(workItem.waitReason)}</div>`
+        : '<div class="wait-reason d-none"></div>';
+    return context + waiting;
+}
+
 /**
  * Returns the HTML markup for the action buttons appropriate to the item's
  * current status (empty string when none are relevant).
@@ -211,6 +232,7 @@ export function getWorkItemHtml(workItem, clusterEnabled) {
         </div>
         ${progressBar}
         ${errorBlock}
+        ${getVideoPolicyHtml(workItem)}
         <div class="text-muted small mt-1">
             ${new Date(workItem.createdAt).toLocaleString()}${workItem.completedAt ? ` &rarr; ${new Date(workItem.completedAt).toLocaleString()}` : ''}
         </div>`;
@@ -302,6 +324,18 @@ export function updateWorkItemDom(element, workItem, clusterEnabled) {
         }
     } else if (existingError) {
         existingError.remove();
+    }
+
+    // Resolved advanced profile/rule/encoder and scheduler waiting reason can
+    // change while an item remains Pending as workers reconnect or settings change.
+    const policyMarkup = getVideoPolicyHtml(workItem);
+    const policyStart = element.querySelector('.video-policy-line');
+    const waiting = element.querySelector('.wait-reason');
+    if (policyStart && waiting) {
+        const holder = document.createElement('div');
+        holder.innerHTML = policyMarkup;
+        policyStart.replaceWith(holder.children[0]);
+        waiting.replaceWith(holder.children[0]);
     }
 
 

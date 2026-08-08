@@ -32,6 +32,7 @@ public sealed class ClusterDiscoveryService
     private readonly IHubContext<TranscodingHub> _hubContext;
     private readonly IHttpClientFactory         _httpClientFactory;
     private readonly TranscodingService         _transcodingService;
+    private readonly FfmpegCapabilityService    _ffmpegCapabilities;
     private readonly ConcurrentDictionary<string, ClusterNode> _nodes;
     private readonly JsonSerializerOptions _jsonOptions = new()
     {
@@ -86,12 +87,14 @@ public sealed class ClusterDiscoveryService
         IHubContext<TranscodingHub> hubContext,
         IHttpClientFactory httpClientFactory,
         TranscodingService transcodingService,
+        FfmpegCapabilityService ffmpegCapabilities,
         ConcurrentDictionary<string, ClusterNode> nodes)
     {
         _config             = config;
         _hubContext         = hubContext;
         _httpClientFactory  = httpClientFactory;
         _transcodingService = transcodingService;
+        _ffmpegCapabilities = ffmpegCapabilities;
         _nodes              = nodes;
     }
 
@@ -647,8 +650,11 @@ public sealed class ClusterDiscoveryService
 
         return new WorkerCapabilities
         {
+            AdvancedVideoProtocolVersion = VideoJobPlan.CurrentProtocolVersion,
             GpuVendor              = _detectedGpuVendor ?? "none",
-            SupportedEncoders      = _supportedEncoders ?? BuildSupportedEncodersList(),
+            // Recompose on every heartbeat. The underlying FFmpeg inventory is
+            // cheaply cached, while device tests and reconnect state remain live.
+            SupportedEncoders      = BuildSupportedEncodersList(),
             OsPlatform             = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "Windows"
                                    : RuntimeInformation.IsOSPlatform(OSPlatform.OSX)     ? "macOS"
                                    : "Linux",
@@ -693,36 +699,38 @@ public sealed class ClusterDiscoveryService
     /// <summary> Builds and caches the list of encoder identifiers supported by this node's hardware. </summary>
     private List<string> BuildSupportedEncodersList()
     {
-        var encoders = new List<string> { "libx265", "libx264", "libsvtav1" };
-        var hw = _detectedGpuVendor;
-
-        if (hw == "nvidia")
+        try
         {
-            encoders.AddRange(new[] { "hevc_nvenc", "h264_nvenc" });
+            var inventory = _ffmpegCapabilities.GetVideoEncodersAsync().GetAwaiter().GetResult();
+            var devices = _transcodingService.GetDetectedDevices();
+            var testedHardware = devices.Where(d => d.IsHardware)
+                .SelectMany(d => d.Encoders)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var detected = inventory
+                .Where(e => e.DeviceId == "cpu" || testedHardware.Contains(e.Encoder))
+                .Select(e => e.Encoder)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            if (detected.Count > 0)
+            {
+                _supportedEncoders = detected;
+                return detected;
+            }
         }
-        else if (hw == "intel")
+        catch (Exception ex)
         {
-            // On Linux, Snacks probes QSV before VAAPI during hardware detection and sets
-            // LinuxIntelUsesQsv when the QSV probe succeeds on the chosen render node.
-            // Advertise QSV encoders in that case so the master scheduler dispatches
-            // QSV-aware jobs; otherwise fall back to VAAPI encoders for compatibility.
-            bool useQsv = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) || TranscodingService.LinuxIntelUsesQsv;
-            if (useQsv)
-                encoders.AddRange(new[] { "hevc_qsv", "h264_qsv" });
-            else
-                encoders.AddRange(new[] { "hevc_vaapi", "h264_vaapi" });
-        }
-        else if (hw == "amd")
-        {
-            encoders.AddRange(new[] { "hevc_amf", "h264_amf" });
-        }
-        else if (hw == "apple")
-        {
-            encoders.AddRange(new[] { "hevc_videotoolbox", "h264_videotoolbox" });
+            Log.Warning($"FFmpeg capability catalog unavailable; using compatibility fallback: {ex.Message}");
         }
 
-        _supportedEncoders = encoders;
-        return encoders;
+        // Inventory failure must not turn assumptions into advertised protocol
+        // capabilities. Hardware device lists contain only encoders whose probes
+        // actually passed, so they remain the safe last-resort source of truth.
+        var tested = _transcodingService.GetDetectedDevices()
+            .SelectMany(device => device.Encoders)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        _supportedEncoders = tested;
+        return tested;
     }
 
     /******************************************************************

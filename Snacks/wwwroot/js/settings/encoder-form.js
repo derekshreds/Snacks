@@ -15,6 +15,7 @@
 import { settingsApi }                    from '../api.js';
 import { setChipValues, getChipValues }   from './chip-input.js';
 import { applyEnvLocks }                  from './env-locks.js';
+import { getAdvancedVideoOptions, restoreAdvancedVideoOptions } from './advanced-video.js';
 
 
 // ---------------------------------------------------------------------------
@@ -263,7 +264,7 @@ function ensureAudioOutputAddBound(prefix) {
  * @param {string} [prefix='settings'] Id prefix shared by all form inputs.
  * @returns {object} The options snapshot.
  */
-export function getEncoderOptions(prefix = 'settings') {
+export function getEncoderOptions(prefix = 'settings', persist = true) {
 
     /** Reads a string value with a default for a missing input. */
     const str = (id, d = '') => el(prefix, id)?.value ?? d;
@@ -363,6 +364,10 @@ export function getEncoderOptions(prefix = 'settings') {
         VideoProfile:        sel('VideoProfile', '') || null,
         VideoLevel:          sel('VideoLevel', '') || null,
 
+        // Transactionally-committed advanced editor state. Staged changes do not
+        // enter this snapshot until the user clicks Validate & Apply.
+        advancedVideo: getAdvancedVideoOptions(),
+
         // Music — nested object on EncoderOptions, codec is derived from the format selector.
         Music: {
             Format:                   sel('MusicFormat', 'm4a'),
@@ -384,11 +389,11 @@ export function getEncoderOptions(prefix = 'settings') {
     // them would overwrite the user's real settings.json. Don't fail silently
     // in the disarmed state either: the user is editing a form whose changes
     // are NOT being persisted, and they need to know.
-    if (restoredPrefixes.has(prefix)) {
+    if (persist && restoredPrefixes.has(prefix)) {
         settingsApi.save(options)
             .then(() => reportAutoSaveStatus(true))
             .catch(() => reportAutoSaveStatus(false));
-    } else {
+    } else if (persist) {
         reportAutoSaveStatus(false,
             "⚠ Settings couldn't be loaded from the server — changes are not being saved. Close and reopen Settings to retry.");
     }
@@ -623,6 +628,9 @@ export function applyEncoderOptionsToForm(prefix, saved) {
         set('FfmpegQualityPreset', or(pick('FfmpegQualityPreset'), 'medium'));
         set('VideoProfile',        or(pick('VideoProfile'),        ''));
         set('VideoLevel',          or(pick('VideoLevel'),          ''));
+
+        const advancedVideo = pick('AdvancedVideo');
+        if (advancedVideo !== undefined) restoreAdvancedVideoOptions(advancedVideo);
 
         // Chip inputs — only when the key is present; null falls back to a sane default.
         const audioLangs = pick('AudioLanguagesToKeep');
