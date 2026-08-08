@@ -286,9 +286,10 @@ public sealed class PublicApiController : Controller
     /// </summary>
     [HttpGet("/iframe/homarr")]
     public async Task<IActionResult> HomarrIframe(
-        [FromQuery] string theme = "dark",
-        [FromQuery] string tab   = "stats",
-        [FromQuery] int    limit = 10)
+        [FromQuery] string theme   = "dark",
+        [FromQuery] string tab     = "stats",
+        [FromQuery] int    limit   = 10,
+        [FromQuery] int    refresh = 30)
     {
         Response.Headers["Content-Security-Policy"] = $"frame-ancestors {_auth.GetIframeFrameAncestors()}";
         // We deliberately do NOT set X-Frame-Options — frame-ancestors is strictly
@@ -296,9 +297,11 @@ public sealed class PublicApiController : Controller
 
         var clusterConfig = _cluster.GetConfig();
         var summary       = await _history.GetSummaryAsync();
+        var savingsDaily  = await _history.GetSavingsOverTimeAsync(14);
         var workItems     = _transcoding.GetAllWorkItems();
-        var normalizedTab = NormalizeTab(tab);
-        var clampedLimit  = Math.Clamp(limit, 1, 30);
+        var normalizedTab   = NormalizeTab(tab);
+        var clampedLimit    = Math.Clamp(limit, 1, 30);
+        var clampedRefresh  = refresh <= 0 ? 0 : Math.Clamp(refresh, 10, 3600);
 
         var pending    = workItems.Count(w => w.Status == WorkItemStatus.Pending);
         var processing = workItems.Count(w => w.Status is WorkItemStatus.Processing
@@ -332,6 +335,7 @@ public sealed class PublicApiController : Controller
             Theme        = string.Equals(theme, "light", StringComparison.OrdinalIgnoreCase) ? "light" : "dark",
             Tab          = normalizedTab,
             Limit        = clampedLimit,
+            Refresh      = clampedRefresh,
             Version      = ClusterDiscoveryService.ClusterVersion,
             InstanceName = string.IsNullOrWhiteSpace(clusterConfig.NodeName) ? "Snacks" : clusterConfig.NodeName,
 
@@ -342,8 +346,9 @@ public sealed class PublicApiController : Controller
             Processing  = processing,
             Failed      = failed,
 
-            Queue   = queueRecords,
-            Workers = workersRows,
+            Queue         = queueRecords,
+            Workers       = workersRows,
+            SavingsSeries = savingsDaily.Select(d => d.BytesSaved).ToList(),
         };
         return View("~/Views/Homarr/Index.cshtml", model);
     }
@@ -367,18 +372,22 @@ public sealed class PublicApiController : Controller
             }
         };
 
-        rows.AddRange(_cluster.GetNodes().Select(n => new HomarrIframeWorkerRow
-        {
-            NodeName = string.IsNullOrWhiteSpace(n.Hostname) ? n.NodeId : n.Hostname,
-            Paused   = n.IsPaused,
-            Jobs     = n.ActiveJobs.Select(j => new HomarrIframeJobRow
+        // The discovery registry can contain this instance itself (loopback
+        // discovery); the local row above already covers it.
+        rows.AddRange(_cluster.GetNodes()
+            .Where(n => n.NodeId != clusterConfig.NodeId)
+            .Select(n => new HomarrIframeWorkerRow
             {
-                FileName = j.FileName ?? "",
-                Device   = j.DeviceId,
-                Progress = j.Progress,
-                Phase    = j.Phase ?? "Encoding",
-            }).ToList(),
-        }));
+                NodeName = string.IsNullOrWhiteSpace(n.Hostname) ? n.NodeId : n.Hostname,
+                Paused   = n.IsPaused,
+                Jobs     = n.ActiveJobs.Select(j => new HomarrIframeJobRow
+                {
+                    FileName = j.FileName ?? "",
+                    Device   = j.DeviceId,
+                    Progress = j.Progress,
+                    Phase    = j.Phase ?? "Encoding",
+                }).ToList(),
+            }));
 
         return rows;
     }
@@ -397,6 +406,9 @@ public sealed class HomarrIframeModel
     public string Theme        { get; set; } = "dark";
     public string Tab          { get; set; } = "stats";
     public int    Limit        { get; set; } = 10;
+
+    /// <summary> Auto-reload interval in seconds; 0 disables. Clamped to [10, 3600]. </summary>
+    public int    Refresh      { get; set; } = 30;
     public string Version      { get; set; } = "";
     public string InstanceName { get; set; } = "Snacks";
 
@@ -409,6 +421,9 @@ public sealed class HomarrIframeModel
 
     public List<HomarrIframeQueueRow>  Queue   { get; set; } = new();
     public List<HomarrIframeWorkerRow> Workers { get; set; } = new();
+
+    /// <summary> Bytes saved per day, oldest→newest (14 entries, zero-filled), for the sparkline. </summary>
+    public List<long> SavingsSeries { get; set; } = new();
 }
 
 /// <summary> One queue row rendered in the iframe's Queue tab. </summary>
