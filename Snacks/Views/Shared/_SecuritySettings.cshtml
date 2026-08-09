@@ -35,8 +35,9 @@
                 Lets scripts, orchestrators, and external dashboards (Homarr, Glance, …) call the API when
                 sign-in is enabled — e.g. pause/resume the queue, trigger a scan, or read status via the
                 read-only <code>/api/v1/*</code> endpoints. Send the key as an <code>X-Api-Key</code> header,
-                an <code>Authorization: Bearer</code> token, or a <code>?apiKey=</code> query string
-                (Sonarr/Radarr-compatible).
+                or an <code>Authorization: Bearer</code> token. The Sonarr-style <code>?apiKey=</code>
+                query form is accepted only by the read-only <code>/api/v1</code> and Tdarr-compatible routes.
+                See the <a href="/docs/#homarr-tdarr" target="_blank" rel="noopener">native Homarr widget setup guide</a>.
             </p>
 
             <div class="input-group mb-2">
@@ -58,6 +59,31 @@
             </div>
         </div>
 
+        <div class="encoder-panel rounded mb-4">
+            <h6 class="fw-bold mb-3"><i class="fas fa-window-restore me-2 text-primary"></i>Iframe Access</h6>
+            <p class="small text-muted">
+                Generate a credential scoped to the read-only <code>/iframe/*</code> pages. Use this URL in
+                Homarr's iframe widget; it cannot call the Snacks API or change settings. See the
+                <a href="/docs/#homarr-iframe" target="_blank" rel="noopener">compact tile setup guide</a>.
+            </p>
+
+            <div class="input-group mb-3">
+                <input type="password" class="form-control" id="embedUrlValue" readonly placeholder="No iframe URL generated" autocomplete="off">
+                <button class="btn btn-outline-secondary" id="revealEmbedUrlBtn" type="button" title="Show / hide"><i class="fas fa-eye"></i></button>
+                <button class="btn btn-outline-secondary" id="copyEmbedUrlBtn" type="button" title="Copy to clipboard"><i class="fas fa-copy"></i></button>
+            </div>
+
+            <div class="d-flex gap-2 mb-3">
+                <button class="btn btn-primary btn-sm" id="generateEmbedTokenBtn" type="button"><i class="fas fa-sync me-1"></i>Generate URL</button>
+                <button class="btn btn-outline-danger btn-sm" id="deleteEmbedTokenBtn" type="button"><i class="fas fa-trash me-1"></i>Revoke</button>
+            </div>
+
+            <label for="iframeAllowedOrigins" class="form-label small">Allowed Homarr origins</label>
+            <textarea class="form-control mb-2" id="iframeAllowedOrigins" rows="2" placeholder="https://homarr.example.com (one origin per line)"></textarea>
+            <button class="btn btn-outline-primary btn-sm" id="saveEmbedOriginsBtn" type="button"><i class="fas fa-save me-1"></i>Save origins</button>
+            <div class="form-text">When empty, only this Snacks origin may embed the page. Paths and trailing slashes are normalized to the origin.</div>
+        </div>
+
         <div class="encoder-panel rounded">
             <h6 class="fw-bold mb-3"><i class="fas fa-shield-alt me-2 text-warning"></i>Notes</h6>
             <ul class="small text-muted mb-0">
@@ -65,6 +91,7 @@
                 <li>Cluster traffic between master and nodes uses the shared secret configured in the Cluster tab — it is independent of this login.</li>
                 <li>Disabling auth rotates the session secret, invalidating all existing cookies.</li>
                 <li>API keys grant full API access — treat them like a password.</li>
+                <li>Iframe tokens are read-only, but may reveal queue filenames to an allowed embedding site.</li>
             </ul>
         </div>
     </div>

@@ -23,8 +23,6 @@
     // is usually the distinguishing part, so never let CSS ellipsis eat it.
     string TruncateMiddle(string s, int max = 46) =>
         string.IsNullOrEmpty(s) || s.Length <= max ? s : s[..(max - 15)] + "…" + s[^14..];
-    string TabHref(string tab) => $"?theme={Model.Theme}&tab={tab}&limit={Model.Limit}&refresh={Model.Refresh}";
-
     var (heroValue, heroUnit) = FormatBytesParts(Model.BytesSaved);
     var activeJobs = Model.Workers.SelectMany(n => n.Jobs).Take(2).ToList();
 
@@ -246,9 +244,9 @@
                 <span class="name">Snacks</span><span class="ver">@(string.Equals(Model.InstanceName, "Snacks", StringComparison.OrdinalIgnoreCase) ? "" : $"{Model.InstanceName} · ")v@(Model.Version)</span>
             </div>
             <nav>
-                <a href="@TabHref("stats")"   class="@(Model.Tab == "stats"   ? "active" : "")">Stats</a>
-                <a href="@TabHref("queue")"   class="@(Model.Tab == "queue"   ? "active" : "")">Queue</a>
-                <a href="@TabHref("workers")" class="@(Model.Tab == "workers" ? "active" : "")">Workers</a>
+                <a href="@Model.GetTabHref("stats")"   class="@(Model.Tab == "stats"   ? "active" : "")">Stats</a>
+                <a href="@Model.GetTabHref("queue")"   class="@(Model.Tab == "queue"   ? "active" : "")">Queue</a>
+                <a href="@Model.GetTabHref("workers")" class="@(Model.Tab == "workers" ? "active" : "")">Workers</a>
             </nav>
         </header>
 

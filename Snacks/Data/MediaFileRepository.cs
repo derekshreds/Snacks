@@ -276,12 +276,31 @@ public class MediaFileRepository
             return await InQueueOrder(query, newestFirst).Skip(skip).Take(take).ToListAsync();
         }
 
-        /// <summary> One page of the pending queue for the UI, plus the total pending count. </summary>
-        public async Task<(List<MediaFile> Rows, int Total)> GetQueuedPageAsync(int skip, int take, bool newestFirst = false)
+        /// <summary>
+        ///     One page of the pending queue plus the total pending count. Paths already
+        ///     represented by an in-memory active job may be excluded so read-only dashboard
+        ///     projections never show the same file as both queued and processing during the
+        ///     brief DB/status transition between those phases.
+        /// </summary>
+        public async Task<(List<MediaFile> Rows, int Total)> GetQueuedPageAsync(
+            int skip,
+            int take,
+            bool newestFirst = false,
+            IReadOnlyCollection<string>? excludedPaths = null)
         {
             using var context = await _contextFactory.CreateDbContextAsync();
-            var total = await QueuedLocal(context).CountAsync();
-            var rows  = await InQueueOrder(QueuedLocal(context), newestFirst).Skip(skip).Take(take).ToListAsync();
+            var query = QueuedLocal(context);
+            var excluded = excludedPaths?.Where(path => !string.IsNullOrWhiteSpace(path)).Distinct().ToArray() ?? [];
+            if (excluded.Length > 0)
+                query = query.Where(file => !excluded.Contains(file.FilePath));
+
+            var total = await query.CountAsync();
+            var rows  = take <= 0
+                ? []
+                : await InQueueOrder(query, newestFirst)
+                    .Skip(Math.Max(0, skip))
+                    .Take(take)
+                    .ToListAsync();
             return (rows, total);
         }
 
@@ -290,6 +309,15 @@ public class MediaFileRepository
         {
             using var context = await _contextFactory.CreateDbContextAsync();
             return await QueuedLocal(context).CountAsync();
+        }
+
+        /// <summary>Counts persisted media rows in one lifecycle status.</summary>
+        public async Task<int> CountByStatusAsync(MediaFileStatus status, MediaKind? kind = null)
+        {
+            using var context = await _contextFactory.CreateDbContextAsync();
+            var query = context.MediaFiles.Where(file => file.Status == status);
+            if (kind.HasValue) query = query.Where(file => file.Kind == kind.Value);
+            return await query.CountAsync();
         }
 
         /// <summary> Fetches a row by primary key. </summary>

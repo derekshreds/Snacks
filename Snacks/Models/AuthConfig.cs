@@ -21,9 +21,9 @@ public sealed class AuthConfig
     public string SessionSecret { get; set; } = "";
 
     /// <summary>
-    ///     Optional API key accepted on <c>/api/*</c> via the <c>X-Api-Key</c> header, an
-    ///     <c>Authorization: Bearer</c> token, or a <c>?apiKey=</c> query string (the
-    ///     Sonarr/Radarr convention, for dashboards like Homarr that can only set a URL).
+    ///     Optional API key accepted on <c>/api/*</c> via the <c>X-Api-Key</c> header or an
+    ///     <c>Authorization: Bearer</c> token. A <c>?apiKey=</c> query string is accepted only
+    ///     on the read-only dashboard compatibility routes.
     ///     Empty = no stored key. Plaintext, like the cluster shared secret — the config
     ///     directory is the trust boundary. A key set via the <c>SNACKS_API_KEY</c> env var
     ///     is honored independently of this field.
@@ -31,9 +31,16 @@ public sealed class AuthConfig
     public string ApiKey { get; set; } = "";
 
     /// <summary>
+    ///     Scoped bearer token accepted only on read-only <c>/iframe/*</c> routes via
+    ///     <c>?embedToken=</c>. Kept separate from <see cref="ApiKey"/> so an iframe URL
+    ///     cannot be reused to call mutation endpoints.
+    /// </summary>
+    public string EmbedToken { get; set; } = "";
+
+    /// <summary>
     ///     CSP <c>frame-ancestors</c> allowlist for the <c>/iframe/*</c> embed routes.
-    ///     Empty list ⇒ permissive (any origin may embed). Populate with concrete
-    ///     origins (e.g. <c>"https://homarr.local"</c>) to lock embedding down.
+    ///     Empty list permits only the Snacks origin itself. Populate with concrete
+    ///     HTTP(S) origins (e.g. <c>"https://homarr.local"</c>) to allow external embeds.
     /// </summary>
     public List<string> IframeAllowedOrigins { get; set; } = new();
 }

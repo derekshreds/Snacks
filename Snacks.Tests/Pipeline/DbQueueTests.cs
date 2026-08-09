@@ -96,6 +96,34 @@ public sealed class DbQueueTests : IDisposable
     }
 
     [Fact]
+    public async Task Queued_page_excludes_paths_already_represented_by_active_jobs()
+    {
+        var repo = _db.CreateRepository();
+        await repo.UpsertAsync(Row("/m/active.mkv", 9000));
+        await repo.UpsertAsync(Row("/m/pending.mkv", 1000));
+
+        var (rows, total) = await repo.GetQueuedPageAsync(
+            skip: 0,
+            take: 10,
+            excludedPaths: new[] { "/m/active.mkv" });
+
+        total.Should().Be(1);
+        rows.Should().ContainSingle().Which.FileName.Should().Be("pending.mkv");
+    }
+
+    [Fact]
+    public async Task Count_by_status_reads_the_persisted_lifecycle_state()
+    {
+        var repo = _db.CreateRepository();
+        await repo.UpsertAsync(Row("/m/a.mkv", 1000, status: MediaFileStatus.Failed));
+        await repo.UpsertAsync(Row("/m/b.mkv", 1000, status: MediaFileStatus.Failed));
+        await repo.UpsertAsync(Row("/m/c.mkv", 1000, status: MediaFileStatus.Completed));
+
+        (await repo.CountByStatusAsync(MediaFileStatus.Failed)).Should().Be(2);
+        (await repo.CountByStatusAsync(MediaFileStatus.Completed)).Should().Be(1);
+    }
+
+    [Fact]
     public async Task Bump_priority_moves_row_to_front_and_refuses_non_queued()
     {
         var repo = _db.CreateRepository();

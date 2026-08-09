@@ -401,6 +401,7 @@
         <a href="#cluster">Clusters</a>
         <a href="#hardware-containers">Hardware &amp; containers</a>
         <a href="#integrations">Integrations</a>
+        <a href="#homarr">Homarr dashboards</a>
         <a href="#data-backups">Data &amp; backups</a>
         <a href="#observability">Logs &amp; metrics</a>
         <a href="#troubleshooting">Troubleshooting</a>
@@ -416,7 +417,7 @@
         <div class="group">Contributors</div>
         <a href="#development">Development</a>
       </nav>
-      <div class="version">Documents Snacks v2.17.0 · updated 2026-08-07</div>
+      <div class="version">Documents Snacks v2.17.0 · updated 2026-08-09</div>
       </div>
     </aside>
 
@@ -1006,6 +1007,7 @@ environment:
               <tr><td>Jellyfin</td><td>Connection test and optional library rescan after completion.</td><td>API key</td></tr>
               <tr><td>Sonarr / Radarr</td><td>Media-manager connectivity and metadata workflow support.</td><td>API key</td></tr>
               <tr><td>TheTVDB / TMDb</td><td>Original-language and metadata lookups used by language-aware processing.</td><td>API key; TVDB PIN optional</td></tr>
+              <tr><td>Homarr</td><td>Compact Snacks iFrame tile, or Homarr's native Media Transcoding widget through a read-only Tdarr adapter.</td><td>Scoped iframe token or Snacks API key</td></tr>
               <tr><td>Notifications</td><td>Webhook, ntfy, or Apprise destinations for encode/scan/node events.</td><td>Destination-specific</td></tr>
             </tbody>
           </table>
@@ -1014,6 +1016,128 @@ environment:
           Integration credentials are stored in plaintext JSON inside the Snacks config
           directory. Protect that directory with host permissions, enable control-panel
           authentication, and restrict network access to trusted clients.
+        </p>
+
+        <h3 id="homarr">Homarr dashboards: choose a setup</h3>
+        <p>
+          Both choices are read-only and expose the same Snacks queue and cluster state, but they
+          use different presentation, credentials, and network paths. They may be used together.
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Option</th><th>Choose it for</th><th>Who connects to Snacks</th><th>Credential</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Snacks compact tile</strong></td><td>Snacks' responsive Stats, Queue, and Workers views inside a Homarr iFrame widget.</td><td>Each viewer's browser</td><td>Scoped iframe URL when Snacks sign-in is enabled</td></tr>
+              <tr><td><strong>Homarr Media Transcoding</strong></td><td>Homarr's native widget, backed by Snacks' Tdarr-compatible read model.</td><td>The Homarr server or container</td><td>Snacks API key when Snacks sign-in is enabled</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="homarr-iframe">Snacks compact tile (Homarr iFrame)</h3>
+        <p>
+          The compact tile is a server-rendered Snacks page at <code>/iframe/homarr</code>. Its
+          Stats tab shows lifetime space savings, encode counts, current queue counts, a 14-day
+          savings sparkline, and active work. Queue shows active and pending files; Workers shows
+          the local instance and discovered cluster nodes. Nothing in the tile can mutate Snacks.
+        </p>
+        <ol>
+          <li>
+            Open Snacks <strong>Settings → Security → Iframe Access</strong>. Add the exact Homarr
+            origin seen in the browser, including its scheme and non-default port, such as
+            <code>https://homarr.example.com</code> or <code>http://192.168.1.20:7575</code>. Enter
+            an origin, not a board path, then select <strong>Save origins</strong>.
+          </li>
+          <li>
+            Select <strong>Generate URL</strong> and copy the resulting URL. Generating again
+            replaces the previous iframe token; <strong>Revoke</strong> invalidates it immediately.
+          </li>
+          <li>
+            Open the desired Homarr board in edit mode, add an <strong>iFrame</strong> widget, and
+            paste the copied value into <strong>Embed URL</strong>. Disabling widget scrolling is
+            optional because the tile is responsive.
+          </li>
+          <li>
+            Test the board from a normal viewer device. An iFrame is loaded by that device's
+            browser, so its Snacks URL must be resolvable and reachable there; a Docker-only name
+            such as <code>snacks</code> usually is not. If necessary, replace only the generated
+            URL's scheme, host, and port with the browser-reachable Snacks origin.
+          </li>
+        </ol>
+        <p>The generated URL can be customized by appending these query parameters:</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Parameter</th><th>Values and default</th><th>Effect</th></tr></thead>
+            <tbody>
+              <tr><td><code>embedToken</code></td><td>Generated <code>snk_embed_…</code> value</td><td>Required by the iframe route when the Snacks sign-in gate is active. It is retained when changing tile tabs.</td></tr>
+              <tr><td><code>theme</code></td><td><code>dark</code> (default) or <code>light</code></td><td>Selects the tile color scheme.</td></tr>
+              <tr><td><code>tab</code></td><td><code>stats</code> (default), <code>queue</code>, or <code>workers</code></td><td>Selects the initial tab; visitors can still switch tabs in the tile.</td></tr>
+              <tr><td><code>limit</code></td><td><code>10</code> by default; clamped to 1–30</td><td>Limits rows shown on the Queue tab.</td></tr>
+              <tr><td><code>refresh</code></td><td><code>30</code> seconds by default; <code>0</code> disables, other values clamp to 10–3600</td><td>Reloads the server-rendered snapshot.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <pre><code>https://snacks.example.com/iframe/homarr?embedToken=YOUR_TOKEN&amp;theme=dark&amp;tab=stats&amp;limit=10&amp;refresh=30</code></pre>
+        <div class="callout warning">
+          Treat the generated URL as a secret even though its token is read-only: the tile may
+          reveal media filenames. The allowed-origin list is an additional browser framing policy,
+          not a substitute for the token. Snacks always permits same-origin framing; an empty list
+          permits only same-origin framing. An HTTPS Homarr board also cannot embed an HTTP Snacks
+          URL because browsers block mixed content.
+        </div>
+
+        <h3 id="homarr-tdarr">Homarr Media Transcoding widget (Tdarr adapter)</h3>
+        <p>
+          Snacks implements only the read-only Tdarr API subset consumed by Homarr's native
+          <strong>Media Transcoding</strong> widget. Use this choice when the widget should inherit
+          Homarr's own design, default-view setting, and queue pagination.
+        </p>
+        <ol>
+          <li>
+            If Snacks sign-in is enabled, open <strong>Settings → Security → API Access</strong>
+            and generate or copy a Snacks API key. If sign-in is disabled, Homarr's
+            <strong>No Authentication</strong> option also works.
+          </li>
+          <li>
+            In Homarr, open integration management and create a <strong>Tdarr</strong> integration.
+            Give it any descriptive name.
+          </li>
+          <li>
+            Set <strong>URL</strong> to the Snacks base origin only, such as
+            <code>http://snacks:6767</code> or <code>http://192.168.1.20:6767</code>. Do not append
+            <code>/api</code> or an endpoint path. This address must be reachable from the Homarr
+            server or container, not merely from the browser.
+          </li>
+          <li>
+            Choose <strong>API Key</strong> and paste the Snacks key when authentication is active;
+            otherwise choose <strong>No Authentication</strong>. Test and create the integration.
+          </li>
+          <li>
+            Edit a Homarr board, add a <strong>Media Transcoding</strong> widget, select the new
+            integration, then choose its default view and a queue page size from 1–30.
+          </li>
+        </ol>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Homarr tab</th><th>Snacks data</th><th>Intentional limitations</th></tr></thead>
+            <tbody>
+              <tr><td>Statistics</td><td>Catalog and lifetime encode totals, saved space, outcomes, current queue counts, 365-day video/music codec mix, and 4K split.</td><td>Health-check and container-history charts are empty because Snacks does not retain those Tdarr concepts.</td></tr>
+              <tr><td>Queue</td><td>Current active and SQLite-backed pending transcodes, with source container, codec, resolution, size, and status.</td><td>Read-only; completed history and Tdarr health-check table are not exposed here.</td></tr>
+              <tr><td>Workers</td><td>Local and discovered cluster nodes, pause state, active file, device, phase, and progress.</td><td>FPS, ETA, and worker size estimates are not currently available and display neutral values.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout">
+          Point the integration at the Snacks master/coordinator for a cluster-wide view. In a
+          shared Docker network, <code>http://snacks:6767</code> can work here because Homarr makes
+          the requests; <code>localhost</code> refers to Homarr itself. The adapter cannot execute
+          Tdarr plugins, control jobs, or act as a complete Tdarr server. Although its calls are
+          read-only, a Snacks API key is a full API credential and must be protected accordingly.
+        </div>
+        <p>
+          Homarr's current field names and widget options are also described in its official
+          <a href="https://homarr.dev/docs/integrations/tdarr/">Tdarr integration</a>,
+          <a href="https://homarr.dev/docs/widgets/media-transcoding/">Media Transcoding widget</a>,
+          and <a href="https://homarr.dev/docs/widgets/iframe/">iFrame widget</a> documentation.
         </p>
       </section>
 
@@ -1197,6 +1321,44 @@ docker exec snacks vainfo</code></pre>
           </div>
         </details>
         <details>
+          <summary>Homarr rejects the Snacks Tdarr integration</summary>
+          <div>
+            <p>
+              Confirm that the integration URL is the Snacks base origin with no API path, that it
+              points to the master/coordinator, and that the Homarr container can resolve and reach
+              it. Use <strong>API Key</strong> with a current Snacks key when sign-in is enabled, or
+              <strong>No Authentication</strong> only when the Snacks sign-in gate is disabled.
+              Test the same probe from Homarr's network namespace when possible:
+            </p>
+            <pre><code>curl -i -X POST \
+  -H "X-Api-Key: YOUR_SNACKS_API_KEY" \
+  http://snacks:6767/api/v2/is-server-alive</code></pre>
+            <p>
+              HTTP 401 indicates a missing or stale key. A DNS or connection error indicates the
+              Homarr-to-Snacks network path. For HTTPS, also verify the certificate trust chain.
+              See <a href="#homarr-tdarr">Homarr Media Transcoding setup</a>.
+            </p>
+          </div>
+        </details>
+        <details>
+          <summary>The Snacks tile is blank, refused, or unauthorized in Homarr</summary>
+          <div>
+            <p>
+              First open the generated iframe URL directly on the same viewer device. HTTP 401
+              means the scoped token was omitted, revoked, or replaced. If the URL works directly
+              but not inside Homarr, add the exact Homarr origin—including scheme and port—to
+              <strong>Settings → Security → Iframe Access</strong>. Also check that a reverse proxy
+              is not replacing Snacks' <code>Content-Security-Policy: frame-ancestors …</code>
+              response and that an HTTPS board is not trying to frame an HTTP URL.
+            </p>
+            <p>
+              A browser DNS or connection error means the generated Snacks origin is not reachable
+              from the viewer; unlike an integration, an iFrame is not fetched by the Homarr
+              container. See <a href="#homarr-iframe">Snacks compact tile setup</a>.
+            </p>
+          </div>
+        </details>
+        <details>
           <summary>Authentication configuration is unusable</summary>
           <div>
             Stop Snacks, back up the config directory, and remove only
@@ -1253,6 +1415,12 @@ curl -fsS -b snacks.cookies "$BASE/api/queue/stats"</code></pre>
           <code>POST /api/auth/apikey/generate</code>), or supply one through the
           <code>SNACKS_API_KEY</code> environment variable; both work at once, and the env-supplied
           key is never revealed by the API.
+        </p>
+        <p>
+          The Sonarr-style <code>?apiKey=</code> query form is restricted to the read-only
+          <code>/api/v1/*</code> and Homarr/Tdarr compatibility routes because URL credentials can
+          leak into history and proxy logs. Mutation routes require a header, bearer token, or
+          signed session. Iframe pages use a separate scoped <code>?embedToken=</code> credential.
         </p>
         <pre><code>curl -fsS -H "X-Api-Key: $SNACKS_API_KEY" "$BASE/api/queue/stats"</code></pre>
 
@@ -1386,6 +1554,11 @@ curl -fsS -b snacks.cookies \
               <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/settings/reevaluate</code></td><td><code>forceRetryNoSavings=false</code></td><td>Re-evaluates catalog eligibility using current settings.</td></tr>
               <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/settings/video-encoders</code></td><td><code>refresh=false</code></td><td>Runtime H.264/HEVC/AV1 encoder catalog, native rate controls, local devices, and connected-worker availability.</td></tr>
               <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/settings/advanced-video/validate</code></td><td><code>{advancedVideo, profileId?, sourceFacts?}</code></td><td>Validates staged profiles/rules and returns stable diagnostics plus a literal FFmpeg video-argument preview without executing it.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/settings/advanced-video/impact</code></td><td><code>{advancedVideo}</code></td><td>Read-only library impact preview for a staged policy, including decision buckets and rule matches.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/settings/advanced-video/measured</code></td><td>—</td><td>Measured encode-history outcomes grouped by Advanced Video profile.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/settings/advanced-video/templates</code></td><td>—</td><td>Lists user-saved Advanced Video policy templates.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/settings/advanced-video/templates</code></td><td><code>{name,advancedVideo}</code></td><td>Validates and upserts a named policy template (maximum 20).</td></tr>
+              <tr class="api-row"><td><span class="method delete">DELETE</span></td><td><code>/api/settings/advanced-video/templates/{name}</code></td><td>Template name</td><td>Deletes one Advanced Video policy template.</td></tr>
               <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/settings/presets</code></td><td>—</td><td>Lists saved preset names and values.</td></tr>
               <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/settings/presets</code></td><td><code>{name, options}</code></td><td>Creates or replaces a named preset.</td></tr>
               <tr class="api-row"><td><span class="method delete">DELETE</span></td><td><code>/api/settings/presets/{name}</code></td><td>Preset name</td><td>Deletes one preset.</td></tr>
@@ -1423,6 +1596,10 @@ curl -fsS -b snacks.cookies \
               <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/auth/apikey</code></td><td>—</td><td>Returns the stored API key. A key supplied via <code>SNACKS_API_KEY</code> is never exposed here.</td></tr>
               <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/auth/apikey/generate</code></td><td>—</td><td>Generates and persists a new stored API key, replacing any previous one.</td></tr>
               <tr class="api-row"><td><span class="method delete">DELETE</span></td><td><code>/api/auth/apikey</code></td><td>—</td><td>Removes the stored API key. A key set via <code>SNACKS_API_KEY</code> stays valid.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/auth/embed</code></td><td>—</td><td>Returns the stored iframe-only token and concrete CSP origin allowlist.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/auth/embed/generate</code></td><td>—</td><td>Generates a new token accepted only by read-only <code>/iframe/*</code> pages.</td></tr>
+              <tr class="api-row"><td><span class="method delete">DELETE</span></td><td><code>/api/auth/embed</code></td><td>—</td><td>Revokes the iframe-only token.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/auth/embed/origins</code></td><td><code>{origins:["https://homarr.example"]}</code></td><td>Replaces and normalizes the HTTP(S) origins allowed by iframe CSP.</td></tr>
               <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/notifications/config</code></td><td>—</td><td>Full destination and event-toggle configuration.</td></tr>
               <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/notifications/config</code></td><td>Notification config</td><td>Saves destinations and toggles.</td></tr>
               <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/notifications/test</code></td><td>One destination object</td><td>Sends a test notification.</td></tr>
@@ -1459,6 +1636,31 @@ curl -fsS -b snacks.cookies \
               <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/dashboard/recent</code></td><td><code>limit=25</code>, <code>kind</code></td><td>Recent successful encodes.</td></tr>
               <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/dashboard/top-savings</code></td><td><code>limit=10</code>, <code>days=365</code>, <code>kind</code></td><td>Largest compression wins.</td></tr>
               <tr class="api-row"><td><span class="method delete">DELETE</span></td><td><code>/api/dashboard/history</code></td><td>—</td><td><span class="risk">Destructive to history:</span> deletes the complete encode-history ledger.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Read-only dashboard and Homarr compatibility</h3>
+        <p>
+          The v1 routes are Snacks-native read models. The v2 routes intentionally reproduce only
+          the case-sensitive Tdarr response shapes consumed by Homarr. Although three Tdarr probes
+          use POST, every compatibility action is read-only. When sign-in is enabled these routes
+          accept the API key as <code>X-Api-Key</code>, a bearer token, or the compatibility-only
+          <code>?apiKey=</code> query parameter. See the <a href="#homarr-tdarr">setup and supported
+          data</a> before treating this subset as a general Tdarr API.
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Method</th><th>Path</th><th>Inputs</th><th>Purpose</th></tr></thead>
+            <tbody>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/v1/system/status</code></td><td>—</td><td>Version, instance, runtime, role, node, uptime, and auth status.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/v1/stats</code></td><td>—</td><td>Lifetime history plus DB-backed current queue statistics.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/v1/queue</code></td><td><code>page=1</code>, <code>pageSize=10</code> (max 100)</td><td>Active jobs, the complete SQLite pending queue, and recent terminal records.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/v1/workers</code></td><td>—</td><td>Deduplicated local and cluster worker/job snapshots.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/v2/is-server-alive</code></td><td>—</td><td>Homarr Tdarr-adapter connection probe.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/v2/stats/get-pies</code></td><td><code>{data:{libraryId:""}}</code></td><td>Tdarr-shaped queue, history, codec, resolution, and saved-space statistics.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/v2/get-nodes</code></td><td>—</td><td>Tdarr-shaped node and active-worker dictionaries.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/v2/client/status-tables</code></td><td><code>{data:{start,pageSize,opts:{table}}}</code></td><td><code>table1</code> is the DB-backed transcode queue; unsupported health-check <code>table4</code> is empty.</td></tr>
             </tbody>
           </table>
         </div>

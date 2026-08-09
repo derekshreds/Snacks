@@ -2633,6 +2633,12 @@ public class TranscodingService
 
         var inflight = new List<Task>();
 
+        // Items that this local scheduler could not serve during the current pass.
+        // Keeping their IDs out of subsequent picks lets a later item target another
+        // free device instead of the first exact-encoder/capacity mismatch pinning the
+        // head of the queue. The set is cleared whenever running work frees capacity.
+        var deferredVideoIds = new HashSet<string>(StringComparer.Ordinal);
+
         // True when a servable item has been seen since the last rotation wrap —
         // a full backlog walk without one means nothing here is locally servable.
         bool servedSinceRotationWrap = false;
@@ -2678,6 +2684,7 @@ public class TranscodingService
                     anyVideoPending = _workQueue.Any(w =>
                         w.Kind == MediaKind.Video &&
                         w.Status == WorkItemStatus.Pending &&
+                        !deferredVideoIds.Contains(w.Id) &&
                         (_shouldSkipLocal == null || !_shouldSkipLocal(w)));
                     anyMusicPending = _workQueue.Any(w =>
                         w.Kind == MediaKind.Music &&
@@ -2748,6 +2755,7 @@ public class TranscodingService
                     // one to drain or for an explicit wake (settings change)
                     // before re-checking.
                     await WaitForSchedulerProgressAsync(inflight);
+                    deferredVideoIds.Clear();
                     continue;
                 }
 
@@ -2841,7 +2849,10 @@ public class TranscodingService
                 if (!anyVideoPending)
                 {
                     if (!dispatched)
+                    {
                         await WaitForSchedulerProgressAsync(inflight);
+                        deferredVideoIds.Clear();
+                    }
                     continue;
                 }
 
@@ -2854,17 +2865,20 @@ public class TranscodingService
                 WorkItem? workItem;
                 lock (_queueLock)
                 {
-                    workItem = _workQueue.FirstOrDefault(w =>
-                        w.Kind == MediaKind.Video &&
-                        w.Status == WorkItemStatus.Pending &&
-                        (_shouldSkipLocal == null || !_shouldSkipLocal(w)));
+                    workItem = SelectNextLocalVideoCandidate(
+                        _workQueue,
+                        deferredVideoIds,
+                        _shouldSkipLocal);
                     if (workItem != null) _workQueue.Remove(workItem);
                 }
 
                 if (workItem == null)
                 {
                     if (!dispatched)
+                    {
                         await WaitForSchedulerProgressAsync(inflight);
+                        deferredVideoIds.Clear();
+                    }
                     continue;
                 }
 
@@ -2892,7 +2906,7 @@ public class TranscodingService
                         _workQueue.Sort((a, b) => CompareQueueOrder(a, b, _queueNewestFirst));
                     }
                     try { await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem); } catch { }
-                    if (!dispatched) await WaitForSchedulerProgressAsync(inflight);
+                    deferredVideoIds.Add(workItem.Id);
                     continue;
                 }
                 if (policy.Plan.Action == AdvancedVideoAction.Skip)
@@ -2919,8 +2933,7 @@ public class TranscodingService
                         _workQueue.Add(workItem);
                         _workQueue.Sort((a, b) => CompareQueueOrder(a, b, _queueNewestFirst));
                     }
-                    if (!dispatched)
-                        await WaitForSchedulerProgressAsync(inflight);
+                    deferredVideoIds.Add(workItem.Id);
                     continue;
                 }
                 _slotLedger?.TransitionPhase(workItem.Id, SlotPhase.Encoding);
@@ -3011,6 +3024,20 @@ public class TranscodingService
             _processingLock.Release();
         }
     }
+
+    /// <summary>
+    ///     Selects the first locally eligible video that has not already failed local
+    ///     routing during this scheduler pass. Queue ordering is preserved by the caller.
+    /// </summary>
+    internal static WorkItem? SelectNextLocalVideoCandidate(
+        IEnumerable<WorkItem> queue,
+        IReadOnlySet<string> deferredIds,
+        Func<WorkItem, bool>? shouldSkipLocal = null) =>
+        queue.FirstOrDefault(item =>
+            item.Kind == MediaKind.Video
+            && item.Status == WorkItemStatus.Pending
+            && !deferredIds.Contains(item.Id)
+            && (shouldSkipLocal == null || !shouldSkipLocal(item)));
 
     /// <summary>
     ///     Picks the first hwaccel-eligible device for <paramref name="workItem"/>

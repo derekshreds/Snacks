@@ -148,6 +148,7 @@ See the [complete Docker/NAS guide](https://snacksvideo.com/docs/#quick-start) o
 - Distributed encoding with coordinator and worker roles
 - Plex and Jellyfin library rescans
 - Sonarr, Radarr, TMDb, and TheTVDB connectivity
+- Homarr dashboards through either a compact Snacks iFrame tile or the native Media Transcoding widget via a read-only Tdarr adapter
 - Webhook, Discord, ntfy, and Apprise notifications
 - API-key authentication, environment-variable configuration, OpenAPI, and health endpoints
 
@@ -186,7 +187,17 @@ Everything needed for unattended operation is configurable from the UI, environm
 - Configure integrations with `SNACKS_INTEG_*`
 - Pause and resume the queue, trigger scans, analyze directories, and enqueue media through the API
 - Authenticate automation with `X-Api-Key` or a bearer token when sign-in is enabled
+- Add the compact Snacks tile to Homarr, or point Homarr's Tdarr integration at Snacks for its native transcoding widget
 - Subscribe to real-time state through SignalR
+
+Homarr can display Snacks in two ways:
+
+| Option | What it provides | Connection and credential |
+|---|---|---|
+| **Snacks compact tile** | A read-only, responsive iFrame with Stats, Queue, and Workers tabs | Each viewer's browser connects to Snacks using a scoped iframe URL generated under **Settings → Security → Iframe Access** |
+| **Homarr Media Transcoding widget** | Homarr's native transcoding UI backed by Snacks queue, worker, and savings data | The Homarr server connects to Snacks through a **Tdarr** integration, using a Snacks API key when authentication is enabled |
+
+See the [Homarr dashboard guide](https://snacksvideo.com/docs/#homarr) for complete setup steps, URL options, security notes, limitations, and troubleshooting for both choices.
 
 Use the [operations and API guide](https://snacksvideo.com/docs/#api-basics) for examples, or inspect the hosted [OpenAPI specification](https://snacksvideo.com/openapi/v1.json).
 

@@ -31,21 +31,29 @@ public sealed class PublicApiController : Controller
     private readonly TranscodingService      _transcoding;
     private readonly ClusterService          _cluster;
     private readonly EncodeHistoryRepository _history;
+    private readonly MediaFileRepository     _mediaFiles;
+    private readonly DashboardIntegrationService _dashboard;
     private readonly AuthService             _auth;
 
     public PublicApiController(
         TranscodingService transcoding,
         ClusterService cluster,
         EncodeHistoryRepository history,
+        MediaFileRepository mediaFiles,
+        DashboardIntegrationService dashboard,
         AuthService auth)
     {
         ArgumentNullException.ThrowIfNull(transcoding);
         ArgumentNullException.ThrowIfNull(cluster);
         ArgumentNullException.ThrowIfNull(history);
+        ArgumentNullException.ThrowIfNull(mediaFiles);
+        ArgumentNullException.ThrowIfNull(dashboard);
         ArgumentNullException.ThrowIfNull(auth);
         _transcoding = transcoding;
         _cluster     = cluster;
         _history     = history;
+        _mediaFiles  = mediaFiles;
+        _dashboard   = dashboard;
         _auth        = auth;
     }
 
@@ -87,31 +95,30 @@ public sealed class PublicApiController : Controller
     ///     <c>MediaTranscodingIntegration</c> expects. <c>healthCheck*</c> arrays
     ///     are intentionally empty — Snacks has no "health check" concept distinct
     ///     from a normal encode. Container, audio codec, and audio container arrays
-    ///     are empty until Snacks's encode-history schema is extended to track them.
+    ///     remain empty because Snacks does not currently retain container history;
+    ///     video and music codec history are reported separately.
     /// </summary>
     [HttpGet("/api/v1/stats")]
     public async Task<IActionResult> Stats()
     {
         var summary  = await _history.GetSummaryAsync();
-        var codecMix = await _history.GetCodecMixAsync(days: 365);
-
-        var workItems  = _transcoding.GetAllWorkItems();
-        var pending    = workItems.Count(w => w.Status == WorkItemStatus.Pending);
-        var processing = workItems.Count(w => w.Status is WorkItemStatus.Processing
-                                                or WorkItemStatus.Uploading or WorkItemStatus.Downloading);
-        var failed     = workItems.Count(w => w.Status == WorkItemStatus.Failed);
+        var codecMix = await _history.GetCodecMixAsync(days: 365, MediaKind.Video);
+        var audioCodecMix = await _history.GetCodecMixAsync(days: 365, MediaKind.Music);
+        var counts    = await _transcoding.GetWorkItemCountsAsync();
+        var totalFiles = await _mediaFiles.CountAllAsync();
+        var failed    = await _mediaFiles.CountByStatusAsync(MediaFileStatus.Failed);
 
         return new JsonResult(new
         {
-            totalFiles         = summary.TotalEncodes,
+            totalFiles,
             totalTranscoded    = summary.TotalEncodes,
             totalHealthChecked = 0,
             bytesSaved         = summary.TotalBytesSaved,
 
             transcodeStatus = new[]
             {
-                new { name = "Pending",    value = pending },
-                new { name = "Processing", value = processing },
+                new { name = "Pending",    value = counts.Pending },
+                new { name = "Processing", value = counts.Processing },
                 new { name = "Completed",  value = summary.TotalEncodes },
                 new { name = "Failed",     value = failed },
             },
@@ -128,13 +135,17 @@ public sealed class PublicApiController : Controller
                 resolutions = new[]
                 {
                     new { name = "4K",      value = summary.FourKEncodes },
-                    new { name = "<=1080p", value = Math.Max(0, summary.TotalEncodes - summary.FourKEncodes) },
+                    new { name = "<=1080p", value = Math.Max(0, summary.VideoEncodes - summary.FourKEncodes) },
                 },
             },
 
             audio = new
             {
-                codecs     = Array.Empty<object>(),
+                codecs     = audioCodecMix.Select(c => new
+                {
+                    name  = string.IsNullOrEmpty(c.Codec) ? "unknown" : c.Codec,
+                    value = c.Encodes,
+                }).ToArray(),
                 containers = Array.Empty<object>(),
             },
         });
@@ -152,72 +163,32 @@ public sealed class PublicApiController : Controller
     /// <param name="page"> 1-indexed page number. Clamped to ≥ 1. </param>
     /// <param name="pageSize"> Items per page. Clamped to 1–100. </param>
     [HttpGet("/api/v1/queue")]
-    public IActionResult Queue([FromQuery] int page = 1, [FromQuery] int pageSize = 10)
+    public async Task<IActionResult> Queue([FromQuery] int page = 1, [FromQuery] int pageSize = 10)
     {
         page     = Math.Max(1, page);
         pageSize = Math.Clamp(pageSize, 1, 100);
-
-        var all = _transcoding.GetAllWorkItems();
-        all.Sort((a, b) =>
-        {
-            int Priority(WorkItem w) => w.Status switch
-            {
-                WorkItemStatus.Processing  => 0,
-                WorkItemStatus.Uploading   => 0,
-                WorkItemStatus.Downloading => 0,
-                WorkItemStatus.Pending     => 1,
-                WorkItemStatus.Completed   => 2,
-                WorkItemStatus.NoSavings   => 2,
-                WorkItemStatus.Failed      => 3,
-                WorkItemStatus.Cancelled   => 4,
-                WorkItemStatus.Stopped     => 4,
-                _                          => 5,
-            };
-            var cmp = Priority(a).CompareTo(Priority(b));
-            return cmp != 0 ? cmp : b.Bitrate.CompareTo(a.Bitrate);
-        });
-
-        var total = all.Count;
-        var skip  = (page - 1) * pageSize;
-        var slice = all.Skip(skip).Take(pageSize);
+        var skip = (long)(page - 1) * pageSize;
+        var result = await _dashboard.GetQueueWithRecentHistoryPageAsync(skip, pageSize);
 
         return new JsonResult(new
         {
             page,
             pageSize,
-            total,
-            records = slice.Select(MapQueueRecord).ToArray(),
+            total = result.Total,
+            records = result.Records.Select(MapQueueRecord).ToArray(),
         });
     }
 
-    private static object MapQueueRecord(WorkItem w)
+    private static object MapQueueRecord(DashboardQueueItem item) => new
     {
-        var ext = Path.GetExtension(w.Path)?.TrimStart('.').ToLowerInvariant() ?? "";
-        return new
-        {
-            id                = w.Id,
-            file              = w.FileName,
-            sizeBytes         = w.Size,
-            container         = ext,
-            videoCodec        = w.IsHevc ? "hevc" : "h264",
-            videoResolution   = w.Is4K   ? "4K"   : "<=1080p",
-            healthCheck       = (string?)null,
-            transcodeDecision = MapDecision(w.Status),
-        };
-    }
-
-    private static string MapDecision(WorkItemStatus s) => s switch
-    {
-        WorkItemStatus.Pending     => "Queued",
-        WorkItemStatus.Processing  => "Processing",
-        WorkItemStatus.Uploading   => "Processing",
-        WorkItemStatus.Downloading => "Processing",
-        WorkItemStatus.Completed   => "Completed",
-        WorkItemStatus.NoSavings   => "No Savings",
-        WorkItemStatus.Failed      => "Failed",
-        WorkItemStatus.Cancelled   => "Cancelled",
-        WorkItemStatus.Stopped     => "Stopped",
-        _                          => s.ToString(),
+        id                = item.Id,
+        file              = item.FileName,
+        sizeBytes         = item.SizeBytes,
+        container         = item.Container,
+        videoCodec        = item.VideoCodec,
+        videoResolution   = item.VideoResolution,
+        healthCheck       = (string?)null,
+        transcodeDecision = item.Decision,
     };
 
     /******************************************************************
@@ -234,7 +205,7 @@ public sealed class PublicApiController : Controller
     public IActionResult Workers()
     {
         var clusterConfig = _cluster.GetConfig();
-        var remoteNodes   = _cluster.GetNodes();
+        var remoteNodes   = _cluster.GetNodes().Where(node => node.NodeId != clusterConfig.NodeId);
 
         var selfNode = new
         {
@@ -278,53 +249,40 @@ public sealed class PublicApiController : Controller
     /// <summary>
     ///     Renders a compact Homarr-tile-shaped HTML page suitable for embedding via
     ///     Homarr's iframe widget. Sits at <c>/iframe/homarr</c> so the embed URL
-    ///     remains human-readable. Allowlist is enforced via CSP <c>frame-ancestors</c>.
-    ///     Data is server-rendered into the page — the iframe itself bypasses auth
-    ///     (browsers can't send <c>X-Api-Key</c> on a frame load), but follow-up
-    ///     <c>fetch()</c> calls from the iframe JS would hit the API-key gate, so we
-    ///     bake the snapshot in.
+    ///     remains human-readable. A scoped <c>?embedToken=</c> grants access to this
+    ///     read-only page when login is enabled, while CSP <c>frame-ancestors</c> limits
+    ///     which configured origins may embed it. Data is server-rendered into the page.
     /// </summary>
     [HttpGet("/iframe/homarr")]
     public async Task<IActionResult> HomarrIframe(
         [FromQuery] string theme   = "dark",
         [FromQuery] string tab     = "stats",
         [FromQuery] int    limit   = 10,
-        [FromQuery] int    refresh = 30)
+        [FromQuery] int    refresh = 30,
+        [FromQuery] string? embedToken = null)
     {
         Response.Headers["Content-Security-Policy"] = $"frame-ancestors {_auth.GetIframeFrameAncestors()}";
+        Response.Headers["Cache-Control"] = "no-store";
+        Response.Headers["Referrer-Policy"] = "no-referrer";
         // We deliberately do NOT set X-Frame-Options — frame-ancestors is strictly
         // more flexible and modern browsers honor it correctly.
 
         var clusterConfig = _cluster.GetConfig();
         var summary       = await _history.GetSummaryAsync();
         var savingsDaily  = await _history.GetSavingsOverTimeAsync(14);
-        var workItems     = _transcoding.GetAllWorkItems();
+        var counts        = await _transcoding.GetWorkItemCountsAsync();
+        var failed        = await _mediaFiles.CountByStatusAsync(MediaFileStatus.Failed);
         var normalizedTab   = NormalizeTab(tab);
         var clampedLimit    = Math.Clamp(limit, 1, 30);
         var clampedRefresh  = refresh <= 0 ? 0 : Math.Clamp(refresh, 10, 3600);
-
-        var pending    = workItems.Count(w => w.Status == WorkItemStatus.Pending);
-        var processing = workItems.Count(w => w.Status is WorkItemStatus.Processing
-                                                or WorkItemStatus.Uploading or WorkItemStatus.Downloading);
-        var failed     = workItems.Count(w => w.Status == WorkItemStatus.Failed);
-
-        var queueRecords = workItems
-            .OrderBy(w => w.Status switch
+        var currentQueue = await _dashboard.GetCurrentQueuePageAsync(0, clampedLimit);
+        var queueRecords = currentQueue.Records
+            .Select(item => new HomarrIframeQueueRow
             {
-                WorkItemStatus.Processing  => 0,
-                WorkItemStatus.Uploading   => 0,
-                WorkItemStatus.Downloading => 0,
-                WorkItemStatus.Pending     => 1,
-                _                          => 2,
-            })
-            .ThenByDescending(w => w.Bitrate)
-            .Take(clampedLimit)
-            .Select(w => new HomarrIframeQueueRow
-            {
-                FileName  = w.FileName,
-                Status    = MapDecision(w.Status),
-                Progress  = w.Progress,
-                SizeBytes = w.Size,
+                FileName  = item.FileName,
+                Status    = item.Decision,
+                Progress  = item.Progress,
+                SizeBytes = item.SizeBytes,
             })
             .ToList();
 
@@ -336,14 +294,15 @@ public sealed class PublicApiController : Controller
             Tab          = normalizedTab,
             Limit        = clampedLimit,
             Refresh      = clampedRefresh,
+            EmbedToken   = embedToken ?? "",
             Version      = ClusterDiscoveryService.ClusterVersion,
             InstanceName = string.IsNullOrWhiteSpace(clusterConfig.NodeName) ? "Snacks" : clusterConfig.NodeName,
 
             TotalFiles  = summary.TotalEncodes,
             BytesSaved  = summary.TotalBytesSaved,
             FourKCount  = summary.FourKEncodes,
-            Pending     = pending,
-            Processing  = processing,
+            Pending     = counts.Pending,
+            Processing  = counts.Processing,
             Failed      = failed,
 
             Queue         = queueRecords,
@@ -409,6 +368,8 @@ public sealed class HomarrIframeModel
 
     /// <summary> Auto-reload interval in seconds; 0 disables. Clamped to [10, 3600]. </summary>
     public int    Refresh      { get; set; } = 30;
+    /// <summary>Scoped credential retained across the iframe's server-rendered tab links.</summary>
+    public string EmbedToken   { get; set; } = "";
     public string Version      { get; set; } = "";
     public string InstanceName { get; set; } = "Snacks";
 
@@ -424,6 +385,15 @@ public sealed class HomarrIframeModel
 
     /// <summary> Bytes saved per day, oldest→newest (14 entries, zero-filled), for the sparkline. </summary>
     public List<long> SavingsSeries { get; set; } = new();
+
+    /// <summary>Builds a same-page tab link without dropping the scoped iframe credential.</summary>
+    public string GetTabHref(string tab)
+    {
+        var href = $"?theme={Theme}&tab={tab}&limit={Limit}&refresh={Refresh}";
+        if (!string.IsNullOrEmpty(EmbedToken))
+            href += $"&embedToken={Uri.EscapeDataString(EmbedToken)}";
+        return href;
+    }
 }
 
 /// <summary> One queue row rendered in the iframe's Queue tab. </summary>

@@ -419,6 +419,18 @@ export const authApi = {
     /** Removes the stored API key (a SNACKS_API_KEY env key stays valid). */
     deleteApiKey: () => deleteJson('/api/auth/apikey'),
 
+    /** Fetches the iframe-only token and CSP origin allowlist. */
+    getEmbedConfig: () => getJson('/api/auth/embed'),
+
+    /** Generates and persists a new iframe-only token. */
+    generateEmbedToken: () => postJson('/api/auth/embed/generate'),
+
+    /** Revokes the stored iframe-only token. */
+    deleteEmbedToken: () => deleteJson('/api/auth/embed'),
+
+    /** Replaces the origins permitted to embed /iframe/* pages. */
+    saveEmbedOrigins: (origins) => postJson('/api/auth/embed/origins', { origins }),
+
     /** Signs the current user out; navigation is typically handled by the caller. */
     logout: () => fetch('/Auth/Logout', { method: 'POST' }),
 };
