@@ -5929,8 +5929,18 @@ public class TranscodingService
     /// </summary>
     internal static (string args, string variant)[] BuildEncoderProbeAttempts(string hwFlags, string encoder)
     {
+        // Keep the generic probe tiny, but use a normal media resolution for AMF.
+        // RDNA4 (RX 9070 XT / Adrenalin 26.7.1) accepts H.264 at 256x256 while
+        // HEVC and AV1 reject that frame size from encoder->Init() with
+        // AMF_OUT_OF_RANGE. That false negative registered the AMD device as
+        // H.264-only even though a real 1080p hevc_amf encode worked. One 1080p
+        // frame is still cheap while exercising a resolution every AMF codec is
+        // expected to support.
+        string source = encoder.Contains("amf", StringComparison.OrdinalIgnoreCase)
+            ? "color=c=black:s=1920x1080:r=30:d=0.1"
+            : "color=c=black:s=256x256:d=0.1";
         string Args(string vf, string extra) =>
-            $"-y {hwFlags} -f lavfi -i color=c=black:s=256x256:d=0.1 {vf} -c:v {encoder} {extra} -frames:v 1 -f null -";
+            $"-y {hwFlags} -f lavfi -i {source} {vf} -c:v {encoder} {extra} -frames:v 1 -f null -";
 
         if (encoder.Contains("vaapi"))
         {
