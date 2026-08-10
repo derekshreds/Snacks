@@ -328,13 +328,10 @@ public sealed class LibraryController : ControllerBase
         // override. Without this, the file is queued under the global options and the local
         // dispatcher's override application can't help — the request.Options it'd see is
         // already the globals.
-        var folderOverride = _autoScanService.FindFolderOverride(request.FilePath);
-        var fileOptions    = EncoderOptionsOverride.ApplyOverrides(request.Options, folderOverride, null);
-
         // Manual "Process Item" is an explicit user action: force past DB status checks
         // and treat it as a Hybrid mux pass so an at-target file gets remuxed (audio/subs
         // re-applied, container normalized) instead of being skipped.
-        var workItemId = await _transcodingService.AddFileAsync(request.FilePath, fileOptions, force: true, forceMux: true);
+        var workItemId = await _transcodingService.AddFileAsync(request.FilePath, request.Options, force: true, forceMux: true);
         return new JsonResult(new { success = true, workItemId });
     }
 

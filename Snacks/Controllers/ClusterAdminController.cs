@@ -366,6 +366,16 @@ public sealed class ClusterAdminController : ControllerBase
     public IActionResult SaveFolderSettings([FromBody] SaveFolderSettingsRequest request)
     {
         if (string.IsNullOrEmpty(request.Path)) return BadRequest("Path is required");
+        if (request.EncodingOverrides?.AdvancedVideoPolicy == AdvancedVideoFolderPolicy.Profile)
+        {
+            if (!request.EncodingOverrides.AdvancedVideoProfileId.HasValue)
+                return BadRequest("A profile must be selected when the folder policy is Profile.");
+
+            var current = _transcodingService.GetLastOptions();
+            if (current != null && !(current.AdvancedVideo?.Profiles ?? []).Any(profile =>
+                    profile.Id == request.EncodingOverrides.AdvancedVideoProfileId.Value))
+                return BadRequest("The selected advanced video profile no longer exists.");
+        }
         _autoScanService.SaveFolderSettings(request.Path, request.EncodingOverrides);
         return new JsonResult(new { success = true });
     }

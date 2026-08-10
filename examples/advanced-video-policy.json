@@ -1,0 +1,124 @@
+{
+  "advancedVideo": {
+    "version": 1,
+    "enabled": true,
+    "profiles": [
+      {
+        "id": "11111111-1111-4111-8111-111111111111",
+        "name": "AV1 libaom 1080p CQ 35",
+        "codec": "av1",
+        "encoderSelection": "Explicit",
+        "encoder": "libaom-av1",
+        "hardwareAcceleration": "none",
+        "rateControl": {
+          "mode": "Quality",
+          "targetKbps": 3500,
+          "minKbps": null,
+          "maxKbps": null,
+          "bufferKbits": null,
+          "strictBitrate": false,
+          "quality": 35
+        },
+        "preset": "4",
+        "threads": 8,
+        "pixelFormat": "yuv420p10le",
+        "gopSize": 300,
+        "videoProfile": null,
+        "videoLevel": null,
+        "downscalePolicy": "Never",
+        "downscaleTarget": "1080p",
+        "fixedFrameSize": null,
+        "maxFrameRate": 0,
+        "tonemapHdrToSdr": false,
+        "removeBlackBorders": false,
+        "additionalVideoFilters": [],
+        "customOptions": [
+          { "option": "-aq-mode", "values": ["1"] },
+          { "option": "-tune", "values": ["ssim"] },
+          { "option": "-lag-in-frames", "values": ["35"] },
+          { "option": "-arnr-max-frames", "values": ["15"] },
+          { "option": "-arnr-strength", "values": ["4"] },
+          {
+            "option": "-aom-params",
+            "values": [
+              "tune=ssim:cq-level=35:cpu-used=4:noise-sensitivity=2:tune-content=default:arnr-strength=4:arnr-maxframes=15:enable-qm=1:enable-chroma-deltaq=1:quant-b-adapt=1"
+            ]
+          }
+        ],
+        "outputRetention": "AlwaysKeep"
+      },
+      {
+        "id": "33333333-3333-4333-8333-333333333333",
+        "name": "AV1 libaom 4K CQ 32",
+        "codec": "av1",
+        "encoderSelection": "Explicit",
+        "encoder": "libaom-av1",
+        "hardwareAcceleration": "none",
+        "rateControl": {
+          "mode": "Quality",
+          "targetKbps": 14000,
+          "minKbps": null,
+          "maxKbps": null,
+          "bufferKbits": null,
+          "strictBitrate": false,
+          "quality": 32
+        },
+        "preset": "3",
+        "threads": 12,
+        "pixelFormat": "yuv420p10le",
+        "gopSize": 300,
+        "videoProfile": null,
+        "videoLevel": null,
+        "downscalePolicy": "Never",
+        "downscaleTarget": "4K",
+        "fixedFrameSize": null,
+        "maxFrameRate": 0,
+        "tonemapHdrToSdr": false,
+        "removeBlackBorders": false,
+        "additionalVideoFilters": [],
+        "customOptions": [
+          { "option": "-aq-mode", "values": ["1"] },
+          { "option": "-tune", "values": ["ssim"] },
+          { "option": "-lag-in-frames", "values": ["35"] },
+          { "option": "-arnr-max-frames", "values": ["15"] },
+          { "option": "-arnr-strength", "values": ["4"] },
+          {
+            "option": "-aom-params",
+            "values": [
+              "tune=ssim:cq-level=32:cpu-used=3:noise-sensitivity=2:tune-content=default:arnr-strength=4:arnr-maxframes=15:enable-qm=1:enable-chroma-deltaq=1:quant-b-adapt=1"
+            ]
+          }
+        ],
+        "outputRetention": "AlwaysKeep"
+      }
+    ],
+    "rules": [
+      {
+        "id": "44444444-4444-4444-8444-444444444444",
+        "name": "Non-AV1 4K sources",
+        "enabled": true,
+        "match": "All",
+        "conditions": [
+          { "field": "Codec", "operator": "IsNot", "values": ["av1"] },
+          { "field": "ResolutionClass", "operator": "Is", "values": ["2160p+"] }
+        ],
+        "action": "TranscodeWithProfile",
+        "profileId": "33333333-3333-4333-8333-333333333333"
+      },
+      {
+        "id": "55555555-5555-4555-8555-555555555555",
+        "name": "Other non-AV1 sources",
+        "enabled": true,
+        "match": "All",
+        "conditions": [
+          { "field": "Codec", "operator": "IsNot", "values": ["av1"] },
+          { "field": "ResolutionClass", "operator": "NotIn", "values": ["2160p+"] }
+        ],
+        "action": "TranscodeWithProfile",
+        "profileId": "11111111-1111-4111-8111-111111111111"
+      }
+    ],
+    "defaultAction": "UseSimpleSettings",
+    "defaultProfileId": null
+  }
+}

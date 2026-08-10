@@ -300,9 +300,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
     public async Task AddSingleFileAsync(string filePath)
     {
         var globalOptions  = LoadEncoderOptions();
-        var folderOverride = FindFolderOverride(filePath);
-        var fileOptions    = EncoderOptionsOverride.ApplyOverrides(globalOptions, folderOverride, null);
-        await _transcodingService.AddFileAsync(filePath, fileOptions);
+        await _transcodingService.AddFileAsync(filePath, globalOptions);
     }
 
     /// <summary>
@@ -792,9 +790,7 @@ public sealed class AutoScanService : IHostedService, IDisposable
 
         try
         {
-            var folderOverride = FindFolderOverride(file);
-            var fileOptions    = EncoderOptionsOverride.ApplyOverrides(globalOptions, folderOverride, null);
-            await _transcodingService.AddFileAsync(file, fileOptions, cancellationToken: ct);
+            await _transcodingService.AddFileAsync(file, globalOptions, cancellationToken: ct);
             return true;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }

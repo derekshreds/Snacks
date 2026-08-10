@@ -32,8 +32,25 @@ async function load() {
         const envHint = document.getElementById('envApiKeyHint');
         if (envHint) envHint.style.display = cfg.envApiKeySet ? '' : 'none';
 
-        await loadApiKey();
+        await Promise.all([loadApiKey(), loadEmbedConfig()]);
     } catch { /* auth may already gate this */ }
+}
+
+function renderEmbedUrl(token) {
+    const input = document.getElementById('embedUrlValue');
+    if (!input) return;
+    input.value = token
+        ? `${window.location.origin}/iframe/homarr?embedToken=${encodeURIComponent(token)}`
+        : '';
+}
+
+async function loadEmbedConfig() {
+    try {
+        const data = await authApi.getEmbedConfig();
+        renderEmbedUrl(data.embedToken || '');
+        const origins = document.getElementById('iframeAllowedOrigins');
+        if (origins) origins.value = (data.iframeAllowedOrigins || []).join('\n');
+    } catch { /* gated pre-auth, same as the rest of the panel */ }
 }
 
 /**
@@ -148,6 +165,64 @@ async function copyApiKey() {
 
 
 // ---------------------------------------------------------------------------
+// Scoped iframe access
+// ---------------------------------------------------------------------------
+
+async function generateEmbedToken() {
+    try {
+        const data = await authApi.generateEmbedToken();
+        renderEmbedUrl(data.embedToken || '');
+        const input = document.getElementById('embedUrlValue');
+        if (input) input.type = 'text';
+        showToast('New iframe URL generated — the old URL no longer works', 'success');
+    } catch (e) {
+        showToast('Generate failed: ' + e.message, 'danger');
+    }
+}
+
+async function deleteEmbedToken() {
+    try {
+        await authApi.deleteEmbedToken();
+        renderEmbedUrl('');
+        showToast('Iframe token revoked', 'success');
+    } catch (e) {
+        showToast('Revoke failed: ' + e.message, 'danger');
+    }
+}
+
+async function saveEmbedOrigins() {
+    const value = document.getElementById('iframeAllowedOrigins')?.value || '';
+    const origins = value.split(/\r?\n|,/).map(origin => origin.trim()).filter(Boolean);
+    try {
+        const data = await authApi.saveEmbedOrigins(origins);
+        const input = document.getElementById('iframeAllowedOrigins');
+        if (input) input.value = (data.iframeAllowedOrigins || []).join('\n');
+        showToast('Iframe origins saved', 'success');
+    } catch (e) {
+        showToast('Save failed: ' + e.message, 'danger');
+    }
+}
+
+function toggleEmbedUrlVisibility() {
+    const input = document.getElementById('embedUrlValue');
+    if (input) input.type = input.type === 'password' ? 'text' : 'password';
+}
+
+async function copyEmbedUrl() {
+    const input = document.getElementById('embedUrlValue');
+    if (!input?.value) { showToast('No iframe URL to copy', 'warning'); return; }
+    try {
+        await navigator.clipboard.writeText(input.value);
+        showToast('Iframe URL copied', 'success');
+    } catch {
+        input.type = 'text';
+        input.select();
+        showToast('Press Ctrl/Cmd+C to copy', 'info');
+    }
+}
+
+
+// ---------------------------------------------------------------------------
 // Public entry points
 // ---------------------------------------------------------------------------
 
@@ -161,6 +236,11 @@ export function initAuthPanel() {
     document.getElementById('deleteApiKeyBtn')   ?.addEventListener('click', deleteApiKey);
     document.getElementById('revealApiKeyBtn')   ?.addEventListener('click', toggleApiKeyVisibility);
     document.getElementById('copyApiKeyBtn')     ?.addEventListener('click', copyApiKey);
+    document.getElementById('generateEmbedTokenBtn') ?.addEventListener('click', generateEmbedToken);
+    document.getElementById('deleteEmbedTokenBtn')   ?.addEventListener('click', deleteEmbedToken);
+    document.getElementById('saveEmbedOriginsBtn')   ?.addEventListener('click', saveEmbedOrigins);
+    document.getElementById('revealEmbedUrlBtn')     ?.addEventListener('click', toggleEmbedUrlVisibility);
+    document.getElementById('copyEmbedUrlBtn')       ?.addEventListener('click', copyEmbedUrl);
 }
 
 /** Lazy data load, invoked when the settings modal is first opened. */

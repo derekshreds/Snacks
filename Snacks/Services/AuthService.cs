@@ -27,11 +27,19 @@ public sealed class AuthService
         ArgumentNullException.ThrowIfNull(configFileService);
         _configFileService = configFileService;
         _config            = _configFileService.Load<AuthConfig>("auth.json");
+        var configChanged = false;
         if (string.IsNullOrEmpty(_config.SessionSecret))
         {
             _config.SessionSecret = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));
-            _configFileService.Save("auth.json", _config);
+            configChanged = true;
         }
+        var normalizedOrigins = NormalizeIframeOrigins(_config.IframeAllowedOrigins, throwOnInvalid: false);
+        if (!normalizedOrigins.SequenceEqual(_config.IframeAllowedOrigins ?? [], StringComparer.Ordinal))
+        {
+            _config.IframeAllowedOrigins = normalizedOrigins;
+            configChanged = true;
+        }
+        if (configChanged) _configFileService.Save("auth.json", _config);
     }
 
     /******************************************************************
@@ -45,7 +53,7 @@ public sealed class AuthService
     }
 
     /// <summary>
-    ///     Public view of auth config — never exposes the password hash or session secret.
+    ///     Public view of auth config — never exposes the password hash, session secret, or API key.
     /// </summary>
     public object GetPublicConfig()
     {
@@ -57,6 +65,8 @@ public sealed class AuthService
                 username     = _config.Username,
                 hasPassword  = !string.IsNullOrEmpty(_config.PasswordHash),
                 hasApiKey    = !string.IsNullOrEmpty(_config.ApiKey),
+                hasEmbedToken = !string.IsNullOrEmpty(_config.EmbedToken),
+                iframeAllowedOrigins = _config.IframeAllowedOrigins?.ToArray() ?? [],
                 envApiKeySet = HasEnvApiKey,
             };
         }
@@ -77,9 +87,11 @@ public sealed class AuthService
             {
                 Enabled       = enabled,
                 Username      = username ?? "",
-                PasswordHash  = _config.PasswordHash,
-                SessionSecret = _config.SessionSecret,
-                ApiKey        = _config.ApiKey,
+                PasswordHash         = _config.PasswordHash,
+                SessionSecret        = _config.SessionSecret,
+                ApiKey               = _config.ApiKey,
+                EmbedToken           = _config.EmbedToken,
+                IframeAllowedOrigins = _config.IframeAllowedOrigins?.ToList() ?? [],
             };
 
             if (!string.IsNullOrEmpty(newPassword))
@@ -182,7 +194,7 @@ public sealed class AuthService
     ///     key, both via constant-time comparison. Empty presented or configured keys never
     ///     match — an unconfigured key must not accept an empty header.
     /// </summary>
-    /// <param name="presented"> The key from the X-Api-Key header or Bearer token. </param>
+    /// <param name="presented"> The key from the X-Api-Key header, Bearer token, or ?apiKey= query. </param>
     public bool ValidateApiKey(string? presented)
     {
         if (string.IsNullOrEmpty(presented)) return false;
@@ -225,6 +237,96 @@ public sealed class AuthService
         {
             _config.ApiKey = "";
             _configFileService.Save("auth.json", _config);
+        }
+    }
+
+    /// <summary>
+    ///     Generates a scoped token for server-rendered iframe pages. Unlike the API key,
+    ///     this credential is never accepted on <c>/api/*</c>.
+    /// </summary>
+    public string GenerateEmbedToken()
+    {
+        var token = "snk_embed_" + Convert.ToBase64String(RandomNumberGenerator.GetBytes(32))
+            .Replace("+", "-").Replace("/", "_").TrimEnd('=');
+        lock (_lock)
+        {
+            _config.EmbedToken = token;
+            _configFileService.Save("auth.json", _config);
+        }
+        return token;
+    }
+
+    /// <summary>Validates a scoped iframe token using a constant-time comparison.</summary>
+    public bool ValidateEmbedToken(string? presented)
+    {
+        if (string.IsNullOrEmpty(presented)) return false;
+        string stored;
+        lock (_lock) stored = _config.EmbedToken;
+        return !string.IsNullOrEmpty(stored) && SecretCompare.ConstantTimeEquals(stored, presented);
+    }
+
+    /// <summary>Returns the persisted iframe token, or an empty string when unset.</summary>
+    public string GetStoredEmbedToken()
+    {
+        lock (_lock) return _config.EmbedToken;
+    }
+
+    /// <summary>Revokes the persisted iframe token.</summary>
+    public void ClearEmbedToken()
+    {
+        lock (_lock)
+        {
+            _config.EmbedToken = "";
+            _configFileService.Save("auth.json", _config);
+        }
+    }
+
+    /// <summary>
+    ///     Replaces the iframe CSP allowlist after reducing each entry to a concrete
+    ///     HTTP(S) origin. Wildcards and non-web schemes are deliberately rejected.
+    /// </summary>
+    public void UpdateIframeAllowedOrigins(IEnumerable<string>? origins)
+    {
+        var normalized = NormalizeIframeOrigins(origins, throwOnInvalid: true);
+        lock (_lock)
+        {
+            _config.IframeAllowedOrigins = normalized;
+            _configFileService.Save("auth.json", _config);
+        }
+    }
+
+    private static List<string> NormalizeIframeOrigins(IEnumerable<string>? origins, bool throwOnInvalid)
+    {
+        var normalized = new List<string>();
+        foreach (var candidate in origins ?? [])
+        {
+            var value = candidate?.Trim();
+            if (string.IsNullOrEmpty(value)) continue;
+            if (!Uri.TryCreate(value, UriKind.Absolute, out var uri)
+                || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps)
+                || !string.IsNullOrEmpty(uri.UserInfo))
+            {
+                if (throwOnInvalid) throw new ArgumentException($"Invalid iframe origin: {value}");
+                continue;
+            }
+
+            normalized.Add(uri.GetLeftPart(UriPartial.Authority));
+        }
+        return normalized.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+    }
+
+    /// <summary>
+    ///     CSP <c>frame-ancestors</c> directive value derived from the configured
+    ///     iframe allowlist. Same-origin embedding is always allowed; an empty list
+    ///     therefore remains locked to <c>'self'</c> rather than allowing every site.
+    /// </summary>
+    public string GetIframeFrameAncestors()
+    {
+        lock (_lock)
+        {
+            var origins = _config.IframeAllowedOrigins;
+            if (origins == null || origins.Count == 0) return "'self'";
+            return "'self' " + string.Join(' ', origins.Where(o => !string.IsNullOrWhiteSpace(o)));
         }
     }
 

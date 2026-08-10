@@ -52,6 +52,7 @@ import { initFolderPicker }     from './settings/folder-picker.js';
 import { initSettingsTabs, applySettingsRoleVisibility } from './settings/settings-tabs.js';
 import { restoreEncoderOptions, getEncoderOptions, retryRestoreEncoderOptionsIfNeeded } from './settings/encoder-form.js';
 import { initPresets } from './settings/presets.js';
+import { initAdvancedVideoEditor } from './settings/advanced-video.js';
 
 import { AutoScanPanel }                                  from './settings/panels/auto-scan-panel.js';
 import { initIntegrationsPanel,  loadIntegrationsPanel }  from './settings/panels/integrations-panel.js';
@@ -169,6 +170,9 @@ document.addEventListener('DOMContentLoaded', () => {
     initSchedulingPanel();
     initNetworkingPanel();
     initPresets();
+    initAdvancedVideoEditor({
+        readEncoderOptions: () => getEncoderOptions('settings', false),
+    });
 
 
     // 4. Initial data loads (shared — not page-specific).
@@ -225,11 +229,12 @@ document.addEventListener('DOMContentLoaded', () => {
     const NON_ENCODER_ID_PREFIXES = [
         'autoScan', 'exclusion', 'auth', 'cluster', 'manualNode',
         'notif', 'newNotif', 'plex', 'jellyfin', 'sonarr', 'radarr',
-        'tvdb', 'tmdb', 'settingsNet', 'settingsScheduling', 'preset',
+        'tvdb', 'tmdb', 'settingsNet', 'settingsScheduling', 'preset', 'advancedVideo',
     ];
     const isMainSettingsField = (e) =>
         !NON_ENCODER_ID_PREFIXES.some((p) => e.target.id.startsWith(p))
-        && !e.target.closest('#overrideDialog');
+        && !e.target.closest('#overrideDialog')
+        && !e.target.closest('#advancedVideoWorkspace');
 
     // Debounce so typing "8000" into Target Bitrate doesn't live-apply the
     // intermediate "8" — the backend applies saved options to the NEXT

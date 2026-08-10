@@ -57,4 +57,19 @@ public sealed class FileAnalysisResult
     ///     Queue/Skip decision once audio/subtitles are subtracted.
     /// </summary>
     public bool Borderline { get; set; }
+
+    /// <summary>Advanced policy action selected for this source.</summary>
+    public AdvancedVideoAction VideoPolicyAction { get; set; } = AdvancedVideoAction.UseSimpleSettings;
+
+    /// <summary>Name of the first matching rule, if any.</summary>
+    public string? MatchedRule { get; set; }
+
+    /// <summary>Name of the selected profile, if any.</summary>
+    public string? SelectedProfile { get; set; }
+
+    /// <summary>Human-readable encoder/rate-control preview.</summary>
+    public string? VideoPlanSummary { get; set; }
+
+    /// <summary>Validation/capability warnings relevant to the selected plan.</summary>
+    public List<string> VideoPlanWarnings { get; set; } = new();
 }

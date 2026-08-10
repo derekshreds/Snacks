@@ -76,6 +76,9 @@ chmod +x electron-app/ffmpeg/ffmpeg electron-app/ffmpeg/ffprobe
 echo "FFmpeg found."
 echo "  bundling ffmpeg/ffprobe dylib deps (so end users don't need Homebrew)..."
 bash electron-app/scripts/bundle-ffmpeg-mac.sh electron-app/ffmpeg
+node scripts/validate-ffmpeg-inventory.mjs electron-app/ffmpeg/ffmpeg
+node scripts/validate-advanced-templates.mjs
+node scripts/test-advanced-video-ui.mjs
 echo
 
 # ---------------------------------------------------------------------------

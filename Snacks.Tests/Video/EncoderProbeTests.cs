@@ -90,6 +90,11 @@ public sealed class EncoderProbeTests
         foreach (var (args, _) in attempts)
         {
             args.Should().Contain("-hwaccel auto");
+            // RDNA4 reports AMF_OUT_OF_RANGE when HEVC/AV1 are initialized with
+            // the old 256x256 toy source. Probe a representative media size so
+            // codec detection reflects real encodes instead of that size limit.
+            args.Should().Contain("color=c=black:s=1920x1080:r=30:d=0.1");
+            args.Should().NotContain("s=256x256");
             args.Should().Contain($"-c:v {encoder}");
             args.Should().Contain("-frames:v 1");
             args.Should().NotContain("-low_power");
@@ -115,6 +120,7 @@ public sealed class EncoderProbeTests
 
         variant.Should().BeEmpty();
         args.Should().Contain(hwFlags);
+        args.Should().Contain("color=c=black:s=256x256:d=0.1");
         args.Should().Contain($"-c:v {encoder}");
         args.Should().Contain("-frames:v 1");
         args.Should().NotContain("-low_power");

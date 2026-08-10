@@ -68,6 +68,14 @@ public sealed class JobProgress
 
     /// <summary> Current job phase: "Uploading", "Encoding", or "Downloading". </summary>
     public string? Phase { get; set; }
+
+    /// <summary>
+    ///     Encoder actually in use (e.g. "hevc_nvenc", "copy") — stamped by the worker once
+    ///     FFmpeg starts, so the master's queue card can show the real encoder for remote
+    ///     jobs the same way it does for local ones. Null before encoding begins and from
+    ///     workers running an older release.
+    /// </summary>
+    public string? EncoderName { get; set; }
 }
 
 /// <summary> Completion notification sent from a worker node to the master after encoding finishes. </summary>

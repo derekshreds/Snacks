@@ -394,12 +394,14 @@
         <a href="#quick-start">Quick start</a>
         <a href="#everyday-use">Everyday use</a>
         <a href="#settings">Settings</a>
+        <a href="#advanced-video">Advanced video policies</a>
         <a href="#processing-details">Processing &amp; file safety</a>
         <div class="group">Operations</div>
         <a href="#auto-scan">Automatic scanning</a>
         <a href="#cluster">Clusters</a>
         <a href="#hardware-containers">Hardware &amp; containers</a>
         <a href="#integrations">Integrations</a>
+        <a href="#homarr">Homarr dashboards</a>
         <a href="#data-backups">Data &amp; backups</a>
         <a href="#observability">Logs &amp; metrics</a>
         <a href="#troubleshooting">Troubleshooting</a>
@@ -415,7 +417,7 @@
         <div class="group">Contributors</div>
         <a href="#development">Development</a>
       </nav>
-      <div class="version">Documents Snacks v2.17.0 · updated 2026-08-07</div>
+      <div class="version">Documents Snacks v2.18.0 · updated 2026-08-09</div>
       </div>
     </aside>
 
@@ -626,6 +628,183 @@
         </div>
       </section>
 
+      <section id="advanced-video">
+        <div class="eyebrow">Opt-in power controls</div>
+        <h2>Advanced video policies and encoding profiles</h2>
+        <p>
+          Advanced Video is an optional layer under <strong>Settings → Video</strong>. It is off
+          by default and upgrades never change it: until you enable it, existing settings,
+          presets, watched folders, skip decisions, and
+          FFmpeg behavior remain unchanged. Enable it only after creating and validating at
+          least one profile. Audio, subtitles, container, paths, and file handling continue to
+          come from the ordinary settings; profiles are deliberately video-only.
+        </p>
+
+        <p>
+          The panel is organized as three numbered steps that mirror how a decision actually
+          happens: a <strong>decision flow</strong> of plain-language rule cards every video
+          falls through top to bottom (the first match wins — visibly), the
+          <strong>encoding recipes</strong> those rules pick (recipes are the UI name for video
+          profiles), and a live <strong>library impact</strong> preview that runs the staged,
+          unsaved flow against every video Snacks knows about and shows exactly how many files
+          each rule catches and what would happen to them — before anything is applied.
+        </p>
+
+        <div class="grid">
+          <div class="card">
+            <h3>Recipes are complete</h3>
+            <p>A recipe (video profile) selects H.264, HEVC, or AV1; automatic or one exact
+              detected encoder; bitrate, quality, or custom rate control; preset/speed, threads,
+              pixel format, GOP, codec profile/level, transformations, extra filters, guarded
+              options, and output retention. The editor shows the FFmpeg video arguments the
+              recipe generates as you type.</p>
+          </div>
+          <div class="card">
+            <h3>Rules are predictable</h3>
+            <p>Enabled rules run top to bottom and the first match wins. Each card reads as a
+              sentence — <em>“If the codec is not av1 and the resolution class is 2160p+ →
+              encode with AV1 4K”</em> — with a live count of the library files it catches.
+              A rule uses a flat <strong>All</strong> or <strong>Any</strong> condition list;
+              there are no scripts, expressions, or nested condition trees.</p>
+          </div>
+        </div>
+
+        <h3>Library impact preview</h3>
+        <p>
+          The impact section is read-only: it never queues, re-evaluates, or saves anything.
+          It applies the same shared resolver used by scanning and dispatch — including
+          per-folder policies — to every tracked video and buckets the outcomes with example
+          files, current disk usage, and how many files in each bucket were already processed,
+          so a mistake is visible as a wrong-looking bar instead of a surprise batch of jobs.
+          Bitrate recipes also show an approximate output size (target × duration); quality
+          and custom recipes deliberately show no forecast, because their size genuinely
+          depends on content. A search box answers "what happens to <em>this</em> file" by
+          name, and once encodes complete, a <strong>Measured so far</strong> strip shows each
+          recipe's real jobs, savings, and average output bitrate next to the forecast. Very
+          large libraries are analyzed as a uniform random sample beyond 20,000 videos and
+          labeled as such.
+        </p>
+        <p>
+          <img src="img/advanced-flow.png" alt="Decision flow with plain-language rule cards and live per-rule file counts" style="max-width: 100%; border-radius: 8px;">
+        </p>
+        <p>
+          <img src="img/advanced-impact.png" alt="Library impact preview with counts, disk usage, and measured results" style="max-width: 100%; border-radius: 8px;">
+        </p>
+
+        <h3>Applying is not reprocessing</h3>
+        <p>
+          Applying a policy only changes future decisions. Files already in the catalog keep
+          their current status until <strong>Re-evaluate</strong> runs — the impact panel says
+          so and offers the button right after an apply. Rules the flow can never reach are
+          flagged inline ("never reached — an earlier rule always claims these files first")
+          by a conservative static analysis that only reports what it can prove.
+        </p>
+
+        <h3>Sharing policies</h3>
+        <p>
+          A policy exports as a plain <code>snacks-video-policy.json</code> file and imports on
+          any Snacks instance; imports arrive as a staged draft with fresh internal ids and
+          nothing applies until Validate &amp; Apply. The current draft can also be saved as a
+          named template that appears alongside the built-in quick-start cards. Exact-encoder
+          recipes may name any adapter-known encoder — including ones no connected node
+          advertises yet, labeled "not detected yet" — so a policy can be written today for
+          hardware that joins the cluster tomorrow.
+        </p>
+
+        <h3>Rate control and retention</h3>
+        <ul>
+          <li><strong>Bitrate</strong> uses an absolute profile target with optional min, max, buffer, and strict/constrained behavior. The Simple 4K multiplier is not applied to a profile.</li>
+          <li><strong>Quality</strong> maps to the encoder's native CRF, CQ, ICQ, global-quality, or quantizer controls. Selecting it defaults new edits to <strong>Always Keep</strong>, because final size is intentionally unpredictable.</li>
+          <li><strong>Custom</strong> emits no generated rate-control arguments. Add the required encoder-private controls in the guarded option editor.</li>
+          <li><strong>Smaller Only</strong> keeps the existing savings behavior. <strong>Always Keep</strong> retains any valid completed output, even when it is larger than its source.</li>
+        </ul>
+
+        <h3>Conditions and actions</h3>
+        <p>
+          Conditions can inspect normalized codec aliases, width, height, short-edge resolution
+          class (SD, 720p, 1080p, 1440p, or 2160p+), video bitrate, file size, duration, pixel
+          format, derived bit depth, HDR, and 4K. Unknown values match only
+          <code>IsUnknown</code>; numeric ranges include both endpoints.
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Action</th><th>Behavior</th></tr></thead>
+            <tbody>
+              <tr><td><code>UseSimpleSettings</code></td><td>Runs the established codec/bitrate/filter/mux skip ladder unchanged.</td></tr>
+              <tr><td><code>TranscodeWithProfile</code></td><td>Forces video re-encoding with the complete selected profile, even when legacy bitrate checks would skip.</td></tr>
+              <tr><td><code>MuxOnly</code></td><td>Copies video and runs only applicable container, audio, and subtitle work; files with no mux work remain skipped.</td></tr>
+              <tr><td><code>Skip</code></td><td>Skips the entire job, including mux-only work.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Exact encoders and clusters</h3>
+        <p>
+          The encoder picker is populated from the configured FFmpeg binary and connected
+          workers. An exact encoder is never remapped or replaced by a retry fallback. If no
+          local or protocol-compatible worker advertises that exact name on the assigned device,
+          the job remains Pending and shows why. Older workers can still run Simple jobs, but
+          cannot receive resolved Advanced plans.
+        </p>
+        <div class="callout warning">
+          <strong>Portable, not magical.</strong> A profile may be saved while its exact encoder
+          is unavailable so it can move between installations. Validate the availability badges
+          before queueing a large batch; Snacks will wait rather than silently substitute.
+        </div>
+
+        <h3>Guarded FFmpeg controls</h3>
+        <p>
+          Each custom row stores one option and at most one literal value token. Encoder-private
+          controls such as <code>-aom-params</code> are allowed and appended after generated video
+          settings so an intentional duplicate wins with a warning. Inputs, outputs, maps,
+          muxers, audio/subtitle controls, progress/report controls, and replacement filtergraphs
+          are rejected. Additional filters belong in the dedicated ordered single-chain field.
+          FFmpeg is started with an argument vector, never through a shell; the displayed command
+          is only a readable preview.
+        </p>
+
+        <h3>Quick-start templates</h3>
+        <p>
+          The fastest way in is the <strong>Quick start</strong> gallery at the top of the
+          Advanced Video panel. Each template stages a complete working policy — profiles,
+          rules, and default action — and immediately shows its validation result and the
+          FFmpeg arguments it would generate. Nothing is saved until you press
+          <strong>Validate &amp; Apply</strong>, so a template is also a safe way to explore
+          how profiles and rules fit together before building your own.
+        </p>
+        <ul>
+          <li><strong>Convert everything to AV1</strong> — one quality-based AV1 profile; already-AV1 sources are skipped.</li>
+          <li><strong>Tiered AV1 (1080p + 4K)</strong> — separate quality levels selected by ordered resolution rules.</li>
+          <li><strong>HEVC space saver</strong> — re-encodes older codecs to quality-based HEVC and leaves HEVC/AV1 alone.</li>
+          <li><strong>Fine-tuned libaom-av1 (expert)</strong> — the complete community-requested archival policy below, including its guarded <code>-aom-params</code> rows. Requires an FFmpeg build with libaom.</li>
+        </ul>
+
+        <h3>Suggested AV1 setup</h3>
+        <p>The expert template stages all of the following in one click; the same policy can be built by hand:</p>
+        <ol>
+          <li>Create a profile from the current Simple settings, choose AV1 and exact <code>libaom-av1</code>, then choose Quality.</li>
+          <li>Set quality 35, speed 4, threads 8, <code>yuv420p10le</code>, GOP 300, and Always Keep.</li>
+          <li>Add lag, ARNR, tune, and <code>-aom-params</code> as separate guarded rows; use Validate Preview to inspect exact tokens.</li>
+          <li>Create a first rule for <code>codec is not AV1</code> plus <code>resolutionClass is 2160p+</code> and select a 4K profile.</li>
+          <li>Create a later codec-not-AV1 rule for the 1080p profile. Analyze a test folder before processing it.</li>
+        </ol>
+        <p>
+          A complete importable block for that scenario lives at
+          <code>examples/advanced-video-policy.json</code>. Full-app user presets include this
+          block. Applying a built-in Simple preset disables Advanced Video without deleting its
+          profiles or rules, so it can be turned back on later.
+        </p>
+
+        <h3>Folders, changes, and rollout</h3>
+        <ul>
+          <li>A watched folder can inherit global rules, force Simple behavior, or always select one global profile. Existing scalar overrides apply afterward.</li>
+          <li>A profile cannot be deleted while a rule or watched folder references it.</li>
+          <li>Analyze, scanning, manual processing, re-evaluation, local dispatch, and cluster dispatch share the same resolver. Rules are checked again immediately before dispatch.</li>
+          <li>Saving settings does not walk the full library. Use the existing <strong>Re-evaluate</strong> action when a policy change should update old catalog rows.</li>
+          <li>Invalid hand-edited configuration blocks affected work with a diagnostic; it never falls back to Simple without being asked.</li>
+        </ul>
+      </section>
+
       <section id="processing-details">
         <div class="eyebrow">What happens to a file</div>
         <h2>Processing, retries, and file safety</h2>
@@ -638,9 +817,9 @@
 
         <h3>Eligibility and smart filtering</h3>
         <ul>
-          <li>Files whose codec is already at least as efficient as the target can be skipped when they sit below the configured bitrate ceiling and tolerance.</li>
-          <li>4K files use the configured 2×–8× bitrate multiplier; <strong>Skip 4K</strong> takes precedence over the remaining video rules.</li>
-          <li>Snacks does not re-encode AV1 down to HEVC or H.264, or HEVC down to H.264, merely to satisfy an exact codec-name match.</li>
+          <li>In Simple behavior, files whose codec is already at least as efficient as the target can be skipped when they sit below the configured bitrate ceiling and tolerance.</li>
+          <li>Simple behavior applies the configured 2×–8× bitrate multiplier to 4K files. Advanced profile bitrates are absolute; choose a different profile through a rule instead.</li>
+          <li>Simple behavior does not re-encode AV1 down to HEVC or H.264, or HEVC down to H.264, merely to satisfy an exact codec-name match. An explicit Advanced profile action intentionally overrides that legacy guard.</li>
           <li>Mux, audio, subtitle, container, crop, resolution, frame-rate, and HDR work can make an otherwise efficient file eligible for processing.</li>
           <li><strong>Analyze</strong> applies the same decision policy without adding work to the queue.</li>
           <li>A filename already containing <code>[snacks]</code> is treated as previously produced output and is not automatically fed back into the pipeline.</li>
@@ -662,7 +841,8 @@
           Sidecar files produced during processing move with the output. A stale tagged output
           left by an interrupted attempt is removed before FFmpeg starts again. If an ordinary
           encode is not smaller than its source, Snacks discards it as <code>NoSavings</code>;
-          intentional remuxes and explicitly configured audio-output growth are retained.
+          intentional remuxes, explicitly configured audio-output growth, and Advanced profiles
+          set to <code>AlwaysKeep</code> are retained.
         </p>
 
         <h3>Video retry ladder</h3>
@@ -681,7 +861,8 @@
           Failed partial output is cleaned between attempts. When all retries are exhausted, the
           source remains unchanged and the final reason is stored in the job log and catalog.
           The music path is deliberately simpler: it validates duration and discards empty,
-          invalid, or no-savings output instead of using the video retry ladder.
+          invalid, or no-savings output instead of using the video retry ladder. Exact Advanced
+          encoders may retry decoding/subtitle handling, but never enter the encoder-substitution step.
         </p>
       </section>
 
@@ -827,6 +1008,7 @@ environment:
               <tr><td>Jellyfin</td><td>Connection test and optional library rescan after completion.</td><td>API key</td></tr>
               <tr><td>Sonarr / Radarr</td><td>Media-manager connectivity and metadata workflow support.</td><td>API key</td></tr>
               <tr><td>TheTVDB / TMDb</td><td>Original-language and metadata lookups used by language-aware processing.</td><td>API key; TVDB PIN optional</td></tr>
+              <tr><td>Homarr</td><td>Compact Snacks iFrame tile, or Homarr's native Media Transcoding widget through a read-only Tdarr adapter.</td><td>Scoped iframe token or Snacks API key</td></tr>
               <tr><td>Notifications</td><td>Webhook, ntfy, or Apprise destinations for encode/scan/node events.</td><td>Destination-specific</td></tr>
             </tbody>
           </table>
@@ -835,6 +1017,128 @@ environment:
           Integration credentials are stored in plaintext JSON inside the Snacks config
           directory. Protect that directory with host permissions, enable control-panel
           authentication, and restrict network access to trusted clients.
+        </p>
+
+        <h3 id="homarr">Homarr dashboards: choose a setup</h3>
+        <p>
+          Both choices are read-only and expose the same Snacks queue and cluster state, but they
+          use different presentation, credentials, and network paths. They may be used together.
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Option</th><th>Choose it for</th><th>Who connects to Snacks</th><th>Credential</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Snacks compact tile</strong></td><td>Snacks' responsive Stats, Queue, and Workers views inside a Homarr iFrame widget.</td><td>Each viewer's browser</td><td>Scoped iframe URL when Snacks sign-in is enabled</td></tr>
+              <tr><td><strong>Homarr Media Transcoding</strong></td><td>Homarr's native widget, backed by Snacks' Tdarr-compatible read model.</td><td>The Homarr server or container</td><td>Snacks API key when Snacks sign-in is enabled</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="homarr-iframe">Snacks compact tile (Homarr iFrame)</h3>
+        <p>
+          The compact tile is a server-rendered Snacks page at <code>/iframe/homarr</code>. Its
+          Stats tab shows lifetime space savings, encode counts, current queue counts, a 14-day
+          savings sparkline, and active work. Queue shows active and pending files; Workers shows
+          the local instance and discovered cluster nodes. Nothing in the tile can mutate Snacks.
+        </p>
+        <ol>
+          <li>
+            Open Snacks <strong>Settings → Security → Iframe Access</strong>. Add the exact Homarr
+            origin seen in the browser, including its scheme and non-default port, such as
+            <code>https://homarr.example.com</code> or <code>http://192.168.1.20:7575</code>. Enter
+            an origin, not a board path, then select <strong>Save origins</strong>.
+          </li>
+          <li>
+            Select <strong>Generate URL</strong> and copy the resulting URL. Generating again
+            replaces the previous iframe token; <strong>Revoke</strong> invalidates it immediately.
+          </li>
+          <li>
+            Open the desired Homarr board in edit mode, add an <strong>iFrame</strong> widget, and
+            paste the copied value into <strong>Embed URL</strong>. Disabling widget scrolling is
+            optional because the tile is responsive.
+          </li>
+          <li>
+            Test the board from a normal viewer device. An iFrame is loaded by that device's
+            browser, so its Snacks URL must be resolvable and reachable there; a Docker-only name
+            such as <code>snacks</code> usually is not. If necessary, replace only the generated
+            URL's scheme, host, and port with the browser-reachable Snacks origin.
+          </li>
+        </ol>
+        <p>The generated URL can be customized by appending these query parameters:</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Parameter</th><th>Values and default</th><th>Effect</th></tr></thead>
+            <tbody>
+              <tr><td><code>embedToken</code></td><td>Generated <code>snk_embed_…</code> value</td><td>Required by the iframe route when the Snacks sign-in gate is active. It is retained when changing tile tabs.</td></tr>
+              <tr><td><code>theme</code></td><td><code>dark</code> (default) or <code>light</code></td><td>Selects the tile color scheme.</td></tr>
+              <tr><td><code>tab</code></td><td><code>stats</code> (default), <code>queue</code>, or <code>workers</code></td><td>Selects the initial tab; visitors can still switch tabs in the tile.</td></tr>
+              <tr><td><code>limit</code></td><td><code>10</code> by default; clamped to 1–30</td><td>Limits rows shown on the Queue tab.</td></tr>
+              <tr><td><code>refresh</code></td><td><code>30</code> seconds by default; <code>0</code> disables, other values clamp to 10–3600</td><td>Reloads the server-rendered snapshot.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <pre><code>https://snacks.example.com/iframe/homarr?embedToken=YOUR_TOKEN&amp;theme=dark&amp;tab=stats&amp;limit=10&amp;refresh=30</code></pre>
+        <div class="callout warning">
+          Treat the generated URL as a secret even though its token is read-only: the tile may
+          reveal media filenames. The allowed-origin list is an additional browser framing policy,
+          not a substitute for the token. Snacks always permits same-origin framing; an empty list
+          permits only same-origin framing. An HTTPS Homarr board also cannot embed an HTTP Snacks
+          URL because browsers block mixed content.
+        </div>
+
+        <h3 id="homarr-tdarr">Homarr Media Transcoding widget (Tdarr adapter)</h3>
+        <p>
+          Snacks implements only the read-only Tdarr API subset consumed by Homarr's native
+          <strong>Media Transcoding</strong> widget. Use this choice when the widget should inherit
+          Homarr's own design, default-view setting, and queue pagination.
+        </p>
+        <ol>
+          <li>
+            If Snacks sign-in is enabled, open <strong>Settings → Security → API Access</strong>
+            and generate or copy a Snacks API key. If sign-in is disabled, Homarr's
+            <strong>No Authentication</strong> option also works.
+          </li>
+          <li>
+            In Homarr, open integration management and create a <strong>Tdarr</strong> integration.
+            Give it any descriptive name.
+          </li>
+          <li>
+            Set <strong>URL</strong> to the Snacks base origin only, such as
+            <code>http://snacks:6767</code> or <code>http://192.168.1.20:6767</code>. Do not append
+            <code>/api</code> or an endpoint path. This address must be reachable from the Homarr
+            server or container, not merely from the browser.
+          </li>
+          <li>
+            Choose <strong>API Key</strong> and paste the Snacks key when authentication is active;
+            otherwise choose <strong>No Authentication</strong>. Test and create the integration.
+          </li>
+          <li>
+            Edit a Homarr board, add a <strong>Media Transcoding</strong> widget, select the new
+            integration, then choose its default view and a queue page size from 1–30.
+          </li>
+        </ol>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Homarr tab</th><th>Snacks data</th><th>Intentional limitations</th></tr></thead>
+            <tbody>
+              <tr><td>Statistics</td><td>Catalog and lifetime encode totals, saved space, outcomes, current queue counts, 365-day video/music codec mix, and 4K split.</td><td>Health-check and container-history charts are empty because Snacks does not retain those Tdarr concepts.</td></tr>
+              <tr><td>Queue</td><td>Current active and SQLite-backed pending transcodes, with source container, codec, resolution, size, and status.</td><td>Read-only; completed history and Tdarr health-check table are not exposed here.</td></tr>
+              <tr><td>Workers</td><td>Local and discovered cluster nodes, pause state, active file, device, phase, and progress.</td><td>FPS, ETA, and worker size estimates are not currently available and display neutral values.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout">
+          Point the integration at the Snacks master/coordinator for a cluster-wide view. In a
+          shared Docker network, <code>http://snacks:6767</code> can work here because Homarr makes
+          the requests; <code>localhost</code> refers to Homarr itself. The adapter cannot execute
+          Tdarr plugins, control jobs, or act as a complete Tdarr server. Although its calls are
+          read-only, a Snacks API key is a full API credential and must be protected accordingly.
+        </div>
+        <p>
+          Homarr's current field names and widget options are also described in its official
+          <a href="https://homarr.dev/docs/integrations/tdarr/">Tdarr integration</a>,
+          <a href="https://homarr.dev/docs/widgets/media-transcoding/">Media Transcoding widget</a>,
+          and <a href="https://homarr.dev/docs/widgets/iframe/">iFrame widget</a> documentation.
         </p>
       </section>
 
@@ -901,6 +1205,9 @@ environment:
   - SNACKS_SET_Music__BitrateKbps=256
   - SNACKS_SET_AudioLanguagesToKeep=en,ja
   - 'SNACKS_SET_AudioOutputs=[{"Codec":"aac","Layout":"Stereo","BitrateKbps":192}]'
+  - SNACKS_SET_AdvancedVideo__Enabled=true
+  - 'SNACKS_SET_AdvancedVideo__Profiles=[{"Id":"11111111-1111-4111-8111-111111111111","Name":"AV1 CQ 35","Codec":"av1","EncoderSelection":"Explicit","Encoder":"libaom-av1","RateControl":{"Mode":"Quality","Quality":35},"Preset":"4","Threads":8,"PixelFormat":"yuv420p10le","GopSize":300,"OutputRetention":"AlwaysKeep"}]'
+  - 'SNACKS_SET_AdvancedVideo__Rules=[{"Id":"22222222-2222-4222-8222-222222222222","Name":"Codec is not AV1","Match":"All","Conditions":[{"Field":"Codec","Operator":"IsNot","Values":["av1"]}],"Action":"TranscodeWithProfile","ProfileId":"11111111-1111-4111-8111-111111111111"}]'
   - 'SNACKS_SCAN_Directories=["/media/tv","/media/movies"]'
   - SNACKS_SCAN_Enabled=true
   - SNACKS_SCAN_IntervalMinutes=30
@@ -1015,6 +1322,44 @@ docker exec snacks vainfo</code></pre>
           </div>
         </details>
         <details>
+          <summary>Homarr rejects the Snacks Tdarr integration</summary>
+          <div>
+            <p>
+              Confirm that the integration URL is the Snacks base origin with no API path, that it
+              points to the master/coordinator, and that the Homarr container can resolve and reach
+              it. Use <strong>API Key</strong> with a current Snacks key when sign-in is enabled, or
+              <strong>No Authentication</strong> only when the Snacks sign-in gate is disabled.
+              Test the same probe from Homarr's network namespace when possible:
+            </p>
+            <pre><code>curl -i -X POST \
+  -H "X-Api-Key: YOUR_SNACKS_API_KEY" \
+  http://snacks:6767/api/v2/is-server-alive</code></pre>
+            <p>
+              HTTP 401 indicates a missing or stale key. A DNS or connection error indicates the
+              Homarr-to-Snacks network path. For HTTPS, also verify the certificate trust chain.
+              See <a href="#homarr-tdarr">Homarr Media Transcoding setup</a>.
+            </p>
+          </div>
+        </details>
+        <details>
+          <summary>The Snacks tile is blank, refused, or unauthorized in Homarr</summary>
+          <div>
+            <p>
+              First open the generated iframe URL directly on the same viewer device. HTTP 401
+              means the scoped token was omitted, revoked, or replaced. If the URL works directly
+              but not inside Homarr, add the exact Homarr origin—including scheme and port—to
+              <strong>Settings → Security → Iframe Access</strong>. Also check that a reverse proxy
+              is not replacing Snacks' <code>Content-Security-Policy: frame-ancestors …</code>
+              response and that an HTTPS board is not trying to frame an HTTP URL.
+            </p>
+            <p>
+              A browser DNS or connection error means the generated Snacks origin is not reachable
+              from the viewer; unlike an integration, an iFrame is not fetched by the Homarr
+              container. See <a href="#homarr-iframe">Snacks compact tile setup</a>.
+            </p>
+          </div>
+        </details>
+        <details>
           <summary>Authentication configuration is unusable</summary>
           <div>
             Stop Snacks, back up the config directory, and remove only
@@ -1034,7 +1379,7 @@ docker exec snacks vainfo</code></pre>
         </p>
         <div class="callout warning">
           <strong>Compatibility note.</strong> The API is not URL-versioned. Treat this reference as
-          the v2.17.0 contract and test automation against new Snacks releases before deployment.
+          the v2.18.0 contract and test automation against new Snacks releases before deployment.
         </div>
         <p>
           The running app also publishes a generated, machine-readable OpenAPI document at
@@ -1071,6 +1416,12 @@ curl -fsS -b snacks.cookies "$BASE/api/queue/stats"</code></pre>
           <code>POST /api/auth/apikey/generate</code>), or supply one through the
           <code>SNACKS_API_KEY</code> environment variable; both work at once, and the env-supplied
           key is never revealed by the API.
+        </p>
+        <p>
+          The Sonarr-style <code>?apiKey=</code> query form is restricted to the read-only
+          <code>/api/v1/*</code> and Homarr/Tdarr compatibility routes because URL credentials can
+          leak into history and proxy logs. Mutation routes require a header, bearer token, or
+          signed session. Iframe pages use a separate scoped <code>?embedToken=</code> credential.
         </p>
         <pre><code>curl -fsS -H "X-Api-Key: $SNACKS_API_KEY" "$BASE/api/queue/stats"</code></pre>
 
@@ -1202,6 +1553,13 @@ curl -fsS -b snacks.cookies \
               <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/settings</code></td><td>—</td><td>Full effective <code>EncoderOptions</code> JSON.</td></tr>
               <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/settings</code></td><td>Settings object</td><td>Saves settings atomically and applies presence-aware migration.</td></tr>
               <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/settings/reevaluate</code></td><td><code>forceRetryNoSavings=false</code></td><td>Re-evaluates catalog eligibility using current settings.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/settings/video-encoders</code></td><td><code>refresh=false</code></td><td>Runtime H.264/HEVC/AV1 encoder catalog, native rate controls, local devices, and connected-worker availability.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/settings/advanced-video/validate</code></td><td><code>{advancedVideo, profileId?, sourceFacts?}</code></td><td>Validates staged profiles/rules and returns stable diagnostics plus a literal FFmpeg video-argument preview without executing it.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/settings/advanced-video/impact</code></td><td><code>{advancedVideo}</code></td><td>Read-only library impact preview for a staged policy, including decision buckets and rule matches.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/settings/advanced-video/measured</code></td><td>—</td><td>Measured encode-history outcomes grouped by Advanced Video profile.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/settings/advanced-video/templates</code></td><td>—</td><td>Lists user-saved Advanced Video policy templates.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/settings/advanced-video/templates</code></td><td><code>{name,advancedVideo}</code></td><td>Validates and upserts a named policy template (maximum 20).</td></tr>
+              <tr class="api-row"><td><span class="method delete">DELETE</span></td><td><code>/api/settings/advanced-video/templates/{name}</code></td><td>Template name</td><td>Deletes one Advanced Video policy template.</td></tr>
               <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/settings/presets</code></td><td>—</td><td>Lists saved preset names and values.</td></tr>
               <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/settings/presets</code></td><td><code>{name, options}</code></td><td>Creates or replaces a named preset.</td></tr>
               <tr class="api-row"><td><span class="method delete">DELETE</span></td><td><code>/api/settings/presets/{name}</code></td><td>Preset name</td><td>Deletes one preset.</td></tr>
@@ -1239,6 +1597,10 @@ curl -fsS -b snacks.cookies \
               <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/auth/apikey</code></td><td>—</td><td>Returns the stored API key. A key supplied via <code>SNACKS_API_KEY</code> is never exposed here.</td></tr>
               <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/auth/apikey/generate</code></td><td>—</td><td>Generates and persists a new stored API key, replacing any previous one.</td></tr>
               <tr class="api-row"><td><span class="method delete">DELETE</span></td><td><code>/api/auth/apikey</code></td><td>—</td><td>Removes the stored API key. A key set via <code>SNACKS_API_KEY</code> stays valid.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/auth/embed</code></td><td>—</td><td>Returns the stored iframe-only token and concrete CSP origin allowlist.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/auth/embed/generate</code></td><td>—</td><td>Generates a new token accepted only by read-only <code>/iframe/*</code> pages.</td></tr>
+              <tr class="api-row"><td><span class="method delete">DELETE</span></td><td><code>/api/auth/embed</code></td><td>—</td><td>Revokes the iframe-only token.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/auth/embed/origins</code></td><td><code>{origins:["https://homarr.example"]}</code></td><td>Replaces and normalizes the HTTP(S) origins allowed by iframe CSP.</td></tr>
               <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/notifications/config</code></td><td>—</td><td>Full destination and event-toggle configuration.</td></tr>
               <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/notifications/config</code></td><td>Notification config</td><td>Saves destinations and toggles.</td></tr>
               <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/notifications/test</code></td><td>One destination object</td><td>Sends a test notification.</td></tr>
@@ -1275,6 +1637,31 @@ curl -fsS -b snacks.cookies \
               <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/dashboard/recent</code></td><td><code>limit=25</code>, <code>kind</code></td><td>Recent successful encodes.</td></tr>
               <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/dashboard/top-savings</code></td><td><code>limit=10</code>, <code>days=365</code>, <code>kind</code></td><td>Largest compression wins.</td></tr>
               <tr class="api-row"><td><span class="method delete">DELETE</span></td><td><code>/api/dashboard/history</code></td><td>—</td><td><span class="risk">Destructive to history:</span> deletes the complete encode-history ledger.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Read-only dashboard and Homarr compatibility</h3>
+        <p>
+          The v1 routes are Snacks-native read models. The v2 routes intentionally reproduce only
+          the case-sensitive Tdarr response shapes consumed by Homarr. Although three Tdarr probes
+          use POST, every compatibility action is read-only. When sign-in is enabled these routes
+          accept the API key as <code>X-Api-Key</code>, a bearer token, or the compatibility-only
+          <code>?apiKey=</code> query parameter. See the <a href="#homarr-tdarr">setup and supported
+          data</a> before treating this subset as a general Tdarr API.
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Method</th><th>Path</th><th>Inputs</th><th>Purpose</th></tr></thead>
+            <tbody>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/v1/system/status</code></td><td>—</td><td>Version, instance, runtime, role, node, uptime, and auth status.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/v1/stats</code></td><td>—</td><td>Lifetime history plus DB-backed current queue statistics.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/v1/queue</code></td><td><code>page=1</code>, <code>pageSize=10</code> (max 100)</td><td>Active jobs, the complete SQLite pending queue, and recent terminal records.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/v1/workers</code></td><td>—</td><td>Deduplicated local and cluster worker/job snapshots.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/v2/is-server-alive</code></td><td>—</td><td>Homarr Tdarr-adapter connection probe.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/v2/stats/get-pies</code></td><td><code>{data:{libraryId:""}}</code></td><td>Tdarr-shaped queue, history, codec, resolution, and saved-space statistics.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/v2/get-nodes</code></td><td>—</td><td>Tdarr-shaped node and active-worker dictionaries.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/v2/client/status-tables</code></td><td><code>{data:{start,pageSize,opts:{table}}}</code></td><td><code>table1</code> is the DB-backed transcode queue; unsupported health-check <code>table4</code> is empty.</td></tr>
             </tbody>
           </table>
         </div>
@@ -1465,7 +1852,7 @@ node scripts/sync-version.mjs
 
       <footer>
         <p>
-          Snacks documentation for v2.17.0. This file is self-contained: save or print it for
+          Snacks documentation for v2.18.0. This file is self-contained: save or print it for
           offline use. The running app serves it at <code>/docs/index.html</code>.
         </p>
       </footer>

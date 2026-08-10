@@ -79,6 +79,22 @@ electron-app/ffmpeg/ffmpeg.exe
 electron-app/ffmpeg/ffprobe.exe
 ```
 
+Native package builds run `scripts/validate-ffmpeg-inventory.mjs` before packaging and fail if
+the staged FFmpeg does not advertise the baseline `libx264`, `libx265`, and `libsvtav1`
+encoders. Optional Advanced Video implementations such as libaom and rav1e are discovered at
+runtime and are not packaging requirements.
+
+They also run `scripts/validate-advanced-templates.mjs`, which builds every Advanced Video
+quick-start template from the settings UI module and fails if a template has dangling profile
+references, if the expert template drifts from `examples/advanced-video-policy.json`, or if
+the generated C# fixture (`Snacks.Tests/Video/Fixtures/quick-start-templates.json`) is stale —
+the JS templates are the single source of truth; regenerate the fixture with
+`node scripts/validate-advanced-templates.mjs --write` after changing them.
+
+`scripts/test-advanced-video-ui.mjs` unit-tests the pure display logic in the Advanced Video
+settings module (plain-language rule sentences, byte humanization, policy import id-remapping)
+and runs in both native package builds as well.
+
 ### Development launch
 
 ```cmd
@@ -270,7 +286,7 @@ Snacks/
 
 1. Update `<Version>` in `Snacks/Snacks.csproj` and run the synchronization script.
 2. Update release notes and confirm documentation describes changed behavior.
-3. Run release build, .NET tests, Electron checks, and both package vulnerability audits.
+3. Run release build, .NET tests, Electron checks, FFmpeg inventory validation, and both package vulnerability audits.
 4. Run the OpenAPI validator against a production-mode local instance.
 5. Run relevant E2E scenarios and representative real-media tests.
 6. Build the target installer or image on its native build host.

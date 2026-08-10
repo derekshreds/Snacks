@@ -190,6 +190,7 @@ public sealed class ClusterService : IHostedService, IDisposable
         NotificationService notificationService,
         EncodeHistoryRepository encodeHistoryRepo,
         Snacks.Services.Routing.JobKindRouters routers,
+        FfmpegCapabilityService ffmpegCapabilities,
         Snacks.Services.Cluster.TransferThrottle? transferThrottle = null,
         ILogger<ClusterService>? logger = null)
     {
@@ -217,7 +218,7 @@ public sealed class ClusterService : IHostedService, IDisposable
 
         // Sub-services share the node registry and are configured after config load
         _discovery = new ClusterDiscoveryService(
-            _config, hubContext, httpClientFactory, transcodingService, _nodes);
+            _config, hubContext, httpClientFactory, transcodingService, ffmpegCapabilities, _nodes);
 
         _fileTransfer = new ClusterFileTransferService(hubContext, httpClientFactory, _transferThrottle);
 
@@ -1122,7 +1123,25 @@ public sealed class ClusterService : IHostedService, IDisposable
                         try
                         {
                             var updated = JsonSerializer.Deserialize<WorkerCapabilities>(caps.GetRawText(), _jsonOptions);
-                            if (updated != null) node.Capabilities = updated;
+                            if (updated != null)
+                            {
+                                var routingChanged = !string.Equals(
+                                    RoutingCapabilitySignature(node.Capabilities),
+                                    RoutingCapabilitySignature(updated),
+                                    StringComparison.Ordinal);
+                                node.Capabilities = updated;
+                                if (isMaster && routingChanged)
+                                {
+                                    // An encoder, device, or protocol gate may just have
+                                    // become satisfiable. Wake dispatch immediately instead
+                                    // of leaving exact-profile jobs parked until the timer.
+                                    _ = Task.Run(async () =>
+                                    {
+                                        try { await RunDispatchAsync(); }
+                                        catch (Exception ex) { Log.Warning($"Cluster: capability-wake dispatch error: {ex.Message}"); }
+                                    });
+                                }
+                            }
                         }
                         catch (Exception ex)
                         {
@@ -1161,6 +1180,25 @@ public sealed class ClusterService : IHostedService, IDisposable
                 }
             }
         }
+    }
+
+    /// <summary>
+    ///     Stable comparison key for fields that affect video routing. Volatile
+    ///     heartbeat data such as free disk and CanAcceptJobs is intentionally
+    ///     excluded so ordinary heartbeats do not trigger redundant dispatch runs.
+    /// </summary>
+    private static string RoutingCapabilitySignature(WorkerCapabilities? capabilities)
+    {
+        if (capabilities == null) return "";
+        var encoders = string.Join(',', (capabilities.SupportedEncoders ?? [])
+            .OrderBy(value => value, StringComparer.OrdinalIgnoreCase));
+        var devices = string.Join('|', (capabilities.Devices ?? [])
+            .Where(device => device != null)
+            .OrderBy(device => device.DeviceId, StringComparer.OrdinalIgnoreCase)
+            .Select(device => $"{device.DeviceId}:{device.DefaultConcurrency}:"
+                + string.Join(',', (device.Encoders ?? []).OrderBy(value => value, StringComparer.OrdinalIgnoreCase))
+                + ":" + string.Join(',', (device.SupportedCodecs ?? []).OrderBy(value => value, StringComparer.OrdinalIgnoreCase))));
+        return $"{capabilities.AdvancedVideoProtocolVersion};{encoders};{devices}";
     }
 
     /******************************************************************
@@ -1537,9 +1575,24 @@ public sealed class ClusterService : IHostedService, IDisposable
                     continue;
                 }
 
-                // Resolve folder-level overrides for worker selection (GPU/encoder matching)
-                var folderOverride = FolderOverrideResolver?.Invoke(workItem.Path);
-                var folderOptions  = EncoderOptionsOverride.ApplyOverrides(globalOptions, folderOverride, null);
+                VideoPolicyResolution? basePolicy = null;
+                if (workItem.Kind == MediaKind.Video)
+                {
+                    basePolicy = _transcodingService.ResolveVideoPolicyForWorkItem(workItem, globalOptions);
+                    if (!string.IsNullOrEmpty(basePolicy.Plan.BlockingReason))
+                    {
+                        _transcodingService.RequeueWorkItem(workItem, silent: true);
+                        skipThisTick.Add(workItem.Id);
+                        try { await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem); } catch { }
+                        continue;
+                    }
+                    if (basePolicy.Plan.Action == AdvancedVideoAction.Skip)
+                    {
+                        await _transcodingService.MarkDispatchSkippedAsync(workItem,
+                            basePolicy.Plan.RuleName == null ? "advanced video policy" : $"advanced video rule '{basePolicy.Plan.RuleName}'");
+                        continue;
+                    }
+                }
 
                 // FindBestSlot picks the best (node, device) pair across the
                 // whole cluster — original behavior, preserves load-spread and
@@ -1547,28 +1600,50 @@ public sealed class ClusterService : IHostedService, IDisposable
                 // by any current candidate; mark it skippable for the rest of
                 // this tick and continue (instead of breaking the loop, which
                 // would strand other-kind items behind it).
-                var slot = FindBestSlot(workItem, folderOptions);
+                var slot = FindBestSlot(workItem, globalOptions);
                 if (slot == null)
                 {
+                    if (!string.IsNullOrWhiteSpace(basePolicy?.Plan.ExplicitEncoder))
+                        workItem.WaitReason = $"Waiting for exact encoder {basePolicy.Plan.ExplicitEncoder}; no compatible local or worker slot is currently available.";
+                    else if (basePolicy?.Plan is { IsAdvanced: true } advancedPlan)
+                    {
+                        bool protocolCandidate = availableNow.Any(node =>
+                            node.Capabilities?.AdvancedVideoProtocolVersion >= advancedPlan.ProtocolVersion);
+                        workItem.WaitReason = protocolCandidate
+                            ? $"Waiting for an available worker encoder/device slot for profile {advancedPlan.ProfileName ?? advancedPlan.Action.ToString()}."
+                            : $"Waiting for worker Advanced Video protocol v{advancedPlan.ProtocolVersion}; connected workers are incompatible.";
+                    }
                     _transcodingService.RequeueWorkItem(workItem, silent: true);
                     skipThisTick.Add(workItem.Id);
+                    try { await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem); } catch { }
                     continue;
                 }
 
                 var bestNode = slot.Value.Node;
                 var deviceId = slot.Value.DeviceId;
 
-                // Final options: global → folder → node overrides. Reuses the
-                // folderOverride resolved a few lines up for the slot-pick filter.
                 var nodeOverride = GetNodeSettings(bestNode.NodeId)?.EncodingOverrides;
-                var finalOptions = EncoderOptionsOverride.ApplyOverrides(globalOptions, folderOverride, nodeOverride);
+                var finalResolution = workItem.Kind == MediaKind.Video
+                    ? _transcodingService.ResolveVideoPolicyForWorkItem(workItem, globalOptions, nodeOverride)
+                    : null;
+                var finalOptions = finalResolution?.Options
+                    ?? EncoderOptionsOverride.ApplyOverrides(globalOptions, FolderOverrideResolver?.Invoke(workItem.Path), nodeOverride);
+                if (!string.IsNullOrEmpty(finalResolution?.Plan.BlockingReason))
+                {
+                    workItem.WaitReason = finalResolution.Plan.BlockingReason;
+                    _transcodingService.RequeueWorkItem(workItem, silent: true);
+                    skipThisTick.Add(workItem.Id);
+                    continue;
+                }
+                workItem.WaitReason = null;
 
                 // Force-mux items ("Process Item" / "Process Directory") dispatch as Hybrid even
                 // when the global mode is Transcode. The upgraded mode survives the pre-dispatch
                 // skip gate below and is cloned into the JobMetadata sent to the worker, so the
                 // worker mux-passes an at-target file (video copy, container normalized) instead
                 // of re-encoding or skipping it.
-                if (workItem.ForceMux && finalOptions.EncodingMode == EncodingMode.Transcode)
+                if (workItem.ForceMux && (finalResolution?.Plan.Action ?? AdvancedVideoAction.UseSimpleSettings) == AdvancedVideoAction.UseSimpleSettings
+                                      && finalOptions.EncodingMode == EncodingMode.Transcode)
                     finalOptions.EncodingMode = EncodingMode.Hybrid;
 
                 // Pre-dispatch skip gate (mirror of the local FinaliseForDispatchAsync).
@@ -1929,6 +2004,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                 FileName = workItem.FileName,
                 FileSize = workItem.Size,
                 Options  = clonedOptions,
+                VideoPlan = workItem.VideoPlan?.Clone(),
                 Probe    = workItem.Probe,
                 Duration = workItem.Length,
                 Bitrate  = workItem.Bitrate,
@@ -2097,6 +2173,11 @@ public sealed class ClusterService : IHostedService, IDisposable
 
         workItem.Progress       = progress.Progress;
         workItem.RemoteJobPhase = progress.Phase ?? "Encoding";
+        // The worker stamps the encoder it actually chose once FFmpeg starts; a
+        // report without one (pre-encode, or an older worker) must not clear a
+        // value that is already known.
+        if (!string.IsNullOrEmpty(progress.EncoderName))
+            workItem.VideoEncoderName = progress.EncoderName;
         await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
 
         if (!string.IsNullOrEmpty(progress.LogLine))
@@ -2414,8 +2495,15 @@ public sealed class ClusterService : IHostedService, IDisposable
                 StartedAt           = encodeStart,
                 CompletedAt         = DateTime.UtcNow,
                 Outcome             = noSavings ? "NoSavings" : "Completed",
+                AdvancedProfileId   = workItem.VideoPlan?.ProfileId,
+                AdvancedProfileName = workItem.VideoPlan?.ProfileName,
+                AdvancedRuleName    = workItem.VideoPlan?.RuleName,
             };
             await _encodeHistoryRepo.RecordAsync(record);
+            Log.Information(
+                "EncodeHistoryVideoPolicy jobId={JobId} rule={Rule} profile={Profile} encoder={Encoder} retention={Retention}",
+                workItem.Id, workItem.VideoPlan?.RuleName, workItem.VideoPlan?.ProfileName,
+                workItem.VideoEncoderName, workItem.VideoPlan?.OutputRetention.ToString() ?? "SmallerOnly");
             await _hubContext.Clients.All.SendAsync("EncodeHistoryAdded", record);
         }
         catch (Exception ex)
@@ -3230,6 +3318,19 @@ public sealed class ClusterService : IHostedService, IDisposable
 
         foreach (var node in candidates)
         {
+            VideoPolicyResolution? candidatePolicy = null;
+            if (workItem.Kind == MediaKind.Video)
+            {
+                candidatePolicy = VideoPolicyResolver.Resolve(
+                    options,
+                    FolderOverrideResolver?.Invoke(workItem.Path),
+                    GetNodeSettings(node.NodeId)?.EncodingOverrides,
+                    VideoSourceFacts.From(workItem));
+                if (!string.IsNullOrEmpty(candidatePolicy.Plan.BlockingReason)
+                    || candidatePolicy.Plan.Action == AdvancedVideoAction.Skip)
+                    continue;
+            }
+
             foreach (var device in node.Capabilities!.Devices)
             {
                 if (!IsDeviceEnabled(node, device.DeviceId)) continue;
@@ -3238,7 +3339,10 @@ public sealed class ClusterService : IHostedService, IDisposable
                 int used = UsedDeviceSlots(node, device.DeviceId);
                 if (used >= cap) continue;
 
-                int score = ScoreSlot(node, device, workItem, options);
+                var previousPlan = workItem.VideoPlan;
+                if (candidatePolicy != null) workItem.VideoPlan = candidatePolicy.Plan;
+                int score = ScoreSlot(node, device, workItem, candidatePolicy?.Options ?? options);
+                workItem.VideoPlan = previousPlan;
                 bool freshest = bestNode != null && node.LastHeartbeat < bestNode.LastHeartbeat;
                 if (score > bestScore || (score == bestScore && freshest))
                 {
@@ -3625,6 +3729,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                     await _mediaFileRepo.ClearRemoteAssignmentAsync(mediaFile.FilePath, MediaFileStatus.Unseen);
                     continue;
                 }
+                workItem.ForceMux = mediaFile.ForceMux;
 
                 var baseUrl = $"{(_config.UseHttps ? "https" : "http")}://{mediaFile.AssignedNodeIp}:{mediaFile.AssignedNodePort}";
                 bool nodeReachable = false;
@@ -3808,6 +3913,55 @@ public sealed class ClusterService : IHostedService, IDisposable
                     if (receivedBytes > 0)
                     {
                         Log.Information($"Cluster: Node has {receivedBytes / 1048576}MB of {mediaFile.FileName} — resuming upload");
+
+                        // The previous coordinator may have crashed before the
+                        // worker received metadata. Re-resolve from current facts and
+                        // settings before resuming so Advanced jobs carry a complete
+                        // profile plan rather than silently executing the effective
+                        // options through the Simple rate-control path.
+                        var options = ResolveOptionsForJob(mediaFile.FilePath, mediaFile.AssignedNodeId);
+                        if (workItem.Kind == MediaKind.Video)
+                        {
+                            var global = LoadEncoderOptions();
+                            var nodeOverride = mediaFile.AssignedNodeId == null
+                                ? null
+                                : GetNodeSettings(mediaFile.AssignedNodeId)?.EncodingOverrides;
+                            var recoveredPolicy = _transcodingService.ResolveVideoPolicyForWorkItem(workItem, global, nodeOverride);
+                            if (!string.IsNullOrEmpty(recoveredPolicy.Plan.BlockingReason)
+                                || recoveredPolicy.Plan.Action == AdvancedVideoAction.Skip)
+                            {
+                                Log.Warning($"Cluster: Recovered upload for {mediaFile.FileName} no longer has a dispatchable video policy — re-queueing for a fresh decision");
+                                await RequeueRecoveredJobAsync(mediaFile, workItem);
+                                continue;
+                            }
+                            options = recoveredPolicy.Options;
+                        }
+
+                        var nodeForDispatch = _nodes.Values.FirstOrDefault(n => n.NodeId == mediaFile.AssignedNodeId)
+                            ?? new ClusterNode
+                            {
+                                NodeId    = mediaFile.AssignedNodeId!,
+                                IpAddress = mediaFile.AssignedNodeIp!,
+                                Port      = mediaFile.AssignedNodePort ?? 6767,
+                                Hostname  = mediaFile.AssignedNodeName ?? "recovered"
+                            };
+                        if (workItem.VideoPlan is { IsAdvanced: true } recoveredPlan
+                            && (nodeForDispatch.Capabilities?.AdvancedVideoProtocolVersion ?? 0) < recoveredPlan.ProtocolVersion)
+                        {
+                            workItem.WaitReason = $"Waiting for worker Advanced Video protocol v{recoveredPlan.ProtocolVersion}; recovered worker is incompatible.";
+                            await RequeueRecoveredJobAsync(mediaFile, workItem);
+                            continue;
+                        }
+                        if (!string.IsNullOrWhiteSpace(workItem.VideoPlan?.ExplicitEncoder)
+                            && nodeForDispatch.Capabilities?.Devices.FirstOrDefault(device =>
+                                device.DeviceId == mediaFile.DispatchedDeviceId)?.Encoders.Contains(
+                                    workItem.VideoPlan.ExplicitEncoder, StringComparer.OrdinalIgnoreCase) != true)
+                        {
+                            workItem.WaitReason = $"Waiting for exact encoder {workItem.VideoPlan.ExplicitEncoder}; it is no longer available on the recovered worker device.";
+                            await RequeueRecoveredJobAsync(mediaFile, workItem);
+                            continue;
+                        }
+
                         if (!TryReserveRecoveredSlot(mediaFile, workItem, Snacks.Services.Slots.SlotPhase.Uploading))
                         {
                             await RequeueRecoveredJobAsync(mediaFile, workItem);
@@ -3820,16 +3974,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                         _remoteJobs[workItem.Id]  = workItem;
                         await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
 
-                        var options = ResolveOptionsForJob(mediaFile.FilePath, mediaFile.AssignedNodeId);
                         _dispatchedOptions[workItem.Id] = options;
-                        var nodeForDispatch = _nodes.Values.FirstOrDefault(n => n.NodeId == mediaFile.AssignedNodeId)
-                            ?? new ClusterNode
-                            {
-                                NodeId    = mediaFile.AssignedNodeId!,
-                                IpAddress = mediaFile.AssignedNodeIp!,
-                                Port      = mediaFile.AssignedNodePort ?? 6767,
-                                Hostname  = mediaFile.AssignedNodeName ?? "recovered"
-                            };
 
                         _ = Task.Run(async () =>
                         {
@@ -3857,12 +4002,16 @@ public sealed class ClusterService : IHostedService, IDisposable
                                     FileName = workItem.FileName,
                                     FileSize = workItem.Size,
                                     Options  = await CloneOptionsForWorkerAsync(options, workItem.Path, workItem.Id, recoveryCts.Token),
+                                    VideoPlan = workItem.VideoPlan?.Clone(),
                                     Probe    = workItem.Probe,
                                     Duration = workItem.Length,
                                     Bitrate  = workItem.Bitrate,
                                     IsHevc   = workItem.IsHevc,
                                     Is4K     = workItem.Is4K,
                                     Kind     = workItem.Kind,
+                                    DeviceId = workItem.DispatchedDeviceId,
+                                    DeviceMaxConcurrency = nodeForDispatch.Capabilities?.Devices
+                                        .FirstOrDefault(device => device.DeviceId == workItem.DispatchedDeviceId)?.DefaultConcurrency,
                                 };
 
                                 var uploadClient = _discovery.CreateAuthenticatedClient();
@@ -3998,6 +4147,11 @@ public sealed class ClusterService : IHostedService, IDisposable
         EncoderOptions options, string originalPath, string workItemId, CancellationToken ct)
     {
         var clone = CloneOptions(options);
+        // Rules/catalogs are coordinator configuration, not executable worker
+        // input. The resolved VideoJobPlan travels separately in JobMetadata;
+        // stripping the block makes it impossible for a worker path to accidentally
+        // re-evaluate policies against different settings or source facts.
+        clone.AdvancedVideo = new AdvancedVideoOptions();
         if (!clone.KeepOriginalLanguage) return clone;
 
         try

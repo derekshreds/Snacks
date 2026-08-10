@@ -6,6 +6,7 @@ using Snacks.Hubs;
 using Snacks.Models;
 using System.Runtime.InteropServices;
 using System.Text.Json;
+using Serilog.Events;
 
 // macOS / Linux: TesseractOCR ships only Windows DLLs and uses its own LibraryLoader
 // (not .NET DllImport), so a SetDllImportResolver wouldn't fire. Instead we point its
@@ -39,6 +40,10 @@ try { Directory.CreateDirectory(snacksLogDir); } catch { /* logger fallback hand
 
 Log.Logger = new LoggerConfiguration()
     .MinimumLevel.Information()
+    // ASP.NET's built-in request-start event includes the raw query string. Dashboard
+    // compatibility supports URL credentials, so suppress that category to keep API
+    // and iframe tokens out of the rolling operation log.
+    .MinimumLevel.Override("Microsoft.AspNetCore.Hosting.Diagnostics", LogEventLevel.Warning)
     .Enrich.FromLogContext()
     .WriteTo.Console()
     .WriteTo.File(
@@ -214,6 +219,8 @@ builder.Services.AddSingleton<Snacks.Services.Ocr.NativeOcrService>();
 builder.Services.AddSingleton<SubtitleExtractionService>();
 builder.Services.AddSingleton<AuthService>();
 builder.Services.AddSingleton<TranscodingService>();
+builder.Services.AddSingleton<DashboardIntegrationService>();
+builder.Services.AddSingleton<FfmpegCapabilityService>();
 builder.Services.AddSingleton<LibraryAnalysisJobService>();
 builder.Services.AddSingleton<FileHealthService>();
 builder.Services.AddHostedService<RollingVerificationService>();

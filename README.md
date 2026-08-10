@@ -125,9 +125,9 @@ See the [complete Docker/NAS guide](https://snacksvideo.com/docs/#quick-start) o
 ## How it works
 
 1. **Scan** — FFprobe inventories codec, bitrate, resolution, streams, and duration.
-2. **Decide** — the selected preset determines whether each file should be skipped, remuxed, or encoded. Analyze mode previews those decisions without queueing work.
+2. **Decide** — the selected preset determines whether each file should be skipped, remuxed, or encoded. The opt-in Advanced Video layer can instead select reusable profiles with ordered source-property rules. Analyze mode previews those decisions without queueing work.
 3. **Process** — FFmpeg uses hardware acceleration when available and software when it is not.
-4. **Verify** — Snacks checks the result and rejects invalid or larger outputs rather than silently replacing good media.
+4. **Verify** — Snacks checks every result. The default Smaller Only policy rejects larger outputs; an Advanced quality profile can explicitly use Always Keep when predictable quality matters more than final size.
 5. **Repeat** — watch folders, integrations, notifications, and the API keep the workflow moving as the library changes.
 
 > [!IMPORTANT]
@@ -137,6 +137,7 @@ See the [complete Docker/NAS guide](https://snacksvideo.com/docs/#quick-start) o
 
 - Video and music pipelines with independent settings
 - H.264, HEVC/H.265, and AV1 output
+- Opt-in Advanced Video profiles with codec/resolution/bitrate rules, CRF/CQ/QP modes, exact runtime-detected encoders, guarded FFmpeg options, and cluster-aware routing
 - MKV and MP4 containers
 - Quality presets plus detailed video, audio, subtitle, crop, and file-handling controls
 - NVIDIA NVENC, Intel QSV/VAAPI, AMD AMF/VAAPI, and Apple VideoToolbox support
@@ -147,8 +148,22 @@ See the [complete Docker/NAS guide](https://snacksvideo.com/docs/#quick-start) o
 - Distributed encoding with coordinator and worker roles
 - Plex and Jellyfin library rescans
 - Sonarr, Radarr, TMDb, and TheTVDB connectivity
+- Homarr dashboards through either a compact Snacks iFrame tile or the native Media Transcoding widget via a read-only Tdarr adapter
 - Webhook, Discord, ntfy, and Apprise notifications
 - API-key authentication, environment-variable configuration, OpenAPI, and health endpoints
+
+<details>
+<summary><strong>Advanced Video policies</strong></summary>
+
+Advanced Video is opt-in and disabled by default — upgrading never changes existing settings or decisions, and the layer does nothing until you enable it. The settings panel shows the decision flow as plain-language cards and previews what a staged policy would do to your entire library — per-rule file counts, disk usage, and measured results from completed encodes included — before you apply anything. Policies export and import as plain JSON files for sharing. See the [in-app Advanced Video guide](https://snacksvideo.com/docs/#advanced-video) and the [AV1 quality-policy example](examples/advanced-video-policy.json).
+
+<p align="center">
+  <img src="docs/images/advanced-flow.png" alt="Advanced Video decision flow: plain-language rule cards with live per-rule file counts" width="720">
+  <br>
+  <img src="docs/images/advanced-impact.png" alt="Library impact preview with per-outcome counts, disk usage, and measured results" width="720">
+</p>
+
+</details>
 
 <details>
 <summary><strong>Hardware acceleration matrix</strong></summary>
@@ -177,7 +192,17 @@ Everything needed for unattended operation is configurable from the UI, environm
 - Configure integrations with `SNACKS_INTEG_*`
 - Pause and resume the queue, trigger scans, analyze directories, and enqueue media through the API
 - Authenticate automation with `X-Api-Key` or a bearer token when sign-in is enabled
+- Add the compact Snacks tile to Homarr, or point Homarr's Tdarr integration at Snacks for its native transcoding widget
 - Subscribe to real-time state through SignalR
+
+Homarr can display Snacks in two ways:
+
+| Option | What it provides | Connection and credential |
+|---|---|---|
+| **Snacks compact tile** | A read-only, responsive iFrame with Stats, Queue, and Workers tabs | Each viewer's browser connects to Snacks using a scoped iframe URL generated under **Settings → Security → Iframe Access** |
+| **Homarr Media Transcoding widget** | Homarr's native transcoding UI backed by Snacks queue, worker, and savings data | The Homarr server connects to Snacks through a **Tdarr** integration, using a Snacks API key when authentication is enabled |
+
+See the [Homarr dashboard guide](https://snacksvideo.com/docs/#homarr) for complete setup steps, URL options, security notes, limitations, and troubleshooting for both choices.
 
 Use the [operations and API guide](https://snacksvideo.com/docs/#api-basics) for examples, or inspect the hosted [OpenAPI specification](https://snacksvideo.com/openapi/v1.json).
 

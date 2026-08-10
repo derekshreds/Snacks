@@ -84,4 +84,57 @@ public sealed class AuthApiController : ControllerBase
         _auth.ClearApiKey();
         return new JsonResult(new { success = true });
     }
+
+    /******************************************************************
+     *  Scoped iframe access
+     ******************************************************************/
+
+    /// <summary>Returns the stored iframe token and the configured CSP origin allowlist.</summary>
+    [HttpGet("embed")]
+    public IActionResult GetEmbedConfig() => new JsonResult(new
+    {
+        embedToken = _auth.GetStoredEmbedToken(),
+        iframeAllowedOrigins = _auth.GetConfig().IframeAllowedOrigins?.ToArray() ?? [],
+    });
+
+    /// <summary>Generates and persists a new iframe-only token.</summary>
+    [HttpPost("embed/generate")]
+    public IActionResult GenerateEmbedToken() => new JsonResult(new
+    {
+        success = true,
+        embedToken = _auth.GenerateEmbedToken(),
+    });
+
+    /// <summary>Revokes the stored iframe-only token.</summary>
+    [HttpDelete("embed")]
+    public IActionResult DeleteEmbedToken()
+    {
+        _auth.ClearEmbedToken();
+        return new JsonResult(new { success = true });
+    }
+
+    /// <summary>Replaces the concrete HTTP(S) origins allowed to frame iframe pages.</summary>
+    [HttpPost("embed/origins")]
+    public IActionResult SaveEmbedOrigins([FromBody] SaveEmbedOriginsRequest request)
+    {
+        try
+        {
+            _auth.UpdateIframeAllowedOrigins(request.Origins);
+            return new JsonResult(new
+            {
+                success = true,
+                iframeAllowedOrigins = _auth.GetConfig().IframeAllowedOrigins.ToArray(),
+            });
+        }
+        catch (ArgumentException ex)
+        {
+            return BadRequest(new { success = false, error = ex.Message });
+        }
+    }
+}
+
+/// <summary>Origin allowlist update for server-rendered iframe pages.</summary>
+public sealed class SaveEmbedOriginsRequest
+{
+    public List<string> Origins { get; init; } = [];
 }

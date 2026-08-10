@@ -51,6 +51,37 @@ public class EncodeHistoryRepository
     }
 
     /// <summary>
+    ///     Rows carrying an Advanced Video profile label, slimmed to the columns
+    ///     the measured-results aggregation needs. Projection keeps a long ledger
+    ///     cheap to scan; EF cannot project to the entity type, so the anonymous
+    ///     shape is rehydrated into POCOs for the pure aggregator.
+    /// </summary>
+    public async Task<List<EncodeHistory>> GetAdvancedLabeledAsync()
+    {
+        using var context = await _contextFactory.CreateDbContextAsync();
+        var slim = await context.EncodeHistory
+            .Where(row => row.AdvancedProfileName != null)
+            .Select(row => new
+            {
+                row.AdvancedProfileId, row.AdvancedProfileName, row.AdvancedRuleName,
+                row.OriginalSizeBytes, row.EncodedSizeBytes, row.BytesSaved,
+                row.DurationSeconds, row.CompletedAt,
+            })
+            .ToListAsync();
+        return slim.Select(row => new EncodeHistory
+        {
+            AdvancedProfileId   = row.AdvancedProfileId,
+            AdvancedProfileName = row.AdvancedProfileName,
+            AdvancedRuleName    = row.AdvancedRuleName,
+            OriginalSizeBytes   = row.OriginalSizeBytes,
+            EncodedSizeBytes    = row.EncodedSizeBytes,
+            BytesSaved          = row.BytesSaved,
+            DurationSeconds     = row.DurationSeconds,
+            CompletedAt         = row.CompletedAt,
+        }).ToList();
+    }
+
+    /// <summary>
     ///     Top-line stats for the dashboard hero strip: lifetime totals
     ///     across every completed encode in the ledger. Optional
     ///     <paramref name="kind"/> scopes the totals to video-only or

@@ -117,4 +117,18 @@ public sealed class EncodeHistory
     ///     a ledger of completed work, not an error log.
     /// </summary>
     public string Outcome { get; set; } = "Completed";
+
+    /// <summary>
+    ///     Advanced Video provenance, null for Simple jobs. Snapshotted at write
+    ///     time (not joined) so the ledger keeps meaning after a profile is renamed
+    ///     or deleted — these power the settings panel's "measured so far" figures
+    ///     that sit next to the impact forecast.
+    /// </summary>
+    public Guid? AdvancedProfileId { get; set; }
+
+    /// <summary> Profile name at encode time; see <see cref="AdvancedProfileId"/>. </summary>
+    public string? AdvancedProfileName { get; set; }
+
+    /// <summary> Rule name that selected the profile at dispatch time, if any. </summary>
+    public string? AdvancedRuleName { get; set; }
 }

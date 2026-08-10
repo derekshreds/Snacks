@@ -137,4 +137,51 @@ public sealed class ApiKeyAuthTests : IDisposable
             Environment.SetEnvironmentVariable("SNACKS_API_KEY", null);
         }
     }
+
+    [Fact]
+    public void Embed_token_is_scoped_separately_and_survives_login_config_updates()
+    {
+        var auth = NewAuthService();
+        var token = auth.GenerateEmbedToken();
+
+        token.Should().StartWith("snk_embed_");
+        auth.ValidateEmbedToken(token).Should().BeTrue();
+        auth.ValidateApiKey(token).Should().BeFalse();
+
+        auth.UpdateConfig(enabled: true, username: "derek", newPassword: "hunter2");
+
+        auth.ValidateEmbedToken(token).Should().BeTrue();
+        auth.GetConfig().EmbedToken.Should().Be(token);
+    }
+
+    [Fact]
+    public void Iframe_origins_are_normalized_and_default_to_same_origin()
+    {
+        var auth = NewAuthService();
+        auth.GetIframeFrameAncestors().Should().Be("'self'");
+
+        auth.UpdateIframeAllowedOrigins(new[]
+        {
+            "https://homarr.example.test/boards/home",
+            "https://homarr.example.test/",
+            "http://localhost:7575/path",
+        });
+
+        auth.GetConfig().IframeAllowedOrigins.Should().Equal(
+            "https://homarr.example.test",
+            "http://localhost:7575");
+        auth.GetIframeFrameAncestors().Should().Be(
+            "'self' https://homarr.example.test http://localhost:7575");
+    }
+
+    [Theory]
+    [InlineData("*")]
+    [InlineData("data:text/html,hello")]
+    [InlineData("https://user:pass@example.test")]
+    public void Iframe_origins_reject_wildcards_non_web_schemes_and_credentials(string origin)
+    {
+        var auth = NewAuthService();
+        var action = () => auth.UpdateIframeAllowedOrigins(new[] { origin });
+        action.Should().Throw<ArgumentException>();
+    }
 }

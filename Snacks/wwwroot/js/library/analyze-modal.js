@@ -349,7 +349,10 @@ export class AnalyzeModal {
                 <td>
                     <div class="d-flex align-items-start gap-2">
                         ${renderBadge(r.decision, r.borderline)}
-                        <span class="small text-muted" style="line-height: 1.4;">${escapeHtml(r.reason)}</span>
+                        <div class="small text-muted" style="line-height: 1.4;">
+                            <div>${escapeHtml(r.reason)}</div>
+                            ${renderVideoPlan(r)}
+                        </div>
                     </div>
                 </td>
             </tr>`).join('');
@@ -424,6 +427,19 @@ function renderSource(r) {
     if (r.width)       parts.push(`${r.width}×${r.height}`);
     parts.push(formatSize(r.sizeBytes));
     return parts.join(' · ');
+}
+
+/** Shows the exact advanced rule/profile/action selected by the same resolver used at dispatch. */
+function renderVideoPlan(r) {
+    const parts = [];
+    if (r.matchedRule) parts.push(`Rule: ${r.matchedRule}`);
+    if (r.selectedProfile) parts.push(`Profile: ${r.selectedProfile}`);
+    if (r.videoPlanSummary) parts.push(r.videoPlanSummary);
+    if (!parts.length && (!r.videoPolicyAction || r.videoPolicyAction === 'UseSimpleSettings')) return '';
+    if (!parts.length) parts.push(r.videoPolicyAction);
+    const warnings = (r.videoPlanWarnings || []).map(warning =>
+        `<div class="text-warning"><i class="fas fa-triangle-exclamation me-1"></i>${escapeHtml(warning)}</div>`).join('');
+    return `<div class="mt-1 text-info"><i class="fas fa-code-branch me-1"></i>${escapeHtml(parts.join(' · '))}</div>${warnings}`;
 }
 
 /** Renders the decision pill plus a borderline-warning icon when applicable. */

@@ -49,6 +49,20 @@ public sealed class DeviceSlotSelectionTests
         SupportedCodecs = new List<string> { "h264", "h265", "av1" },
     };
 
+    [Fact]
+    public void Scheduler_candidate_selection_skips_a_deferred_head_item()
+    {
+        var blocked = new WorkItem { Id = "exact-encoder", Kind = MediaKind.Video, Status = WorkItemStatus.Pending };
+        var runnable = new WorkItem { Id = "general", Kind = MediaKind.Video, Status = WorkItemStatus.Pending };
+        var music = new WorkItem { Id = "music", Kind = MediaKind.Music, Status = WorkItemStatus.Pending };
+
+        var selected = TranscodingService.SelectNextLocalVideoCandidate(
+            new[] { blocked, music, runnable },
+            new HashSet<string> { blocked.Id });
+
+        selected.Should().BeSameAs(runnable);
+    }
+
     /// <summary>
     ///     Mirrors what <c>TryReserveLocalDeviceSlot</c> does once the ledger
     ///     decisions are stripped out: pick the first device that passes the
