@@ -417,7 +417,7 @@
         <div class="group">Contributors</div>
         <a href="#development">Development</a>
       </nav>
-      <div class="version">Documents Snacks v2.17.0 · updated 2026-08-09</div>
+      <div class="version">Documents Snacks v2.18.0 · updated 2026-08-09</div>
       </div>
     </aside>
 
@@ -633,7 +633,8 @@
         <h2>Advanced video policies and encoding profiles</h2>
         <p>
           Advanced Video is an optional layer under <strong>Settings → Video</strong>. It is off
-          after upgrade, so existing settings, presets, watched folders, skip decisions, and
+          by default and upgrades never change it: until you enable it, existing settings,
+          presets, watched folders, skip decisions, and
           FFmpeg behavior remain unchanged. Enable it only after creating and validating at
           least one profile. Audio, subtitles, container, paths, and file handling continue to
           come from the ordinary settings; profiles are deliberately video-only.
@@ -1378,7 +1379,7 @@ docker exec snacks vainfo</code></pre>
         </p>
         <div class="callout warning">
           <strong>Compatibility note.</strong> The API is not URL-versioned. Treat this reference as
-          the v2.17.0 contract and test automation against new Snacks releases before deployment.
+          the v2.18.0 contract and test automation against new Snacks releases before deployment.
         </div>
         <p>
           The running app also publishes a generated, machine-readable OpenAPI document at
@@ -1851,7 +1852,7 @@ node scripts/sync-version.mjs
 
       <footer>
         <p>
-          Snacks documentation for v2.17.0. This file is self-contained: save or print it for
+          Snacks documentation for v2.18.0. This file is self-contained: save or print it for
           offline use. The running app serves it at <code>/docs/index.html</code>.
         </p>
       </footer>

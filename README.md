@@ -152,13 +152,18 @@ See the [complete Docker/NAS guide](https://snacksvideo.com/docs/#quick-start) o
 - Webhook, Discord, ntfy, and Apprise notifications
 - API-key authentication, environment-variable configuration, OpenAPI, and health endpoints
 
-Advanced Video is disabled after upgrade, so existing settings and decisions remain unchanged. The settings panel shows the decision flow as plain-language cards and previews what a staged policy would do to your entire library — per-rule file counts, disk usage, and measured results from completed encodes included — before you apply anything. Policies export and import as plain JSON files for sharing. See the [in-app Advanced Video guide](https://snacksvideo.com/docs/#advanced-video) and the [AV1 quality-policy example](examples/advanced-video-policy.json).
+<details>
+<summary><strong>Advanced Video policies</strong></summary>
+
+Advanced Video is opt-in and disabled by default — upgrading never changes existing settings or decisions, and the layer does nothing until you enable it. The settings panel shows the decision flow as plain-language cards and previews what a staged policy would do to your entire library — per-rule file counts, disk usage, and measured results from completed encodes included — before you apply anything. Policies export and import as plain JSON files for sharing. See the [in-app Advanced Video guide](https://snacksvideo.com/docs/#advanced-video) and the [AV1 quality-policy example](examples/advanced-video-policy.json).
 
 <p align="center">
   <img src="docs/images/advanced-flow.png" alt="Advanced Video decision flow: plain-language rule cards with live per-rule file counts" width="720">
   <br>
   <img src="docs/images/advanced-impact.png" alt="Library impact preview with per-outcome counts, disk usage, and measured results" width="720">
 </p>
+
+</details>
 
 <details>
 <summary><strong>Hardware acceleration matrix</strong></summary>
