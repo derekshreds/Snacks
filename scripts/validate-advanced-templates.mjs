@@ -127,7 +127,10 @@ if (process.argv.includes('--write')) {
     console.log(`wrote ${fixturePath}`);
 } else if (!existsSync(fixturePath)) {
     fail(`fixture missing: ${fixturePath} — run: node scripts/validate-advanced-templates.mjs --write`);
-} else if (readFileSync(fixturePath, 'utf8') !== fixtureJson) {
+} else if (readFileSync(fixturePath, 'utf8').replace(/\r\n/g, '\n') !== fixtureJson) {
+    // CRLF-insensitive: git autocrlf materializes the fixture with CRLF on
+    // Windows checkouts, and the C# consumer parses JSON, so only content drift
+    // matters — not line endings.
     fail('fixture drift: the JS templates changed — run: node scripts/validate-advanced-templates.mjs --write');
 } else {
     console.log('ok: C# fixture matches the JS templates');
