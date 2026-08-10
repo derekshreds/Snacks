@@ -2173,6 +2173,11 @@ public sealed class ClusterService : IHostedService, IDisposable
 
         workItem.Progress       = progress.Progress;
         workItem.RemoteJobPhase = progress.Phase ?? "Encoding";
+        // The worker stamps the encoder it actually chose once FFmpeg starts; a
+        // report without one (pre-encode, or an older worker) must not clear a
+        // value that is already known.
+        if (!string.IsNullOrEmpty(progress.EncoderName))
+            workItem.VideoEncoderName = progress.EncoderName;
         await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem);
 
         if (!string.IsNullOrEmpty(progress.LogLine))

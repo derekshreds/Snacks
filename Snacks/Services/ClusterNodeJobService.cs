@@ -619,10 +619,11 @@ public sealed class ClusterNodeJobService
                     var client         = CreateAuthenticatedClient();
                     var progressReport = new JobProgress
                     {
-                        JobId    = id,
-                        Progress = workItem.Progress,
-                        Phase    = "Encoding",
-                        LogLine  = string.Join("\n", lines)
+                        JobId       = id,
+                        Progress    = workItem.Progress,
+                        Phase       = "Encoding",
+                        EncoderName = workItem.VideoEncoderName,
+                        LogLine     = string.Join("\n", lines)
                     };
                     var content = new StringContent(
                         JsonSerializer.Serialize(progressReport, _jsonOptions),
@@ -640,9 +641,10 @@ public sealed class ClusterNodeJobService
                     var client         = CreateAuthenticatedClient();
                     var progressReport = new JobProgress
                     {
-                        JobId    = id,
-                        Progress = progress,
-                        Phase    = "Encoding"
+                        JobId       = id,
+                        Progress    = progress,
+                        Phase       = "Encoding",
+                        EncoderName = workItem.VideoEncoderName
                     };
                     var content = new StringContent(
                         JsonSerializer.Serialize(progressReport, _jsonOptions),
