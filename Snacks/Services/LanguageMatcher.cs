@@ -26,7 +26,14 @@ public static class LanguageMatcher
 
     /// <summary>
     ///     Ordered seed of common languages. Hand-maintained; additions are
-    ///     cheap. Keep this in sync with <c>wwwroot/js/settings/iso-languages.js</c>.
+    ///     cheap. Keep this in sync with <c>wwwroot/js/settings/iso-languages.js</c>
+    ///     (which deliberately carries one extra row — <c>und</c> / "Undetermined" —
+    ///     so the chip UI can offer it; see <see cref="Undetermined"/>).
+    ///
+    ///     <para>Never add <c>und</c>, <c>mul</c>, or <c>zxx</c> rows here:
+    ///     <see cref="ToTwoLetter"/> must keep returning <see langword="null"/> for
+    ///     them so title inference, sidecar naming, and metadata suppression keep
+    ///     treating those tags as "no known language".</para>
     /// </summary>
     public static readonly IReadOnlyList<Entry> Entries = new[]
     {
@@ -201,29 +208,82 @@ public static class LanguageMatcher
     /// </summary>
     /// <remarks>
     ///     A null or empty <paramref name="wantedTwoLetter"/> keeps every
-    ///     track. When the language tag can't be canonicalized (exotic code
-    ///     not in the table), falls back to a case-insensitive exact match
-    ///     against the raw entries in <paramref name="wantedTwoLetter"/>.
+    ///     track. Otherwise delegates to <see cref="KeepEntryIndex"/> so
+    ///     filtering, bucketing, and ordering all agree on which keep entry
+    ///     claims a track.
     /// </remarks>
     public static bool Matches(string? trackLang, string? trackTitle, IReadOnlyList<string>? wantedTwoLetter)
     {
         if (wantedTwoLetter == null || wantedTwoLetter.Count == 0) return true;
+        return KeepEntryIndex(trackLang, trackTitle, wantedTwoLetter) != null;
+    }
+
+    /// <summary>
+    ///     The sentinel keep-list value meaning "tracks whose language no specific
+    ///     language entry could claim": a missing/empty tag, a literal <c>und</c> /
+    ///     <c>mul</c> / <c>zxx</c>, or an unrecognized tag with no language-bearing
+    ///     title. Stored like any other keep entry so overrides, env vars, and chip
+    ///     ordering carry it for free — but deliberately absent from
+    ///     <see cref="Entries"/> so <see cref="ToTwoLetter"/> stays null for it.
+    /// </summary>
+    public const string Undetermined = "und";
+
+    /// <summary>
+    ///     Whether <paramref name="entry"/> is the "undetermined" keep-list sentinel.
+    ///     Accepts the aliases users may type into env overrides (which are not
+    ///     validated by the chip UI): <c>und</c>, <c>undetermined</c>, <c>unknown</c>.
+    /// </summary>
+    public static bool IsUndeterminedKeepEntry(string? entry)
+    {
+        if (string.IsNullOrWhiteSpace(entry)) return false;
+        return entry.Trim().ToLowerInvariant() is "und" or "undetermined" or "unknown";
+    }
+
+    /// <summary>
+    ///     Returns the index of the keep-list entry that claims this track, or
+    ///     <see langword="null"/> when no entry does. Every track is claimed by at
+    ///     most ONE entry, resolved in precedence order:
+    ///     <list type="number">
+    ///         <item><description>Canonical: the tag (or, failing that, the title) resolves
+    ///         to a known language matching a non-undetermined entry. A resolvable track
+    ///         never falls through to the undetermined entry — an <c>und</c>-tagged track
+    ///         titled "English SDH" belongs to <c>en</c>, and a French track with keep
+    ///         list [en, und] is dropped, not swallowed by <c>und</c>.</description></item>
+    ///         <item><description>Raw-exact: an unresolvable non-blank tag string-equals a
+    ///         non-undetermined entry (preserves exotic-tag matching, e.g. private-use
+    ///         <c>qaa</c>), regardless of where the undetermined entry sits.</description></item>
+    ///         <item><description>Otherwise the undetermined entry, if present.</description></item>
+    ///     </list>
+    /// </summary>
+    public static int? KeepEntryIndex(string? trackLang, string? trackTitle, IReadOnlyList<string>? keepList)
+    {
+        if (keepList == null || keepList.Count == 0) return null;
 
         var trackTwo = ToTwoLetter(trackLang) ?? InferFromTitle(trackTitle);
         if (trackTwo != null)
         {
-            foreach (var w in wantedTwoLetter)
-                if (string.Equals(w, trackTwo, StringComparison.OrdinalIgnoreCase))
-                    return true;
-            return false;
+            for (int i = 0; i < keepList.Count; i++)
+            {
+                if (IsUndeterminedKeepEntry(keepList[i])) continue;
+                var entryTwo = ToTwoLetter(keepList[i]) ?? keepList[i]?.Trim();
+                if (string.Equals(entryTwo, trackTwo, StringComparison.OrdinalIgnoreCase)) return i;
+            }
+            return null;
         }
 
-        if (string.IsNullOrWhiteSpace(trackLang)) return false;
-        var trackRaw = trackLang.Trim();
-        foreach (var w in wantedTwoLetter)
-            if (string.Equals(w, trackRaw, StringComparison.OrdinalIgnoreCase))
-                return true;
+        if (!string.IsNullOrWhiteSpace(trackLang))
+        {
+            var trackRaw = trackLang.Trim();
+            for (int i = 0; i < keepList.Count; i++)
+            {
+                if (IsUndeterminedKeepEntry(keepList[i])) continue;
+                if (string.Equals(keepList[i]?.Trim(), trackRaw, StringComparison.OrdinalIgnoreCase)) return i;
+            }
+        }
 
-        return false;
+        for (int i = 0; i < keepList.Count; i++)
+            if (IsUndeterminedKeepEntry(keepList[i])) return i;
+
+        return null;
     }
 }

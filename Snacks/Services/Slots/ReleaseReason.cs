@@ -38,5 +38,12 @@ public enum ReleaseReason
     ///     One-time release fired during master-restart recovery for a job
     ///     whose worker no longer reports it. Job is re-queued from <c>Pending</c>.
     /// </summary>
-    Recovered
+    Recovered,
+
+    /// <summary>
+    ///     The orphan-reservation reaper released a local reservation that had no
+    ///     backing active job past its grace window — a leak that would otherwise
+    ///     hold the device slot until app restart.
+    /// </summary>
+    StaleReservation
 }

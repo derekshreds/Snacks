@@ -1465,8 +1465,10 @@ public sealed class ClusterService : IHostedService, IDisposable
             // re-pick the same blocked item every iteration — and, more
             // importantly, doesn't have to break the moment a video item
             // can't find a video slot, which would strand a music item
-            // sitting behind it.
-            var skipThisTick = new HashSet<string>(StringComparer.Ordinal);
+            // sitting behind it. Keyed by NormalizedPath, not WorkItem.Id —
+            // window eviction/rehydration mints a fresh Guid for the same DB
+            // row, which would defeat an id-keyed set mid-tick.
+            var skipThisTick = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             while (true)
             {
@@ -1538,9 +1540,13 @@ public sealed class ClusterService : IHostedService, IDisposable
                 // pulling work straight through a 500k-row backlog.
                 await _transcodingService.EnsureQueueWindowAsync();
 
-                var workItem = _transcodingService.DequeueForRemoteProcessing(item =>
+                // Claim, don't dequeue: the item stays Pending and in the queue
+                // window while this iteration evaluates it (policy, slot search,
+                // pre-dispatch gate). Bounces just release the claim — the item
+                // never flashes Processing in the UI and never needs a requeue.
+                var workItem = _transcodingService.ClaimForRemoteDispatch(item =>
                 {
-                    if (skipThisTick.Contains(item.Id)) return false;
+                    if (skipThisTick.Contains(item.NormalizedPath)) return false;
 
                     // Music items take a different routing path — the 4K worker checks
                     // are video-only. Eligible only when (a) cluster dispatch is enabled
@@ -1564,193 +1570,226 @@ public sealed class ClusterService : IHostedService, IDisposable
                 });
                 if (workItem == null) break;
 
-                // Source-vanished guard: the source can disappear between scan-time
-                // enqueue and remote dispatch (user deletes the folder, file is renamed,
-                // network share drops the path). Drop the item now rather than upload
-                // a stale path to a worker and have it fail with "source missing".
-                if (!File.Exists(workItem.Path))
+                // Claim discipline: every exit from this iteration that did not
+                // commit the dispatch must release the claim, or the item would be
+                // invisible to all pickers until the TTL purge.
+                bool committed = false;
+                try
                 {
-                    Log.Information($"Cluster: Dropping {workItem.FileName}: source file no longer exists at dispatch time");
-                    await _transcodingService.DropMissingWorkItemAsync(workItem);
-                    continue;
-                }
 
-                VideoPolicyResolution? basePolicy = null;
-                if (workItem.Kind == MediaKind.Video)
-                {
-                    basePolicy = _transcodingService.ResolveVideoPolicyForWorkItem(workItem, globalOptions);
-                    if (!string.IsNullOrEmpty(basePolicy.Plan.BlockingReason))
+                    // Source-vanished guard: the source can disappear between scan-time
+                    // enqueue and remote dispatch (user deletes the folder, file is renamed,
+                    // network share drops the path). Drop the item now rather than upload
+                    // a stale path to a worker and have it fail with "source missing".
+                    if (!File.Exists(workItem.Path))
                     {
-                        _transcodingService.RequeueWorkItem(workItem, silent: true);
-                        skipThisTick.Add(workItem.Id);
+                        Log.Information($"Cluster: Dropping {workItem.FileName}: source file no longer exists at dispatch time");
+                        await _transcodingService.DropMissingWorkItemAsync(workItem);
+                        continue;
+                    }
+
+                    VideoPolicyResolution? basePolicy = null;
+                    if (workItem.Kind == MediaKind.Video)
+                    {
+                        basePolicy = _transcodingService.ResolveVideoPolicyForWorkItem(workItem, globalOptions);
+                        if (!string.IsNullOrEmpty(basePolicy.Plan.BlockingReason))
+                        {
+                            skipThisTick.Add(workItem.NormalizedPath);
+                            try { await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem); } catch { }
+                            continue;
+                        }
+                        if (basePolicy.Plan.Action == AdvancedVideoAction.Skip)
+                        {
+                            await _transcodingService.MarkDispatchSkippedAsync(workItem,
+                                basePolicy.Plan.RuleName == null ? "advanced video policy" : $"advanced video rule '{basePolicy.Plan.RuleName}'");
+                            continue;
+                        }
+                    }
+
+                    // FindBestSlot picks the best (node, device) pair across the
+                    // whole cluster — original behavior, preserves load-spread and
+                    // codec-aware selection. If null, this item can't be placed
+                    // by any current candidate; mark it skippable for the rest of
+                    // this tick and continue (instead of breaking the loop, which
+                    // would strand other-kind items behind it).
+                    var slot = FindBestSlot(workItem, globalOptions);
+                    if (slot == null)
+                    {
+                        if (!string.IsNullOrWhiteSpace(basePolicy?.Plan.ExplicitEncoder))
+                            workItem.WaitReason = $"Waiting for exact encoder {basePolicy.Plan.ExplicitEncoder}; no compatible local or worker slot is currently available.";
+                        else if (basePolicy?.Plan is { IsAdvanced: true } advancedPlan)
+                        {
+                            bool protocolCandidate = availableNow.Any(node =>
+                                node.Capabilities?.AdvancedVideoProtocolVersion >= advancedPlan.ProtocolVersion);
+                            workItem.WaitReason = protocolCandidate
+                                ? $"Waiting for an available worker encoder/device slot for profile {advancedPlan.ProfileName ?? advancedPlan.Action.ToString()}."
+                                : $"Waiting for worker Advanced Video protocol v{advancedPlan.ProtocolVersion}; connected workers are incompatible.";
+                        }
+                        skipThisTick.Add(workItem.NormalizedPath);
                         try { await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem); } catch { }
                         continue;
                     }
-                    if (basePolicy.Plan.Action == AdvancedVideoAction.Skip)
+
+                    var bestNode = slot.Value.Node;
+                    var deviceId = slot.Value.DeviceId;
+
+                    var nodeOverride = GetNodeSettings(bestNode.NodeId)?.EncodingOverrides;
+                    var finalResolution = workItem.Kind == MediaKind.Video
+                        ? _transcodingService.ResolveVideoPolicyForWorkItem(workItem, globalOptions, nodeOverride)
+                        : null;
+                    var finalOptions = finalResolution?.Options
+                        ?? EncoderOptionsOverride.ApplyOverrides(globalOptions, FolderOverrideResolver?.Invoke(workItem.Path), nodeOverride);
+                    if (!string.IsNullOrEmpty(finalResolution?.Plan.BlockingReason))
                     {
-                        await _transcodingService.MarkDispatchSkippedAsync(workItem,
-                            basePolicy.Plan.RuleName == null ? "advanced video policy" : $"advanced video rule '{basePolicy.Plan.RuleName}'");
+                        workItem.WaitReason = finalResolution.Plan.BlockingReason;
+                        skipThisTick.Add(workItem.NormalizedPath);
                         continue;
                     }
-                }
+                    workItem.WaitReason = null;
 
-                // FindBestSlot picks the best (node, device) pair across the
-                // whole cluster — original behavior, preserves load-spread and
-                // codec-aware selection. If null, this item can't be placed
-                // by any current candidate; mark it skippable for the rest of
-                // this tick and continue (instead of breaking the loop, which
-                // would strand other-kind items behind it).
-                var slot = FindBestSlot(workItem, globalOptions);
-                if (slot == null)
-                {
-                    if (!string.IsNullOrWhiteSpace(basePolicy?.Plan.ExplicitEncoder))
-                        workItem.WaitReason = $"Waiting for exact encoder {basePolicy.Plan.ExplicitEncoder}; no compatible local or worker slot is currently available.";
-                    else if (basePolicy?.Plan is { IsAdvanced: true } advancedPlan)
-                    {
-                        bool protocolCandidate = availableNow.Any(node =>
-                            node.Capabilities?.AdvancedVideoProtocolVersion >= advancedPlan.ProtocolVersion);
-                        workItem.WaitReason = protocolCandidate
-                            ? $"Waiting for an available worker encoder/device slot for profile {advancedPlan.ProfileName ?? advancedPlan.Action.ToString()}."
-                            : $"Waiting for worker Advanced Video protocol v{advancedPlan.ProtocolVersion}; connected workers are incompatible.";
-                    }
-                    _transcodingService.RequeueWorkItem(workItem, silent: true);
-                    skipThisTick.Add(workItem.Id);
-                    try { await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem); } catch { }
-                    continue;
-                }
+                    // Force-mux items ("Process Item" / "Process Directory") dispatch as Hybrid even
+                    // when the global mode is Transcode. The upgraded mode survives the pre-dispatch
+                    // skip gate below and is cloned into the JobMetadata sent to the worker, so the
+                    // worker mux-passes an at-target file (video copy, container normalized) instead
+                    // of re-encoding or skipping it.
+                    if (workItem.ForceMux && (finalResolution?.Plan.Action ?? AdvancedVideoAction.UseSimpleSettings) == AdvancedVideoAction.UseSimpleSettings
+                                          && finalOptions.EncodingMode == EncodingMode.Transcode)
+                        finalOptions.EncodingMode = EncodingMode.Hybrid;
 
-                var bestNode = slot.Value.Node;
-                var deviceId = slot.Value.DeviceId;
-
-                var nodeOverride = GetNodeSettings(bestNode.NodeId)?.EncodingOverrides;
-                var finalResolution = workItem.Kind == MediaKind.Video
-                    ? _transcodingService.ResolveVideoPolicyForWorkItem(workItem, globalOptions, nodeOverride)
-                    : null;
-                var finalOptions = finalResolution?.Options
-                    ?? EncoderOptionsOverride.ApplyOverrides(globalOptions, FolderOverrideResolver?.Invoke(workItem.Path), nodeOverride);
-                if (!string.IsNullOrEmpty(finalResolution?.Plan.BlockingReason))
-                {
-                    workItem.WaitReason = finalResolution.Plan.BlockingReason;
-                    _transcodingService.RequeueWorkItem(workItem, silent: true);
-                    skipThisTick.Add(workItem.Id);
-                    continue;
-                }
-                workItem.WaitReason = null;
-
-                // Force-mux items ("Process Item" / "Process Directory") dispatch as Hybrid even
-                // when the global mode is Transcode. The upgraded mode survives the pre-dispatch
-                // skip gate below and is cloned into the JobMetadata sent to the worker, so the
-                // worker mux-passes an at-target file (video copy, container normalized) instead
-                // of re-encoding or skipping it.
-                if (workItem.ForceMux && (finalResolution?.Plan.Action ?? AdvancedVideoAction.UseSimpleSettings) == AdvancedVideoAction.UseSimpleSettings
-                                      && finalOptions.EncodingMode == EncodingMode.Transcode)
-                    finalOptions.EncodingMode = EncodingMode.Hybrid;
-
-                // Pre-dispatch skip gate (mirror of the local FinaliseForDispatchAsync).
-                // Resolves any missing OriginalLanguage live, persists it, merges it into
-                // finalOptions, and re-runs WouldSkipUnderOptions against those merged
-                // options. Catches the same three cases the local path does — legacy rows,
-                // settings flipped between queue add and remote dispatch, force-adds — so
-                // remote workers don't waste time on no-op encodes either.
-                if (!await _transcodingService.FinaliseForDispatchAsync(workItem, finalOptions, CancellationToken.None))
-                {
-                    await _transcodingService.MarkDispatchSkippedAsync(workItem,
-                        "cluster pre-dispatch check — file already meets target under current options");
-                    // Release the optimistic slot we never actually claimed yet (we're
-                    // still pre-dispatch — ActiveJobs hasn't been touched on this iteration).
-                    continue;
-                }
-
-                // Cancel/Stop race: workItem.Status could have flipped during the awaits
-                // inside FinaliseForDispatchAsync. Without this, the dispatch task would
-                // upload + run the encode despite the user having cancelled.
-                if (workItem.Status is WorkItemStatus.Cancelled or WorkItemStatus.Stopped)
-                {
-                    Log.Information($"Dropping {workItem.FileName}: cancelled/stopped during cluster dispatch finalisation");
-                    continue;
-                }
-
-                // Optimistic slot accounting: claim the slot now so the next
-                // iteration of this dispatch loop counts it against the
-                // device's cap before the heartbeat reflects the new state.
-                // ActiveJobs is the authoritative per-slot accounting;
-                // ActiveWorkItemId is kept in sync as a "first active" hint
-                // for legacy UI fields.
-                //
-                // _activeUploads is pre-claimed synchronously with the
-                // ActiveJobs.Add so the heartbeat reconciliation that runs
-                // between this loop's awaits sees the slot as held — without
-                // this, the gap between here and DispatchToNodeAsync's body
-                // running on the thread pool lets a heartbeat strip the
-                // entry and the next dispatch tick double-books the slot.
-                // Atomic slot reservation via the ledger. Returns false if
-                // capacity raced (e.g. another dispatch tick or recovery path
-                // grabbed the same slot first). On false we requeue and let
-                // the next tick try a different slot.
-                if (!_slotLedger.TryReserve(bestNode.NodeId, deviceId, workItem.Id, workItem.FileName))
-                {
-                    Log.Information($"Cluster: Slot reservation lost for {workItem.FileName} on {bestNode.Hostname}/{deviceId} — requeueing");
-                    _transcodingService.RequeueWorkItem(workItem, silent: true);
-                    continue;
-                }
-                _slotLedger.TransitionPhase(workItem.Id, Snacks.Services.Slots.SlotPhase.Uploading);
-
-                _activeUploads.TryAdd(workItem.Id, true);
-                bestNode.ActiveWorkItemId = workItem.Id;
-                // Legacy projection field — populated immediately so any UI
-                // broadcast between dispatch and the next heartbeat shows
-                // the new reservation. The heartbeat reconcile rebuilds this
-                // list from the ledger on every tick.
-                lock (bestNode)
-                {
-                    bestNode.ActiveJobs.Add(new ActiveJobInfo
-                    {
-                        JobId    = workItem.Id,
-                        DeviceId = deviceId,
-                        FileName = workItem.FileName,
-                        Progress = 0,
-                        Phase    = "Uploading",
-                    });
-                }
-                bestNode.Status = NodeStatus.Uploading;
-
-                // Stash the chosen device on the work item so the encode-history
-                // ledger can attribute the encode to the right slot family even
-                // after the slot has been released back to the pool.
-                workItem.DispatchedDeviceId = deviceId;
-
-                // Snapshot the dispatched options under the jobId so the completion path can
-                // read back exactly what the worker was dispatched with — even if the master's
-                // _lastOptions has shifted since (settings save, Re-evaluate, etc.).
-                _dispatchedOptions[workItem.Id] = finalOptions.Clone();
-
-                // Track each dispatch task per-jobId so multiple uploads to
-                // the same node can run in parallel. The dictionary is used
-                // for cleanup hygiene only — slot capacity is gated by
-                // HasFreeSlot, not by counting tasks here.
-                //
-                // Outer try/catch releases the pre-claimed slot + upload
-                // entry if Task.Run's body throws before DispatchToNodeAsync
-                // can register its own cleanup paths — otherwise a
-                // synchronous throw would leak the reservation forever.
-                var capturedNode = bestNode;
-                var capturedItem = workItem;
-                var capturedOpts = finalOptions;
-                var capturedDev  = deviceId;
-                var dispatchTask = Task.Run(async () =>
-                {
+                    // Pre-dispatch skip gate (mirror of the local FinaliseForDispatchAsync).
+                    // Resolves any missing OriginalLanguage live, persists it, merges it into
+                    // finalOptions, and re-runs WouldSkipUnderOptions against those merged
+                    // options. Catches the same three cases the local path does — legacy rows,
+                    // settings flipped between queue add and remote dispatch, force-adds — so
+                    // remote workers don't waste time on no-op encodes either.
+                    //
+                    // A throw here just skips the item for this tick: it is still Pending and
+                    // still in the work queue (we only hold a claim), so there is nothing to
+                    // roll back — the ledger reservation happens further down.
+                    bool stillNeedsEncode;
                     try
                     {
-                        await DispatchToNodeAsync(capturedNode, capturedItem, capturedOpts, capturedDev, preClaimed: true);
+                        stillNeedsEncode = await _transcodingService.FinaliseForDispatchAsync(workItem, finalOptions, CancellationToken.None);
                     }
                     catch (Exception ex)
                     {
-                        Log.Information($"Cluster: Dispatch task threw for {capturedItem.FileName}: {ex.Message} — releasing pre-claim");
-                        _activeUploads.TryRemove(capturedItem.Id, out _);
-                        ReleaseActiveSlot(capturedNode, capturedItem.Id, Snacks.Services.Slots.ReleaseReason.DispatchThrew);
+                        Log.Warning($"Cluster: pre-dispatch finalisation failed for {workItem.FileName} — will retry next tick: {ex.Message}");
+                        skipThisTick.Add(workItem.NormalizedPath);
+                        continue;
                     }
-                });
-                _activeDispatchTasks[workItem.Id] = dispatchTask;
+                    if (!stillNeedsEncode)
+                    {
+                        // Marks the DB row Skipped and removes the still-queued item from
+                        // the work queue; our claim is released by the finally below.
+                        await _transcodingService.MarkDispatchSkippedAsync(workItem,
+                            "cluster pre-dispatch check — file already meets target under current options");
+                        continue;
+                    }
+
+                    // Cancel/Stop race: workItem.Status could have flipped during the awaits
+                    // inside FinaliseForDispatchAsync. Without this, the dispatch task would
+                    // upload + run the encode despite the user having cancelled.
+                    if (workItem.Status is WorkItemStatus.Cancelled or WorkItemStatus.Stopped)
+                    {
+                        Log.Information($"Dropping {workItem.FileName}: cancelled/stopped during cluster dispatch finalisation");
+                        continue;
+                    }
+
+                    // Optimistic slot accounting: claim the slot now so the next
+                    // iteration of this dispatch loop counts it against the
+                    // device's cap before the heartbeat reflects the new state.
+                    // ActiveJobs is the authoritative per-slot accounting;
+                    // ActiveWorkItemId is kept in sync as a "first active" hint
+                    // for legacy UI fields.
+                    //
+                    // _activeUploads is pre-claimed synchronously with the
+                    // ActiveJobs.Add so the heartbeat reconciliation that runs
+                    // between this loop's awaits sees the slot as held — without
+                    // this, the gap between here and DispatchToNodeAsync's body
+                    // running on the thread pool lets a heartbeat strip the
+                    // entry and the next dispatch tick double-books the slot.
+                    // Atomic slot reservation via the ledger. Returns false if
+                    // capacity raced (e.g. another dispatch tick or recovery path
+                    // grabbed the same slot first). On false we requeue and let
+                    // the next tick try a different slot.
+                    if (!_slotLedger.TryReserve(bestNode.NodeId, deviceId, workItem.Id, workItem.FileName))
+                    {
+                        Log.Information($"Cluster: Slot reservation lost for {workItem.FileName} on {bestNode.Hostname}/{deviceId} — will retry next tick");
+                        continue;
+                    }
+
+                    // ── DISPATCH COMMIT ──
+                    // The slot is reserved: only now does the item leave the pending queue
+                    // and become visibly active. Committing here (not in DispatchToNodeAsync)
+                    // matters because that method's re-attach branches return before its own
+                    // status write, and its resume path can rekey workItem.Id.
+                    _transcodingService.CommitDispatchClaim(workItem);
+                    workItem.Status = WorkItemStatus.Uploading;
+                    committed = true;
+
+                    _slotLedger.TransitionPhase(workItem.Id, Snacks.Services.Slots.SlotPhase.Uploading);
+
+                    _activeUploads.TryAdd(workItem.Id, true);
+                    bestNode.ActiveWorkItemId = workItem.Id;
+                    // Legacy projection field — populated immediately so any UI
+                    // broadcast between dispatch and the next heartbeat shows
+                    // the new reservation. The heartbeat reconcile rebuilds this
+                    // list from the ledger on every tick.
+                    lock (bestNode)
+                    {
+                        bestNode.ActiveJobs.Add(new ActiveJobInfo
+                        {
+                            JobId    = workItem.Id,
+                            DeviceId = deviceId,
+                            FileName = workItem.FileName,
+                            Progress = 0,
+                            Phase    = "Uploading",
+                        });
+                    }
+                    bestNode.Status = NodeStatus.Uploading;
+
+                    // Stash the chosen device on the work item so the encode-history
+                    // ledger can attribute the encode to the right slot family even
+                    // after the slot has been released back to the pool.
+                    workItem.DispatchedDeviceId = deviceId;
+
+                    // Snapshot the dispatched options under the jobId so the completion path can
+                    // read back exactly what the worker was dispatched with — even if the master's
+                    // _lastOptions has shifted since (settings save, Re-evaluate, etc.).
+                    _dispatchedOptions[workItem.Id] = finalOptions.Clone();
+
+                    // Track each dispatch task per-jobId so multiple uploads to
+                    // the same node can run in parallel. The dictionary is used
+                    // for cleanup hygiene only — slot capacity is gated by
+                    // HasFreeSlot, not by counting tasks here.
+                    //
+                    // Outer try/catch releases the pre-claimed slot + upload
+                    // entry if Task.Run's body throws before DispatchToNodeAsync
+                    // can register its own cleanup paths — otherwise a
+                    // synchronous throw would leak the reservation forever.
+                    var capturedNode = bestNode;
+                    var capturedItem = workItem;
+                    var capturedOpts = finalOptions;
+                    var capturedDev  = deviceId;
+                    var dispatchTask = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            await DispatchToNodeAsync(capturedNode, capturedItem, capturedOpts, capturedDev, preClaimed: true);
+                        }
+                        catch (Exception ex)
+                        {
+                            Log.Information($"Cluster: Dispatch task threw for {capturedItem.FileName}: {ex.Message} — releasing pre-claim");
+                            _activeUploads.TryRemove(capturedItem.Id, out _);
+                            ReleaseActiveSlot(capturedNode, capturedItem.Id, Snacks.Services.Slots.ReleaseReason.DispatchThrew);
+                        }
+                    });
+                    _activeDispatchTasks[workItem.Id] = dispatchTask;
+                }
+                finally
+                {
+                    if (!committed) _transcodingService.ReleaseDispatchClaim(workItem);
+                }
             }
 
         }
@@ -1784,10 +1823,10 @@ public sealed class ClusterService : IHostedService, IDisposable
             }
             else
             {
-                // Stale _activeUploads entry from a prior aborted attempt. The work
-                // item was just dequeued and marked Processing by DequeueForRemoteProcessing —
-                // returning silently here would orphan it (no AssignedNodeId, not in
-                // _remoteJobs, not in _workQueue, not the master's _activeWorkItem).
+                // Stale _activeUploads entry from a prior aborted attempt. On the
+                // (legacy, non-preClaimed) path the item was committed out of the
+                // queue before this call — returning silently here would orphan it
+                // (no AssignedNodeId, not in _remoteJobs, not in _workQueue).
                 // Clear the stale entry and requeue so the next dispatch tick can retry.
                 Log.Information($"Cluster: Stale _activeUploads entry for {workItem.FileName} — clearing and requeueing");
                 _activeUploads.TryRemove(workItem.Id, out _);
@@ -1853,6 +1892,11 @@ public sealed class ClusterService : IHostedService, IDisposable
                     _activeUploads.TryRemove(workItem.Id, out _);
                     workItem.AssignedNodeId   = node.NodeId;
                     workItem.AssignedNodeName = node.Hostname;
+                    // The dispatch commit set Uploading; this item is actually past
+                    // upload and encoding on the node. Progress callbacks never touch
+                    // Status, so set it here or the card would show Uploading forever.
+                    workItem.Status           = WorkItemStatus.Processing;
+                    workItem.RemoteJobPhase   = "Encoding";
                     _remoteJobs[workItem.Id]  = workItem;
                     UpdateNodeStatus(node.NodeId, NodeStatus.Busy, workItem.Id, workItem.FileName);
                     return;
@@ -4185,7 +4229,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                 }
             }
         }
-        catch (OperationCanceledException) { throw; }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
         catch (Exception ex)
         {
             Log.Warning($"Cluster: Original-language pre-resolve failed for {workItemId}: {ex.Message}");

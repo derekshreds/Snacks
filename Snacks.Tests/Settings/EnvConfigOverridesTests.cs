@@ -100,6 +100,17 @@ public sealed class EnvConfigOverridesTests : IDisposable
     }
 
     [Fact]
+    public void String_lists_carry_the_und_sentinel()
+    {
+        // Env overrides bypass chip normalization; the "und" sentinel (and its
+        // free-typed aliases, resolved later by LanguageMatcher) pass through as-is.
+        SetEnv(("SNACKS_SET_AudioLanguagesToKeep", "en,und"));
+
+        EnvConfigOverrides.Apply(new EncoderOptions(), EnvConfigOverrides.SettingsPrefix)
+            .AudioLanguagesToKeep.Should().Equal("en", "und");
+    }
+
+    [Fact]
     public void String_lists_accept_json_arrays()
     {
         SetEnv(("SNACKS_SET_SubtitleLanguagesToKeep", """["en","fr"]"""));

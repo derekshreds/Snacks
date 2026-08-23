@@ -63,9 +63,11 @@ public sealed class ExclusionRules
     {
         if (width <= 0 || height <= 0) return null;
 
-        // Classify by the larger of height / derived-4:3 from width so ultra-wide crops still
-        // bucket with their native vertical resolution.
-        int h = Math.Max(height, width * 3 / 4);
+        // Classify by the larger of height / derived-16:9 from width so ultra-wide crops
+        // still bucket with their native vertical resolution (1920×800 → 1080p). The old
+        // 4:3 derivation (width * 3/4) overshot every widescreen file — a plain 1920×1080
+        // computed 1440 and bucketed as 1440p, so a "1080p" exclusion never matched it.
+        int h = Math.Max(height, width * 9 / 16);
         if (h >= 2000) return "2160p";
         if (h >= 1300) return "1440p";
         if (h >= 900)  return "1080p";

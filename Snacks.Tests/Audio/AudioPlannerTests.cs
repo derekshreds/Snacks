@@ -1002,6 +1002,109 @@ public sealed class AudioPlannerTests
     }
 
 
+    // ---------------------------------------------------------------------
+    //  Undetermined chip: "und" as a normal keep-list entry.
+    // ---------------------------------------------------------------------
+
+    [Fact]
+    public void Und_chip_keeps_untagged_track_as_a_normal_bucket()
+    {
+        var probe = new ProbeBuilder()
+            .Video()
+            .Audio(codec: "ac3", channels: 6, lang: "eng")
+            .Audio(codec: "aac", channels: 2, lang: null!)
+            .Build();
+
+        var (streams, warnings) = Plan(probe, preserve: true, outputs: null,
+            languages: new[] { "en", "und" });
+
+        // Both tracks kept, in chip order (en bucket first) — and NO safeguard
+        // warning, because this is a normal bucket, not a rescue.
+        streams.Should().HaveCount(2);
+        streams[0].SourceIndex.Should().Be(1);
+        streams[1].SourceIndex.Should().Be(2);
+        warnings.Should().BeEmpty();
+    }
+
+
+    [Fact]
+    public void Und_chip_position_drives_output_order()
+    {
+        var probe = new ProbeBuilder()
+            .Video()
+            .Audio(codec: "ac3", channels: 6, lang: "eng")
+            .Audio(codec: "aac", channels: 2, lang: "und")
+            .Build();
+
+        var (streams, _) = Plan(probe, preserve: true, outputs: null,
+            languages: new[] { "und", "en" });
+
+        // Undetermined chip dragged to the top → its bucket emits first.
+        streams.Should().HaveCount(2);
+        streams[0].SourceIndex.Should().Be(2);
+        streams[1].SourceIndex.Should().Be(1);
+    }
+
+
+    [Fact]
+    public void Und_chip_fans_profiles_out_into_the_undetermined_bucket()
+    {
+        var probe = new ProbeBuilder()
+            .Video()
+            .Audio(codec: "ac3", channels: 6, lang: "und")
+            .Build();
+
+        var (streams, warnings) = Plan(probe,
+            preserve: false,
+            outputs: new[] { new AudioOutputProfile { Codec = "aac", Layout = "Stereo", BitrateKbps = 192 } },
+            languages: new[] { "und" });
+
+        streams.Should().ContainSingle();
+        streams[0].Codec.Should().Be("aac");
+        warnings.Should().BeEmpty();
+    }
+
+
+    [Fact]
+    public void Und_chip_does_not_double_bucket_raw_matched_tracks()
+    {
+        // qaa is claimed by its raw-exact entry, the untagged track by und —
+        // each track maps exactly once even though und could also claim qaa.
+        var probe = new ProbeBuilder()
+            .Video()
+            .Audio(codec: "ac3", channels: 6, lang: "qaa")
+            .Audio(codec: "aac", channels: 2, lang: null!)
+            .Build();
+
+        var (streams, warnings) = Plan(probe, preserve: true, outputs: null,
+            languages: new[] { "qaa", "und" });
+
+        streams.Should().HaveCount(2);
+        streams.Select(s => s.SourceIndex).Should().BeEquivalentTo(new[] { 1, 2 });
+        warnings.Should().BeEmpty();
+    }
+
+
+    [Fact]
+    public void Safeguard_still_fires_when_und_chip_matches_nothing()
+    {
+        // Keep ["und"] against a French-only file: the und chip does not mean
+        // "drop tagged languages at all costs" — the whole-file safeguard keeps
+        // the French track rather than emit a silent movie.
+        var probe = new ProbeBuilder()
+            .Video()
+            .Audio(codec: "ac3", channels: 6, lang: "fra")
+            .Build();
+
+        var (streams, warnings) = Plan(probe, preserve: true, outputs: null,
+            languages: new[] { "und" });
+
+        streams.Should().ContainSingle();
+        streams[0].SourceIndex.Should().Be(1);
+        warnings.Should().Contain(w => w.Contains("without audio"));
+    }
+
+
     [Fact]
     public void Safeguard_fires_even_when_preserve_is_off()
     {

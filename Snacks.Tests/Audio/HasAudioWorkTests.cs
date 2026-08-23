@@ -63,6 +63,82 @@ public sealed class HasAudioWorkTests
 
 
     // ---------------------------------------------------------------------
+    //  Undetermined chip — the gate must agree with the planner's claims.
+    // ---------------------------------------------------------------------
+
+    [Fact]
+    public void Und_chip_keeping_an_untagged_track_is_not_work()
+    {
+        var opts = new EncoderOptions
+        {
+            PreserveOriginalAudio = true,
+            AudioOutputs          = new(),
+            AudioLanguagesToKeep  = new() { "en", "und" },
+        };
+        var streams = new[] { Sum("ac3", 6, "eng"), Sum("aac", 2, lang: null!) };
+
+        TranscodingService.HasAudioWork(opts, streams).Should().BeFalse();
+    }
+
+
+    [Fact]
+    public void Untagged_track_without_und_chip_still_counts_as_drop_work()
+    {
+        var opts = new EncoderOptions
+        {
+            PreserveOriginalAudio = true,
+            AudioOutputs          = new(),
+            AudioLanguagesToKeep  = new() { "en" },
+        };
+        var streams = new[] { Sum("ac3", 6, "eng"), Sum("aac", 2, lang: null!) };
+
+        TranscodingService.HasAudioWork(opts, streams).Should().BeTrue();
+    }
+
+
+    [Fact]
+    public void Und_chip_position_change_counts_as_reorder_work()
+    {
+        var streams = new[] { Sum("ac3", 6, "eng"), Sum("aac", 2, "und") };
+
+        var undFirst = new EncoderOptions
+        {
+            PreserveOriginalAudio = true,
+            AudioOutputs          = new(),
+            AudioLanguagesToKeep  = new() { "und", "en" },
+        };
+        var enFirst = new EncoderOptions
+        {
+            PreserveOriginalAudio = true,
+            AudioOutputs          = new(),
+            AudioLanguagesToKeep  = new() { "en", "und" },
+        };
+
+        // File order is [eng, und]: chip order [und, en] must re-mux, [en, und] is a no-op.
+        TranscodingService.HasAudioWork(undFirst, streams).Should().BeTrue();
+        TranscodingService.HasAudioWork(enFirst,  streams).Should().BeFalse();
+    }
+
+
+    [Fact]
+    public void Preserve_off_groups_undetermined_siblings_like_the_planner()
+    {
+        // "mul" and a missing tag both land in the und claim — one bucket with two
+        // tracks, whose sibling drop is real work. Raw-tag grouping would see two
+        // singletons and wrongly report no work.
+        var opts = new EncoderOptions
+        {
+            PreserveOriginalAudio = false,
+            AudioOutputs          = new(),
+            AudioLanguagesToKeep  = new() { "und" },
+        };
+        var streams = new[] { Sum("ac3", 6, "mul"), Sum("aac", 2, lang: null!) };
+
+        TranscodingService.HasAudioWork(opts, streams).Should().BeTrue();
+    }
+
+
+    // ---------------------------------------------------------------------
     //  PreserveOriginalAudio.
     // ---------------------------------------------------------------------
 
