@@ -9,7 +9,7 @@ public sealed class AppVersionTests
     [Fact]
     public void RuntimeVersion_ComesFromProjectAssemblyMetadata()
     {
-        AppVersion.Current.Should().Be("2.18.0");
+        AppVersion.Current.Should().Be("2.18.1");
         ClusterDiscoveryService.ClusterVersion.Should().Be(AppVersion.Current);
     }
 }
