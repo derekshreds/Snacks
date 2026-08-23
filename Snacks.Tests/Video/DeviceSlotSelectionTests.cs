@@ -52,13 +52,13 @@ public sealed class DeviceSlotSelectionTests
     [Fact]
     public void Scheduler_candidate_selection_skips_a_deferred_head_item()
     {
-        var blocked = new WorkItem { Id = "exact-encoder", Kind = MediaKind.Video, Status = WorkItemStatus.Pending };
-        var runnable = new WorkItem { Id = "general", Kind = MediaKind.Video, Status = WorkItemStatus.Pending };
-        var music = new WorkItem { Id = "music", Kind = MediaKind.Music, Status = WorkItemStatus.Pending };
+        var blocked = new WorkItem { Id = "exact-encoder", Path = "/library/blocked.mkv", Kind = MediaKind.Video, Status = WorkItemStatus.Pending };
+        var runnable = new WorkItem { Id = "general", Path = "/library/runnable.mkv", Kind = MediaKind.Video, Status = WorkItemStatus.Pending };
+        var music = new WorkItem { Id = "music", Path = "/library/music.flac", Kind = MediaKind.Music, Status = WorkItemStatus.Pending };
 
         var selected = TranscodingService.SelectNextLocalVideoCandidate(
             new[] { blocked, music, runnable },
-            new HashSet<string> { blocked.Id });
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase) { blocked.NormalizedPath });
 
         selected.Should().BeSameAs(runnable);
     }

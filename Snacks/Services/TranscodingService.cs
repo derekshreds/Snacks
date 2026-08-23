@@ -458,6 +458,33 @@ public class TranscodingService
             DeviceId = deviceId,
         };
 
+    /// <summary>
+    ///     Test seam: injects the detected-device list, which production code only
+    ///     populates via async hardware detection. Lets scheduler tests reach real
+    ///     dispatch decisions (device eligibility, capacity deferral) deterministically.
+    ///     Pins the list so the constructor's background detection can't overwrite it.
+    /// </summary>
+    internal void SetDetectedDevicesForTest(List<HardwareDevice> devices)
+    {
+        _devicesPinnedForTest = true;
+        _detectedDevices = devices;
+    }
+
+    /// <summary> See <see cref="SetDetectedDevicesForTest"/>. </summary>
+    private volatile bool _devicesPinnedForTest;
+
+    /// <summary> Test seam: current queue-window rotation offset. </summary>
+    internal int WindowRotationOffsetForTest => _windowRotationOffset;
+
+    /// <summary>
+    ///     Test seam: runs the (private, otherwise fire-and-forget) scheduler loop
+    ///     until the token cancels or the loop exits on its own. The token is checked
+    ///     at the top of each iteration; the idle wait polls at 200ms when nothing is
+    ///     inflight, so cancellation is observed promptly.
+    /// </summary>
+    internal Task RunSchedulerForTestAsync(EncoderOptions options, CancellationToken cancellationToken)
+        => ProcessQueueAsync(options, cancellationToken);
+
     /// <summary> Live-read accessor for callers that need to reach the ledger via TranscodingService. </summary>
     public SlotLedger? GetSlotLedger() => _slotLedger;
 
@@ -1997,11 +2024,14 @@ public class TranscodingService
     ///     and lazily quarantines rows whose source file vanished. No-op unless the
     ///     window has been marked dirty, so calling per scheduler tick is free.
     /// </summary>
-    /// <param name="rotationOffset">
-    ///     Row offset into the queue order; non-zero only when the scheduler is
-    ///     rotating past a locally-unservable head (see <see cref="_windowRotationOffset"/>).
-    /// </param>
-    internal async Task SyncQueueWindowAsync(int rotationOffset = 0)
+    /// <remarks>
+    ///     Reads <see cref="_windowRotationOffset"/> directly (non-zero only while the
+    ///     scheduler is rotating past a locally-unservable head). The offset used to be
+    ///     a caller parameter, which raced: the cluster loop's parameterless sync could
+    ///     consume a dirty flag the scheduler had set for a rotated sync, snapping the
+    ///     window back to offset 0 while the scheduler believed it was N rows deep.
+    /// </remarks>
+    internal async Task SyncQueueWindowAsync()
     {
         if (Volatile.Read(ref _queueWindowDirty) == 0) return;
 
@@ -2010,6 +2040,7 @@ public class TranscodingService
         {
             if (Interlocked.Exchange(ref _queueWindowDirty, 0) == 0) return;
 
+            int rotationOffset = _windowRotationOffset;
             var topRows = await _mediaFileRepo.GetQueueWindowAsync(
                 QueueWindowSize, _queueNewestFirst, rotationOffset);
 
@@ -2051,7 +2082,12 @@ public class TranscodingService
             {
                 foreach (var stale in _workQueue.Where(w =>
                              w.Status == WorkItemStatus.Pending &&
-                             !topPaths.Contains(w.NormalizedPath)).ToList())
+                             !topPaths.Contains(w.NormalizedPath) &&
+                             // Never evict an item the cluster dispatcher is mid-
+                             // evaluation on: eviction unregisters it, and a later
+                             // sync would rehydrate the same row as a duplicate
+                             // Pending item under a fresh id.
+                             !_dispatchClaims.ContainsKey(w.NormalizedPath)).ToList())
                 {
                     _workQueue.Remove(stale);
                     UnregisterWorkItem(stale.Id);
@@ -2654,7 +2690,7 @@ public class TranscodingService
     ///     gets a concrete device so two simultaneous encodes don't both
     ///     auto-resolve to the same NVENC card and starve.</para>
     /// </summary>
-    private async Task ProcessQueueAsync(EncoderOptions options)
+    private async Task ProcessQueueAsync(EncoderOptions options, CancellationToken cancellationToken = default)
     {
         if (!await _processingLock.WaitAsync(100))
         {
@@ -2678,10 +2714,21 @@ public class TranscodingService
         var inflight = new List<Task>();
 
         // Items that this local scheduler could not serve during the current pass.
-        // Keeping their IDs out of subsequent picks lets a later item target another
+        // Keeping them out of subsequent picks lets a later item target another
         // free device instead of the first exact-encoder/capacity mismatch pinning the
         // head of the queue. The set is cleared whenever running work frees capacity.
-        var deferredVideoIds = new HashSet<string>(StringComparer.Ordinal);
+        // Keyed by NormalizedPath, NOT WorkItem.Id — window eviction/rehydration mints
+        // a fresh Guid per hydration of the same DB row, which would silently defeat
+        // an id-keyed set.
+        var deferredVideoPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        // True when at least one deferral in the current pass was a CAPACITY failure
+        // (an eligible device exists but is full). While set, the queueEmpty branch
+        // must wait for capacity instead of rotating the window deeper — rotating on
+        // a busy device is what walked the window away from the head of the queue
+        // and dispatched low-bitrate items from deep in the backlog once a slot
+        // freed. Cleared together with deferredVideoPaths.
+        bool anyCapacityDeferral = false;
 
         // True when a servable item has been seen since the last rotation wrap —
         // a full backlog walk without one means nothing here is locally servable.
@@ -2691,6 +2738,10 @@ public class TranscodingService
         {
             while (true)
             {
+                // Test seam: bounded scheduler runs (production callers pass none —
+                // the loop is exited via pause/schedule gates or an empty queue).
+                if (cancellationToken.IsCancellationRequested) break;
+
                 // Keep-alive: no single-iteration failure (a DB blip in the window
                 // sync, a transient IO error) may kill the scheduler — once this loop
                 // exits, nothing restarts it until an external kick. Log, pace, retry.
@@ -2723,7 +2774,7 @@ public class TranscodingService
                     var current = _lastOptions ?? options;
 
                     // Top up the working window from the DB queue (no-op unless dirty).
-                    await SyncQueueWindowAsync(_windowRotationOffset);
+                    await SyncQueueWindowAsync();
 
                     bool anyVideoPending, anyMusicPending;
                     int windowPending;
@@ -2733,11 +2784,13 @@ public class TranscodingService
                         anyVideoPending = _workQueue.Any(w =>
                             w.Kind == MediaKind.Video &&
                             w.Status == WorkItemStatus.Pending &&
-                            !deferredVideoIds.Contains(w.Id) &&
+                            !deferredVideoPaths.Contains(w.NormalizedPath) &&
+                            !_dispatchClaims.ContainsKey(w.NormalizedPath) &&
                             (_shouldSkipLocal == null || !_shouldSkipLocal(w)));
                         anyMusicPending = _workQueue.Any(w =>
                             w.Kind == MediaKind.Music &&
                             w.Status == WorkItemStatus.Pending &&
+                            !_dispatchClaims.ContainsKey(w.NormalizedPath) &&
                             (_shouldSkipLocal == null || !_shouldSkipLocal(w)));
                         windowPending = _workQueue.Count(w => w.Status == WorkItemStatus.Pending);
                     }
@@ -2746,6 +2799,20 @@ public class TranscodingService
 
                     if (queueEmpty)
                     {
+                        // Capacity deferrals mean the window is NOT unservable — an
+                        // eligible device exists and is merely full right now. Park on
+                        // the head until an encode finishes (or a wake fires), then
+                        // re-try the deferred items from the top of the queue order.
+                        // Rotating here instead would walk the window away from the
+                        // head for the whole duration of the running encode.
+                        if (anyCapacityDeferral)
+                        {
+                            await WaitForSchedulerProgressAsync(inflight);
+                            deferredVideoPaths.Clear();
+                            anyCapacityDeferral = false;
+                            continue;
+                        }
+
                         // The window says empty, but the real queue is the DB — there
                         // may be more rows than the window holds, or the whole window
                         // may be locally-unservable (skip-local exclusions) with
@@ -2793,7 +2860,7 @@ public class TranscodingService
                                 servedSinceRotationWrap = false;
                             }
                             Interlocked.Exchange(ref _queueWindowDirty, 1);
-                            await SyncQueueWindowAsync(_windowRotationOffset);
+                            await SyncQueueWindowAsync();
                             await WaitForSchedulerProgressAsync(inflight);
                             continue;
                         }
@@ -2804,7 +2871,8 @@ public class TranscodingService
                         // one to drain or for an explicit wake (settings change)
                         // before re-checking.
                         await WaitForSchedulerProgressAsync(inflight);
-                        deferredVideoIds.Clear();
+                        deferredVideoPaths.Clear();
+                        anyCapacityDeferral = false;
                         continue;
                     }
 
@@ -2830,6 +2898,7 @@ public class TranscodingService
                             musicItem = _workQueue.FirstOrDefault(w =>
                                 w.Kind == MediaKind.Music &&
                                 w.Status == WorkItemStatus.Pending &&
+                                !_dispatchClaims.ContainsKey(w.NormalizedPath) &&
                                 (_shouldSkipLocal == null || !_shouldSkipLocal(w)));
                             if (musicItem != null) _workQueue.Remove(musicItem);
                         }
@@ -2910,7 +2979,8 @@ public class TranscodingService
                         if (!dispatched)
                         {
                             await WaitForSchedulerProgressAsync(inflight);
-                            deferredVideoIds.Clear();
+                            deferredVideoPaths.Clear();
+                            anyCapacityDeferral = false;
                         }
                         continue;
                     }
@@ -2926,8 +2996,9 @@ public class TranscodingService
                     {
                         workItem = SelectNextLocalVideoCandidate(
                             _workQueue,
-                            deferredVideoIds,
-                            _shouldSkipLocal);
+                            deferredVideoPaths,
+                            _shouldSkipLocal,
+                            IsPathClaimedForDispatch);
                         if (workItem != null) _workQueue.Remove(workItem);
                     }
 
@@ -2936,7 +3007,8 @@ public class TranscodingService
                         if (!dispatched)
                         {
                             await WaitForSchedulerProgressAsync(inflight);
-                            deferredVideoIds.Clear();
+                            deferredVideoPaths.Clear();
+                            anyCapacityDeferral = false;
                         }
                         continue;
                     }
@@ -2974,7 +3046,7 @@ public class TranscodingService
                                 _workQueue.Sort((a, b) => CompareQueueOrder(a, b, _queueNewestFirst));
                             }
                             try { await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem); } catch { }
-                            deferredVideoIds.Add(workItem.Id);
+                            deferredVideoPaths.Add(workItem.NormalizedPath);
                             continue;
                         }
                         if (policy.Plan.Action == AdvancedVideoAction.Skip)
@@ -2989,7 +3061,7 @@ public class TranscodingService
                                               && perJobOptions.EncodingMode == EncodingMode.Transcode)
                             perJobOptions.EncodingMode = EncodingMode.Hybrid;
 
-                        var deviceId = TryReserveLocalDeviceSlot(workItem, perJobOptions);
+                        var deviceId = TryReserveLocalDeviceSlot(workItem, perJobOptions, out var sawEligibleDevice);
                         if (deviceId == null)
                         {
                             // No master slot fits this item (capacity full, codec
@@ -3001,7 +3073,11 @@ public class TranscodingService
                                 _workQueue.Add(workItem);
                                 _workQueue.Sort((a, b) => CompareQueueOrder(a, b, _queueNewestFirst));
                             }
-                            deferredVideoIds.Add(workItem.Id);
+                            deferredVideoPaths.Add(workItem.NormalizedPath);
+                            // Capacity deferral (an eligible device exists but is full)
+                            // must keep the scheduler parked on the head of the queue —
+                            // see the anyCapacityDeferral gate in the queueEmpty branch.
+                            if (sawEligibleDevice) anyCapacityDeferral = true;
                             ReapOrphanedLocalReservationsIfDue();
                             continue;
                         }
@@ -3089,7 +3165,7 @@ public class TranscodingService
                         // the item, and move on. Deferring the item paces any repeat throw
                         // to one retry per scheduler-progress event.
                         RecoverFailedLocalDispatch(workItem, ex);
-                        deferredVideoIds.Add(workItem.Id);
+                        deferredVideoPaths.Add(workItem.NormalizedPath);
                     }
                 }
                 catch (Exception ex)
@@ -3206,15 +3282,19 @@ public class TranscodingService
     /// <summary>
     ///     Selects the first locally eligible video that has not already failed local
     ///     routing during this scheduler pass. Queue ordering is preserved by the caller.
+    ///     Both exclusion sets are keyed by <see cref="WorkItem.NormalizedPath"/> —
+    ///     stable across window rehydration, unlike <see cref="WorkItem.Id"/>.
     /// </summary>
     internal static WorkItem? SelectNextLocalVideoCandidate(
         IEnumerable<WorkItem> queue,
-        IReadOnlySet<string> deferredIds,
-        Func<WorkItem, bool>? shouldSkipLocal = null) =>
+        IReadOnlySet<string> deferredPaths,
+        Func<WorkItem, bool>? shouldSkipLocal = null,
+        Func<string, bool>? isPathClaimed = null) =>
         queue.FirstOrDefault(item =>
             item.Kind == MediaKind.Video
             && item.Status == WorkItemStatus.Pending
-            && !deferredIds.Contains(item.Id)
+            && !deferredPaths.Contains(item.NormalizedPath)
+            && (isPathClaimed == null || !isPathClaimed(item.NormalizedPath))
             && (shouldSkipLocal == null || !shouldSkipLocal(item)));
 
     /// <summary>
@@ -3242,8 +3322,17 @@ public class TranscodingService
     ///         <item>Anything else: CPU is excluded so jobs queue rather than spilling onto a slow software encode.</item>
     ///     </list></para>
     /// </summary>
-    private string? TryReserveLocalDeviceSlot(WorkItem workItem, EncoderOptions options)
+    /// <param name="sawEligibleDevice">
+    ///     Set when at least one device passed the eligibility + codec gates and a
+    ///     reserve was actually attempted. Lets the caller distinguish a CAPACITY
+    ///     failure (device fits but is full right now — retry when a slot frees;
+    ///     must NOT rotate the queue window away from the head) from a PERMANENT
+    ///     one (no device can ever serve this item — rotation/deferral to the
+    ///     cluster is appropriate).
+    /// </param>
+    private string? TryReserveLocalDeviceSlot(WorkItem workItem, EncoderOptions options, out bool sawEligibleDevice)
     {
+        sawEligibleDevice = false;
         if (_slotLedger == null) return null;
 
         var devices = GetDetectedDevices();
@@ -3277,6 +3366,7 @@ public class TranscodingService
             // Atomic capacity check + reserve. Returns false when the device
             // is at capacity (MaxConcurrency / DefaultConcurrency / cpu=1)
             // or disabled (resolver returns 0).
+            sawEligibleDevice = true;
             if (_slotLedger.TryReserve(_localNodeId, device.DeviceId, workItem.Id, workItem.FileName))
             {
                 workItem.WaitReason = null;
@@ -4920,6 +5010,12 @@ public class TranscodingService
             await _mediaFileRepo.SetStatusAsync(Path.GetFullPath(workItem.Path), MediaFileStatus.Skipped);
         }
         catch { /* DB blip — next scan re-evaluates */ }
+        // The cluster claim path no longer dequeues before evaluating, so the item
+        // may still sit in the queue window; remove it here (no-op for the local
+        // dispatcher, which dequeues before calling). Without this, a skipped item
+        // would linger as a Cancelled queue entry when master-local encoding is
+        // paused and the local sweep never runs.
+        lock (_queueLock) { _workQueue.Remove(workItem); }
         UnregisterWorkItem(workItem.Id);
         workItem.Status = WorkItemStatus.Cancelled;
         try { await _hubContext.Clients.All.SendAsync("WorkItemRemoved", workItem.Id); }
@@ -5879,7 +5975,10 @@ public class TranscodingService
         // worker can software-encode regardless of GPU presence.
         devices.Add(await MakeCpuDeviceAsync());
 
-        _detectedDevices = devices;
+        // Tests pin an injected device list; the constructor's background detection
+        // must not clobber it mid-test.
+        if (!_devicesPinnedForTest)
+            _detectedDevices = devices;
 
         // Legacy primary: first hardware device, else "none". Preserves the
         // original auto-resolution semantics for callers that haven't yet
@@ -7917,26 +8016,100 @@ public class TranscodingService
         Log.Information("TranscodingService: In-memory state cleared");
     }
 
+    /******************************************************************
+     *  Dispatch claims (cluster pre-dispatch evaluation)
+     ******************************************************************/
+
     /// <summary>
-    ///     Atomically dequeues the next pending work item and marks it as Processing,
-    ///     making it available for dispatch to a cluster node.
+    ///     Paths currently held by the cluster dispatcher between
+    ///     <see cref="ClaimForRemoteDispatch"/> and either
+    ///     <see cref="CommitDispatchClaim"/> or <see cref="ReleaseDispatchClaim"/>.
+    ///     A claimed item stays <see cref="WorkItemStatus.Pending"/> and stays in
+    ///     <see cref="_workQueue"/> — the claim only makes it invisible to other
+    ///     pickers (local scheduler, second cluster claim, window eviction). This
+    ///     replaces the old dequeue-and-mark-Processing scheme, whose bounce paths
+    ///     flashed ghost "Now Processing" cards in the UI and whose removed-but-
+    ///     Pending items could strand outside the queue window.
+    ///     Keyed by <see cref="WorkItem.NormalizedPath"/> (WorkItem ids churn across
+    ///     window rehydration and the remote-resume rekey). Value = claim time, for
+    ///     the TTL purge below.
     /// </summary>
-    /// <returns> The next pending <see cref="WorkItem"/>, or <see langword="null"/> if the queue is empty. </returns>
-    public WorkItem? DequeueForRemoteProcessing(Func<WorkItem, bool>? filter = null)
+    private readonly ConcurrentDictionary<string, DateTime> _dispatchClaims = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    ///     Safety net for a claim whose holder died without releasing (the dispatch
+    ///     loop releases in a finally, so this should never fire in practice). A
+    ///     legitimate claim lives at most one dispatch-loop iteration (~15-30s worst
+    ///     case with a slow arr lookup). Mirrors <see cref="OrphanReservationGrace"/>.
+    /// </summary>
+    private static readonly TimeSpan DispatchClaimTtl = TimeSpan.FromMinutes(2);
+
+    /// <summary> Whether the cluster dispatcher currently holds a claim on this path. </summary>
+    internal bool IsPathClaimedForDispatch(string normalizedPath)
+        => _dispatchClaims.ContainsKey(normalizedPath);
+
+    /// <summary>
+    ///     Claims the next pending work item for cluster dispatch evaluation. The
+    ///     item is NOT dequeued and NOT status-flipped — it stays Pending and in the
+    ///     queue window, merely excluded from other pickers, so a bounced evaluation
+    ///     (no slot, blocking reason, pre-dispatch skip gate throw) is invisible to
+    ///     the UI and needs no requeue. The caller MUST pair every claim with
+    ///     <see cref="CommitDispatchClaim"/> (dispatch goes ahead) or
+    ///     <see cref="ReleaseDispatchClaim"/> (bounce), typically via try/finally.
+    /// </summary>
+    /// <returns> The next claimable pending <see cref="WorkItem"/>, or <see langword="null"/>. </returns>
+    public WorkItem? ClaimForRemoteDispatch(Func<WorkItem, bool>? filter = null)
     {
+        // Purge claims whose holder died without releasing.
+        var cutoff = DateTime.UtcNow - DispatchClaimTtl;
+        foreach (var stale in _dispatchClaims.Where(kv => kv.Value < cutoff).Select(kv => kv.Key).ToList())
+        {
+            if (_dispatchClaims.TryRemove(stale, out _))
+                Log.Warning($"DispatchClaim: purged stale claim on {stale} (holder never released)");
+        }
+
         lock (_queueLock)
         {
             var item = _workQueue.FirstOrDefault(w =>
-                w.Status == WorkItemStatus.Pending && (filter == null || filter(w)));
+                w.Status == WorkItemStatus.Pending
+                && !_dispatchClaims.ContainsKey(w.NormalizedPath)
+                && (filter == null || filter(w)));
             if (item != null)
-            {
-                item.Status = WorkItemStatus.Processing;
-                _workQueue.Remove(item);
-                // Item left the window — flag it so the next sync refills from the DB.
-                Interlocked.Exchange(ref _queueWindowDirty, 1);
-            }
+                _dispatchClaims[item.NormalizedPath] = DateTime.UtcNow;
             return item;
         }
+    }
+
+    /// <summary>
+    ///     Releases a claim after a bounced dispatch evaluation. The item was never
+    ///     dequeued or status-flipped, so there is nothing else to undo. Safe to call
+    ///     for an item that went terminal mid-evaluation (drop/skip/cancel paths).
+    /// </summary>
+    public void ReleaseDispatchClaim(WorkItem item)
+        => _dispatchClaims.TryRemove(item.NormalizedPath, out _);
+
+    /// <summary>
+    ///     Commits a claim at the moment dispatch actually goes ahead (the ledger
+    ///     slot is reserved): removes the item — and any duplicate Pending entry for
+    ///     the same path that slipped in via window rehydration — from the queue, and
+    ///     drops the claim. The caller flips the status (Uploading) right after, so
+    ///     there is no window in which the item is neither queued nor active.
+    /// </summary>
+    public void CommitDispatchClaim(WorkItem item)
+    {
+        lock (_queueLock)
+        {
+            foreach (var dup in _workQueue
+                         .Where(w => w.NormalizedPath.Equals(item.NormalizedPath, StringComparison.OrdinalIgnoreCase))
+                         .ToList())
+            {
+                _workQueue.Remove(dup);
+                if (!ReferenceEquals(dup, item)) UnregisterWorkItem(dup.Id);
+            }
+            // Item left the window — flag it so the next sync refills from the DB.
+            Interlocked.Exchange(ref _queueWindowDirty, 1);
+        }
+        _dispatchClaims.TryRemove(item.NormalizedPath, out _);
     }
 
     /// <summary>
