@@ -15,7 +15,12 @@ namespace Snacks.Tests.Pipeline;
 ///     item (the historical leak held a capacity-1 device slot until app restart), and
 ///     the orphan-reservation reaper must free any local reservation with no backing
 ///     active job — without ever touching live encodes or remote reservations.
+///
+///     In the EnvConfigOverrides collection because the Finalise test mutates the
+///     process-wide SNACKS_WORK_DIR — every suite touching that env var must
+///     serialize together or it races the auth/config round-trip tests.
 /// </summary>
+[Collection("EnvConfigOverrides")]
 public sealed class DispatchRecoveryTests : IDisposable
 {
     private readonly InMemoryDb _db = new();

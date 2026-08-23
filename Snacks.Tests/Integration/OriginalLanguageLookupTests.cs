@@ -12,9 +12,13 @@ namespace Snacks.Tests.Integration;
 ///     dispatch path depends on: an HttpClient timeout (a TaskCanceledException with an
 ///     un-cancelled caller token) must degrade to null — NOT propagate and unwind the
 ///     scheduler — and failures must be negative-cached so a struggling Arr instance
-///     isn't re-fetched on every dispatch. Mutates SNACKS_WORK_DIR, so runs serially
-///     within the class like the other config-file suites.
+///     isn't re-fetched on every dispatch. Mutates the process-wide SNACKS_WORK_DIR,
+///     so it must share the EnvConfigOverrides collection with every other suite
+///     that touches that env var — xUnit runs distinct collections in parallel, and
+///     an un-collected class racing ApiKeyAuthTests flips the work dir mid-test
+///     (auth.json written to one dir, validated against another).
 /// </summary>
+[Collection("EnvConfigOverrides")]
 public sealed class OriginalLanguageLookupTests : IDisposable
 {
     private const string TvPath = "/tv/Some Show (2020)/Season 01/Some Show - S01E01.mkv";
