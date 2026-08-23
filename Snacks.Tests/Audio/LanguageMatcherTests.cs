@@ -237,17 +237,82 @@ public sealed class LanguageMatcherTests
     }
 
 
-    [Fact]
-    public void Matches_does_NOT_normalize_keep_list_entries()
+    // =====================================================================
+    //  Undetermined sentinel ("und" chip) — KeepEntryIndex claim precedence.
+    // =====================================================================
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("und")]
+    [InlineData("UND")]
+    [InlineData("mul")]
+    [InlineData("zxx")]
+    [InlineData("not-a-language")]
+    public void Und_entry_matches_tracks_with_no_determinable_language(string? tag)
     {
-        // Pinning surprising behavior: the matcher canonicalizes the *track* tag to
-        // its 2-letter form but compares string-equal against the keep-list. So a
-        // user who put "eng" or "English" in their keep-list will NOT match a track
-        // tagged "eng" — they must use the 2-letter "en". The chip-input UI normalizes
-        // to 2-letter on save, so production users don't see this; an API caller might.
+        LanguageMatcher.Matches(tag, null, new[] { "en", "und" }).Should().BeTrue();
+        // Regression: without the und entry these tracks stay dropped, exactly as
+        // before — the silent-movie safeguard downstream depends on that.
+        LanguageMatcher.Matches(tag, null, new[] { "en" }).Should().BeFalse();
+    }
+
+
+    [Fact]
+    public void Und_entry_does_not_claim_determinable_tracks()
+    {
+        // A resolvable language that isn't in the keep list stays dropped — the
+        // und chip means "no chip could claim it", not "keep everything".
+        LanguageMatcher.Matches("fra", null, new[] { "en", "und" }).Should().BeFalse();
+
+        // Title inference claims the track as English, so und can't swallow it —
+        // it matches iff "en" is kept, same as before the sentinel existed.
+        LanguageMatcher.Matches("und", "English SDH", new[] { "fr", "und" }).Should().BeFalse();
+        LanguageMatcher.Matches("und", "English SDH", new[] { "en" }).Should().BeTrue();
+    }
+
+
+    [Fact]
+    public void KeepEntryIndex_resolves_claims_by_precedence()
+    {
+        // Canonical claim (tag or title resolves to a known language) wins over und.
+        LanguageMatcher.KeepEntryIndex("und", "English SDH", new[] { "und", "en" }).Should().Be(1);
+        // Raw-exact claim beats und regardless of chip order.
+        LanguageMatcher.KeepEntryIndex("qaa", null, new[] { "und", "qaa" }).Should().Be(1);
+        // Unclaimed unresolvable tags land on the und entry.
+        LanguageMatcher.KeepEntryIndex("mul", null, new[] { "en", "und" }).Should().Be(1);
+        LanguageMatcher.KeepEntryIndex(null,  null, new[] { "en", "und" }).Should().Be(1);
+        // A literal "und" tag is itself undetermined, not a raw-exact match.
+        LanguageMatcher.KeepEntryIndex("und", null, new[] { "und", "en" }).Should().Be(0);
+        // Resolvable language absent from the keep list → no claim at all.
+        LanguageMatcher.KeepEntryIndex("fra", null, new[] { "en", "und" }).Should().BeNull();
+    }
+
+
+    [Fact]
+    public void IsUndeterminedKeepEntry_accepts_env_aliases()
+    {
+        // Env overrides bypass the chip UI's normalization, so the free-typed
+        // aliases must be recognized too.
+        LanguageMatcher.IsUndeterminedKeepEntry("und").Should().BeTrue();
+        LanguageMatcher.IsUndeterminedKeepEntry("Undetermined").Should().BeTrue();
+        LanguageMatcher.IsUndeterminedKeepEntry("UNKNOWN").Should().BeTrue();
+        LanguageMatcher.IsUndeterminedKeepEntry("en").Should().BeFalse();
+        LanguageMatcher.IsUndeterminedKeepEntry(null).Should().BeFalse();
+    }
+
+
+    [Fact]
+    public void Matches_normalizes_keep_list_entries()
+    {
+        // Keep-list entries are canonicalized the same way track tags are, so an
+        // API- or env-provided "eng" / "English" entry matches the same tracks the
+        // 2-letter "en" chip would. (The chip UI still stores 2-letter codes; this
+        // matters for env overrides and API callers, and keeps Matches consistent
+        // with the preference-ordering path, which always normalized entries.)
         LanguageMatcher.Matches("eng", null, new[] { "en" }).Should().BeTrue();
-        LanguageMatcher.Matches("eng", null, new[] { "eng" }).Should().BeFalse();
-        LanguageMatcher.Matches("eng", null, new[] { "English" }).Should().BeFalse();
+        LanguageMatcher.Matches("eng", null, new[] { "eng" }).Should().BeTrue();
+        LanguageMatcher.Matches("eng", null, new[] { "English" }).Should().BeTrue();
     }
 
 

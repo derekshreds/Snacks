@@ -1652,7 +1652,24 @@ public sealed class ClusterService : IHostedService, IDisposable
                 // options. Catches the same three cases the local path does — legacy rows,
                 // settings flipped between queue add and remote dispatch, force-adds — so
                 // remote workers don't waste time on no-op encodes either.
-                if (!await _transcodingService.FinaliseForDispatchAsync(workItem, finalOptions, CancellationToken.None))
+                //
+                // A throw here must requeue, not unwind: the item is already out of the
+                // work queue, and leaving it dequeued as in-memory Pending blocks its own
+                // DB re-hydration until restart. No slot to roll back — the ledger
+                // reservation happens further down.
+                bool stillNeedsEncode;
+                try
+                {
+                    stillNeedsEncode = await _transcodingService.FinaliseForDispatchAsync(workItem, finalOptions, CancellationToken.None);
+                }
+                catch (Exception ex)
+                {
+                    Log.Warning($"Cluster: pre-dispatch finalisation failed for {workItem.FileName} — requeueing: {ex.Message}");
+                    _transcodingService.RequeueWorkItem(workItem, silent: true);
+                    skipThisTick.Add(workItem.Id);
+                    continue;
+                }
+                if (!stillNeedsEncode)
                 {
                     await _transcodingService.MarkDispatchSkippedAsync(workItem,
                         "cluster pre-dispatch check — file already meets target under current options");
@@ -4185,7 +4202,7 @@ public sealed class ClusterService : IHostedService, IDisposable
                 }
             }
         }
-        catch (OperationCanceledException) { throw; }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
         catch (Exception ex)
         {
             Log.Warning($"Cluster: Original-language pre-resolve failed for {workItemId}: {ex.Message}");

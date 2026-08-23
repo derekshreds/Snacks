@@ -60,6 +60,37 @@ public sealed class HasSubtitleWorkTests
     }
 
 
+    // ---------------------------------------------------------------------
+    //  Undetermined chip — the gate must agree with the planner's claims.
+    // ---------------------------------------------------------------------
+
+    [Fact]
+    public void Und_chip_keeping_an_untagged_sub_is_not_work()
+    {
+        var subs = new[] { Sum("subrip", "eng"), Sum("subrip", lang: null!) };
+        TranscodingService.HasSubtitleWork(Opts(keep: new[] { "en", "und" }), subs).Should().BeFalse();
+    }
+
+
+    [Fact]
+    public void Untagged_sub_without_und_chip_is_drop_work()
+    {
+        var subs = new[] { Sum("subrip", "eng"), Sum("subrip", lang: null!) };
+        TranscodingService.HasSubtitleWork(Opts(keep: new[] { "en" }), subs).Should().BeTrue();
+    }
+
+
+    [Fact]
+    public void Und_chip_position_change_is_reorder_work()
+    {
+        // File order is [eng, und]: und dragged to the top must re-mux, the
+        // matching order is a no-op.
+        var subs = new[] { Sum("subrip", "eng"), Sum("subrip", "und") };
+        TranscodingService.HasSubtitleWork(Opts(keep: new[] { "und", "en" }), subs).Should().BeTrue();
+        TranscodingService.HasSubtitleWork(Opts(keep: new[] { "en", "und" }), subs).Should().BeFalse();
+    }
+
+
     [Fact]
     public void Language_filter_keeping_every_track_is_not_work()
     {

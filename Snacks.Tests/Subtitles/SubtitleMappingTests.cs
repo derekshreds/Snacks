@@ -97,6 +97,71 @@ public sealed class SubtitleMappingTests
     }
 
 
+    // ---------------------------------------------------------------------
+    //  Undetermined chip ("und" keep entry).
+    // ---------------------------------------------------------------------
+
+    [Fact]
+    public void Und_chip_keeps_untagged_and_und_tagged_subs()
+    {
+        var probe = new ProbeBuilder()
+            .Video()
+            .Subtitle(codec: "subrip", lang: "und")
+            .Subtitle(codec: "subrip", lang: null!)
+            .Build();
+
+        var flags = _svc.MapSub(probe, new[] { "en", "und" }, container: "mkv");
+        flags.Should().Contain("-map 0:1");
+        flags.Should().Contain("-map 0:2");
+    }
+
+
+    [Fact]
+    public void Und_subs_stay_dropped_without_the_und_chip()
+    {
+        var probe = new ProbeBuilder()
+            .Video()
+            .Subtitle(codec: "subrip", lang: "eng")
+            .Subtitle(codec: "subrip", lang: "und")
+            .Build();
+
+        var flags = _svc.MapSub(probe, new[] { "en" }, container: "mkv");
+        flags.Should().Contain("-map 0:1");
+        flags.Should().NotContain("-map 0:2");
+    }
+
+
+    [Fact]
+    public void Und_chip_position_orders_undetermined_subs()
+    {
+        var probe = new ProbeBuilder()
+            .Video()
+            .Subtitle(codec: "subrip", lang: "eng")
+            .Subtitle(codec: "subrip", lang: "und")
+            .Build();
+
+        // Undetermined dragged above English → its track maps first.
+        var flags = _svc.MapSub(probe, new[] { "und", "en" }, container: "mkv");
+        flags.IndexOf("-map 0:2", StringComparison.Ordinal)
+            .Should().BeLessThan(flags.IndexOf("-map 0:1", StringComparison.Ordinal));
+    }
+
+
+    [Fact]
+    public void Sidecar_selection_includes_und_track_with_und_chip()
+    {
+        var probe = new ProbeBuilder()
+            .Video()
+            .Subtitle(codec: "subrip", lang: "und")
+            .Build();
+
+        var picks = _svc.SelectSidecarStreams(probe, new[] { "und" }, includeBitmaps: false);
+
+        picks.Should().ContainSingle();
+        picks[0].Lang.Should().Be("und");   // sidecar naming falls back to the literal und
+    }
+
+
     /// <summary>Rows: (codec, isBitmap).</summary>
     public static IEnumerable<object[]> CodecBitmapRows() => new[]
     {

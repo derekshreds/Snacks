@@ -246,13 +246,30 @@ public class FfprobeService
 
         if (keepList != null)
         {
-            foreach (var lang in keepList)
+            // Claim-based grouping: each track belongs to exactly one keep entry
+            // (LanguageMatcher.KeepEntryIndex), so the undetermined sentinel never
+            // double-buckets a track that a specific language entry already claimed.
+            // Buckets come out in keep-list order (the user's chip order); entries
+            // that claimed nothing are omitted — identical to the old per-entry
+            // loop for keep lists with no undetermined entry.
+            var claims = new List<Stream>?[keepList.Count];
+            foreach (var s in audioStreams)
             {
-                var sources = audioStreams
-                    .Where(s => LanguageMatcher.Matches(s.Tags?.Language, s.Tags?.Title, new[] { lang })
-                             && !IsCommentary(s))
-                    .ToList();
-                if (sources.Count > 0) buckets.Add((lang, sources));
+                if (IsCommentary(s)) continue;
+                var idx = LanguageMatcher.KeepEntryIndex(s.Tags?.Language, s.Tags?.Title, keepList);
+                if (idx == null) continue;
+                (claims[idx.Value] ??= new List<Stream>()).Add(s);
+            }
+            for (int i = 0; i < claims.Length; i++)
+            {
+                if (claims[i] is not { Count: > 0 } sources) continue;
+                // Normalize env-typed aliases ("undetermined", "unknown") to the
+                // canonical sentinel so downstream metadata lookups treat them all
+                // as "no known language".
+                var bucketName = LanguageMatcher.IsUndeterminedKeepEntry(keepList[i])
+                    ? LanguageMatcher.Undetermined
+                    : keepList[i];
+                buckets.Add((bucketName, sources));
             }
         }
         else
@@ -705,18 +722,10 @@ public class FfprobeService
     ///     in <see cref="MapSub"/> so the user's preference order becomes the output order.
     /// </summary>
     private static int PreferenceIndex(Stream s, IReadOnlyList<string> languagesToKeep)
-    {
-        var two = LanguageMatcher.ToTwoLetter(s.Tags?.Language)
-               ?? LanguageMatcher.InferFromTitle(s.Tags?.Title);
-        if (two == null) return int.MaxValue;
-
-        for (int i = 0; i < languagesToKeep.Count; i++)
-        {
-            var wantedTwo = LanguageMatcher.ToTwoLetter(languagesToKeep[i]) ?? languagesToKeep[i];
-            if (string.Equals(wantedTwo, two, StringComparison.OrdinalIgnoreCase)) return i;
-        }
-        return int.MaxValue;
-    }
+        // Claimed-entry index so ordering agrees with the keep/drop decision —
+        // including the undetermined sentinel, whose chip position now orders
+        // missing-tag/unknown-language tracks instead of pinning them last.
+        => LanguageMatcher.KeepEntryIndex(s.Tags?.Language, s.Tags?.Title, languagesToKeep) ?? int.MaxValue;
 
     /// <summary>
     ///     A single subtitle stream selected for sidecar extraction.

@@ -21,6 +21,11 @@ public sealed class IntegrationService
     // lookups on a busy queue, short enough that library edits pick up on a
     // reasonable timescale.
     private static readonly TimeSpan _rootCacheTtl = TimeSpan.FromMinutes(10);
+
+    // Failure suppression for the Arr catalogue fetch. Dispatches are serialized
+    // in the scheduler, so without this a slow/unreachable Sonarr/Radarr costs a
+    // full HttpClient timeout on every single dispatch of a busy queue.
+    private static readonly TimeSpan _arrFailureCacheTtl = TimeSpan.FromMinutes(3);
     private readonly Dictionary<string, (DateTime expires, IReadOnlyList<LibraryRoot> roots)> _plexRootsCache     = new();
     private readonly Dictionary<string, (DateTime expires, IReadOnlyList<LibraryRoot> roots)> _jellyfinRootsCache = new();
     private readonly object _rootsLock = new();
@@ -608,7 +613,11 @@ public sealed class IntegrationService
                 _                                                       => null,
             };
         }
-        catch (OperationCanceledException) { throw; }
+        // Rethrow only genuine caller cancellation. HttpClient timeouts surface as
+        // TaskCanceledException (an OCE) even when the caller passed
+        // CancellationToken.None — those must degrade to null like any other
+        // lookup failure, not unwind the dispatcher.
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
         catch (Exception ex)
         {
             Log.Warning($"Original-language lookup error ({provider}): {ex.Message}");
@@ -631,41 +640,58 @@ public sealed class IntegrationService
 
         if (cached == null)
         {
-            var http     = _httpClientFactory.CreateClient();
-            http.Timeout = TimeSpan.FromSeconds(15);
-            var baseUrl  = arr.BaseUrl.TrimEnd('/');
-            var url      = baseUrl + (isSeries ? "/api/v3/series" : "/api/v3/movie");
-            var req      = new HttpRequestMessage(HttpMethod.Get, url);
-            req.Headers.TryAddWithoutValidation("X-Api-Key", arr.ApiKey);
-            using var resp = await http.SendAsync(req, ct);
-            if (!resp.IsSuccessStatusCode) return null;
-            var json = await resp.Content.ReadAsStringAsync(ct);
-
-            var list = new List<(string path, string lang)>();
-            using var doc = JsonDocument.Parse(json);
-            if (doc.RootElement.ValueKind == JsonValueKind.Array)
+            try
             {
-                foreach (var item in doc.RootElement.EnumerateArray())
+                var http     = _httpClientFactory.CreateClient();
+                http.Timeout = TimeSpan.FromSeconds(15);
+                var baseUrl  = arr.BaseUrl.TrimEnd('/');
+                var url      = baseUrl + (isSeries ? "/api/v3/series" : "/api/v3/movie");
+                var req      = new HttpRequestMessage(HttpMethod.Get, url);
+                req.Headers.TryAddWithoutValidation("X-Api-Key", arr.ApiKey);
+                using var resp = await http.SendAsync(req, ct);
+                if (!resp.IsSuccessStatusCode)
                 {
-                    var path = item.TryGetProperty("path", out var pEl) ? pEl.GetString() : null;
-                    if (string.IsNullOrEmpty(path)) continue;
+                    CacheArrFailure(cacheKey, isSeries, $"HTTP {(int)resp.StatusCode}");
+                    return null;
+                }
+                var json = await resp.Content.ReadAsStringAsync(ct);
 
-                    string? lang = null;
-                    if (item.TryGetProperty("originalLanguage", out var ol))
+                var list = new List<(string path, string lang)>();
+                using var doc = JsonDocument.Parse(json);
+                if (doc.RootElement.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var item in doc.RootElement.EnumerateArray())
                     {
-                        if (ol.ValueKind == JsonValueKind.Object && ol.TryGetProperty("name", out var nEl))
-                            lang = nEl.GetString();
-                        else if (ol.ValueKind == JsonValueKind.String)
-                            lang = ol.GetString();
+                        var path = item.TryGetProperty("path", out var pEl) ? pEl.GetString() : null;
+                        if (string.IsNullOrEmpty(path)) continue;
+
+                        string? lang = null;
+                        if (item.TryGetProperty("originalLanguage", out var ol))
+                        {
+                            if (ol.ValueKind == JsonValueKind.Object && ol.TryGetProperty("name", out var nEl))
+                                lang = nEl.GetString();
+                            else if (ol.ValueKind == JsonValueKind.String)
+                                lang = ol.GetString();
+                        }
+                        if (!string.IsNullOrEmpty(lang))
+                            list.Add((path!, lang));
                     }
-                    if (!string.IsNullOrEmpty(lang))
-                        list.Add((path!, lang));
+                }
+                cached = list;
+                lock (_rootsLock)
+                {
+                    _arrLangCache[cacheKey] = (DateTime.UtcNow + _rootCacheTtl, cached);
                 }
             }
-            cached = list;
-            lock (_rootsLock)
+            // Genuine caller cancellation propagates; a timeout (also an OCE when the
+            // token isn't cancelled), connection failure, or malformed payload is
+            // negative-cached so a struggling Arr instance isn't re-fetched on every
+            // dispatch of a busy queue.
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch (Exception ex) when (ex is HttpRequestException or OperationCanceledException or JsonException)
             {
-                _arrLangCache[cacheKey] = (DateTime.UtcNow + _rootCacheTtl, cached);
+                CacheArrFailure(cacheKey, isSeries, ex.Message);
+                return null;
             }
         }
 
@@ -699,6 +725,22 @@ public sealed class IntegrationService
         }
 
         return string.IsNullOrEmpty(hit.lang) ? null : LanguageMatcher.ToTwoLetter(hit.lang);
+    }
+
+    /// <summary>
+    ///     Negative-caches a failed Arr catalogue fetch: an empty map under the short
+    ///     failure TTL makes every lookup miss (→ null → callers fall back to the
+    ///     configured keep lists) without re-hitting the endpoint per dispatch.
+    ///     A config save clears the cache, so credential/URL fixes apply immediately.
+    /// </summary>
+    private void CacheArrFailure(string cacheKey, bool isSeries, string reason)
+    {
+        Log.Warning($"{(isSeries ? "Sonarr" : "Radarr")} catalogue fetch failed ({reason}) — " +
+                    $"suppressing original-language lookups for {_arrFailureCacheTtl.TotalMinutes:F0} min");
+        lock (_rootsLock)
+        {
+            _arrLangCache[cacheKey] = (DateTime.UtcNow + _arrFailureCacheTtl, Array.Empty<(string, string)>());
+        }
     }
 
     private async Task<string?> LookupTmdbLangAsync(string filePath, TmdbIntegration tmdb, MediaTypeDetector.MediaKind kind, CancellationToken ct)

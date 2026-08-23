@@ -342,6 +342,21 @@ public sealed class EncoderOptionOverrideTests
     }
 
 
+    [Fact]
+    public void Language_list_overrides_carry_the_und_sentinel()
+    {
+        // "und" (Undetermined) is a plain list entry, so per-folder / per-node
+        // overrides carry it with no special handling.
+        var baseOpts = BaseOptions();
+        baseOpts.AudioLanguagesToKeep = new() { "en" };
+
+        var folder = new EncoderOptionsOverride { AudioLanguagesToKeep = new() { "und", "en" } };
+        var result = EncoderOptionsOverride.ApplyOverrides(baseOpts, folder, null);
+
+        result.AudioLanguagesToKeep.Should().Equal("und", "en");
+    }
+
+
     // =====================================================================
     //  Clone deep-copy. Critical for AudioOutputs and the language lists —
     //  per-job mutation must not bleed back into the shared base options.

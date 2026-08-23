@@ -446,6 +446,18 @@ public class TranscodingService
     /// </summary>
     public void SetSlotLedger(SlotLedger ledger) => _slotLedger = ledger;
 
+    /// <summary>
+    ///     Test seam: registers a bare active-job entry so the orphan-reservation
+    ///     reaper tests can simulate a running encode without spawning one.
+    /// </summary>
+    internal void RegisterActiveLocalJobForTest(WorkItem item, string deviceId)
+        => _activeLocalJobs[item.Id] = new ActiveLocalJob
+        {
+            Item     = item,
+            Cts      = new CancellationTokenSource(),
+            DeviceId = deviceId,
+        };
+
     /// <summary> Live-read accessor for callers that need to reach the ledger via TranscodingService. </summary>
     public SlotLedger? GetSlotLedger() => _slotLedger;
 
@@ -1044,6 +1056,22 @@ public class TranscodingService
         {
             cancellationToken.ThrowIfCancellationRequested();
             var fileInfo = new FileInfo(filePath);
+
+            // Library exclusion rules — same provider used by the video path (:755).
+            // Checked before the probe since music only needs filename + size
+            // (resolutionLabel: null skips the video-only resolution rung). Respect
+            // `force` so manual re-adds aren't silently dropped.
+            if (!force)
+            {
+                var exclusions = GetExclusionRules();
+                if (exclusions != null && exclusions.IsExcluded(
+                        Path.GetFileName(filePath), fileInfo.Length, resolutionLabel: null))
+                {
+                    Log.Information($"Excluded by library rules: {Path.GetFileName(filePath)}");
+                    return string.Empty;
+                }
+            }
+
             var probe    = await _ffprobeService.ProbeAsync(filePath, cancellationToken);
 
             double length = 0;
@@ -1332,6 +1360,17 @@ public class TranscodingService
         {
             var fileInfo = new FileInfo(filePath);
             result.SizeBytes = fileInfo.Length;
+
+            // Library exclusion rules — mirrors the rung in AddMusicFileAsync so the
+            // analyze modal sees the same outcome the real run would produce.
+            var exclusions = GetExclusionRules();
+            if (exclusions != null && exclusions.IsExcluded(
+                    Path.GetFileName(filePath), fileInfo.Length, resolutionLabel: null))
+            {
+                result.Decision = "Excluded";
+                result.Reason   = "Excluded by library rules.";
+                return result;
+            }
 
             var probe = await _ffprobeService.ProbeAsync(filePath, cancellationToken);
             double length = 0;
@@ -2631,6 +2670,11 @@ public class TranscodingService
 
         _lastOptions = options;
 
+        // Free any slot a previous scheduler pass leaked before we start picking
+        // work — a leaked reservation on a capacity-1 device would otherwise make
+        // every candidate unservable.
+        ReapOrphanedLocalReservationsIfDue();
+
         var inflight = new List<Task>();
 
         // Items that this local scheduler could not serve during the current pass.
@@ -2647,370 +2691,412 @@ public class TranscodingService
         {
             while (true)
             {
-                if (_isPaused)
+                // Keep-alive: no single-iteration failure (a DB blip in the window
+                // sync, a transient IO error) may kill the scheduler — once this loop
+                // exits, nothing restarts it until an external kick. Log, pace, retry.
+                try
                 {
-                    Log.Information("Queue is paused — stopping processing loop");
-                    break;
-                }
-
-                // When local encoding is paused (master delegating to nodes),
-                // leave items in the queue for the cluster dispatch loop. Wait
-                // for any in-flight encodes that are still finishing before we
-                // exit so the scheduler cleans up cleanly.
-                if (_localEncodingPaused)
-                    break;
-
-                // Off-schedule on this machine: leave items in the queue for
-                // the cluster dispatch loop (workers in their own windows can
-                // still pick them up) and exit the local loop. The dispatch
-                // timer's RefreshOffScheduleFlags re-triggers ProcessQueueAsync
-                // when the master's schedule reopens.
-                if (_localScheduleGate != null && !_localScheduleGate())
-                    break;
-
-                // Reap completed inflight tasks before checking for queue-empty exit.
-                inflight.RemoveAll(t => t.IsCompleted);
-
-                var current = _lastOptions ?? options;
-
-                // Top up the working window from the DB queue (no-op unless dirty).
-                await SyncQueueWindowAsync(_windowRotationOffset);
-
-                bool anyVideoPending, anyMusicPending;
-                int windowPending;
-                lock (_queueLock)
-                {
-                    _workQueue.RemoveAll(w => w.Status is WorkItemStatus.Cancelled or WorkItemStatus.Stopped);
-                    anyVideoPending = _workQueue.Any(w =>
-                        w.Kind == MediaKind.Video &&
-                        w.Status == WorkItemStatus.Pending &&
-                        !deferredVideoIds.Contains(w.Id) &&
-                        (_shouldSkipLocal == null || !_shouldSkipLocal(w)));
-                    anyMusicPending = _workQueue.Any(w =>
-                        w.Kind == MediaKind.Music &&
-                        w.Status == WorkItemStatus.Pending &&
-                        (_shouldSkipLocal == null || !_shouldSkipLocal(w)));
-                    windowPending = _workQueue.Count(w => w.Status == WorkItemStatus.Pending);
-                }
-
-                bool queueEmpty = !anyVideoPending && !anyMusicPending;
-
-                if (queueEmpty)
-                {
-                    // The window says empty, but the real queue is the DB — there
-                    // may be more rows than the window holds, or the whole window
-                    // may be locally-unservable (skip-local exclusions) with
-                    // servable rows sitting deeper in the order.
-                    int dbPending = await _mediaFileRepo.CountQueuedLocalAsync();
-                    if (dbPending > windowPending)
+                    if (_isPaused)
                     {
-                        if (windowPending == 0)
-                        {
-                            // Window drained — refill from the head of the queue.
-                            _windowRotationOffset = 0;
-                            Interlocked.Exchange(ref _queueWindowDirty, 1);
-                            await SyncQueueWindowAsync();
-
-                            // If nothing hydrated (e.g. rows mid-transition to
-                            // Processing, or missing files being quarantined),
-                            // pace the retry instead of hot-looping on the DB.
-                            bool hydratedAny;
-                            lock (_queueLock) hydratedAny = _workQueue.Any(w => w.Status == WorkItemStatus.Pending);
-                            if (!hydratedAny) await WaitForSchedulerProgressAsync(inflight);
-                            continue;
-                        }
-
-                        // Window full of items this machine can't serve — rotate
-                        // deeper so servable rows get a turn. Cluster nodes keep
-                        // consuming the head regardless. The dirty flag is set
-                        // directly (NOT via MarkQueueWindowDirty, which resets the
-                        // offset) so the rotation position survives the sync.
-                        _windowRotationOffset += QueueWindowSize;
-                        if (_windowRotationOffset >= dbPending)
-                        {
-                            _windowRotationOffset = 0;
-
-                            // A full walk of the backlog produced nothing servable —
-                            // stop churning (each pass costs a window rebuild plus
-                            // File.Exists per row against the NAS). The items belong
-                            // to the cluster loop; any add/cancel/settings change
-                            // re-kicks this scheduler via MarkQueueWindowDirty.
-                            if (!servedSinceRotationWrap)
-                            {
-                                if (inflight.Count == 0) break;
-                                await WaitForSchedulerProgressAsync(inflight);
-                                continue;
-                            }
-                            servedSinceRotationWrap = false;
-                        }
-                        Interlocked.Exchange(ref _queueWindowDirty, 1);
-                        await SyncQueueWindowAsync(_windowRotationOffset);
-                        await WaitForSchedulerProgressAsync(inflight);
-                        continue;
+                        Log.Information("Queue is paused — stopping processing loop");
+                        break;
                     }
 
-                    if (inflight.Count == 0) break;
+                    // When local encoding is paused (master delegating to nodes),
+                    // leave items in the queue for the cluster dispatch loop. Wait
+                    // for any in-flight encodes that are still finishing before we
+                    // exit so the scheduler cleans up cleanly.
+                    if (_localEncodingPaused)
+                        break;
 
-                    // Queue is empty but encodes are still finishing — wait for
-                    // one to drain or for an explicit wake (settings change)
-                    // before re-checking.
-                    await WaitForSchedulerProgressAsync(inflight);
-                    deferredVideoIds.Clear();
-                    continue;
-                }
+                    // Off-schedule on this machine: leave items in the queue for
+                    // the cluster dispatch loop (workers in their own windows can
+                    // still pick them up) and exit the local loop. The dispatch
+                    // timer's RefreshOffScheduleFlags re-triggers ProcessQueueAsync
+                    // when the master's schedule reopens.
+                    if (_localScheduleGate != null && !_localScheduleGate())
+                        break;
 
-                // A servable item is visible. Deliberately do NOT reset the rotation
-                // offset here — resetting on every dispatch snapped the window back
-                // to the unservable head and re-walked the whole backlog per item.
-                // External queue changes reset it via MarkQueueWindowDirty.
-                servedSinceRotationWrap = true;
+                    // Reap completed inflight tasks before checking for queue-empty exit.
+                    inflight.RemoveAll(t => t.IsCompleted);
 
-                bool dispatched = false;
+                    var current = _lastOptions ?? options;
 
-                // ───── MUSIC DISPATCH ─────
-                // Music targets the synthetic "music" device, reserved through
-                // the same SlotLedger workers use. EffectiveDeviceCapacity returns
-                // 0 when MasterMusicConcurrency is 0 (or unset and the default-
-                // concurrency fallback is 0) — TryReserve refuses, the master
-                // skips, and the cluster dispatcher routes the item to a worker.
-                if (anyMusicPending && _slotLedger != null)
-                {
-                    WorkItem? musicItem;
+                    // Top up the working window from the DB queue (no-op unless dirty).
+                    await SyncQueueWindowAsync(_windowRotationOffset);
+
+                    bool anyVideoPending, anyMusicPending;
+                    int windowPending;
                     lock (_queueLock)
                     {
-                        musicItem = _workQueue.FirstOrDefault(w =>
+                        _workQueue.RemoveAll(w => w.Status is WorkItemStatus.Cancelled or WorkItemStatus.Stopped);
+                        anyVideoPending = _workQueue.Any(w =>
+                            w.Kind == MediaKind.Video &&
+                            w.Status == WorkItemStatus.Pending &&
+                            !deferredVideoIds.Contains(w.Id) &&
+                            (_shouldSkipLocal == null || !_shouldSkipLocal(w)));
+                        anyMusicPending = _workQueue.Any(w =>
                             w.Kind == MediaKind.Music &&
                             w.Status == WorkItemStatus.Pending &&
                             (_shouldSkipLocal == null || !_shouldSkipLocal(w)));
-                        if (musicItem != null) _workQueue.Remove(musicItem);
+                        windowPending = _workQueue.Count(w => w.Status == WorkItemStatus.Pending);
                     }
 
-                    if (musicItem == null)
+                    bool queueEmpty = !anyVideoPending && !anyMusicPending;
+
+                    if (queueEmpty)
                     {
-                        // Race: another path consumed it. Nothing to do.
+                        // The window says empty, but the real queue is the DB — there
+                        // may be more rows than the window holds, or the whole window
+                        // may be locally-unservable (skip-local exclusions) with
+                        // servable rows sitting deeper in the order.
+                        int dbPending = await _mediaFileRepo.CountQueuedLocalAsync();
+                        if (dbPending > windowPending)
+                        {
+                            if (windowPending == 0)
+                            {
+                                // Window drained — refill from the head of the queue.
+                                _windowRotationOffset = 0;
+                                Interlocked.Exchange(ref _queueWindowDirty, 1);
+                                await SyncQueueWindowAsync();
+
+                                // If nothing hydrated (e.g. rows mid-transition to
+                                // Processing, or missing files being quarantined),
+                                // pace the retry instead of hot-looping on the DB.
+                                bool hydratedAny;
+                                lock (_queueLock) hydratedAny = _workQueue.Any(w => w.Status == WorkItemStatus.Pending);
+                                if (!hydratedAny) await WaitForSchedulerProgressAsync(inflight);
+                                continue;
+                            }
+
+                            // Window full of items this machine can't serve — rotate
+                            // deeper so servable rows get a turn. Cluster nodes keep
+                            // consuming the head regardless. The dirty flag is set
+                            // directly (NOT via MarkQueueWindowDirty, which resets the
+                            // offset) so the rotation position survives the sync.
+                            _windowRotationOffset += QueueWindowSize;
+                            if (_windowRotationOffset >= dbPending)
+                            {
+                                _windowRotationOffset = 0;
+
+                                // A full walk of the backlog produced nothing servable —
+                                // stop churning (each pass costs a window rebuild plus
+                                // File.Exists per row against the NAS). The items belong
+                                // to the cluster loop; any add/cancel/settings change
+                                // re-kicks this scheduler via MarkQueueWindowDirty.
+                                if (!servedSinceRotationWrap)
+                                {
+                                    if (inflight.Count == 0) break;
+                                    await WaitForSchedulerProgressAsync(inflight);
+                                    continue;
+                                }
+                                servedSinceRotationWrap = false;
+                            }
+                            Interlocked.Exchange(ref _queueWindowDirty, 1);
+                            await SyncQueueWindowAsync(_windowRotationOffset);
+                            await WaitForSchedulerProgressAsync(inflight);
+                            continue;
+                        }
+
+                        if (inflight.Count == 0) break;
+
+                        // Queue is empty but encodes are still finishing — wait for
+                        // one to drain or for an explicit wake (settings change)
+                        // before re-checking.
+                        await WaitForSchedulerProgressAsync(inflight);
+                        deferredVideoIds.Clear();
+                        continue;
                     }
-                    else if (musicItem.Status is WorkItemStatus.Cancelled or WorkItemStatus.Stopped)
+
+                    // A servable item is visible. Deliberately do NOT reset the rotation
+                    // offset here — resetting on every dispatch snapped the window back
+                    // to the unservable head and re-walked the whole backlog per item.
+                    // External queue changes reset it via MarkQueueWindowDirty.
+                    servedSinceRotationWrap = true;
+
+                    bool dispatched = false;
+
+                    // ───── MUSIC DISPATCH ─────
+                    // Music targets the synthetic "music" device, reserved through
+                    // the same SlotLedger workers use. EffectiveDeviceCapacity returns
+                    // 0 when MasterMusicConcurrency is 0 (or unset and the default-
+                    // concurrency fallback is 0) — TryReserve refuses, the master
+                    // skips, and the cluster dispatcher routes the item to a worker.
+                    if (anyMusicPending && _slotLedger != null)
                     {
-                        UnregisterWorkItem(musicItem.Id);
-                    }
-                    else if (!File.Exists(musicItem.Path))
-                    {
-                        Log.Information($"Dropping {musicItem.FileName}: source file no longer exists at dispatch time");
-                        await DropMissingWorkItemAsync(musicItem);
-                    }
-                    else if (!_slotLedger.TryReserve(_localNodeId, MusicDeviceId, musicItem.Id, musicItem.FileName))
-                    {
-                        // Master at music capacity (or master music encoding is
-                        // disabled by MasterMusicConcurrency=0). Put the item
-                        // back so the cluster dispatcher can route it to a
-                        // worker, or so a future tick retries once a master
-                        // music slot frees up.
+                        WorkItem? musicItem;
                         lock (_queueLock)
                         {
-                            _workQueue.Add(musicItem);
-                            _workQueue.Sort((a, b) => CompareQueueOrder(a, b, _queueNewestFirst));
+                            musicItem = _workQueue.FirstOrDefault(w =>
+                                w.Kind == MediaKind.Music &&
+                                w.Status == WorkItemStatus.Pending &&
+                                (_shouldSkipLocal == null || !_shouldSkipLocal(w)));
+                            if (musicItem != null) _workQueue.Remove(musicItem);
+                        }
+
+                        if (musicItem == null)
+                        {
+                            // Race: another path consumed it. Nothing to do.
+                        }
+                        else if (musicItem.Status is WorkItemStatus.Cancelled or WorkItemStatus.Stopped)
+                        {
+                            UnregisterWorkItem(musicItem.Id);
+                        }
+                        else if (!File.Exists(musicItem.Path))
+                        {
+                            Log.Information($"Dropping {musicItem.FileName}: source file no longer exists at dispatch time");
+                            await DropMissingWorkItemAsync(musicItem);
+                        }
+                        else if (!_slotLedger.TryReserve(_localNodeId, MusicDeviceId, musicItem.Id, musicItem.FileName))
+                        {
+                            // Master at music capacity (or master music encoding is
+                            // disabled by MasterMusicConcurrency=0). Put the item
+                            // back so the cluster dispatcher can route it to a
+                            // worker, or so a future tick retries once a master
+                            // music slot frees up.
+                            lock (_queueLock)
+                            {
+                                _workQueue.Add(musicItem);
+                                _workQueue.Sort((a, b) => CompareQueueOrder(a, b, _queueNewestFirst));
+                            }
+                        }
+                        else
+                        {
+                            // Same exception-safety contract as the video dispatch below:
+                            // the item is out of _workQueue and holds a music slot, so a
+                            // throw before the job task spawns must recover, not unwind.
+                            try
+                            {
+                                _slotLedger.TransitionPhase(musicItem.Id, SlotPhase.Encoding);
+                                // Item left the window — flag it so refill tops up from the DB.
+                                Interlocked.Exchange(ref _queueWindowDirty, 1);
+
+                                var musicFolderOverride = ResolveFolderOverride(musicItem.Path);
+                                var musicPerJobOptions = EncoderOptionsOverride.ApplyOverrides(current, musicFolderOverride, null);
+
+                                var musicActive = new ActiveLocalJob
+                                {
+                                    Item     = musicItem,
+                                    Cts      = new CancellationTokenSource(),
+                                    DeviceId = MusicDeviceId,
+                                };
+                                _activeLocalJobs[musicItem.Id] = musicActive;
+                                musicItem.DispatchedDeviceId = MusicDeviceId;
+
+                                var capturedItem = musicItem;
+                                var capturedLedger = _slotLedger;
+                                var musicTask = Task.Run(async () =>
+                                {
+                                    try { await ProcessMusicWorkItemAsync(capturedItem, musicPerJobOptions, musicActive); }
+                                    finally
+                                    {
+                                        capturedLedger.Release(capturedItem.Id, ReleaseReason.Completed);
+                                        WakeScheduler();
+                                    }
+                                });
+                                inflight.Add(musicTask);
+                                dispatched = true;
+                            }
+                            catch (Exception ex) when (!dispatched)
+                            {
+                                RecoverFailedLocalDispatch(musicItem, ex);
+                            }
                         }
                     }
-                    else
+
+                    // ───── VIDEO DISPATCH ─────
+                    if (!anyVideoPending)
                     {
-                        _slotLedger.TransitionPhase(musicItem.Id, SlotPhase.Encoding);
+                        if (!dispatched)
+                        {
+                            await WaitForSchedulerProgressAsync(inflight);
+                            deferredVideoIds.Clear();
+                        }
+                        continue;
+                    }
+
+                    // Pick the next pending video item, then try to reserve a
+                    // device slot for it via the ledger. Picking-then-reserving
+                    // (vs. the prior reserve-then-pick) matches the cluster
+                    // dispatcher's order so the two schedulers see the same
+                    // head-of-queue when they race, and avoids the "reserved a
+                    // slot then no item fit it — release" round-trip.
+                    WorkItem? workItem;
+                    lock (_queueLock)
+                    {
+                        workItem = SelectNextLocalVideoCandidate(
+                            _workQueue,
+                            deferredVideoIds,
+                            _shouldSkipLocal);
+                        if (workItem != null) _workQueue.Remove(workItem);
+                    }
+
+                    if (workItem == null)
+                    {
+                        if (!dispatched)
+                        {
+                            await WaitForSchedulerProgressAsync(inflight);
+                            deferredVideoIds.Clear();
+                        }
+                        continue;
+                    }
+
+                    // From here to the job-task spawn the item is out of _workQueue and
+                    // (after TryReserveLocalDeviceSlot) holds a ledger slot, so the whole
+                    // stretch must be exception-safe. A throw here previously unwound the
+                    // entire scheduler, leaking the slot reservation (capacity is 1 per
+                    // device — the queue wedged until restart) and orphaning the item as
+                    // in-memory Pending, which blocked its own DB re-hydration.
+                    var handedToJobTask = false;
+                    try
+                    {
+                        // Source-vanished guard: the source can disappear between scan-time
+                        // enqueue and dispatch (user deletes the folder, file is renamed,
+                        // network share drops the path). Drop the item now rather than burn a
+                        // device slot and have ConvertVideoAsync throw "Source file not found"
+                        // mid-encode.
+                        if (!File.Exists(workItem.Path))
+                        {
+                            Log.Information($"Dropping {workItem.FileName}: source file no longer exists at dispatch time");
+                            await DropMissingWorkItemAsync(workItem);
+                            continue;
+                        }
+
+                        // Resolve Advanced rules/profile before reserving a slot. The old order
+                        // routed using global codec/HW values and only applied the folder override
+                        // afterwards, which made exact encoders and folder profiles unschedulable.
+                        var policy = ResolveVideoPolicyForWorkItem(workItem, current);
+                        if (!string.IsNullOrEmpty(policy.Plan.BlockingReason))
+                        {
+                            lock (_queueLock)
+                            {
+                                _workQueue.Add(workItem);
+                                _workQueue.Sort((a, b) => CompareQueueOrder(a, b, _queueNewestFirst));
+                            }
+                            try { await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem); } catch { }
+                            deferredVideoIds.Add(workItem.Id);
+                            continue;
+                        }
+                        if (policy.Plan.Action == AdvancedVideoAction.Skip)
+                        {
+                            await MarkDispatchSkippedAsync(workItem,
+                                policy.Plan.RuleName == null ? "advanced video policy" : $"advanced video rule '{policy.Plan.RuleName}'");
+                            continue;
+                        }
+
+                        var perJobOptions = policy.Options;
+                        if (workItem.ForceMux && policy.Plan.Action == AdvancedVideoAction.UseSimpleSettings
+                                              && perJobOptions.EncodingMode == EncodingMode.Transcode)
+                            perJobOptions.EncodingMode = EncodingMode.Hybrid;
+
+                        var deviceId = TryReserveLocalDeviceSlot(workItem, perJobOptions);
+                        if (deviceId == null)
+                        {
+                            // No master slot fits this item (capacity full, codec
+                            // mismatch, or every device disabled). Re-queue so the
+                            // cluster dispatcher can route to a worker, or a future
+                            // master tick retries once a slot frees up.
+                            lock (_queueLock)
+                            {
+                                _workQueue.Add(workItem);
+                                _workQueue.Sort((a, b) => CompareQueueOrder(a, b, _queueNewestFirst));
+                            }
+                            deferredVideoIds.Add(workItem.Id);
+                            ReapOrphanedLocalReservationsIfDue();
+                            continue;
+                        }
+                        _slotLedger?.TransitionPhase(workItem.Id, SlotPhase.Encoding);
                         // Item left the window — flag it so refill tops up from the DB.
                         Interlocked.Exchange(ref _queueWindowDirty, 1);
 
-                        var musicFolderOverride = ResolveFolderOverride(musicItem.Path);
-                        var musicPerJobOptions = EncoderOptionsOverride.ApplyOverrides(current, musicFolderOverride, null);
+                        perJobOptions.HardwareAcceleration = deviceId == "cpu" ? "none" : deviceId;
+                        perJobOptions.HardwareDevicePath   = deviceId == "cpu" ? null : GetDevicePathForDeviceId(deviceId);
 
-                        var musicActive = new ActiveLocalJob
+                        // Force-mux items ("Process Item" / "Process Directory") dispatch as Hybrid even
+                        // when the global mode is Transcode, so an at-target file is mux-passed instead of
+                        // being dropped by the pre-dispatch skip gate below. The upgraded mode flows into
+                        // the encode (ConvertVideoAsync), giving a video-copy remux to the target container.
+                        if (workItem.ForceMux && policy.Plan.Action == AdvancedVideoAction.UseSimpleSettings
+                                              && perJobOptions.EncodingMode == EncodingMode.Transcode)
+                            perJobOptions.EncodingMode = EncodingMode.Hybrid;
+
+                        // Pre-dispatch finalisation: resolve any missing OriginalLanguage live,
+                        // merge it into the per-job keep lists, and re-run the skip ladder under
+                        // the merged options. Keeps every "should this still encode?" decision in
+                        // the dispatcher — workers are only ever handed items that genuinely need
+                        // to encode. Catches three cases the queue couldn't pre-vet:
+                        //   • Legacy DB rows queued before the OriginalLanguage cache existed.
+                        //   • Settings toggled between AddFileAsync and dispatch (eg. user flipped
+                        //     KeepOriginalLanguage on after the file was already queued).
+                        //   • Force-adds that bypass parts of AddFileAsync's skip ladder.
+                        if (!await FinaliseForDispatchAsync(workItem, perJobOptions, CancellationToken.None))
                         {
-                            Item     = musicItem,
+                            await MarkDispatchSkippedAsync(workItem, "pre-dispatch check — file already meets target under current options");
+                            // Release the ledger reservation we made above for this item —
+                            // the encode is being skipped, so the slot must go back to the pool.
+                            _slotLedger?.Release(workItem.Id, ReleaseReason.NoSavings);
+                            continue;
+                        }
+
+                        // Cancel/Stop race: a Pending → Cancelled transition could have landed during
+                        // FinaliseForDispatchAsync's awaits. Re-check the workItem.Status before
+                        // committing to dispatch — without this, ProcessWorkItemAsync's unconditional
+                        // Status = Processing assignment would clobber the user's cancel.
+                        if (workItem.Status is WorkItemStatus.Cancelled or WorkItemStatus.Stopped)
+                        {
+                            Log.Information($"Dropping {workItem.FileName}: cancelled/stopped during dispatch finalisation");
+                            UnregisterWorkItem(workItem.Id);
+                            _slotLedger?.Release(workItem.Id, ReleaseReason.Cancelled);
+                            try { await _hubContext.Clients.All.SendAsync("WorkItemRemoved", workItem.Id); } catch { /* SignalR errors are non-fatal */ }
+                            continue;
+                        }
+
+                        // Pre-register the active job synchronously before spawning so
+                        // cancellation can find the running ffmpeg process (slot accounting
+                        // itself is now in the ledger; _activeLocalJobs is purely for
+                        // process-kill plumbing).
+                        var active = new ActiveLocalJob
+                        {
+                            Item     = workItem,
                             Cts      = new CancellationTokenSource(),
-                            DeviceId = MusicDeviceId,
+                            DeviceId = deviceId,
                         };
-                        _activeLocalJobs[musicItem.Id] = musicActive;
-                        musicItem.DispatchedDeviceId = MusicDeviceId;
+                        _activeLocalJobs[workItem.Id] = active;
+                        workItem.DispatchedDeviceId = deviceId;
 
-                        var capturedItem = musicItem;
-                        var capturedLedger = _slotLedger;
-                        var musicTask = Task.Run(async () =>
+                        // Wrap the local encode so the ledger is released exactly once
+                        // when it finishes, regardless of success / failure / cancel.
+                        // ProcessWorkItemAsync owns _activeLocalJobs cleanup in its
+                        // own finally — the ledger release is layered above.
+                        var capturedVideoItem   = workItem;
+                        var capturedVideoLedger = _slotLedger;
+                        var jobTask = Task.Run(async () =>
                         {
-                            try { await ProcessMusicWorkItemAsync(capturedItem, musicPerJobOptions, musicActive); }
+                            try { await ProcessWorkItemAsync(capturedVideoItem, perJobOptions, active); }
                             finally
                             {
-                                capturedLedger.Release(capturedItem.Id, ReleaseReason.Completed);
+                                capturedVideoLedger?.Release(capturedVideoItem.Id, ReleaseReason.Completed);
                                 WakeScheduler();
                             }
                         });
-                        inflight.Add(musicTask);
-                        dispatched = true;
+                        inflight.Add(jobTask);
+                        handedToJobTask = true;
                     }
-                }
-
-                // ───── VIDEO DISPATCH ─────
-                if (!anyVideoPending)
-                {
-                    if (!dispatched)
+                    catch (Exception ex) when (!handedToJobTask)
                     {
-                        await WaitForSchedulerProgressAsync(inflight);
-                        deferredVideoIds.Clear();
+                        // Recover in place instead of unwinding the scheduler: release the
+                        // slot reservation (idempotent no-op if none was made yet), requeue
+                        // the item, and move on. Deferring the item paces any repeat throw
+                        // to one retry per scheduler-progress event.
+                        RecoverFailedLocalDispatch(workItem, ex);
+                        deferredVideoIds.Add(workItem.Id);
                     }
-                    continue;
                 }
-
-                // Pick the next pending video item, then try to reserve a
-                // device slot for it via the ledger. Picking-then-reserving
-                // (vs. the prior reserve-then-pick) matches the cluster
-                // dispatcher's order so the two schedulers see the same
-                // head-of-queue when they race, and avoids the "reserved a
-                // slot then no item fit it — release" round-trip.
-                WorkItem? workItem;
-                lock (_queueLock)
+                catch (Exception ex)
                 {
-                    workItem = SelectNextLocalVideoCandidate(
-                        _workQueue,
-                        deferredVideoIds,
-                        _shouldSkipLocal);
-                    if (workItem != null) _workQueue.Remove(workItem);
+                    Log.Error($"Scheduler iteration failed — recovering: {ex}");
+                    await Task.Delay(1000);
                 }
-
-                if (workItem == null)
-                {
-                    if (!dispatched)
-                    {
-                        await WaitForSchedulerProgressAsync(inflight);
-                        deferredVideoIds.Clear();
-                    }
-                    continue;
-                }
-
-                // Source-vanished guard: the source can disappear between scan-time
-                // enqueue and dispatch (user deletes the folder, file is renamed,
-                // network share drops the path). Drop the item now rather than burn a
-                // device slot and have ConvertVideoAsync throw "Source file not found"
-                // mid-encode.
-                if (!File.Exists(workItem.Path))
-                {
-                    Log.Information($"Dropping {workItem.FileName}: source file no longer exists at dispatch time");
-                    await DropMissingWorkItemAsync(workItem);
-                    continue;
-                }
-
-                // Resolve Advanced rules/profile before reserving a slot. The old order
-                // routed using global codec/HW values and only applied the folder override
-                // afterwards, which made exact encoders and folder profiles unschedulable.
-                var policy = ResolveVideoPolicyForWorkItem(workItem, current);
-                if (!string.IsNullOrEmpty(policy.Plan.BlockingReason))
-                {
-                    lock (_queueLock)
-                    {
-                        _workQueue.Add(workItem);
-                        _workQueue.Sort((a, b) => CompareQueueOrder(a, b, _queueNewestFirst));
-                    }
-                    try { await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem); } catch { }
-                    deferredVideoIds.Add(workItem.Id);
-                    continue;
-                }
-                if (policy.Plan.Action == AdvancedVideoAction.Skip)
-                {
-                    await MarkDispatchSkippedAsync(workItem,
-                        policy.Plan.RuleName == null ? "advanced video policy" : $"advanced video rule '{policy.Plan.RuleName}'");
-                    continue;
-                }
-
-                var perJobOptions = policy.Options;
-                if (workItem.ForceMux && policy.Plan.Action == AdvancedVideoAction.UseSimpleSettings
-                                      && perJobOptions.EncodingMode == EncodingMode.Transcode)
-                    perJobOptions.EncodingMode = EncodingMode.Hybrid;
-
-                var deviceId = TryReserveLocalDeviceSlot(workItem, perJobOptions);
-                if (deviceId == null)
-                {
-                    // No master slot fits this item (capacity full, codec
-                    // mismatch, or every device disabled). Re-queue so the
-                    // cluster dispatcher can route to a worker, or a future
-                    // master tick retries once a slot frees up.
-                    lock (_queueLock)
-                    {
-                        _workQueue.Add(workItem);
-                        _workQueue.Sort((a, b) => CompareQueueOrder(a, b, _queueNewestFirst));
-                    }
-                    deferredVideoIds.Add(workItem.Id);
-                    continue;
-                }
-                _slotLedger?.TransitionPhase(workItem.Id, SlotPhase.Encoding);
-                // Item left the window — flag it so refill tops up from the DB.
-                Interlocked.Exchange(ref _queueWindowDirty, 1);
-
-                perJobOptions.HardwareAcceleration = deviceId == "cpu" ? "none" : deviceId;
-                perJobOptions.HardwareDevicePath   = deviceId == "cpu" ? null : GetDevicePathForDeviceId(deviceId);
-
-                // Force-mux items ("Process Item" / "Process Directory") dispatch as Hybrid even
-                // when the global mode is Transcode, so an at-target file is mux-passed instead of
-                // being dropped by the pre-dispatch skip gate below. The upgraded mode flows into
-                // the encode (ConvertVideoAsync), giving a video-copy remux to the target container.
-                if (workItem.ForceMux && policy.Plan.Action == AdvancedVideoAction.UseSimpleSettings
-                                      && perJobOptions.EncodingMode == EncodingMode.Transcode)
-                    perJobOptions.EncodingMode = EncodingMode.Hybrid;
-
-                // Pre-dispatch finalisation: resolve any missing OriginalLanguage live,
-                // merge it into the per-job keep lists, and re-run the skip ladder under
-                // the merged options. Keeps every "should this still encode?" decision in
-                // the dispatcher — workers are only ever handed items that genuinely need
-                // to encode. Catches three cases the queue couldn't pre-vet:
-                //   • Legacy DB rows queued before the OriginalLanguage cache existed.
-                //   • Settings toggled between AddFileAsync and dispatch (eg. user flipped
-                //     KeepOriginalLanguage on after the file was already queued).
-                //   • Force-adds that bypass parts of AddFileAsync's skip ladder.
-                if (!await FinaliseForDispatchAsync(workItem, perJobOptions, CancellationToken.None))
-                {
-                    await MarkDispatchSkippedAsync(workItem, "pre-dispatch check — file already meets target under current options");
-                    // Release the ledger reservation we made above for this item —
-                    // the encode is being skipped, so the slot must go back to the pool.
-                    _slotLedger?.Release(workItem.Id, ReleaseReason.NoSavings);
-                    continue;
-                }
-
-                // Cancel/Stop race: a Pending → Cancelled transition could have landed during
-                // FinaliseForDispatchAsync's awaits. Re-check the workItem.Status before
-                // committing to dispatch — without this, ProcessWorkItemAsync's unconditional
-                // Status = Processing assignment would clobber the user's cancel.
-                if (workItem.Status is WorkItemStatus.Cancelled or WorkItemStatus.Stopped)
-                {
-                    Log.Information($"Dropping {workItem.FileName}: cancelled/stopped during dispatch finalisation");
-                    UnregisterWorkItem(workItem.Id);
-                    _slotLedger?.Release(workItem.Id, ReleaseReason.Cancelled);
-                    try { await _hubContext.Clients.All.SendAsync("WorkItemRemoved", workItem.Id); } catch { /* SignalR errors are non-fatal */ }
-                    continue;
-                }
-
-                // Pre-register the active job synchronously before spawning so
-                // cancellation can find the running ffmpeg process (slot accounting
-                // itself is now in the ledger; _activeLocalJobs is purely for
-                // process-kill plumbing).
-                var active = new ActiveLocalJob
-                {
-                    Item     = workItem,
-                    Cts      = new CancellationTokenSource(),
-                    DeviceId = deviceId,
-                };
-                _activeLocalJobs[workItem.Id] = active;
-                workItem.DispatchedDeviceId = deviceId;
-
-                // Wrap the local encode so the ledger is released exactly once
-                // when it finishes, regardless of success / failure / cancel.
-                // ProcessWorkItemAsync owns _activeLocalJobs cleanup in its
-                // own finally — the ledger release is layered above.
-                var capturedVideoItem   = workItem;
-                var capturedVideoLedger = _slotLedger;
-                var jobTask = Task.Run(async () =>
-                {
-                    try { await ProcessWorkItemAsync(capturedVideoItem, perJobOptions, active); }
-                    finally
-                    {
-                        capturedVideoLedger?.Release(capturedVideoItem.Id, ReleaseReason.Completed);
-                        WakeScheduler();
-                    }
-                });
-                inflight.Add(jobTask);
             }
 
             // Drain remaining inflight before releasing the scheduler lock so
@@ -3023,6 +3109,98 @@ public class TranscodingService
         {
             _processingLock.Release();
         }
+    }
+
+    /// <summary>
+    ///     Recovery path for a local dispatch that threw after its work item left
+    ///     <see cref="_workQueue"/> (and possibly after a ledger slot was reserved).
+    ///     Releases the reservation (idempotent — no-op when nothing was reserved yet),
+    ///     drops any pre-registered active-job entry, and puts the item back in the
+    ///     queue so it stays dispatchable — or unregisters it if it went terminal
+    ///     mid-dispatch. Never throws: this runs inside the scheduler's recovery catch.
+    /// </summary>
+    internal void RecoverFailedLocalDispatch(WorkItem workItem, Exception ex)
+    {
+        Log.Warning($"Dispatch failed for {workItem.FileName} — releasing slot and requeueing: {ex.Message}");
+
+        try
+        {
+            _slotLedger?.Release(workItem.Id, ReleaseReason.DispatchThrew);
+            _activeLocalJobs.TryRemove(workItem.Id, out _);
+
+            if (workItem.Status == WorkItemStatus.Pending)
+            {
+                lock (_queueLock)
+                {
+                    if (!_workQueue.Contains(workItem))
+                    {
+                        _workQueue.Add(workItem);
+                        _workQueue.Sort((a, b) => CompareQueueOrder(a, b, _queueNewestFirst));
+                    }
+                }
+            }
+            else
+            {
+                UnregisterWorkItem(workItem.Id);
+            }
+        }
+        catch (Exception cleanupEx)
+        {
+            Log.Warning($"Dispatch recovery for {workItem.FileName} failed: {cleanupEx.Message}");
+        }
+    }
+
+    /// <summary>
+    ///     Minimum age before a local reservation with no backing active job counts as
+    ///     orphaned. Must comfortably exceed the reserve→register window in the dispatch
+    ///     path (normally milliseconds; up to ~15s when the pre-dispatch original-language
+    ///     lookup is slow).
+    /// </summary>
+    private static readonly TimeSpan OrphanReservationGrace = TimeSpan.FromMinutes(2);
+
+    private DateTime _lastOrphanReapUtc = DateTime.MinValue;
+
+    /// <summary>
+    ///     Rate-limited (60s) wrapper around <see cref="ReapOrphanedLocalReservations"/>.
+    ///     Called at scheduler entry and whenever a video slot reservation fails — the
+    ///     exact moments a leaked reservation would manifest as "device full forever".
+    /// </summary>
+    private void ReapOrphanedLocalReservationsIfDue()
+    {
+        var now = DateTime.UtcNow;
+        if (now - _lastOrphanReapUtc < TimeSpan.FromSeconds(60)) return;
+        _lastOrphanReapUtc = now;
+        ReapOrphanedLocalReservations(OrphanReservationGrace);
+    }
+
+    /// <summary>
+    ///     Safety net beneath the dispatch-path exception recovery: releases any LOCAL
+    ///     ledger reservation that has no backing entry in <see cref="_activeLocalJobs"/>
+    ///     and is older than <paramref name="grace"/>. Live local encodes always have such
+    ///     an entry (registered before their job task spawns, removed after the job's
+    ///     finally releases the ledger), so an unbacked reservation past the grace window
+    ///     is a leak that would otherwise hold its device slot until app restart. Remote
+    ///     reservations are owned by ClusterService's reconciliation and are never touched.
+    /// </summary>
+    /// <returns>The number of reservations released.</returns>
+    internal int ReapOrphanedLocalReservations(TimeSpan grace)
+    {
+        if (_slotLedger == null) return 0;
+
+        int reaped = 0;
+        var cutoff = DateTime.UtcNow - grace;
+        foreach (var r in _slotLedger.EnumerateAll())
+        {
+            if (!string.Equals(r.NodeId, _localNodeId, StringComparison.Ordinal)) continue;
+            if (_activeLocalJobs.ContainsKey(r.JobId)) continue;
+            if (r.ReservedAt > cutoff || r.PhaseEnteredAt > cutoff) continue;
+
+            Log.Warning($"SlotLedger: Reaping orphaned local reservation {r.JobId} ({r.FileName ?? "?"}) on " +
+                        $"{r.DeviceId} — reserved {(DateTime.UtcNow - r.ReservedAt).TotalMinutes:F1} min ago with no active job");
+            _slotLedger.Release(r.JobId, ReleaseReason.StaleReservation);
+            reaped++;
+        }
+        return reaped;
     }
 
     /// <summary>
@@ -4319,7 +4497,7 @@ public class TranscodingService
             // Preference order changed? Re-mux so the top-priority language ends up
             // on track 0. Without this, a MuxOnly user toggling the order would see
             // nothing happen on already-fine files.
-            if (WouldReorder(audLangs, kept.Select(s => s.Language))) return true;
+            if (WouldReorder(audLangs, kept.Select(s => (s.Language, s.Title)))) return true;
         }
 
         // Commentary tracks are unconditionally dropped by the planner (see
@@ -4346,9 +4524,24 @@ public class TranscodingService
         // discard, while the multi-track case would slip through the no-op gate.
         if (!options.PreserveOriginalAudio)
         {
-            foreach (var bucket in kept.GroupBy(s => (s.Language ?? "und").ToLowerInvariant()))
+            if (options.AudioLanguagesToKeep is { Count: > 0 } keepLangs)
             {
-                if (bucket.Count() > 1) return true;
+                // Group by the same claim the planner's bucketing uses: tracks the
+                // undetermined sentinel claims (missing tag, "mul", exotic) form ONE
+                // bucket, matching MapAudio — raw-tag grouping would split them into
+                // singletons and this gate would disagree with the planner's
+                // sibling-drop.
+                foreach (var bucket in kept.GroupBy(s => LanguageMatcher.KeepEntryIndex(s.Language, s.Title, keepLangs)))
+                {
+                    if (bucket.Count() > 1) return true;
+                }
+            }
+            else
+            {
+                foreach (var bucket in kept.GroupBy(s => (s.Language ?? "und").ToLowerInvariant()))
+                {
+                    if (bucket.Count() > 1) return true;
+                }
             }
             return false;
         }
@@ -4404,7 +4597,7 @@ public class TranscodingService
 
             // Reordering would change the output stream order — that's work even when
             // no streams are added or removed.
-            if (WouldReorder(subLangs, subStreams.Select(s => s.Language))) return true;
+            if (WouldReorder(subLangs, subStreams.Select(s => (s.Language, s.Title)))) return true;
         }
 
         // Sidecar extraction with any text (or OCR-able bitmap) track present?
@@ -4472,40 +4665,27 @@ public class TranscodingService
     ///     triggers a re-mux on files that already contain all the kept languages.
     ///     A null/empty keep-list means "no preference" — never re-orders.
     /// </summary>
-    internal static bool WouldReorder(IReadOnlyList<string>? keepList, IEnumerable<string?> streamLangs)
+    internal static bool WouldReorder(IReadOnlyList<string>? keepList, IEnumerable<(string? Lang, string? Title)> streams)
     {
         if (keepList == null || keepList.Count == 0) return false;
 
-        // Canonicalize the user's keep-list once.
-        var preference = keepList
-            .Select(l => LanguageMatcher.ToTwoLetter(l) ?? l?.Trim().ToLowerInvariant() ?? "")
-            .Where(l => !string.IsNullOrEmpty(l))
-            .ToList();
-
-        // Build the source-order sequence of kept languages, deduped (only the first
-        // occurrence per language matters for ordering — equal-language tracks stay
-        // grouped because their preference index is identical).
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var sourceOrder = new List<string>();
-        foreach (var raw in streamLangs)
+        // Source-order sequence of claimed keep-entry indices (the same claim the
+        // planner's bucketing and PreferenceIndex use, so title-inferred and
+        // undetermined tracks order consistently), deduped — only the first
+        // occurrence per entry matters, equal-entry tracks stay grouped because
+        // their preference index is identical.
+        var seen = new HashSet<int>();
+        var sourceOrder = new List<int>();
+        foreach (var (lang, title) in streams)
         {
-            var two = LanguageMatcher.ToTwoLetter(raw) ?? raw?.Trim().ToLowerInvariant();
-            if (string.IsNullOrEmpty(two)) continue;
-            if (!preference.Contains(two, StringComparer.OrdinalIgnoreCase)) continue;
-            if (seen.Add(two)) sourceOrder.Add(two);
+            var idx = LanguageMatcher.KeepEntryIndex(lang, title, keepList);
+            if (idx == null) continue;
+            if (seen.Add(idx.Value)) sourceOrder.Add(idx.Value);
         }
 
-        if (sourceOrder.Count <= 1) return false;
-
-        // Target order: preference list filtered down to languages actually present.
-        var targetOrder = preference
-            .Where(p => sourceOrder.Contains(p, StringComparer.OrdinalIgnoreCase))
-            .ToList();
-
-        if (sourceOrder.Count != targetOrder.Count) return false;
-        for (int i = 0; i < sourceOrder.Count; i++)
-            if (!string.Equals(sourceOrder[i], targetOrder[i], StringComparison.OrdinalIgnoreCase))
-                return true;
+        // Reordering is needed iff the claimed indices are not already non-decreasing.
+        for (int i = 1; i < sourceOrder.Count; i++)
+            if (sourceOrder[i] < sourceOrder[i - 1]) return true;
         return false;
     }
 
@@ -4671,7 +4851,10 @@ public class TranscodingService
             return await _integrationService.LookupOriginalLanguageAsync(
                 filePath, options.OriginalLanguageProvider, cancellationToken);
         }
-        catch (OperationCanceledException) { throw; }
+        // Only genuine caller cancellation propagates — an HttpClient timeout inside
+        // the lookup is also an OCE and must fall through to the null degrade below
+        // (the dispatcher calls this with CancellationToken.None).
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
         catch { return null; }
     }
 
@@ -7296,8 +7479,8 @@ public class TranscodingService
                 await _mediaFileRepo.UpsertAsync(mf);
                 filled++;
             }
-            catch (OperationCanceledException) { throw; }
-            catch { /* lookup failures fall back to the configured keep lists, matching ConvertVideoAsync */ }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+            catch { /* lookup failures (incl. HTTP timeouts) fall back to the configured keep lists, matching ConvertVideoAsync */ }
         }
         return filled;
     }

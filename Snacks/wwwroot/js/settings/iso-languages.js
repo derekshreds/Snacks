@@ -5,7 +5,11 @@
  * the three forms (2-letter, 3-letter, English name); {@link toTwoLetter}
  * normalizes the input, {@link suggest} drives autocomplete.
  *
- * Keep in sync with Services/LanguageMatcher.cs on the backend.
+ * Keep in sync with Services/LanguageMatcher.cs on the backend — with one
+ * deliberate asymmetry: this table carries an extra `und` / "Undetermined" row
+ * so the chip UI can offer it, while the backend table must NOT (its
+ * ToTwoLetter has to return null for `und` so title inference, sidecar naming,
+ * and metadata suppression keep treating it as "no known language").
  */
 
 
@@ -50,6 +54,10 @@ export const LANGUAGES = [
     { twoLetter: 'vi', threeLetterT: 'vie', threeLetterB: null,  name: 'Vietnamese' },
     { twoLetter: 'id', threeLetterT: 'ind', threeLetterB: null,  name: 'Indonesian' },
     { twoLetter: 'uk', threeLetterT: 'ukr', threeLetterB: null,  name: 'Ukrainian'  },
+    // Sentinel, not a language: keeps tracks whose language no other chip could
+    // claim (missing tag, literal und/mul/zxx, unrecognized). Last on purpose so
+    // it stays out of the empty-query suggestions; typing "und…" surfaces it.
+    { twoLetter: 'und', threeLetterT: 'und', threeLetterB: null, name: 'Undetermined' },
 ];
 
 
@@ -66,6 +74,7 @@ const ALIAS_TO_TWO = (() => {
         if (e.threeLetterB) m.set(e.threeLetterB, e.twoLetter);
         m.set(e.name.toLowerCase(),        e.twoLetter);
     }
+    m.set('unknown', 'und');   // extra alias for the undetermined sentinel
     return m;
 })();
 
