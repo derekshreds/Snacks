@@ -78,6 +78,17 @@ public sealed class ConfigFileService
     /// <param name="filename"> The config file name to write. </param>
     /// <param name="value"> The config value to persist. </param>
     public void Save<T>(string filename, T value)
+        => SaveCore(filename, value, secret: false);
+
+    /// <summary>
+    /// Atomic save for a credential-bearing config. On Unix the temporary,
+    /// primary, and backup files are owner-readable/writable from the instant
+    /// they are created, rather than being tightened only after the write.
+    /// </summary>
+    public void SaveSecret<T>(string filename, T value)
+        => SaveCore(filename, value, secret: true);
+
+    private void SaveCore<T>(string filename, T value, bool secret)
     {
         var path   = GetConfigPath(filename);
         var backup = path + ".bak";
@@ -85,10 +96,34 @@ public sealed class ConfigFileService
         lock (_lock)
         {
             var json = JsonSerializer.Serialize(value, _jsonOptions);
-            File.WriteAllText(temp, json);
+            if (secret && !OperatingSystem.IsWindows())
+            {
+                if (File.Exists(temp)) File.Delete(temp);
+                var options = new FileStreamOptions
+                {
+                    Mode = FileMode.CreateNew,
+                    Access = FileAccess.Write,
+                    Share = FileShare.None,
+                    UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite,
+                };
+                using var stream = new FileStream(temp, options);
+                using var writer = new StreamWriter(stream);
+                writer.Write(json);
+            }
+            else
+            {
+                File.WriteAllText(temp, json);
+            }
             if (File.Exists(path))
                 File.Copy(path, backup, overwrite: true);
             File.Move(temp, path, overwrite: true);
+
+            if (secret && !OperatingSystem.IsWindows())
+            {
+                File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+                if (File.Exists(backup))
+                    File.SetUnixFileMode(backup, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            }
         }
     }
 }

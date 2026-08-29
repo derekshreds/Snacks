@@ -56,6 +56,15 @@ Log.Logger = new LoggerConfiguration()
     .CreateLogger();
 builder.Host.UseSerilog();
 
+if ((Environment.GetEnvironmentVariable(LunaConnectionService.AllowInsecureHttpEnvironmentVariable) ?? "")
+    .Trim().ToLowerInvariant() is "1" or "true" or "yes" or "on")
+{
+    Log.Warning(
+        "{Variable} is enabled: Luna connector credentials may use plain HTTP. " +
+        "Use this only on an isolated local Docker network.",
+        LunaConnectionService.AllowInsecureHttpEnvironmentVariable);
+}
+
 // Determine listening address.
 // Docker: always 0.0.0.0:6767 (container isolation provides security).
 // Electron: localhost by default, 0.0.0.0 when cluster mode is enabled (checked via cluster.json).
@@ -212,8 +221,19 @@ builder.Services.AddSingleton<FileService>();
 builder.Services.AddSingleton<LogArchiveService>();
 builder.Services.AddSingleton<ConfigFileService>();
 builder.Services.AddHttpClient();
+builder.Services.AddHttpClient("LunaConnector")
+    // Connector credentials and bearer tokens must never follow a 307/308 to
+    // another host. Operators should configure Luna's final public URL.
+    .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler
+    {
+        AllowAutoRedirect = false,
+        AutomaticDecompression = System.Net.DecompressionMethods.All,
+    });
 builder.Services.AddSingleton<NotificationService>();
 builder.Services.AddSingleton<IntegrationService>();
+builder.Services.AddSingleton<LunaTaskExecutor>();
+builder.Services.AddSingleton<LunaConnectionService>();
+builder.Services.AddHostedService<LunaTaskWorker>();
 builder.Services.AddSingleton<Snacks.Services.Ocr.TessdataResolver>();
 builder.Services.AddSingleton<Snacks.Services.Ocr.NativeOcrService>();
 builder.Services.AddSingleton<SubtitleExtractionService>();

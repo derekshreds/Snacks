@@ -400,7 +400,8 @@
         <a href="#auto-scan">Automatic scanning</a>
         <a href="#cluster">Clusters</a>
         <a href="#hardware-containers">Hardware &amp; containers</a>
-        <a href="#integrations">Integrations</a>
+        <a href="#luna-integration">Luna integration</a>
+        <a href="#integrations">Other integrations</a>
         <a href="#homarr">Homarr dashboards</a>
         <a href="#data-backups">Data &amp; backups</a>
         <a href="#observability">Logs &amp; metrics</a>
@@ -417,7 +418,7 @@
         <div class="group">Contributors</div>
         <a href="#development">Development</a>
       </nav>
-      <div class="version">Documents Snacks v2.18.1 · updated 2026-08-23</div>
+      <div class="version">Documents Snacks v2.18.1 · updated 2026-08-28</div>
       </div>
     </aside>
 
@@ -997,6 +998,173 @@ environment:
         </p>
       </section>
 
+      <section id="luna-integration">
+        <div class="eyebrow">Personal automation · outbound only</div>
+        <h2>Connect Snacks to Luna</h2>
+        <p class="lede">
+          Luna can privately inspect selected Sonarr/Radarr metadata, search their catalogs,
+          and add movies or series you explicitly request. Snacks stays inside your network:
+          it polls Luna over an outbound connection, executes a small typed action locally,
+          and returns a path-free result. No port forwarding or public Snacks URL is required.
+        </p>
+
+        <div class="callout warning">
+          <strong>Use the official VeryLuna service.</strong> Production Snacks connects only to
+          <code>https://veryluna.com</code>. Luna's source and self-hosting environment are private;
+          there is no public self-hosted Luna distribution. Custom URLs exist only for the project
+          owner's explicit local integration testing.
+        </div>
+
+        <div class="flow" aria-label="Luna connector workflow">
+          <span>Ask Luna</span>
+          <span>Typed task</span>
+          <span>Snacks polls</span>
+          <span>Local Arr API</span>
+          <span>Filtered result</span>
+          <span>Luna replies</span>
+        </div>
+
+        <div class="callout ok">
+          <strong>The network direction is always Snacks → Luna.</strong> Luna never opens a
+          connection into your home network. Sonarr/Radarr URLs and API keys stay in Snacks.
+        </div>
+
+        <h3>Before connecting</h3>
+        <ul>
+          <li>Configure and enable your real Sonarr and/or Radarr connection in <strong>Settings → Connections</strong>, then use each <strong>Test</strong> button.</li>
+          <li>Make sure Snacks can reach the URL you enter. Inside Docker, <code>localhost</code> means the Snacks container—not the Docker host or NAS.</li>
+          <li>Review the root folders and quality profiles in Sonarr/Radarr before allowing writes. Unless a task supplies explicit IDs, Snacks uses the first accessible root folder and first quality profile.</li>
+          <li>Production Snacks uses <code>https://veryluna.com</code>. Do not substitute another Luna endpoint.</li>
+        </ul>
+
+        <h3>Connection setup</h3>
+        <ol>
+          <li>Open <strong>Settings → Connections → Luna</strong>.</li>
+          <li>Enable <strong>Luna task polling</strong>. The URL is fixed to <code>https://veryluna.com</code> in normal deployments.</li>
+          <li>Choose whether Luna may read filtered library metadata and whether it may add movies/series. These are independent permissions.</li>
+          <li>Enter your Luna email and password, then select <strong>Connect Luna</strong>. The password is exchanged once and is not saved by Snacks.</li>
+          <li>Wait for the status badge to show <strong>Connected</strong>. The detail line reports how many Sonarr/Radarr capabilities are currently available.</li>
+          <li>Review or revoke the connection later from Luna <strong>Settings → Connected apps</strong> on web or iOS.</li>
+        </ol>
+
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Where a service runs</th><th>Address to enter in containerized Snacks</th></tr></thead>
+            <tbody>
+              <tr><td>Official VeryLuna service</td><td><code>https://veryluna.com</code></td></tr>
+              <tr><td>Project owner's isolated integration test</td><td><code>http://luna:8080</code> only with both explicit local-testing overrides</td></tr>
+              <tr><td>Radarr/Sonarr published on the Docker host</td><td><code>http://host.docker.internal:7878</code> / <code>:8989</code></td></tr>
+              <tr><td>Radarr/Sonarr on a NAS or another machine</td><td>The machine's LAN URL, such as <code>http://192.168.1.50:7878</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout warning">
+          Custom Luna URLs are rejected unless the project owner's isolated test process sets
+          <code>SNACKS_INTEG_Luna__BaseUrl=http://luna:8080</code> and
+          <code>SNACKS_LUNA_ALLOW_CUSTOM_URL=true</code>. Its HTTP-only Compose bridge additionally
+          sets <code>SNACKS_LUNA_ALLOW_INSECURE_HTTP=true</code>. The test URL is supplied outside
+          the UI; never use these overrides in a normal or internet-routable Snacks deployment.
+        </div>
+
+        <h3>Permissions and capabilities</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Capability</th><th>What it permits</th><th>When it appears</th></tr></thead>
+            <tbody>
+              <tr><td><code>radarr.catalog.search</code></td><td>Search Radarr's public movie catalog.</td><td>Radarr is enabled and configured.</td></tr>
+              <tr><td><code>radarr.library.read</code></td><td>Read path-free movie pages (100 by default, 200 maximum).</td><td>Filtered metadata reads are enabled.</td></tr>
+              <tr><td><code>radarr.movie.add</code></td><td>Add by TMDb ID; monitoring and search options are bounded.</td><td>Library changes are enabled.</td></tr>
+              <tr><td><code>sonarr.catalog.search</code></td><td>Search Sonarr's public series catalog.</td><td>Sonarr is enabled and configured.</td></tr>
+              <tr><td><code>sonarr.library.read</code></td><td>Read path-free series and episode-count metadata.</td><td>Filtered metadata reads are enabled.</td></tr>
+              <tr><td><code>sonarr.series.add</code></td><td>Add by TVDb ID with a validated monitoring mode.</td><td>Library changes are enabled.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          Snacks rechecks the live configuration before executing every task. Turning off a
+          permission blocks that action immediately, even before Luna receives the next
+          capability heartbeat. Add actions are idempotent: a retry checks the stable TMDb/TVDb
+          ID and returns <code>alreadyExists</code> instead of adding a duplicate.
+        </p>
+
+        <h3>Example prompts</h3>
+        <div class="grid">
+          <article class="card">
+            <h4>Explore without changing anything</h4>
+            <ul>
+              <li>“Look through my Radarr library and tell me which genres and directors I return to most.”</li>
+              <li>“Based on my movie collection, suggest ten science-fiction films that are not already in Radarr. Do not add anything yet.”</li>
+              <li>“Find completed mystery series that fit my taste and show me which ones are missing from Sonarr.”</li>
+              <li>“Compare my Sonarr and Radarr libraries with what you remember about me and make a weekend watchlist.”</li>
+            </ul>
+          </article>
+          <article class="card">
+            <h4>Make an explicit library change</h4>
+            <ul>
+              <li>“Add The Matrix to Radarr, monitor it, and start a movie search.”</li>
+              <li>“Add Futurama to Sonarr, monitor all seasons, but do not search for missing episodes yet.”</li>
+              <li>“Recommend five movies I would probably love. Explain each choice and wait for my approval before adding anything.”</li>
+              <li>“I approve choices two and four. Add only those two movies to Radarr.”</li>
+            </ul>
+          </article>
+        </div>
+
+        <div class="callout info">
+          <strong>The same prompts work in Luna voice mode.</strong> Luna acknowledges the
+          request while Snacks is working, then speaks the answer or completion status. Use
+          the same explicit wording for real library changes that you would use in text chat.
+        </div>
+
+        <div class="callout warning">
+          <strong>Write prompts affect your real Arr library.</strong> For the safest first test,
+          enable metadata reads but leave library changes off. Ask Luna for recommendations,
+          review the filtered results, then enable writes and explicitly name what to add.
+          A Radarr/Sonarr add may trigger indexers and download clients according to that app's
+          own configuration.
+        </div>
+
+        <h3>What leaves Snacks—and what does not</h3>
+        <div class="grid three">
+          <article class="card">
+            <h4>Stays local</h4>
+            <p>Arr URLs and API keys, filesystem paths, filenames, file sizes, root-folder paths, and raw error responses.</p>
+          </article>
+          <article class="card">
+            <h4>May be sent to Luna</h4>
+            <p>Titles, years, genres, public TMDb/TVDb/IMDb IDs, ratings, monitoring state, and basic episode/file availability.</p>
+          </article>
+          <article class="card">
+            <h4>Retention</h4>
+            <p>Completed task rows are hard-deleted as soon as Luna consumes the result. An abandoned completion has a five-minute safety prune. Full connector results are omitted from durable tool history; Luna's final chat reply remains normal chat history.</p>
+          </article>
+        </div>
+        <p>
+          Filtered metadata used for a recommendation may be included in Luna's current
+          AI-provider request. Snacks stores the restricted refresh credential separately from
+          integration settings; access tokens remain in memory. On Unix, the credential file and
+          backup are owner-only (<code>0600</code>). Disconnect disables the connector, cancels
+          unfinished work, revokes the refresh credential, and removes the local backup.
+        </p>
+
+        <h3>Troubleshooting</h3>
+        <details>
+          <summary>Connected, but no Sonarr/Radarr capabilities appear</summary>
+          <div>Enable the corresponding Arr integration, provide both its URL and API key, save the Connections panel, and verify its Test button succeeds. Read and add capabilities also depend on their separate Luna permission toggles.</div>
+        </details>
+        <details>
+          <summary>The Luna badge says “Waiting for Luna”</summary>
+          <div>Confirm task polling is enabled and that the Luna URL is reachable from the Snacks backend. In Docker, use a service name, <code>host.docker.internal</code>, or a LAN address—not host <code>localhost</code>.</div>
+        </details>
+        <details>
+          <summary>A task is delivered more than once</summary>
+          <div>Tasks use expiring leases so work can recover after a crash or lost response. Reads are harmless to repeat; add actions recheck TMDb/TVDb IDs before and after posting so they remain effectively idempotent.</div>
+        </details>
+        <details>
+          <summary>I changed the Luna server URL</summary>
+          <div>Reconnect from the Luna card. Snacks deliberately refuses to send an existing token to a different server URL.</div>
+        </details>
+      </section>
+
       <section id="integrations">
         <div class="eyebrow">External systems</div>
         <h2>Integrations and notifications</h2>
@@ -1006,7 +1174,8 @@ environment:
             <tbody>
               <tr><td>Plex</td><td>Connection test and optional library rescan after completion.</td><td>Server token</td></tr>
               <tr><td>Jellyfin</td><td>Connection test and optional library rescan after completion.</td><td>API key</td></tr>
-              <tr><td>Sonarr / Radarr</td><td>Media-manager connectivity and metadata workflow support.</td><td>API key</td></tr>
+              <tr><td>Luna</td><td>Outbound typed tasks for private Sonarr/Radarr recommendations and explicit additions.</td><td>Restricted Luna connector session</td></tr>
+              <tr><td>Sonarr / Radarr</td><td>Media-manager connectivity, Luna tasks, and metadata workflow support.</td><td>API key</td></tr>
               <tr><td>TheTVDB / TMDb</td><td>Original-language and metadata lookups used by language-aware processing.</td><td>API key; TVDB PIN optional</td></tr>
               <tr><td>Homarr</td><td>Compact Snacks iFrame tile, or Homarr's native Media Transcoding widget through a read-only Tdarr adapter.</td><td>Scoped iframe token or Snacks API key</td></tr>
               <tr><td>Notifications</td><td>Webhook, ntfy, or Apprise destinations for encode/scan/node events.</td><td>Destination-specific</td></tr>
@@ -1604,8 +1773,11 @@ curl -fsS -b snacks.cookies \
               <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/notifications/config</code></td><td>—</td><td>Full destination and event-toggle configuration.</td></tr>
               <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/notifications/config</code></td><td>Notification config</td><td>Saves destinations and toggles.</td></tr>
               <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/notifications/test</code></td><td>One destination object</td><td>Sends a test notification.</td></tr>
-              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/integrations/config</code></td><td>—</td><td>Returns Plex, Jellyfin, Sonarr, Radarr, TVDB, and TMDb configuration.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/integrations/config</code></td><td>—</td><td>Returns Plex, Jellyfin, Sonarr, Radarr, TVDB, TMDb, and non-secret Luna preferences.</td></tr>
               <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/integrations/config</code></td><td>Integration config</td><td>Saves third-party configuration.</td></tr>
+              <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/integrations/luna/status</code></td><td>—</td><td>Safe Luna connection health and advertised capabilities; never returns access or refresh tokens.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/integrations/luna/connect</code></td><td><code>{baseUrl,email,password,deviceName?}</code></td><td>Exchanges credentials once for a restricted outbound connector session; the password is not persisted.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/integrations/luna/disconnect</code></td><td>—</td><td>Revokes the scoped Luna session and removes its primary and backup credential files.</td></tr>
               <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/integrations/test/plex</code></td><td><code>{baseUrl,token}</code></td><td>Tests Plex credentials/connectivity without saving.</td></tr>
               <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/integrations/test/jellyfin</code></td><td><code>{baseUrl,token}</code></td><td>Tests Jellyfin credentials/connectivity without saving.</td></tr>
               <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/integrations/test/sonarr</code></td><td><code>{baseUrl,apiKey}</code></td><td>Tests Sonarr credentials/connectivity without saving.</td></tr>

@@ -8,6 +8,9 @@
 
 import { integrationsApi }               from '../../api.js';
 import { applyEnvLocks, addEnvLockNote } from '../env-locks.js';
+import { formatLunaCapabilitySummary }    from '../luna-status.js';
+
+let lunaServiceUrl = 'https://veryluna.com';
 
 
 // ---------------------------------------------------------------------------
@@ -75,6 +78,12 @@ function buildConfig() {
             enabled: chk('tmdbEnabled'),
             apiKey:  val('tmdbApiKey'),
         },
+        luna: {
+            enabled:             chk('lunaEnabled'),
+            baseUrl:             lunaServiceUrl,
+            allowLibraryReads:   chk('lunaAllowLibraryReads'),
+            allowLibraryChanges: chk('lunaAllowLibraryChanges'),
+        },
     };
 }
 
@@ -112,7 +121,21 @@ async function load() {
         setVal('tmdbEnabled',     cfg.tmdb?.enabled);
         setVal('tmdbApiKey',      cfg.tmdb?.apiKey);
 
+        const officialLunaUrl = cfg._lunaOfficialBaseUrl || 'https://veryluna.com';
+        const customLunaUrlAllowed = cfg._lunaCustomUrlAllowed === true;
+        lunaServiceUrl = customLunaUrlAllowed ? (cfg.luna?.baseUrl || officialLunaUrl) : officialLunaUrl;
+        setVal('lunaEnabled',             cfg.luna?.enabled);
+        setVal('lunaAllowLibraryReads',   cfg.luna?.allowLibraryReads);
+        setVal('lunaAllowLibraryChanges', cfg.luna?.allowLibraryChanges);
+        const lunaServiceEndpoint = document.getElementById('lunaServiceEndpoint');
+        if (lunaServiceEndpoint) {
+            // The UI always advertises the official site. A private test URL is
+            // process configuration, not a user-facing alternative endpoint.
+            lunaServiceEndpoint.textContent = officialLunaUrl;
+            lunaServiceEndpoint.href = officialLunaUrl;
+        }
         applyLocks(cfg._envLocked);
+        await loadLunaStatus();
     } catch { /* endpoint may be gated by auth */ }
 }
 
@@ -144,6 +167,74 @@ async function save() {
         showToast('Integrations saved', 'success');
     } catch (e) {
         showToast('Save failed: ' + e.message, 'danger');
+    }
+}
+
+function renderLunaStatus(status) {
+    const badge  = document.getElementById('lunaConnectionStatus');
+    const detail = document.getElementById('lunaConnectionDetail');
+    const email  = document.getElementById('lunaEmail');
+    if (!badge || !detail) return;
+
+    if (status.email && email && !email.value) email.value = status.email;
+
+    badge.textContent = status.online ? 'Connected' : status.connected ? 'Waiting for Luna' : 'Not connected';
+    badge.className = 'badge ' + (status.online ? 'text-bg-success' : status.connected ? 'text-bg-warning' : 'text-bg-secondary');
+
+    detail.textContent = status.lastError
+        ? status.lastError
+        : status.connected
+            ? formatLunaCapabilitySummary(status.capabilities)
+            : 'Your password is never stored by Snacks.';
+    detail.className = 'small ' + (status.lastError ? 'text-danger' : 'text-muted');
+    const disconnect = document.getElementById('disconnectLuna');
+    if (disconnect) disconnect.disabled = !status.connected;
+}
+
+async function loadLunaStatus() {
+    const badge = document.getElementById('lunaConnectionStatus');
+    try {
+        const status = await integrationsApi.getLunaStatus();
+        renderLunaStatus(status);
+    } catch {
+        if (badge) {
+            badge.textContent = 'Unavailable';
+            badge.className = 'badge text-bg-secondary';
+        }
+    }
+}
+
+async function connectLuna() {
+    const button = document.getElementById('connectLuna');
+    const password = document.getElementById('lunaPassword');
+    const passwordValue = val('lunaPassword');
+    if (password) password.value = '';
+    button.disabled = true;
+    try {
+        setVal('lunaEnabled', true);
+        await integrationsApi.saveConfig(buildConfig());
+        const status = await integrationsApi.connectLuna(lunaServiceUrl, val('lunaEmail'), passwordValue);
+        renderLunaStatus(status);
+        showToast('Snacks is connected to Luna', 'success');
+    } catch (e) {
+        showToast('Luna connection failed: ' + e.message, 'danger');
+        await loadLunaStatus();
+    } finally {
+        button.disabled = false;
+    }
+}
+
+async function disconnectLuna() {
+    const button = document.getElementById('disconnectLuna');
+    button.disabled = true;
+    try {
+        const status = await integrationsApi.disconnectLuna();
+        renderLunaStatus(status);
+        showToast('Luna disconnected', 'success');
+    } catch (e) {
+        showToast('Could not disconnect Luna: ' + e.message, 'danger');
+    } finally {
+        button.disabled = false;
     }
 }
 
@@ -210,6 +301,8 @@ export function initIntegrationsPanel() {
     document.getElementById('testRadarr')  ?.addEventListener('click', () => test('radarr'));
     document.getElementById('testTvdb')    ?.addEventListener('click', () => test('tvdb'));
     document.getElementById('testTmdb')    ?.addEventListener('click', () => test('tmdb'));
+    document.getElementById('connectLuna')   ?.addEventListener('click', connectLuna);
+    document.getElementById('disconnectLuna')?.addEventListener('click', disconnectLuna);
 }
 
 /** Lazy data load, invoked when the settings modal is first opened. */
