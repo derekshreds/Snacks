@@ -1,14 +1,14 @@
 /**
- * Integrations settings panel (Plex / Jellyfin / Sonarr / Radarr).
+ * Integrations settings panel (Plex / Jellyfin / Sonarr / Radarr / Luna).
  *
- * Reads/writes the integration config via {@link integrationsApi} and
- * exposes a per-provider "Test" button that pings the backend to confirm
- * the supplied URL + credential are valid.
+ * Reads/writes the integration config via {@link integrationsApi}, exposes a
+ * per-provider "Test" button that pings the backend to confirm the supplied
+ * URL + credential are valid, and manages the outbound Luna connection.
  */
 
 import { integrationsApi }               from '../../api.js';
 import { applyEnvLocks, addEnvLockNote } from '../env-locks.js';
-import { formatLunaCapabilitySummary }    from '../luna-status.js';
+import { formatLunaCapabilitySummary }   from '../luna-status.js';
 
 let lunaServiceUrl = 'https://veryluna.com';
 
@@ -170,6 +170,15 @@ async function save() {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Luna connection
+// ---------------------------------------------------------------------------
+
+/**
+ * Paints the connection badge, detail line, and disconnect button from a
+ * token-free status payload returned by the Luna connector API.
+ */
 function renderLunaStatus(status) {
     const badge  = document.getElementById('lunaConnectionStatus');
     const detail = document.getElementById('lunaConnectionDetail');
@@ -191,6 +200,7 @@ function renderLunaStatus(status) {
     if (disconnect) disconnect.disabled = !status.connected;
 }
 
+/** Fetches live connector status; degrades to an "Unavailable" badge on failure. */
 async function loadLunaStatus() {
     const badge = document.getElementById('lunaConnectionStatus');
     try {
@@ -204,6 +214,11 @@ async function loadLunaStatus() {
     }
 }
 
+/**
+ * Saves the panel (with Luna enabled), then exchanges the entered credentials
+ * for a scoped connector session. The password field is cleared immediately —
+ * it exists only for the single connect call.
+ */
 async function connectLuna() {
     const button = document.getElementById('connectLuna');
     const password = document.getElementById('lunaPassword');
@@ -224,6 +239,7 @@ async function connectLuna() {
     }
 }
 
+/** Revokes the scoped Luna session and repaints the card from the fresh status. */
 async function disconnectLuna() {
     const button = document.getElementById('disconnectLuna');
     button.disabled = true;

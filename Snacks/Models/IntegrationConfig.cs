@@ -23,7 +23,7 @@ public sealed class IntegrationConfig
     /// <summary> TMDb v3 integration (read-only API key). </summary>
     public TmdbIntegration Tmdb { get; set; } = new();
 
-    /// <summary>Outbound, privacy-filtered task connection to Luna.</summary>
+    /// <summary> Outbound, privacy-filtered task connection to Luna. </summary>
     public LunaIntegration Luna { get; set; } = new();
 }
 
@@ -80,20 +80,20 @@ public sealed class TmdbIntegration
 }
 
 /// <summary>
-/// Non-secret Luna connector preferences. The scoped refresh credential is
-/// persisted separately and is never returned by the integrations config API.
+///     Non-secret Luna connector preferences. The scoped refresh credential is
+///     persisted separately and is never returned by the integrations config API.
 /// </summary>
 public sealed class LunaIntegration
 {
-    /// <summary>Whether the outbound task worker should connect and poll.</summary>
-    public bool Enabled { get; set; }
+    /// <summary> Whether the outbound task worker should connect and poll. </summary>
+    public bool Enabled { get; set; } = false;
 
-    /// <summary>Official VeryLuna service root.</summary>
+    /// <summary> Official VeryLuna service root. </summary>
     public string BaseUrl { get; set; } = "https://veryluna.com";
 
-    /// <summary>Share path-free, paginated title metadata from enabled Arr libraries.</summary>
-    public bool AllowLibraryReads { get; set; }
+    /// <summary> Share path-free, paginated title metadata from enabled Arr libraries. </summary>
+    public bool AllowLibraryReads { get; set; } = false;
 
-    /// <summary>Allow explicitly requested, idempotent Sonarr/Radarr add operations.</summary>
-    public bool AllowLibraryChanges { get; set; }
+    /// <summary> Allow explicitly requested, idempotent Sonarr/Radarr add operations. </summary>
+    public bool AllowLibraryChanges { get; set; } = false;
 }

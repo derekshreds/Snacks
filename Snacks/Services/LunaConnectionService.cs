@@ -6,6 +6,17 @@ using Snacks.Models;
 
 namespace Snacks.Services;
 
+/// <summary> Safe, token-free snapshot of the Luna connector for status APIs and the UI. </summary>
+/// <param name="Connected"> Whether a scoped refresh token is currently persisted. </param>
+/// <param name="Enabled"> Whether the background task worker is allowed to poll. </param>
+/// <param name="Online"> Whether a poll or registration succeeded recently enough to call the link live. </param>
+/// <param name="BaseUrl"> The configured Luna service root. </param>
+/// <param name="Email"> The account email reported by Luna at connect time. </param>
+/// <param name="AgentId"> Luna's identifier for this registered connector. </param>
+/// <param name="ConnectedAt"> When the current session was created (UTC). </param>
+/// <param name="LastSuccessfulPoll"> Last successful Luna round-trip (UTC). </param>
+/// <param name="LastError"> Sanitized message of the most recent failure, if any. </param>
+/// <param name="Capabilities"> Action names currently advertised to Luna. </param>
 public sealed record LunaConnectionStatus(
     bool Connected,
     bool Enabled,
@@ -18,32 +29,53 @@ public sealed record LunaConnectionStatus(
     string? LastError,
     IReadOnlyList<string> Capabilities);
 
-public sealed class LunaConnectionException(string message) : Exception(message);
+/// <summary> Raised for expected connector failures whose message is safe to surface in the UI. </summary>
+public sealed class LunaConnectionException : Exception
+{
+    public LunaConnectionException(string message) : base(message) { }
+}
 
 /// <summary>
-/// Owns Snacks' narrow Luna session. Passwords exist only in the connect call;
-/// only a remote-agent scoped refresh token is persisted. Access tokens remain
-/// in memory and are renewed before expiry.
+///     Owns Snacks' narrow Luna session. Passwords exist only in the connect call;
+///     only a remote-agent scoped refresh token is persisted. Access tokens remain
+///     in memory and are renewed before expiry.
 /// </summary>
-public sealed class LunaConnectionService(
-    ConfigFileService configFiles,
-    IntegrationService integrations,
-    LunaTaskExecutor executor,
-    IHttpClientFactory httpClientFactory)
+public sealed class LunaConnectionService
 {
+    /// <summary> Config file holding the scoped session; written via <see cref="ConfigFileService.SaveSecret"/>. </summary>
     private const string StateFile = "luna-connection.json";
+
+    /// <summary> The only Luna endpoint production Snacks connects to. </summary>
     public const string OfficialBaseUrl = "https://veryluna.com";
+
+    /// <summary> Env var permitting non-official Luna URLs for the project owner's local integration testing. </summary>
     public const string AllowCustomUrlEnvironmentVariable = "SNACKS_LUNA_ALLOW_CUSTOM_URL";
+
+    /// <summary> Env var permitting plain-HTTP Luna URLs beyond loopback (isolated test networks only). </summary>
     public const string AllowInsecureHttpEnvironmentVariable = "SNACKS_LUNA_ALLOW_INSECURE_HTTP";
+
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
         PropertyNameCaseInsensitive = true,
     };
 
+    private readonly ConfigFileService  _configFiles;
+    private readonly IntegrationService _integrations;
+    private readonly LunaTaskExecutor   _executor;
+    private readonly IHttpClientFactory _httpClientFactory;
+
+    // Serialization guards. _stateLock protects every mutable field below;
+    // _authGate ensures only one login/refresh credential exchange is in
+    // flight; _operationGate serializes connect/disconnect/poll so a
+    // disconnect can never interleave with a running task.
     private readonly object _stateLock = new();
     private readonly SemaphoreSlim _authGate = new(1, 1);
     private readonly SemaphoreSlim _operationGate = new(1, 1);
-    private LunaConnectionState _state = NormalizeState(configFiles.Load<LunaConnectionState>(StateFile));
+
+    // Only _state (the scoped session) is persisted. The access token and the
+    // poll/registration bookkeeping are in-memory only and reset on restart —
+    // the token deliberately never touches disk.
+    private LunaConnectionState _state;
     private string? _accessToken;
     private DateTime _accessExpiresAt;
     private DateTime? _lastSuccessfulPoll;
@@ -52,6 +84,31 @@ public sealed class LunaConnectionService(
     private string? _registeredCapabilitiesSignature;
     private int _pollIntervalSeconds = 5;
 
+    public LunaConnectionService(
+        ConfigFileService configFiles,
+        IntegrationService integrations,
+        LunaTaskExecutor executor,
+        IHttpClientFactory httpClientFactory)
+    {
+        ArgumentNullException.ThrowIfNull(configFiles);
+        ArgumentNullException.ThrowIfNull(integrations);
+        ArgumentNullException.ThrowIfNull(executor);
+        ArgumentNullException.ThrowIfNull(httpClientFactory);
+        _configFiles       = configFiles;
+        _integrations      = integrations;
+        _executor          = executor;
+        _httpClientFactory = httpClientFactory;
+        _state             = NormalizeState(_configFiles.Load<LunaConnectionState>(StateFile));
+    }
+
+    /******************************************************************
+     *  Status
+     ******************************************************************/
+
+    /// <summary>
+    ///     Returns a token-free snapshot of connection health, identity, and the
+    ///     currently advertised capabilities.
+    /// </summary>
     public LunaConnectionStatus GetStatus()
     {
         LunaConnectionState state;
@@ -64,8 +121,8 @@ public sealed class LunaConnectionService(
             lastError = _lastError;
         }
 
-        var config = integrations.GetConfig().Luna;
-        var capabilities = executor.GetCapabilities();
+        var config = _integrations.GetConfig().Luna;
+        var capabilities = _executor.GetCapabilities();
         var connected = !string.IsNullOrWhiteSpace(state.RefreshToken);
         var online = connected && lastPoll >= DateTime.UtcNow - TimeSpan.FromSeconds(Math.Max(20, _pollIntervalSeconds * 4));
         return new LunaConnectionStatus(
@@ -81,6 +138,20 @@ public sealed class LunaConnectionService(
             capabilities);
     }
 
+    /******************************************************************
+     *  Connect / Disconnect
+     ******************************************************************/
+
+    /// <summary>
+    ///     Exchanges the credentials for a daemon-scoped Luna session, persists only
+    ///     the scoped refresh token, and registers the connector. The password is
+    ///     sent to Luna once and never written to disk.
+    /// </summary>
+    /// <param name="baseUrl"> The Luna service root (the official URL outside local testing). </param>
+    /// <param name="email"> The Luna account email. </param>
+    /// <param name="password"> The Luna account password; used for this call only. </param>
+    /// <param name="deviceName"> Optional connector display name; defaults to the machine name. </param>
+    /// <param name="cancellationToken"> Cancels the sign-in and registration round-trips. </param>
     public async Task<LunaConnectionStatus> ConnectAsync(
         string baseUrl,
         string email,
@@ -99,6 +170,12 @@ public sealed class LunaConnectionService(
         }
     }
 
+    /// <summary>
+    ///     Connect body, run under <see cref="_operationGate"/>: logs in, persists
+    ///     the new scoped session, registers the connector (best-effort — retried by
+    ///     the background poll on failure), then revokes any previous session only
+    ///     after its replacement is safely stored.
+    /// </summary>
     private async Task<LunaConnectionStatus> ConnectCoreAsync(
         string baseUrl,
         string email,
@@ -186,6 +263,11 @@ public sealed class LunaConnectionService(
         return GetStatus();
     }
 
+    /// <summary>
+    ///     Marks the connector offline, revokes the scoped refresh token, and clears
+    ///     every persisted credential (including the on-disk backup).
+    /// </summary>
+    /// <param name="cancellationToken"> Cancels the offline/revocation round-trips. </param>
     public async Task DisconnectAsync(CancellationToken cancellationToken)
     {
         await _operationGate.WaitAsync(cancellationToken);
@@ -199,6 +281,12 @@ public sealed class LunaConnectionService(
         }
     }
 
+    /// <summary>
+    ///     Disconnect body, run under <see cref="_operationGate"/>: best-effort marks
+    ///     the connector offline in Luna, revokes the refresh token, then wipes all
+    ///     persisted and in-memory session state. Local cleanup proceeds even when
+    ///     the remote calls fail so revocation can never be blocked by an outage.
+    /// </summary>
     private async Task DisconnectCoreAsync(CancellationToken cancellationToken)
     {
         var registered = SnapshotState();
@@ -260,7 +348,13 @@ public sealed class LunaConnectionService(
         }
     }
 
-    /// <summary>Polls and, when present, executes exactly one leased task.</summary>
+    /******************************************************************
+     *  Task Polling
+     ******************************************************************/
+
+    /// <summary> Polls and, when present, executes exactly one leased task. </summary>
+    /// <param name="cancellationToken"> Cancels the lease poll and any in-flight task. </param>
+    /// <returns> <see langword="true"/> when a task was leased and completed; otherwise <see langword="false"/>. </returns>
     public async Task<bool> PollOnceAsync(CancellationToken cancellationToken)
     {
         await _operationGate.WaitAsync(cancellationToken);
@@ -274,9 +368,15 @@ public sealed class LunaConnectionService(
         }
     }
 
+    /// <summary>
+    ///     Poll body, run under <see cref="_operationGate"/>: verifies the configured
+    ///     URL still matches the connected one (a changed URL must never receive an
+    ///     existing token), ensures a fresh access token and registration, then leases,
+    ///     executes, and completes at most one task.
+    /// </summary>
     private async Task<bool> PollOnceCoreAsync(CancellationToken cancellationToken)
     {
-        var config = integrations.GetConfig().Luna;
+        var config = _integrations.GetConfig().Luna;
         var initialState = SnapshotState();
         if (!config.Enabled || string.IsNullOrWhiteSpace(initialState.RefreshToken)) return false;
 
@@ -312,7 +412,7 @@ public sealed class LunaConnectionService(
 
             var lease = await ReadJsonAsync<LeaseWireResponse>(response, cancellationToken)
                 ?? throw new LunaConnectionException("Luna returned an invalid task lease.");
-            var execution = await executor.ExecuteAsync(lease.Action, lease.Arguments, cancellationToken);
+            var execution = await _executor.ExecuteAsync(lease.Action, lease.Arguments, cancellationToken);
             await CompleteAsync(configuredBaseUrl, state.AgentId, lease, execution, cancellationToken);
             MarkPollSucceeded();
             return true;
@@ -328,8 +428,20 @@ public sealed class LunaConnectionService(
         }
     }
 
+    /// <summary> Server-suggested lease-poll cadence, clamped to a sane range. </summary>
     public int PollIntervalSeconds => Math.Clamp(_pollIntervalSeconds, 2, 30);
 
+    /******************************************************************
+     *  Base-URL Policy
+     ******************************************************************/
+
+    /// <summary>
+    ///     Validates and canonicalizes a Luna service URL. Anything other than the
+    ///     official URL is rejected unless the explicit local-testing overrides are
+    ///     set, and plain HTTP is limited to loopback/dev-override scenarios.
+    /// </summary>
+    /// <param name="baseUrl"> The Luna service URL to validate. </param>
+    /// <returns> The canonical base URL with any trailing slash removed. </returns>
     internal static string NormalizeBaseUrl(string baseUrl)
     {
         baseUrl = baseUrl?.Trim().TrimEnd('/') ?? string.Empty;
@@ -363,12 +475,23 @@ public sealed class LunaConnectionService(
         return baseUrl;
     }
 
+    /// <summary> Whether the local-testing override permitting custom Luna URLs is set. </summary>
     public static bool CustomUrlAllowed =>
         IsTruthy(Environment.GetEnvironmentVariable(AllowCustomUrlEnvironmentVariable));
 
+    /// <summary> Common truthy spellings accepted for the override env vars. </summary>
     private static bool IsTruthy(string? value) =>
         value?.Trim().ToLowerInvariant() is "1" or "true" or "yes" or "on";
 
+    /******************************************************************
+     *  Tokens & Registration
+     ******************************************************************/
+
+    /// <summary>
+    ///     Returns a valid in-memory access token, refreshing it via the persisted
+    ///     scoped refresh token when missing or within 30s of expiry. Double-checked
+    ///     under <see cref="_authGate"/> so concurrent callers trigger one refresh.
+    /// </summary>
     private async Task<string> EnsureAccessTokenAsync(CancellationToken cancellationToken)
     {
         lock (_stateLock)
@@ -431,12 +554,17 @@ public sealed class LunaConnectionService(
         }
     }
 
+    /// <summary>
+    ///     Re-registers the connector when it has no agent id yet, the advertised
+    ///     capability set changed, or the last registration is over a minute old —
+    ///     Luna treats periodic registration as the connector's presence heartbeat.
+    /// </summary>
     private async Task EnsureRegisteredAsync(
         string accessToken,
         string configuredBaseUrl,
         CancellationToken cancellationToken)
     {
-        var signature = string.Join('\n', executor.GetCapabilities().OrderBy(x => x, StringComparer.Ordinal));
+        var signature = string.Join('\n', _executor.GetCapabilities().OrderBy(x => x, StringComparer.Ordinal));
         var state = SnapshotState();
         if (!string.IsNullOrWhiteSpace(state.AgentId)
             && _lastRegistrationAt > DateTime.UtcNow - TimeSpan.FromMinutes(1)
@@ -446,6 +574,11 @@ public sealed class LunaConnectionService(
         await RegisterWithAccessAsync(accessToken, configuredBaseUrl, null, cancellationToken);
     }
 
+    /// <summary>
+    ///     Registers (or re-registers) this instance as a remote agent under its
+    ///     stable <see cref="LunaConnectionState.InstanceId"/> and records the
+    ///     agent id and poll cadence Luna assigns.
+    /// </summary>
     private async Task RegisterWithAccessAsync(
         string accessToken,
         string baseUrl,
@@ -454,7 +587,7 @@ public sealed class LunaConnectionService(
     {
         baseUrl = NormalizeBaseUrl(baseUrl);
         var state = SnapshotState();
-        var capabilities = executor.GetCapabilities().OrderBy(x => x, StringComparer.Ordinal).ToArray();
+        var capabilities = _executor.GetCapabilities().OrderBy(x => x, StringComparer.Ordinal).ToArray();
         using var http = CreateHttp(TimeSpan.FromSeconds(20));
         using var request = new HttpRequestMessage(HttpMethod.Post, Endpoint(baseUrl, "/api/v1/remote-agents/register"))
         {
@@ -493,6 +626,15 @@ public sealed class LunaConnectionService(
         }
     }
 
+    /******************************************************************
+     *  Task Completion & Session Cleanup
+     ******************************************************************/
+
+    /// <summary>
+    ///     Reports a task's sanitized result back to Luna under its lease token.
+    ///     A 409 means the lease expired and was re-issued elsewhere — logged and
+    ///     swallowed, since the retry will complete it.
+    /// </summary>
     private async Task CompleteAsync(
         string baseUrl,
         string agentId,
@@ -529,6 +671,7 @@ public sealed class LunaConnectionService(
             throw new LunaConnectionException($"Luna task completion returned HTTP {(int)response.StatusCode}.");
     }
 
+    /// <summary> Best-effort server-side revocation of a refresh token; failures are logged, never thrown. </summary>
     private async Task TryRevokeAsync(
         string? baseUrl,
         string refreshToken,
@@ -552,6 +695,7 @@ public sealed class LunaConnectionService(
         }
     }
 
+    /// <summary> Best-effort deregistration so Luna shows the connector offline immediately after disconnect. </summary>
     private async Task TryDisableAgentAsync(
         string baseUrl,
         string agentId,
@@ -570,6 +714,11 @@ public sealed class LunaConnectionService(
             Log.Warning("Marking the Luna connector offline returned HTTP {Status}", (int)response.StatusCode);
     }
 
+    /******************************************************************
+     *  State Persistence
+     ******************************************************************/
+
+    /// <summary> Records a successful Luna round-trip; drives the Online flag and clears the last error. </summary>
     private void MarkPollSucceeded()
     {
         lock (_stateLock)
@@ -579,6 +728,7 @@ public sealed class LunaConnectionService(
         }
     }
 
+    /// <summary> Drops the in-memory access token after a 401 so the next call refreshes it. </summary>
     private void InvalidateAccessToken()
     {
         lock (_stateLock)
@@ -588,15 +738,22 @@ public sealed class LunaConnectionService(
         }
     }
 
+    /// <summary> Returns a defensive copy of the session state for use outside <see cref="_stateLock"/>. </summary>
     private LunaConnectionState SnapshotState()
     {
         lock (_stateLock) return Clone(_state);
     }
 
+    /// <summary>
+    ///     Persists the session state (owner-only on Unix). Must be called while
+    ///     holding <see cref="_stateLock"/>.
+    /// </summary>
+    /// <param name="mirrorBackup"> Copies the fresh file over the <c>.bak</c> so both hold the new token. </param>
+    /// <param name="purgeBackup"> Deletes the <c>.bak</c> so no revoked token survives a disconnect. </param>
     private void SaveStateLocked(bool mirrorBackup = false, bool purgeBackup = false)
     {
-        configFiles.SaveSecret(StateFile, _state);
-        var path = configFiles.GetConfigPath(StateFile);
+        _configFiles.SaveSecret(StateFile, _state);
+        var path = _configFiles.GetConfigPath(StateFile);
         var backup = path + ".bak";
         if (purgeBackup)
         {
@@ -612,6 +769,7 @@ public sealed class LunaConnectionService(
         ProtectSecretFile(backup);
     }
 
+    /// <summary> Tightens a credential file to owner read/write on Unix; no-op on Windows or when the file is absent. </summary>
     private static void ProtectSecretFile(string path)
     {
         if (OperatingSystem.IsWindows() || !File.Exists(path)) return;
@@ -625,35 +783,7 @@ public sealed class LunaConnectionService(
         }
     }
 
-    private HttpClient CreateHttp(TimeSpan timeout)
-    {
-        var http = httpClientFactory.CreateClient("LunaConnector");
-        http.Timeout = timeout;
-        return http;
-    }
-
-    private static string Endpoint(string baseUrl, string path) =>
-        NormalizeBaseUrl(baseUrl) + "/" + path.TrimStart('/');
-
-    private static async Task<T?> ReadJsonAsync<T>(HttpResponseMessage response, CancellationToken cancellationToken) =>
-        await response.Content.ReadFromJsonAsync<T>(JsonOptions, cancellationToken);
-
-    private static string AuthenticationError(HttpResponseMessage response)
-    {
-        if (response.StatusCode == HttpStatusCode.Unauthorized) return "Luna rejected that email or password.";
-        if (response.StatusCode == HttpStatusCode.Forbidden) return "Luna requires account or email confirmation before connecting.";
-        if ((int)response.StatusCode == 429) return "The Luna account is temporarily locked. Try again later.";
-        return $"Luna login returned HTTP {(int)response.StatusCode}.";
-    }
-
-    private static string SafeError(Exception exception) => exception switch
-    {
-        LunaConnectionException => exception.Message,
-        HttpRequestException => "Snacks could not reach Luna.",
-        TaskCanceledException => "The Luna request timed out.",
-        _ => "The Luna connector encountered an unexpected error.",
-    };
-
+    /// <summary> Field-by-field copy so snapshots can't observe mid-update state. </summary>
     private static LunaConnectionState Clone(LunaConnectionState state) => new()
     {
         InstanceId = state.InstanceId,
@@ -665,6 +795,7 @@ public sealed class LunaConnectionService(
         ConnectedAt = state.ConnectedAt,
     };
 
+    /// <summary> Backfills the stable per-install InstanceId on first load or after a corrupted file. </summary>
     private static LunaConnectionState NormalizeState(LunaConnectionState state)
     {
         if (string.IsNullOrWhiteSpace(state.InstanceId))
@@ -672,6 +803,48 @@ public sealed class LunaConnectionService(
         return state;
     }
 
+    /******************************************************************
+     *  HTTP Helpers & Wire Models
+     ******************************************************************/
+
+    /// <summary> Creates the named "LunaConnector" client (redirects disabled in Program.cs) with a per-call timeout. </summary>
+    private HttpClient CreateHttp(TimeSpan timeout)
+    {
+        var http = _httpClientFactory.CreateClient("LunaConnector");
+        http.Timeout = timeout;
+        return http;
+    }
+
+    /// <summary> Joins a path onto a base URL, re-validating the URL so no request can bypass the policy. </summary>
+    private static string Endpoint(string baseUrl, string path) =>
+        NormalizeBaseUrl(baseUrl) + "/" + path.TrimStart('/');
+
+    /// <summary> Deserializes a Luna response body with the shared web-defaults options. </summary>
+    private static async Task<T?> ReadJsonAsync<T>(HttpResponseMessage response, CancellationToken cancellationToken) =>
+        await response.Content.ReadFromJsonAsync<T>(JsonOptions, cancellationToken);
+
+    /// <summary> Maps login failure statuses to user-facing messages that never echo server details. </summary>
+    private static string AuthenticationError(HttpResponseMessage response)
+    {
+        if (response.StatusCode == HttpStatusCode.Unauthorized) return "Luna rejected that email or password.";
+        if (response.StatusCode == HttpStatusCode.Forbidden) return "Luna requires account or email confirmation before connecting.";
+        if ((int)response.StatusCode == 429) return "The Luna account is temporarily locked. Try again later.";
+        return $"Luna login returned HTTP {(int)response.StatusCode}.";
+    }
+
+    /// <summary>
+    ///     Reduces an exception to a message safe to store and show in the UI —
+    ///     only <see cref="LunaConnectionException"/> messages pass through verbatim.
+    /// </summary>
+    private static string SafeError(Exception exception) => exception switch
+    {
+        LunaConnectionException => exception.Message,
+        HttpRequestException => "Snacks could not reach Luna.",
+        TaskCanceledException => "The Luna request timed out.",
+        _ => "The Luna connector encountered an unexpected error.",
+    };
+
+    /// <summary> Luna's login/refresh response: a short-lived access token plus the scoped refresh token. </summary>
     private sealed record AuthWireResponse(
         string AccessToken,
         int ExpiresIn,
@@ -679,8 +852,13 @@ public sealed class LunaConnectionService(
         DateTime RefreshExpiresAt,
         AuthUserWire? User);
 
+    /// <summary> Account subobject of <see cref="AuthWireResponse"/>. </summary>
     private sealed record AuthUserWire(string? Email);
+
+    /// <summary> Luna's registration response: the assigned agent id and suggested poll cadence. </summary>
     private sealed record RegisterWireResponse(string AgentId, int PollIntervalSeconds);
+
+    /// <summary> One leased task: the action to run, its arguments, and the lease token to complete under. </summary>
     private sealed record LeaseWireResponse(
         string Id,
         string LeaseToken,
@@ -690,10 +868,24 @@ public sealed class LunaConnectionService(
         int Attempt);
 }
 
-public sealed class LunaTaskWorker(
-    LunaConnectionService connection,
-    ILogger<LunaTaskWorker> logger) : BackgroundService
+/// <summary>
+///     Background loop that drives <see cref="LunaConnectionService.PollOnceAsync"/>:
+///     fast follow-up after a handled task, the server-suggested cadence when idle,
+///     and exponential backoff (capped at 60s) after failures.
+/// </summary>
+public sealed class LunaTaskWorker : BackgroundService
 {
+    private readonly LunaConnectionService _connection;
+    private readonly ILogger<LunaTaskWorker> _logger;
+
+    public LunaTaskWorker(LunaConnectionService connection, ILogger<LunaTaskWorker> logger)
+    {
+        ArgumentNullException.ThrowIfNull(connection);
+        ArgumentNullException.ThrowIfNull(logger);
+        _connection = connection;
+        _logger     = logger;
+    }
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var failures = 0;
@@ -702,11 +894,11 @@ public sealed class LunaTaskWorker(
             var delay = TimeSpan.FromSeconds(10);
             try
             {
-                var handledTask = await connection.PollOnceAsync(stoppingToken);
+                var handledTask = await _connection.PollOnceAsync(stoppingToken);
                 failures = 0;
                 delay = handledTask
                     ? TimeSpan.FromMilliseconds(100)
-                    : TimeSpan.FromSeconds(connection.PollIntervalSeconds);
+                    : TimeSpan.FromSeconds(_connection.PollIntervalSeconds);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
@@ -716,7 +908,7 @@ public sealed class LunaTaskWorker(
             {
                 failures++;
                 delay = TimeSpan.FromSeconds(Math.Min(60, Math.Pow(2, Math.Min(failures, 5))));
-                logger.LogWarning(ex, "Luna task polling failed; retrying in {DelaySeconds:n0}s", delay.TotalSeconds);
+                _logger.LogWarning(ex, "Luna task polling failed; retrying in {DelaySeconds:n0}s", delay.TotalSeconds);
             }
 
             await Task.Delay(delay, stoppingToken);

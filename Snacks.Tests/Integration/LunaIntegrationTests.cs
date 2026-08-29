@@ -8,10 +8,20 @@ using Xunit;
 
 namespace Snacks.Tests.Integration;
 
+/// <summary>
+///     Pins the Luna connector's privacy and security contract: library reads and
+///     adds must never leak local paths, file names, sizes, or API keys; adds must
+///     stay idempotent across lease retries; capabilities must follow each explicit
+///     permission toggle; custom/insecure URLs must require the explicit local-testing
+///     overrides; and connect/disconnect must persist only the scoped refresh token
+///     (owner-only on Unix) and remove it — backup included — on revocation.
+///     Mutates the process-wide SNACKS_WORK_DIR, so it must share the
+///     EnvConfigOverrides collection with every other suite that touches that env var.
+/// </summary>
 [Collection("EnvConfigOverrides")]
 public sealed class LunaIntegrationTests : IDisposable
 {
-    private readonly string _workDir;
+    private readonly string  _workDir;
     private readonly string? _priorWorkDir;
     private readonly string? _priorCustomUrl;
 
@@ -279,6 +289,10 @@ public sealed class LunaIntegrationTests : IDisposable
         seenPaths.Should().Contain(path => path.EndsWith("/auth/logout"));
     }
 
+    /******************************************************************
+     *  Fixtures & HTTP stubs
+     ******************************************************************/
+
     private (IntegrationService Integrations, LunaTaskExecutor Executor, StubFactory Factory) Build(
         StubHandler handler,
         IntegrationConfig config)
@@ -321,8 +335,10 @@ public sealed class LunaIntegrationTests : IDisposable
         }
     }
 
-    private sealed class StubFactory(StubHandler handler) : IHttpClientFactory
+    private sealed class StubFactory : IHttpClientFactory
     {
-        public HttpClient CreateClient(string name) => new(handler, disposeHandler: false);
+        private readonly StubHandler _handler;
+        public StubFactory(StubHandler handler) => _handler = handler;
+        public HttpClient CreateClient(string name) => new(_handler, disposeHandler: false);
     }
 }

@@ -81,10 +81,13 @@ public sealed class ConfigFileService
         => SaveCore(filename, value, secret: false);
 
     /// <summary>
-    /// Atomic save for a credential-bearing config. On Unix the temporary,
-    /// primary, and backup files are owner-readable/writable from the instant
-    /// they are created, rather than being tightened only after the write.
+    ///     Atomic save for a credential-bearing config. On Unix the temporary,
+    ///     primary, and backup files are owner-readable/writable from the instant
+    ///     they are created, rather than being tightened only after the write.
     /// </summary>
+    /// <typeparam name="T"> The config model type. </typeparam>
+    /// <param name="filename"> The config file name to write. </param>
+    /// <param name="value"> The config value to persist. </param>
     public void SaveSecret<T>(string filename, T value)
         => SaveCore(filename, value, secret: true);
 

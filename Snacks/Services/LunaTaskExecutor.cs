@@ -6,15 +6,22 @@ using Snacks.Models;
 
 namespace Snacks.Services;
 
+/// <summary> Sanitized outcome of one remote task, in the shape Luna's completion API expects. </summary>
+/// <param name="Succeeded"> Whether the local operation completed. </param>
+/// <param name="Result"> Path-free result payload returned to Luna on success. </param>
+/// <param name="ErrorCode"> Stable machine-readable failure code (e.g. <c>configuration_required</c>). </param>
+/// <param name="ErrorMessage"> Sanitized human-readable failure description. </param>
 public sealed record LunaTaskExecutionResult(
     bool Succeeded,
     JsonElement? Result = null,
     string? ErrorCode = null,
     string? ErrorMessage = null)
 {
+    /// <summary> Wraps a sanitized payload as a success result. </summary>
     public static LunaTaskExecutionResult Ok(object value) =>
         new(true, JsonSerializer.SerializeToElement(value, JsonOptions));
 
+    /// <summary> Builds a failure result from a stable code and a sanitized message. </summary>
     public static LunaTaskExecutionResult Fail(string code, string message) =>
         new(false, null, code, message);
 
@@ -22,21 +29,41 @@ public sealed record LunaTaskExecutionResult(
 }
 
 /// <summary>
-/// Executes the deliberately small remote-task allow-list. Task arguments can
-/// select ids and ordinary options, but can never supply a URL, API key, path,
-/// HTTP verb, or raw request body.
+///     Executes the deliberately small remote-task allow-list. Task arguments can
+///     select ids and ordinary options, but can never supply a URL, API key, path,
+///     HTTP verb, or raw request body.
 /// </summary>
-public sealed class LunaTaskExecutor(
-    IntegrationService integrations,
-    IHttpClientFactory httpClientFactory)
+public sealed class LunaTaskExecutor
 {
-    private const int MaxLibraryPageSize = 200;
-    private const int MaxSearchResults = 20;
+    // Hard result bounds. Page size and search count cap what a single task can
+    // exfiltrate; the byte cap keeps a huge Arr library from being buffered into
+    // memory wholesale for one remote request.
+    private const int MaxLibraryPageSize  = 200;
+    private const int MaxSearchResults    = 20;
     private const int MaxArrResponseBytes = 16 * 1024 * 1024;
 
+    private readonly IntegrationService _integrations;
+    private readonly IHttpClientFactory _httpClientFactory;
+
+    public LunaTaskExecutor(IntegrationService integrations, IHttpClientFactory httpClientFactory)
+    {
+        ArgumentNullException.ThrowIfNull(integrations);
+        ArgumentNullException.ThrowIfNull(httpClientFactory);
+        _integrations      = integrations;
+        _httpClientFactory = httpClientFactory;
+    }
+
+    /******************************************************************
+     *  Capabilities & Dispatch
+     ******************************************************************/
+
+    /// <summary>
+    ///     Returns the action names currently advertisable to Luna, derived from the
+    ///     live Arr configuration and the per-permission Luna toggles.
+    /// </summary>
     public IReadOnlyList<string> GetCapabilities()
     {
-        var config = integrations.GetConfig();
+        var config = _integrations.GetConfig();
         if (!config.Luna.Enabled) return Array.Empty<string>();
 
         var capabilities = new List<string>();
@@ -45,6 +72,15 @@ public sealed class LunaTaskExecutor(
         return capabilities;
     }
 
+    /// <summary>
+    ///     Runs one leased task against the local Arr APIs and returns a sanitized
+    ///     result. The live capability list is rechecked first, so disabling a
+    ///     permission blocks the action immediately. Never throws for task-level
+    ///     failures — those map to typed error codes safe to return to Luna.
+    /// </summary>
+    /// <param name="action"> The capability name Luna leased (e.g. <c>radarr.movie.add</c>). </param>
+    /// <param name="arguments"> The task's JSON arguments; ids and bounded options only. </param>
+    /// <param name="cancellationToken"> Cancels the local Arr requests. </param>
     public async Task<LunaTaskExecutionResult> ExecuteAsync(
         string action,
         JsonElement arguments,
@@ -56,7 +92,7 @@ public sealed class LunaTaskExecutor(
                 "capability_disabled",
                 $"'{action}' is not enabled in Snacks.");
 
-        var config = integrations.GetConfig();
+        var config = _integrations.GetConfig();
         try
         {
             return action switch
@@ -94,6 +130,14 @@ public sealed class LunaTaskExecutor(
         }
     }
 
+    /******************************************************************
+     *  Library Reads & Catalog Search
+     ******************************************************************/
+
+    /// <summary>
+    ///     Returns one sanitized page of the movie/series library with offset-based
+    ///     continuation, plus a privacy note describing what was withheld.
+    /// </summary>
     private async Task<LunaTaskExecutionResult> ReadLibraryAsync(
         ArrIntegration arr,
         bool isSeries,
@@ -126,6 +170,7 @@ public sealed class LunaTaskExecutor(
         });
     }
 
+    /// <summary> Runs a bounded Arr catalog lookup and returns sanitized candidates with overviews. </summary>
     private async Task<LunaTaskExecutionResult> SearchCatalogAsync(
         ArrIntegration arr,
         bool isSeries,
@@ -150,6 +195,15 @@ public sealed class LunaTaskExecutor(
         return LunaTaskExecutionResult.Ok(new { items = results, returned = results.Length });
     }
 
+    /******************************************************************
+     *  Idempotent Adds
+     ******************************************************************/
+
+    /// <summary>
+    ///     Adds a movie to Radarr by TMDb id. Idempotent across lease retries: an
+    ///     existing match returns <c>alreadyExists</c> both before the add and after
+    ///     a failed post (in case Radarr committed but the completion was lost).
+    /// </summary>
     private async Task<LunaTaskExecutionResult> AddMovieAsync(
         ArrIntegration arr,
         JsonElement arguments,
@@ -204,6 +258,10 @@ public sealed class LunaTaskExecutor(
         });
     }
 
+    /// <summary>
+    ///     Adds a series to Sonarr by TVDb id with a validated monitor mode. Same
+    ///     idempotency contract as <see cref="AddMovieAsync"/>.
+    /// </summary>
     private async Task<LunaTaskExecutionResult> AddSeriesAsync(
         ArrIntegration arr,
         JsonElement arguments,
@@ -273,6 +331,11 @@ public sealed class LunaTaskExecutor(
         });
     }
 
+    /// <summary>
+    ///     Chooses the root folder and quality profile for an add — the requested id
+    ///     when it exists locally, otherwise the first accessible entry — without ever
+    ///     letting the task supply a path.
+    /// </summary>
     private async Task<AddSelection> ResolveAddSelectionAsync(
         ArrIntegration arr,
         JsonElement arguments,
@@ -312,6 +375,7 @@ public sealed class LunaTaskExecutor(
             null);
     }
 
+    /// <summary> Strips lookup-only fields from the Arr payload and applies the locally resolved root/profile. </summary>
     private static void PrepareAddPayload(JsonObject payload, AddSelection selection, JsonElement arguments)
     {
         payload.Remove("id");
@@ -322,6 +386,7 @@ public sealed class LunaTaskExecutor(
         payload["qualityProfileId"] = selection.QualityProfileId;
     }
 
+    /// <summary> Looks up an existing library entry by stable external id; null when absent or on any failure. </summary>
     private async Task<JsonElement?> FindExistingAsync(
         ArrIntegration arr,
         string endpoint,
@@ -334,6 +399,15 @@ public sealed class LunaTaskExecutor(
         return first.ValueKind == JsonValueKind.Object ? first.Clone() : null;
     }
 
+    /******************************************************************
+     *  Local Arr HTTP
+     ******************************************************************/
+
+    /// <summary>
+    ///     Sends one authenticated request to the local Arr API with a bounded
+    ///     response read. A status code of 0 in the result means the integration
+    ///     itself is missing/disabled rather than an HTTP failure.
+    /// </summary>
     private async Task<ArrResponse> SendArrAsync(
         ArrIntegration arr,
         HttpMethod method,
@@ -344,7 +418,7 @@ public sealed class LunaTaskExecutor(
         if (!arr.Enabled || string.IsNullOrWhiteSpace(arr.BaseUrl) || string.IsNullOrWhiteSpace(arr.ApiKey))
             return new ArrResponse(false, null, 0);
 
-        var http = httpClientFactory.CreateClient();
+        var http = _httpClientFactory.CreateClient();
         http.Timeout = TimeSpan.FromSeconds(20);
         using var request = new HttpRequestMessage(method, arr.BaseUrl.TrimEnd('/') + endpoint);
         request.Headers.TryAddWithoutValidation("X-Api-Key", arr.ApiKey);
@@ -369,6 +443,7 @@ public sealed class LunaTaskExecutor(
         return new ArrResponse(true, document.RootElement.Clone(), (int)response.StatusCode);
     }
 
+    /// <summary> Streams a response body up to <paramref name="maxBytes"/>, throwing instead of buffering past the cap. </summary>
     private static async Task<byte[]> ReadBoundedAsync(
         HttpContent content,
         int maxBytes,
@@ -388,6 +463,7 @@ public sealed class LunaTaskExecutor(
         return output.ToArray();
     }
 
+    /// <summary> Maps a failed Arr response to a typed error that names the service but withholds paths and payloads. </summary>
     private static LunaTaskExecutionResult ArrFailure(ArrResponse response, string service, string operation)
     {
         if (response.StatusCode == 0)
@@ -397,6 +473,14 @@ public sealed class LunaTaskExecutor(
             $"{service} could not {operation} (HTTP {response.StatusCode}). Local paths and response details were withheld.");
     }
 
+    /******************************************************************
+     *  Privacy Sanitizers & JSON Helpers
+     ******************************************************************/
+
+    /// <summary>
+    ///     Rebuilds a movie as an explicit allow-list of public metadata — anything
+    ///     not named here (paths, files, sizes) can never leak by omission.
+    /// </summary>
     private static object SanitizeMovie(JsonElement movie, bool includeOverview)
     {
         var result = new Dictionary<string, object?>
@@ -420,6 +504,7 @@ public sealed class LunaTaskExecutor(
         return result;
     }
 
+    /// <summary> Series counterpart of <see cref="SanitizeMovie"/>, adding season/episode counts from statistics. </summary>
     private static object SanitizeSeries(JsonElement series, bool includeOverview)
     {
         var statistics = TryGetObject(series, "statistics");
@@ -447,6 +532,7 @@ public sealed class LunaTaskExecutor(
         return result;
     }
 
+    /// <summary> Flattens known rating sources to plain numbers, accepting both bare and {value} shapes. </summary>
     private static IReadOnlyDictionary<string, double> SanitizeRatings(JsonElement item)
     {
         var result = new Dictionary<string, double>(StringComparer.Ordinal);
@@ -465,6 +551,11 @@ public sealed class LunaTaskExecutor(
         return result;
     }
 
+    /// <summary>
+    ///     Picks the entry matching <paramref name="requestedId"/> (or the first
+    ///     entry when the task supplied none), optionally skipping roots the Arr
+    ///     instance reports as inaccessible.
+    /// </summary>
     private static JsonElement? SelectById(JsonElement array, int? requestedId, bool requireAccessible)
     {
         foreach (var item in array.EnumerateArray())
@@ -477,6 +568,7 @@ public sealed class LunaTaskExecutor(
         return null;
     }
 
+    /// <summary> Adds the capability names one configured Arr instance earns under the current Luna permissions. </summary>
     private static void AddArrCapabilities(
         ICollection<string> capabilities,
         string prefix,
@@ -489,6 +581,9 @@ public sealed class LunaTaskExecutor(
         if (luna.AllowLibraryChanges)
             capabilities.Add(prefix == "radarr" ? "radarr.movie.add" : "sonarr.series.add");
     }
+
+    // Null-safe JSON property getters. Arr payloads vary by version, so every
+    // read tolerates a missing property or unexpected value kind.
 
     private static JsonElement? TryGetObject(JsonElement item, string name) =>
         item.ValueKind == JsonValueKind.Object
@@ -531,11 +626,14 @@ public sealed class LunaTaskExecutor(
                 .ToArray()
             : Array.Empty<string>();
 
+    /// <summary> Caps free-text fields (overviews) so a result stays a bounded payload. </summary>
     private static string? Truncate(string? value, int max) =>
         string.IsNullOrWhiteSpace(value) ? null : value.Length <= max ? value : value[..max];
 
+    /// <summary> Outcome of one local Arr call; StatusCode 0 means the integration is missing/disabled. </summary>
     private sealed record ArrResponse(bool Succeeded, JsonElement? Body, int StatusCode);
 
+    /// <summary> Locally resolved root folder and quality profile for an add, or the typed error to return. </summary>
     private sealed record AddSelection(
         bool Succeeded,
         string? RootFolderPath,
@@ -543,6 +641,7 @@ public sealed class LunaTaskExecutor(
         string? QualityProfileName,
         LunaTaskExecutionResult? Error)
     {
+        /// <summary> Wraps a typed error as a failed selection. </summary>
         public static AddSelection Fail(LunaTaskExecutionResult error) =>
             new(false, null, 0, null, error);
     }
