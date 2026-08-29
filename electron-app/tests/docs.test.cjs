@@ -16,12 +16,31 @@ test('documentation fragment links resolve and inline scripts parse', async () =
     assert.ok(ids.has('quick-start'));
     assert.ok(ids.has('processing-details'));
     assert.ok(ids.has('hardware-containers'));
+    assert.ok(ids.has('luna-integration'));
     assert.ok(ids.has('api-basics'));
     assert.ok(ids.has('api-realtime'));
 
     const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(match => match[1]);
     assert.equal(scripts.length, 1);
     scripts.forEach(script => new Function(script));
+});
+
+test('Luna integration guide covers setup, privacy, and safe example prompts', async () => {
+    const html = await readFile(docsPath, 'utf8');
+
+    for (const detail of [
+        'Do not add anything yet',
+        'wait for my approval before adding anything',
+        'Write prompts affect your real Arr library',
+        'The same prompts work in Luna voice mode',
+        'Use the official VeryLuna service',
+        'https://veryluna.com',
+        'Completed task rows are hard-deleted as soon as Luna consumes the result',
+    ]) {
+        assert.ok(html.includes(detail), `Luna guide is missing: ${detail}`);
+    }
+
+    assert.ok(!html.includes('your-luna.example.com'), 'Snacks must not advertise arbitrary production Luna endpoints');
 });
 
 test('removed README operational details remain in maintained documentation', async () => {

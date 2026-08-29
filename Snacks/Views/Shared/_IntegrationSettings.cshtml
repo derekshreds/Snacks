@@ -45,6 +45,60 @@
         </div>
     </div>
 
+    <div class="col-12">
+        <div class="encoder-panel rounded">
+            <div class="d-flex flex-wrap justify-content-between align-items-start gap-2 mb-3">
+                <div>
+                    <h6 class="fw-bold mb-1"><i class="fas fa-moon me-2 text-primary"></i>Luna</h6>
+                    <div class="small text-muted">Official VeryLuna integration — outbound only, with no inbound ports required.</div>
+                </div>
+                <span class="badge text-bg-secondary" id="lunaConnectionStatus">Not connected</span>
+            </div>
+
+            <div class="form-check form-switch mb-3">
+                <input class="form-check-input" type="checkbox" id="lunaEnabled">
+                <label class="form-check-label" for="lunaEnabled">Enable Luna task polling</label>
+            </div>
+
+            <div class="row g-2">
+                <div class="col-lg-5">
+                    <label class="form-label">Luna service</label>
+                    <div class="form-control-plaintext py-1">
+                        <a class="luna-service-link" id="lunaServiceEndpoint" href="https://veryluna.com" target="_blank" rel="noopener noreferrer">https://veryluna.com</a>
+                    </div>
+                    <div class="form-text" id="lunaBaseUrlHelp">Sign in below to connect Snacks with your VeryLuna account.</div>
+                </div>
+                <div class="col-lg-3">
+                    <label class="form-label" for="lunaEmail">Email</label>
+                    <input type="email" autocomplete="username" class="form-control form-control-sm" id="lunaEmail">
+                </div>
+                <div class="col-lg-4">
+                    <label class="form-label" for="lunaPassword">Password</label>
+                    <input type="password" autocomplete="current-password" class="form-control form-control-sm" id="lunaPassword">
+                </div>
+            </div>
+
+            <div class="row g-2 mt-2">
+                <div class="col-md-6 form-check">
+                    <input class="form-check-input" type="checkbox" id="lunaAllowLibraryReads">
+                    <label class="form-check-label" for="lunaAllowLibraryReads">Share privacy-filtered library metadata</label>
+                    <div class="form-text">Titles, years, genres, and public IDs may be sent to Luna and its AI provider when needed. Paths, file names, sizes, URLs, and API keys stay local.</div>
+                </div>
+                <div class="col-md-6 form-check">
+                    <input class="form-check-input" type="checkbox" id="lunaAllowLibraryChanges">
+                    <label class="form-check-label" for="lunaAllowLibraryChanges">Allow Luna to add movies and series</label>
+                    <div class="form-text">Only typed, idempotent Sonarr/Radarr add actions are accepted; arbitrary HTTP and commands are never allowed.</div>
+                </div>
+            </div>
+
+            <div class="d-flex flex-wrap align-items-center gap-2 mt-3">
+                <button class="btn btn-sm btn-primary" id="connectLuna"><i class="fas fa-link me-1"></i>Connect Luna</button>
+                <button class="btn btn-sm btn-outline-danger" id="disconnectLuna"><i class="fas fa-unlink me-1"></i>Disconnect</button>
+                <span class="small text-muted" id="lunaConnectionDetail"></span>
+            </div>
+        </div>
+    </div>
+
     <div class="col-md-6">
         <div class="encoder-panel rounded">
             <h6 class="fw-bold mb-3"><i class="fas fa-play-circle me-2" style="color:#e5a00d"></i>Plex</h6>

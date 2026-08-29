@@ -21,11 +21,12 @@
  * Issues a GET and returns the parsed JSON body.
  *
  * @param {string} url
+ * @param {RequestInit} [options]
  * @returns {Promise<any>}
  * @throws {Error} When the response status is not OK.
  */
-async function getJson(url) {
-    const resp = await fetch(url);
+async function getJson(url, options) {
+    const resp = await fetch(url, options);
     if (!resp.ok) throw new Error(`GET ${url} → ${resp.status}`);
     return resp.json();
 }
@@ -387,6 +388,27 @@ export const integrationsApi = {
 
     /** Verifies a TMDb API key reaches the service. */
     testTmdb:     (apiKey)           => postJson('/api/integrations/test/tmdb',     { apiKey }),
+
+    /** Returns only safe connection metadata; connector tokens never cross this boundary. */
+    getLunaStatus: () => getJson('/api/integrations/luna/status', { cache: 'no-store' }),
+
+    /** Exchanges credentials locally for a daemon-scoped Luna session. */
+    connectLuna: async (baseUrl, email, password) => {
+        const url  = '/api/integrations/luna/connect';
+        const resp = await fetch(url, {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body:    JSON.stringify({ baseUrl, email, password }),
+        });
+        if (!resp.ok) {
+            const body = await resp.json().catch(() => ({}));
+            throw new Error(body.error || `POST ${url} → ${resp.status}`);
+        }
+        return resp.json();
+    },
+
+    /** Revokes and removes the daemon-scoped Luna session. */
+    disconnectLuna: () => postJson('/api/integrations/luna/disconnect'),
 };
 
 

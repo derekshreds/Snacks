@@ -59,3 +59,49 @@ test('library paths are URL encoded before browsing', async () => {
         requestedUrl,
         '/api/library/subdirectories?directoryPath=%2Fmedia%2FTV%20%26%20Movies');
 });
+
+test('Luna status is never cached and capability labels are pluralized correctly', async () => {
+    const requests = [];
+    global.fetch = async (url, options = {}) => {
+        requests.push({ url, options });
+        return { ok: true, json: async () => ({ connected: true, online: true, capabilities: [] }) };
+    };
+
+    const { integrationsApi } = await importBrowserModule('Snacks/wwwroot/js/api.js');
+    await integrationsApi.getLunaStatus();
+    assert.equal(requests[0].url, '/api/integrations/luna/status');
+    assert.equal(requests[0].options.cache, 'no-store');
+
+    const { formatLunaCapabilitySummary } = await importBrowserModule(
+        'Snacks/wwwroot/js/settings/luna-status.js');
+    assert.equal(formatLunaCapabilitySummary([]), '0 capabilities enabled');
+    assert.equal(formatLunaCapabilitySummary(['radarr.catalog.search']), '1 capability enabled');
+    assert.equal(
+        formatLunaCapabilitySummary(['radarr.catalog.search', 'radarr.library.read']),
+        '2 capabilities enabled');
+});
+
+test('the public Luna settings UI is pinned to the official endpoint', async () => {
+    const [model, view, panel, styles] = await Promise.all([
+        readFile(path.join(repoRoot, 'Snacks/Models/IntegrationConfig.cs'), 'utf8'),
+        readFile(path.join(repoRoot, 'Snacks/Views/Shared/_IntegrationSettings.cshtml'), 'utf8'),
+        readFile(path.join(repoRoot, 'Snacks/wwwroot/js/settings/panels/integrations-panel.js'), 'utf8'),
+        readFile(path.join(repoRoot, 'Snacks/wwwroot/css/site.css'), 'utf8'),
+    ]);
+
+    assert.ok(model.includes('https://veryluna.com'));
+    assert.ok(view.includes('Official VeryLuna integration'));
+    assert.ok(view.includes('id="lunaServiceEndpoint"'));
+    assert.ok(view.includes('href="https://veryluna.com"'));
+    assert.ok(view.includes('class="luna-service-link"'));
+    assert.ok(view.includes('rel="noopener noreferrer"'));
+    assert.ok(view.includes('Sign in below to connect Snacks with your VeryLuna account.'));
+    assert.ok(!view.includes('not configurable'));
+    assert.ok(!view.includes('id="lunaBaseUrl"'));
+    assert.ok(panel.includes('_lunaCustomUrlAllowed'));
+    assert.ok(panel.includes('lunaServiceEndpoint.href = officialLunaUrl'));
+    assert.ok(!panel.includes('Private local-testing endpoint supplied outside the Snacks UI'));
+    assert.ok(!panel.includes("val('lunaBaseUrl')"));
+    assert.ok(styles.includes('.luna-service-link:visited'));
+    assert.ok(styles.includes('color: var(--primary)'));
+});

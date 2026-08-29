@@ -37,6 +37,8 @@ public sealed class IntegrationsController : ControllerBase
         node["_envLocked"] = new System.Text.Json.Nodes.JsonArray(
             EnvConfigOverrides.LockedPaths(EnvConfigOverrides.IntegrationsPrefix, typeof(IntegrationConfig))
                 .Select(p => (System.Text.Json.Nodes.JsonNode)p).ToArray());
+        node["_lunaOfficialBaseUrl"] = LunaConnectionService.OfficialBaseUrl;
+        node["_lunaCustomUrlAllowed"] = LunaConnectionService.CustomUrlAllowed;
         return new JsonResult(node);
     }
 

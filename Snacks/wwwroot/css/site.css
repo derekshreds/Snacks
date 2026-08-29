@@ -139,6 +139,26 @@ footer a.text-muted:hover {
     text-shadow: 0 0 8px var(--primary-glow);
 }
 
+.luna-service-link,
+.luna-service-link:visited {
+    color: var(--primary);
+    font-weight: 600;
+    text-decoration-color: color-mix(in srgb, var(--primary) 55%, transparent);
+    text-underline-offset: 0.18em;
+}
+
+.luna-service-link:hover {
+    color: var(--primary-hover);
+    text-shadow: 0 0 8px var(--primary-glow);
+}
+
+.luna-service-link:focus-visible {
+    color: var(--primary-hover);
+    border-radius: 2px;
+    outline: 2px solid var(--primary);
+    outline-offset: 3px;
+}
+
 /* ===========================
    Cards
    =========================== */
