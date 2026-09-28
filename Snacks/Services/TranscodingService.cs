@@ -4121,10 +4121,15 @@ public class TranscodingService
         bool useQsv = !videoCopy && encoder.Contains("qsv");
         bool canHwDecode = !forceSwDecode && CanVaapiDecode(workItem.Probe);
         if ((useVaapi || useQsv) && hasFilter) canHwDecode = false;
-        if ((useVaapi || useQsv) && !canHwDecode && (forceSwDecode || hasFilter))
+        bool profileBlocksHwDecode = !IsHwDecodableVideoProfile(
+            workItem.Probe?.Streams?.FirstOrDefault(s => s.CodecType == "video"));
+        if ((useVaapi || useQsv) && !canHwDecode && (forceSwDecode || hasFilter || profileBlocksHwDecode))
         {
+            string why = profileBlocksHwDecode && !forceSwDecode && !hasFilter
+                ? "source profile has no hardware decoder"
+                : "hwaccel decode disabled";
             await LogAsync(workItem.Id,
-                $"Using software decode + {(useQsv ? "QSV" : "VAAPI")} encode (hwaccel decode disabled)");
+                $"Using software decode + {(useQsv ? "QSV" : "VAAPI")} encode ({why})");
         }
 
         string initFlags = useVaapi || useQsv
@@ -4143,10 +4148,15 @@ public class TranscodingService
         // hwdownload, so NVDEC surfaces can't feed them ("Impossible to convert
         // between the formats") — decode in software when a filter is active,
         // mirroring the VAAPI/QSV gate above.
+        // Same profile gate as the VAAPI/QSV path: h264_cuvid has no High 10 / 4:2:2 /
+        // 4:4:4 support, so leave the decoder unset and let -hwaccel cuda's auto-attach
+        // fall back to the software h264 decoder.
         if (isNvidia && !videoCopy && !forceSwDecode && !hasFilter && !encoder.StartsWith("lib"))
         {
-            var srcCodec = workItem.Probe?.Streams?.FirstOrDefault(s => s.CodecType == "video")?.CodecName;
-            string cuvid = GetNvidiaInputDecoder(srcCodec);
+            var srcStream = workItem.Probe?.Streams?.FirstOrDefault(s => s.CodecType == "video");
+            string cuvid = IsHwDecodableVideoProfile(srcStream)
+                ? GetNvidiaInputDecoder(srcStream?.CodecName)
+                : "";
             if (!string.IsNullOrEmpty(cuvid))
                 initFlags = $"{initFlags} {cuvid}";
         }
@@ -6504,11 +6514,52 @@ public class TranscodingService
 
     internal static bool CanVaapiDecode(ProbeResult? probe, HashSet<string>? detectedDecodeCodecs)
     {
-        var codec = probe?.Streams?.FirstOrDefault(s => s.CodecType == "video")?.CodecName;
+        var stream = probe?.Streams?.FirstOrDefault(s => s.CodecType == "video");
+        var codec = stream?.CodecName;
         if (codec is null) return false;
+        // Codec support alone isn't enough — the codec's profile has to be one the
+        // decode engine handles (see IsHwDecodableVideoProfile). vainfo lists
+        // codec-level profiles, so the detected set can't answer this either.
+        if (!IsHwDecodableVideoProfile(stream)) return false;
         if (detectedDecodeCodecs != null) return detectedDecodeCodecs.Contains(codec);
         // J6412 (Elkhart Lake) VAAPI decode: h264, hevc, mpeg2, vp8, vp9, jpeg
         return codec is "h264" or "hevc" or "mpeg2video" or "vp8" or "vp9" or "mjpeg";
+    }
+
+    /// <summary>
+    ///     Returns <c>false</c> when the video stream's codec profile is one no consumer
+    ///     GPU decodes in hardware, regardless of vendor. Today that's H.264 outside
+    ///     8-bit 4:2:0: High 10 (yuv420p10le), High 4:2:2 and High 4:4:4 have no
+    ///     fixed-function decoder on Intel, AMD, or NVIDIA. Forcing the hwaccel path on
+    ///     such a source fails every packet (QSV: "Error querying IO surface:
+    ///     unsupported"; VAAPI: "Failed to get HW config"; cuvid: "Codec not
+    ///     supported") — the job never produces a frame, so route it to software
+    ///     decode up front instead. Unknown profile / pix_fmt is treated as decodable.
+    /// </summary>
+    internal static bool IsHwDecodableVideoProfile(Models.Stream? stream)
+    {
+        if (stream is null) return true;
+        if (!string.Equals(stream.CodecName, "h264", StringComparison.OrdinalIgnoreCase)) return true;
+
+        var profile = stream.Profile ?? "";
+        if (profile.Contains("10", StringComparison.Ordinal)
+            || profile.Contains("4:2:2", StringComparison.Ordinal)
+            || profile.Contains("4:4:4", StringComparison.Ordinal))
+            return false;
+
+        var pixFmt = stream.PixFmt ?? "";
+        // yuv420p is 8-bit 4:2:0; anything carrying a bit-depth suffix or a non-4:2:0
+        // sampling (yuv420p10le, yuv422p, yuv444p10le, ...) needs the High 10 / 4:2:2 /
+        // 4:4:4 profile even when ffprobe leaves the profile string blank.
+        if (pixFmt.Contains("10", StringComparison.Ordinal)
+            || pixFmt.Contains("12", StringComparison.Ordinal)
+            || pixFmt.Contains("14", StringComparison.Ordinal)
+            || pixFmt.Contains("16", StringComparison.Ordinal)
+            || pixFmt.Contains("422", StringComparison.Ordinal)
+            || pixFmt.Contains("444", StringComparison.Ordinal))
+            return false;
+
+        return true;
     }
 
     /// <summary>
@@ -7486,12 +7537,23 @@ public class TranscodingService
         }
 
         // Classify the failure once — order of the retry tiers below is driven by this.
-        bool isEncoderFeatureError =
+        // Decoder-side failures (hwaccel decoder rejected the stream: QSV "Error querying
+        // IO surface", the per-packet "Error submitting packet to decoder", cuvid "Codec
+        // not supported") must not be mistaken for encoder feature errors — the tail of
+        // that stderr also says "Function not implemented" / "not supported", and
+        // re-running with conservative *encoder* flags would replay the same decode.
+        bool isDecoderError =
+            reason.Contains("Error querying IO surface", StringComparison.OrdinalIgnoreCase) ||
+            reason.Contains("Error submitting packet to decoder", StringComparison.OrdinalIgnoreCase) ||
+            reason.Contains("Error while decoding", StringComparison.OrdinalIgnoreCase) ||
+            reason.Contains("[dec:", StringComparison.OrdinalIgnoreCase);
+
+        bool isEncoderFeatureError = !isDecoderError && (
             reason.Contains("not supported", StringComparison.OrdinalIgnoreCase) ||
             reason.Contains("Provided device doesn't support", StringComparison.OrdinalIgnoreCase) ||
             reason.Contains("Error while opening encoder", StringComparison.OrdinalIgnoreCase) ||
             reason.Contains("Invalid FrameType", StringComparison.OrdinalIgnoreCase) ||
-            reason.Contains("Function not implemented", StringComparison.OrdinalIgnoreCase);
+            reason.Contains("Function not implemented", StringComparison.OrdinalIgnoreCase));
 
         bool isHwEncoder = !options.HardwareAcceleration.Equals("none", StringComparison.OrdinalIgnoreCase);
 
@@ -7524,7 +7586,8 @@ public class TranscodingService
         // This tier runs BEFORE the subtitle tiers: a decode/filter format error has
         // nothing to do with sub streams, and stripping subs first meant the eventual
         // sw-decode success shipped without subtitles for no reason.
-        bool isHwaccelError = reason.Contains("hwaccel", StringComparison.OrdinalIgnoreCase)
+        bool isHwaccelError = isDecoderError
+            || reason.Contains("hwaccel", StringComparison.OrdinalIgnoreCase)
             || reason.Contains("filter graph", StringComparison.OrdinalIgnoreCase)
             || reason.Contains("Impossible to convert", StringComparison.OrdinalIgnoreCase)
             || reason.Contains("hwupload", StringComparison.OrdinalIgnoreCase)
