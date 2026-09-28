@@ -55,6 +55,23 @@ public sealed class VideoTagArgumentsTests
     }
 
     [Theory]
+    [InlineData("dvh1")]
+    [InlineData("dvhe")]
+    public void Dolby_vision_mp4_copy_into_matroska_uses_a_compatible_codec_tag(string sourceTag)
+    {
+        var probe = new ProbeBuilder()
+            .Video(codec: "hevc", codecTag: sourceTag, dolbyVisionProfile: 5)
+            .Build();
+
+        TranscodingService.GetVideoTagArguments("mkv", isVideoCopy: true, "copy", probe)
+            .Should().Equal("-tag:v", "hvc1");
+        TranscodingService.GetVideoTagArguments("mkv", isVideoCopy: false, "libx265", probe)
+            .Should().BeEmpty();
+        TranscodingService.GetVideoTagArguments("webm", isVideoCopy: true, "copy", probe)
+            .Should().BeEmpty();
+    }
+
+    [Theory]
     [InlineData(null)]
     [InlineData("[0][0][0][0]")]
     [InlineData("hev1")]
@@ -180,6 +197,9 @@ public sealed class VideoTagArgumentsTests
     [InlineData("-vtag", "hvc1")]
     [InlineData("-x265-params", "dolby-vision-profile=8.1:dolby-vision-rpu=/tmp/rpu.bin")]
     [InlineData("-dolbyvision", "1")]
+    [InlineData("-dolbyvision:v", "auto")]
+    [InlineData("-dolbyvision:v:0", "1")]
+    [InlineData("-x265-params:v:0", "dolby-vision-profile=8.1")]
     public void Advanced_profile_that_sets_its_own_tag_owns_the_sample_entry(
         string option, string value)
     {
@@ -193,6 +213,51 @@ public sealed class VideoTagArgumentsTests
         TranscodingService.AdvancedProfileOwnsVideoTag(["-crf", "20", "-tag:a", "mp4a"])
             .Should().BeFalse();
         TranscodingService.AdvancedProfileOwnsVideoTag(null).Should().BeFalse();
+    }
+
+    [Theory]
+    [InlineData("-dolbyvision", "0")]
+    [InlineData("-dolbyvision", "false")]
+    [InlineData("-dolbyvision", "off")]
+    [InlineData("-dolbyvision", "no")]
+    [InlineData("-dolbyvision:0", "0")]
+    [InlineData("-dolbyvision:v:0", "off")]
+    [InlineData("-dolbyvision:v:1", "1")]
+    [InlineData("-x265-params", "dolby-vision-profile=0")]
+    [InlineData("-x265-params", "dolby-vision-profile=8.1:dolby-vision-profile=0")]
+    [InlineData("-x265-params", "stats=/tmp/dolby-analysis.log")]
+    public void Disabled_or_unrelated_dolby_vision_options_leave_the_automatic_tag_enabled(
+        string option, string value)
+    {
+        TranscodingService.AdvancedProfileOwnsVideoTag(["-crf", "20", option, value])
+            .Should().BeFalse();
+    }
+
+    [Theory]
+    [InlineData("1", "0", false)]
+    [InlineData("0", "1", true)]
+    [InlineData("0", "auto", true)]
+    public void Repeated_dolby_vision_options_use_the_last_value(string first, string last, bool ownsTag)
+    {
+        TranscodingService.AdvancedProfileOwnsVideoTag(
+                ["-dolbyvision", first, "-dolbyvision", last])
+            .Should().Be(ownsTag);
+    }
+
+    [Fact]
+    public void Disabling_dolby_vision_does_not_override_an_explicit_video_tag()
+    {
+        TranscodingService.AdvancedProfileOwnsVideoTag(
+                ["-dolbyvision", "0", "-tag:v", "hev1"])
+            .Should().BeTrue();
+    }
+
+    [Fact]
+    public void A_later_video_stream_option_can_disable_dolby_vision()
+    {
+        TranscodingService.AdvancedProfileOwnsVideoTag(
+                ["-dolbyvision", "1", "-dolbyvision:v:0", "0"])
+            .Should().BeFalse();
     }
 
     [Fact]

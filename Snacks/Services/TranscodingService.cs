@@ -5451,11 +5451,12 @@ public class TranscodingService
       : "mp4";
 
     /// <summary>
-    ///     Returns the output arguments that fix the MP4 sample entry for an HEVC stream, or
-    ///     nothing otherwise. ffmpeg's MP4 muxer defaults HEVC to <c>hev1</c>, which Apple's
-    ///     AVFoundation / VideoToolbox players refuse (black video, audio only); <c>hvc1</c>
+    ///     Returns the output arguments that fix an HEVC container's codec tag, or nothing
+    ///     when no adjustment is needed. ffmpeg's MP4 muxer defaults HEVC to <c>hev1</c>,
+    ///     which Apple's AVFoundation / VideoToolbox players refuse (black video, audio only); <c>hvc1</c>
     ///     plays everywhere. A stream copy of a Dolby Vision source is tagged by its profile
-    ///     and keeps its configuration record, so the copy stays Dolby Vision.
+    ///     and keeps its configuration record, so the copy stays Dolby Vision. When copying
+    ///     a Dolby Vision MP4 into Matroska, replace the incompatible inherited codec tag.
     /// </summary>
     /// <param name="format"> Output container token. </param>
     /// <param name="isVideoCopy"> Whether the video stream is stream-copied. </param>
@@ -5465,7 +5466,8 @@ public class TranscodingService
     internal static IReadOnlyList<string> GetVideoTagArguments(
         string format, bool isVideoCopy, string encoder, ProbeResult? probe)
     {
-        if (!FfprobeService.IsMp4(format)) return [];
+        if (!FfprobeService.IsMp4(format)
+            && !(isVideoCopy && FfprobeService.IsMatroska(format))) return [];
 
         if (!isVideoCopy)
         {
@@ -5473,23 +5475,24 @@ public class TranscodingService
             return isHevcEncode ? ["-tag:v", AppleHevcSampleEntry] : [];
         }
 
-        return GetHevcCopyArguments(probe);
+        return GetHevcCopyArguments(format, probe);
     }
 
     /// <summary>
     ///     Whether an advanced profile's own arguments already decide the MP4 sample entry,
     ///     either by passing a codec tag option outright or by driving a Dolby Vision encode
     ///     (x265 <c>dolby-vision-*</c> params or ffmpeg <c>-dolbyvision</c>) whose tag and
-    ///     <c>-strict unofficial</c> the profile author must supply.
+    ///     <c>-strict unofficial</c> the profile author must supply. Explicitly disabling
+    ///     Dolby Vision leaves automatic tagging enabled.
     /// </summary>
     /// <param name="advancedVideoArguments"> Literal tokens the advanced profile emitted. </param>
     internal static bool AdvancedProfileOwnsVideoTag(IEnumerable<string>? advancedVideoArguments)
     {
         if (advancedVideoArguments == null) return false;
 
-        return advancedVideoArguments.Any(argument =>
-            Mp4SampleEntryOptions.IsVideoTagOption(argument)
-            || Mp4SampleEntryOptions.MentionsDolbyVision(argument));
+        var arguments = advancedVideoArguments.ToArray();
+        return arguments.Any(Mp4SampleEntryOptions.IsVideoTagOption)
+            || Mp4SampleEntryOptions.EnablesDolbyVision(arguments);
     }
 
     /// <summary> Whether the sample entry arguments raise the muxer compliance level. </summary>
@@ -5502,12 +5505,13 @@ public class TranscodingService
     ///     not HEVC or the muxer's own choice should stand. A Dolby Vision source also gets
     ///     <see cref="DolbyVisionMuxerArguments" /> so its configuration record is written:
     ///     profile 5 has no compatible base layer and must be <c>dvh1</c>; profile 8 is HDR10 /
-    ///     HLG-compatible and Apple wants <c>hvc1</c>. Dual-layer profile 7 (its enhancement
-    ///     layer is not carried into MP4), legacy profiles, and sources whose only Dolby Vision
+    ///     HLG-compatible and Apple wants <c>hvc1</c>. For MP4, dual-layer profile 7 (whose
+    ///     enhancement layer is not carried into MP4), legacy profiles, and sources whose only Dolby Vision
     ///     signal is a <c>dvh1</c> / <c>dvhe</c> tag are left untouched.
     /// </summary>
+    /// <param name="format"> Output container token. </param>
     /// <param name="probe"> Source probe; its first video stream is the one being mapped. </param>
-    private static IReadOnlyList<string> GetHevcCopyArguments(ProbeResult? probe)
+    private static IReadOnlyList<string> GetHevcCopyArguments(string format, ProbeResult? probe)
     {
         var sourceVideoStream = probe?.Streams?
             .FirstOrDefault(stream => stream.CodecType == "video");
@@ -5517,13 +5521,18 @@ public class TranscodingService
             sourceVideoStream.CodecName, "hevc", StringComparison.OrdinalIgnoreCase);
         if (!isHevcSource) return [];
 
+        bool hasDolbyVisionTag = DolbyVisionSampleEntries.Contains(
+            sourceVideoStream.CodecTagString ?? "", StringComparer.OrdinalIgnoreCase);
+
+        // Matroska rejects an inherited dvh1/dvhe tag. hvc1 selects its normal HEVC
+        // codec mapping without changing the video or Dolby Vision metadata; -tag:v 0
+        // does not work because FFmpeg then inherits the incompatible source tag again.
+        if (FfprobeService.IsMatroska(format))
+            return hasDolbyVisionTag ? ["-tag:v", AppleHevcSampleEntry] : [];
+
         int? dolbyVisionProfile = GetDolbyVisionProfile(sourceVideoStream);
         if (dolbyVisionProfile == null)
-        {
-            bool hasDolbyVisionTag = DolbyVisionSampleEntries.Contains(
-                sourceVideoStream.CodecTagString ?? "", StringComparer.OrdinalIgnoreCase);
             return hasDolbyVisionTag ? [] : ["-tag:v", AppleHevcSampleEntry];
-        }
 
         string? dolbyVisionSampleEntry = dolbyVisionProfile switch
         {

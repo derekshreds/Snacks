@@ -315,7 +315,8 @@ public static class AdvancedVideoValidator
     /// <summary>
     ///     Dolby Vision encodes make the profile responsible for the MP4 sample entry: Snacks
     ///     stops adding its automatic <c>-tag:v hvc1</c>, and ffmpeg writes the Dolby Vision
-    ///     configuration box only under <c>-strict unofficial</c>. Warn when either is missing.
+    ///     configuration box only under <c>-strict unofficial</c> or a more permissive level.
+    ///     Warn when the tag is missing or the effective compliance level drops the record.
     /// </summary>
     /// <param name="result"> Diagnostics sink for the profile being validated. </param>
     /// <param name="options"> The profile's custom options. </param>
@@ -323,16 +324,19 @@ public static class AdvancedVideoValidator
     private static void WarnWhenDolbyVisionLeavesSampleEntryUnset(
         AdvancedVideoValidationResult result, IReadOnlyList<CustomVideoOption> options, string path)
     {
-        bool hasDolbyVisionOptions = options.Any(custom =>
-            Mp4SampleEntryOptions.MentionsDolbyVision(custom?.Option)
-            || (custom?.Values ?? []).Any(Mp4SampleEntryOptions.MentionsDolbyVision));
-        if (!hasDolbyVisionOptions) return;
+        var arguments = new List<string>();
+        foreach (var custom in options)
+        {
+            if (custom == null) continue;
+            arguments.Add(custom.Option);
+            arguments.AddRange(custom.Values ?? []);
+        }
+        if (!Mp4SampleEntryOptions.EnablesDolbyVision(arguments)) return;
 
         bool setsVideoTag = options.Any(custom =>
             Mp4SampleEntryOptions.IsVideoTagOption(custom?.Option));
-        bool setsCompliance = options.Any(custom =>
-            Mp4SampleEntryOptions.IsComplianceOption(custom?.Option));
-        if (setsVideoTag && setsCompliance) return;
+        bool keepsConfiguration = Mp4SampleEntryOptions.AllowsDolbyVisionConfiguration(arguments);
+        if (setsVideoTag && keepsConfiguration) return;
 
         Warn(result, $"{path}.customOptions", "dolby_vision_sample_entry",
             "Dolby Vision options make this profile responsible for the MP4 sample entry: add "
