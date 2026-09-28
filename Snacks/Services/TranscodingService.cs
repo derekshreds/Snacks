@@ -136,6 +136,25 @@ public class TranscodingService
     /// </summary>
     private const string MusicDeviceId = "music";
 
+    /// <summary> HEVC MP4 sample entry Apple players require; ffmpeg defaults to hev1. </summary>
+    private const string AppleHevcSampleEntry = "hvc1";
+
+    /// <summary> Dolby Vision profile 5 HEVC sample entry (no compatible base layer). </summary>
+    private const string DolbyVisionHevcSampleEntry = "dvh1";
+
+    /// <summary> MP4 sample entries that carry a Dolby Vision HEVC stream. </summary>
+    private static readonly string[] DolbyVisionSampleEntries =
+        [DolbyVisionHevcSampleEntry, "dvhe"];
+
+    /// <summary>
+    ///     ffmpeg's MP4 muxer writes the Dolby Vision <c>dvcC</c> / <c>dvvC</c> box only at this
+    ///     compliance level; without it a copy silently drops to the base layer. At this level
+    ///     the muxer also emits the HEVC config extension and 3D / spherical boxes when a source
+    ///     carries them, and none of the audio encoders Snacks emits change behaviour.
+    /// </summary>
+    private static readonly string[] DolbyVisionMuxerArguments =
+        [Mp4SampleEntryOptions.ComplianceOption, Mp4SampleEntryOptions.DolbyVisionComplianceLevel];
+
     /// <summary>
     ///     Authoritative slot ledger, shared with <see cref="ClusterService"/>.
     ///     Master-local encodes reserve <c>(_localNodeId, deviceId)</c> entries
@@ -4192,6 +4211,22 @@ public class TranscodingService
         }
         if (advancedVideoArguments != null)
             literalVideoArguments.AddRange(advancedVideoArguments);
+        if (AdvancedProfileOwnsVideoTag(advancedVideoArguments))
+        {
+            await LogAsync(workItem.Id,
+                "Advanced profile owns the MP4 sample entry; not adding a video tag.");
+        }
+        else
+        {
+            var tagArguments = GetVideoTagArguments(
+                options.Format, videoCopy, encoder, workItem.Probe);
+            if (RaisesMuxerComplianceLevel(tagArguments))
+            {
+                await LogAsync(workItem.Id,
+                    "Dolby Vision source: keeping its configuration record in the MP4 copy.");
+            }
+            literalVideoArguments.AddRange(tagArguments);
+        }
 
         // On a mux pass that excludes audio (MuxStreams.Subtitles), keep every audio track as-is:
         // empty language list = keep all, preserve-only profile = no re-encode.
@@ -5414,6 +5449,107 @@ public class TranscodingService
         FfprobeService.IsMatroska(format) ? "matroska"
       : FfprobeService.IsWebm(format)     ? "webm"
       : "mp4";
+
+    /// <summary>
+    ///     Returns the output arguments that fix the MP4 sample entry for an HEVC stream, or
+    ///     nothing otherwise. ffmpeg's MP4 muxer defaults HEVC to <c>hev1</c>, which Apple's
+    ///     AVFoundation / VideoToolbox players refuse (black video, audio only); <c>hvc1</c>
+    ///     plays everywhere. A stream copy of a Dolby Vision source is tagged by its profile
+    ///     and keeps its configuration record, so the copy stays Dolby Vision.
+    /// </summary>
+    /// <param name="format"> Output container token. </param>
+    /// <param name="isVideoCopy"> Whether the video stream is stream-copied. </param>
+    /// <param name="encoder"> The ffmpeg video encoder name (ignored on a copy). </param>
+    /// <param name="probe"> Source probe; its first video stream is the one being mapped. </param>
+    /// <returns> The literal argument tokens to append after the video codec flags. </returns>
+    internal static IReadOnlyList<string> GetVideoTagArguments(
+        string format, bool isVideoCopy, string encoder, ProbeResult? probe)
+    {
+        if (!FfprobeService.IsMp4(format)) return [];
+
+        if (!isVideoCopy)
+        {
+            bool isHevcEncode = VideoEncoderRegistry.EncoderCodec(encoder) == "h265";
+            return isHevcEncode ? ["-tag:v", AppleHevcSampleEntry] : [];
+        }
+
+        return GetHevcCopyArguments(probe);
+    }
+
+    /// <summary>
+    ///     Whether an advanced profile's own arguments already decide the MP4 sample entry,
+    ///     either by passing a codec tag option outright or by driving a Dolby Vision encode
+    ///     (x265 <c>dolby-vision-*</c> params or ffmpeg <c>-dolbyvision</c>) whose tag and
+    ///     <c>-strict unofficial</c> the profile author must supply.
+    /// </summary>
+    /// <param name="advancedVideoArguments"> Literal tokens the advanced profile emitted. </param>
+    internal static bool AdvancedProfileOwnsVideoTag(IEnumerable<string>? advancedVideoArguments)
+    {
+        if (advancedVideoArguments == null) return false;
+
+        return advancedVideoArguments.Any(argument =>
+            Mp4SampleEntryOptions.IsVideoTagOption(argument)
+            || Mp4SampleEntryOptions.MentionsDolbyVision(argument));
+    }
+
+    /// <summary> Whether the sample entry arguments raise the muxer compliance level. </summary>
+    /// <param name="tagArguments"> Tokens returned by <see cref="GetVideoTagArguments" />. </param>
+    private static bool RaisesMuxerComplianceLevel(IReadOnlyList<string> tagArguments) =>
+        tagArguments.Any(Mp4SampleEntryOptions.IsComplianceOption);
+
+    /// <summary>
+    ///     The sample entry arguments for a stream-copied source, or nothing when the source is
+    ///     not HEVC or the muxer's own choice should stand. A Dolby Vision source also gets
+    ///     <see cref="DolbyVisionMuxerArguments" /> so its configuration record is written:
+    ///     profile 5 has no compatible base layer and must be <c>dvh1</c>; profile 8 is HDR10 /
+    ///     HLG-compatible and Apple wants <c>hvc1</c>. Dual-layer profile 7 (its enhancement
+    ///     layer is not carried into MP4), legacy profiles, and sources whose only Dolby Vision
+    ///     signal is a <c>dvh1</c> / <c>dvhe</c> tag are left untouched.
+    /// </summary>
+    /// <param name="probe"> Source probe; its first video stream is the one being mapped. </param>
+    private static IReadOnlyList<string> GetHevcCopyArguments(ProbeResult? probe)
+    {
+        var sourceVideoStream = probe?.Streams?
+            .FirstOrDefault(stream => stream.CodecType == "video");
+        if (sourceVideoStream == null) return [];
+
+        bool isHevcSource = string.Equals(
+            sourceVideoStream.CodecName, "hevc", StringComparison.OrdinalIgnoreCase);
+        if (!isHevcSource) return [];
+
+        int? dolbyVisionProfile = GetDolbyVisionProfile(sourceVideoStream);
+        if (dolbyVisionProfile == null)
+        {
+            bool hasDolbyVisionTag = DolbyVisionSampleEntries.Contains(
+                sourceVideoStream.CodecTagString ?? "", StringComparer.OrdinalIgnoreCase);
+            return hasDolbyVisionTag ? [] : ["-tag:v", AppleHevcSampleEntry];
+        }
+
+        string? dolbyVisionSampleEntry = dolbyVisionProfile switch
+        {
+            5 => DolbyVisionHevcSampleEntry,
+            8 => AppleHevcSampleEntry,
+            _ => null,
+        };
+        if (dolbyVisionSampleEntry == null) return [];
+
+        return [.. DolbyVisionMuxerArguments, "-tag:v", dolbyVisionSampleEntry];
+    }
+
+    /// <summary>
+    ///     The Dolby Vision profile from the stream's ffprobe side data, or <see langword="null" />
+    ///     when no configuration record is present. MKV sources carry Dolby Vision only here;
+    ///     their codec tag is always <c>[0][0][0][0]</c>.
+    /// </summary>
+    /// <param name="stream"> Source video stream. </param>
+    private static int? GetDolbyVisionProfile(Models.Stream stream)
+    {
+        var record = stream.SideDataList?.FirstOrDefault(sideData => string.Equals(
+            sideData.SideDataType,
+            Mp4SampleEntryOptions.DolbyVisionSideDataType,
+            StringComparison.OrdinalIgnoreCase));
+        return record?.DvProfile;
+    }
 
     /// <summary> Maps an output container token to its on-disk file extension. </summary>
     internal static string FormatExtension(string format) =>

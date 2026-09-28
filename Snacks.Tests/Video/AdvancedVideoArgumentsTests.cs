@@ -71,6 +71,38 @@ public sealed class AdvancedVideoArgumentsTests
         result.Warnings.Should().Contain(d => d.Code == "option_override");
     }
 
+    [Theory]
+    [InlineData("-x265-params", "dolby-vision-profile=8.1:dolby-vision-rpu=/tmp/rpu.bin")]
+    [InlineData("-dolbyvision", "1")]
+    public void Dolby_vision_options_without_a_tag_and_compliance_flag_warn(
+        string option, string value)
+    {
+        var advanced = ValidAdvanced();
+        advanced.Profiles[0].CustomOptions.Add(
+            new CustomVideoOption { Option = option, Values = [value] });
+
+        var result = AdvancedVideoValidator.Validate(advanced);
+
+        result.IsValid.Should().BeTrue();
+        result.Warnings.Should()
+            .Contain(diagnostic => diagnostic.Code == "dolby_vision_sample_entry");
+    }
+
+    [Fact]
+    public void Dolby_vision_options_with_a_tag_and_compliance_flag_do_not_warn()
+    {
+        var advanced = ValidAdvanced();
+        advanced.Profiles[0].CustomOptions =
+        [
+            new CustomVideoOption { Option = "-x265-params", Values = ["dolby-vision-profile=8"] },
+            new CustomVideoOption { Option = "-tag:v", Values = ["hvc1"] },
+            new CustomVideoOption { Option = "-strict", Values = ["unofficial"] },
+        ];
+
+        AdvancedVideoValidator.Validate(advanced).Warnings
+            .Should().NotContain(diagnostic => diagnostic.Code == "dolby_vision_sample_entry");
+    }
+
     [Fact]
     public void Multi_output_filter_topology_is_rejected()
     {

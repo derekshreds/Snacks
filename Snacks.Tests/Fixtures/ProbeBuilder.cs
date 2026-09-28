@@ -1,4 +1,5 @@
 using Snacks.Models;
+using Snacks.Services;
 using Stream = Snacks.Models.Stream;
 
 namespace Snacks.Tests.Fixtures;
@@ -11,27 +12,33 @@ internal sealed class ProbeBuilder
 {
     private readonly List<Stream> _streams = new();
 
+    /// <summary> Adds a video stream, optionally with a Dolby Vision record. </summary>
     public ProbeBuilder Video(
-        string  codec         = "h264",
-        string? colorTransfer = null,
-        int     width         = 1920,
-        int     height        = 1080,
-        string? frameRate     = null)
+        string  codec              = "h264",
+        string? colorTransfer      = null,
+        int     width              = 1920,
+        int     height             = 1080,
+        string? frameRate          = null,
+        string? codecTag           = null,
+        int?    dolbyVisionProfile = null)
     {
         _streams.Add(new Stream
         {
-            Index         = _streams.Count,
-            CodecType     = "video",
-            CodecName     = codec,
-            ColorTransfer = colorTransfer,
-            Width         = width,
-            Height        = height,
-            AvgFrameRate  = frameRate,
-            RFrameRate    = frameRate,
+            Index          = _streams.Count,
+            CodecType      = "video",
+            CodecName      = codec,
+            CodecTagString = codecTag,
+            ColorTransfer  = colorTransfer,
+            Width          = width,
+            Height         = height,
+            AvgFrameRate   = frameRate,
+            RFrameRate     = frameRate,
+            SideDataList   = DolbyVisionSideData(dolbyVisionProfile),
         });
         return this;
     }
 
+    /// <summary> Adds an audio stream; the channel layout follows the channel count. </summary>
     public ProbeBuilder Audio(
         string codec    = "aac",
         int    channels = 2,
@@ -50,6 +57,7 @@ internal sealed class ProbeBuilder
         return this;
     }
 
+    /// <summary> Adds a subtitle stream with optional disposition flags. </summary>
     public ProbeBuilder Subtitle(
         string codec           = "subrip",
         string lang            = "eng",
@@ -76,7 +84,19 @@ internal sealed class ProbeBuilder
         return this;
     }
 
+    /// <summary> Materialises the probe result with the streams added so far. </summary>
     public ProbeResult Build() => new() { Streams = _streams.ToArray() };
+
+    private static IReadOnlyList<StreamSideData>? DolbyVisionSideData(int? profile)
+    {
+        if (profile == null) return null;
+
+        return [new StreamSideData
+        {
+            SideDataType = Mp4SampleEntryOptions.DolbyVisionSideDataType,
+            DvProfile    = profile.Value,
+        }];
+    }
 
     private static string ChannelLayoutFor(int channels) => channels switch
     {
