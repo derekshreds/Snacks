@@ -10,8 +10,8 @@
 #   $TARGET/libtesseract.5.dylib          (with @loader_path/* deps)
 #   $TARGET/libleptonica.6.dylib          (with @loader_path/* deps)
 #   $TARGET/libpng16.16.dylib, libtiff.6.dylib, ... (transitive deps)
-#   $TARGET/x64/libtesseract53.dll.dylib  (symlink — TesseractOCR's LibraryLoader
-#   $TARGET/x64/libleptonica-1.83.1.dll.dylib   uses an "x64" subdir on every
+#   $TARGET/x64/libtesseract55.dll.dylib  (symlink — TesseractOCR's LibraryLoader
+#   $TARGET/x64/libleptonica-1.85.0.dll.dylib   uses an "x64" subdir on every
 #                                                non-Windows platform.)
 #
 # Usage: bundle-ocr-mac.sh <target-dir>
@@ -112,11 +112,11 @@ bundle_lib "$LEPTONICA_SRC"
 codesign --force -s - "$TARGET"/lib*.dylib 2>/dev/null || true
 
 # Drop the TesseractOCR-expected names into x64/ as relative symlinks.
-# The .NET wrapper hardcodes the dll names "tesseract53.dll" and
-# "leptonica-1.83.1.dll" and prefixes "lib" + suffixes ".dylib" before dlopen.
+# The .NET wrapper hardcodes the dll names "tesseract55.dll" and
+# "leptonica-1.85.0.dll" and prefixes "lib" + suffixes ".dylib" before dlopen.
 mkdir -p "$TARGET/x64"
-ln -sf ../libtesseract.5.dylib  "$TARGET/x64/libtesseract53.dll.dylib"
-ln -sf ../libleptonica.6.dylib  "$TARGET/x64/libleptonica-1.83.1.dll.dylib"
+ln -sf ../libtesseract.5.dylib  "$TARGET/x64/libtesseract55.dll.dylib"
+ln -sf ../libleptonica.6.dylib  "$TARGET/x64/libleptonica-1.85.0.dll.dylib"
 
 # Verify no /opt/homebrew refs leaked through on the libs we bundled.
 # (We deliberately don't warn on @rpath here — .NET's own native dylibs like libcoreclr

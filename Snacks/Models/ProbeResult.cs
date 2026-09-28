@@ -214,6 +214,29 @@ public sealed class Stream
     /// <summary> ffprobe disposition flags (default, forced, hearing_impaired, ...). </summary>
     [JsonProperty("disposition")]
     public Disposition? Disposition { get; set; }
+
+    /// <summary> Side data ffprobe reports for the stream (e.g. a Dolby Vision record). </summary>
+    [JsonProperty("side_data_list")]
+    public IReadOnlyList<StreamSideData>? SideDataList { get; set; }
+}
+
+/// <summary>
+///     One entry of a stream's ffprobe side data list. Only the fields needed to recognise
+///     a Dolby Vision configuration record are modelled; other entries carry just their type.
+/// </summary>
+public sealed class StreamSideData
+{
+    /// <summary> ffprobe's side data label (e.g. "DOVI configuration record"). </summary>
+    [JsonProperty("side_data_type")]
+    public string? SideDataType { get; set; }
+
+    /// <summary> Dolby Vision profile (5, 7, 8, ...); 0 when not a Dolby Vision record. </summary>
+    [JsonProperty("dv_profile")]
+    public int DvProfile { get; set; }
+
+    /// <summary> Dolby Vision base-layer compatibility id (1 = HDR10, 4 = HLG). </summary>
+    [JsonProperty("dv_bl_signal_compatibility_id")]
+    public int DvBlSignalCompatibilityId { get; set; }
 }
 
 /// <summary>

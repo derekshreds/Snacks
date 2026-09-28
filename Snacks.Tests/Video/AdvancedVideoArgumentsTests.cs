@@ -71,6 +71,119 @@ public sealed class AdvancedVideoArgumentsTests
         result.Warnings.Should().Contain(d => d.Code == "option_override");
     }
 
+    [Theory]
+    [InlineData("-x265-params", "dolby-vision-profile=8.1:dolby-vision-rpu=/tmp/rpu.bin")]
+    [InlineData("-dolbyvision", "1")]
+    public void Dolby_vision_options_without_a_tag_and_compliance_flag_warn(
+        string option, string value)
+    {
+        var advanced = ValidAdvanced();
+        advanced.Profiles[0].CustomOptions.Add(
+            new CustomVideoOption { Option = option, Values = [value] });
+
+        var result = AdvancedVideoValidator.Validate(advanced);
+
+        result.IsValid.Should().BeTrue();
+        result.Warnings.Should()
+            .Contain(diagnostic => diagnostic.Code == "dolby_vision_sample_entry");
+    }
+
+    [Fact]
+    public void Dolby_vision_options_with_a_tag_and_compliance_flag_do_not_warn()
+    {
+        var advanced = ValidAdvanced();
+        advanced.Profiles[0].CustomOptions =
+        [
+            new CustomVideoOption { Option = "-x265-params", Values = ["dolby-vision-profile=8"] },
+            new CustomVideoOption { Option = "-tag:v", Values = ["hvc1"] },
+            new CustomVideoOption { Option = "-strict", Values = ["unofficial"] },
+        ];
+
+        AdvancedVideoValidator.Validate(advanced).Warnings
+            .Should().NotContain(diagnostic => diagnostic.Code == "dolby_vision_sample_entry");
+    }
+
+    [Theory]
+    [InlineData("normal", true)]
+    [InlineData("strict", true)]
+    [InlineData("very", true)]
+    [InlineData("0", true)]
+    [InlineData("1", true)]
+    [InlineData("2", true)]
+    [InlineData("", true)]
+    [InlineData("unofficial", false)]
+    [InlineData("experimental", false)]
+    [InlineData("-1", false)]
+    [InlineData("-2", false)]
+    public void Dolby_vision_compliance_warning_checks_the_value(string compliance, bool shouldWarn)
+    {
+        var advanced = ValidAdvanced();
+        advanced.Profiles[0].CustomOptions =
+        [
+            new CustomVideoOption { Option = "-dolbyvision", Values = ["1"] },
+            new CustomVideoOption { Option = "-tag:v", Values = ["hvc1"] },
+            new CustomVideoOption { Option = "-strict", Values = [compliance] },
+        ];
+
+        var result = AdvancedVideoValidator.Validate(advanced);
+
+        result.IsValid.Should().BeTrue();
+        result.Warnings.Any(diagnostic => diagnostic.Code == "dolby_vision_sample_entry")
+            .Should().Be(shouldWarn);
+    }
+
+    [Theory]
+    [InlineData("unofficial", "normal", true)]
+    [InlineData("normal", "unofficial", false)]
+    public void Dolby_vision_compliance_warning_uses_the_last_value(
+        string first, string last, bool shouldWarn)
+    {
+        var advanced = ValidAdvanced();
+        advanced.Profiles[0].CustomOptions =
+        [
+            new CustomVideoOption { Option = "-dolbyvision", Values = ["1"] },
+            new CustomVideoOption { Option = "-tag:v", Values = ["hvc1"] },
+            new CustomVideoOption { Option = "-strict", Values = [first] },
+            new CustomVideoOption { Option = "-strict", Values = [last] },
+        ];
+
+        AdvancedVideoValidator.Validate(advanced).Warnings
+            .Any(diagnostic => diagnostic.Code == "dolby_vision_sample_entry")
+            .Should().Be(shouldWarn);
+    }
+
+    [Theory]
+    [InlineData("-dolbyvision", "0")]
+    [InlineData("-dolbyvision", "false")]
+    [InlineData("-dolbyvision:v:0", "false")]
+    [InlineData("-x265-params", "dolby-vision-profile=0")]
+    [InlineData("-x265-params", "stats=/tmp/dolby-analysis.log")]
+    public void Disabled_or_unrelated_dolby_vision_options_do_not_require_a_sample_entry(
+        string option, string value)
+    {
+        var advanced = ValidAdvanced();
+        advanced.Profiles[0].CustomOptions.Add(
+            new CustomVideoOption { Option = option, Values = [value] });
+
+        AdvancedVideoValidator.Validate(advanced).Warnings
+            .Should().NotContain(diagnostic => diagnostic.Code == "dolby_vision_sample_entry");
+    }
+
+    [Fact]
+    public void Encoder_compliance_does_not_replace_muxer_compliance()
+    {
+        var advanced = ValidAdvanced();
+        advanced.Profiles[0].CustomOptions =
+        [
+            new CustomVideoOption { Option = "-dolbyvision:v:0", Values = ["1"] },
+            new CustomVideoOption { Option = "-tag:v", Values = ["hvc1"] },
+            new CustomVideoOption { Option = "-strict:v:0", Values = ["unofficial"] },
+        ];
+
+        AdvancedVideoValidator.Validate(advanced).Warnings
+            .Should().Contain(diagnostic => diagnostic.Code == "dolby_vision_sample_entry");
+    }
+
     [Fact]
     public void Multi_output_filter_topology_is_rejected()
     {

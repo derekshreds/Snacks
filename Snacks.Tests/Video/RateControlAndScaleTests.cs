@@ -266,6 +266,85 @@ public sealed class RateControlAndScaleTests
     }
 
 
+    // =====================================================================
+    //  H.264 profile gate — no consumer GPU decodes H.264 High 10 / 4:2:2 / 4:4:4
+    //  in hardware. Forcing -hwaccel qsv on such a source fails every packet
+    //  ("Error querying IO surface: unsupported"), so the codec-level answer must be
+    //  overridden by the profile / pix_fmt. HEVC Main 10 stays hw-decodable.
+    // =====================================================================
+
+    /// <summary>Rows: (codec, ffprobe profile, pix_fmt, expected hw-decodable).</summary>
+    public static IEnumerable<object?[]> HwDecodableProfileRows() => new[]
+    {
+        new object?[] { "h264", "High",                   "yuv420p",     true  },
+        new object?[] { "h264", "Main",                   "yuv420p",     true  },
+        new object?[] { "h264", "Constrained Baseline",   "yuv420p",     true  },
+        new object?[] { "h264", null,                     null,          true  },  // unknown → optimistic
+        new object?[] { "h264", "High 10",                "yuv420p10le", false },  // The Expanse S01E04
+        new object?[] { "h264", "High 10 Intra",          "yuv420p10le", false },
+        new object?[] { "h264", "High 4:2:2",             "yuv422p",     false },
+        new object?[] { "h264", "High 4:4:4 Predictive",  "yuv444p",     false },
+        new object?[] { "h264", null,                     "yuv420p10le", false },  // pix_fmt alone is enough
+        new object?[] { "h264", "High 10",                null,          false },  // profile alone is enough
+        new object?[] { "hevc", "Main 10",                "yuv420p10le", true  },
+        new object?[] { "hevc", "Main",                   "yuv420p",     true  },
+        new object?[] { "vp9",  "Profile 2",              "yuv420p10le", true  },
+        new object?[] { "av1",  "Main",                   "yuv420p10le", true  },
+    };
+
+    [Theory]
+    [MemberData(nameof(HwDecodableProfileRows))]
+    public void IsHwDecodableVideoProfile_rejects_h264_outside_8bit_420(
+        string codec, string? profile, string? pixFmt, bool expected)
+    {
+        var stream = new Stream { Index = 0, CodecType = "video", CodecName = codec, Profile = profile, PixFmt = pixFmt };
+        TranscodingService.IsHwDecodableVideoProfile(stream).Should().Be(expected);
+    }
+
+
+    [Fact]
+    public void IsHwDecodableVideoProfile_with_null_stream_is_optimistic()
+    {
+        TranscodingService.IsHwDecodableVideoProfile(null).Should().BeTrue();
+    }
+
+
+    [Fact]
+    public void CanVaapiDecode_rejects_h264_high10_on_baseline()
+    {
+        var probe = new ProbeResult
+        {
+            Streams = new[] { new Stream { Index = 0, CodecType = "video", CodecName = "h264", Profile = "High 10", PixFmt = "yuv420p10le" } },
+        };
+        TranscodingService.CanVaapiDecode(probe).Should().BeFalse();
+    }
+
+
+    [Fact]
+    public void CanVaapiDecode_rejects_h264_high10_even_when_vainfo_lists_h264()
+    {
+        // vainfo reports codec-level profiles (VAProfileH264High), never High 10 —
+        // the detected set must not override the profile gate.
+        var detected = new HashSet<string> { "h264", "hevc", "av1", "vp9" };
+        var probe = new ProbeResult
+        {
+            Streams = new[] { new Stream { Index = 0, CodecType = "video", CodecName = "h264", Profile = "High 10", PixFmt = "yuv420p10le" } },
+        };
+        TranscodingService.CanVaapiDecode(probe, detected).Should().BeFalse();
+    }
+
+
+    [Fact]
+    public void CanVaapiDecode_keeps_hevc_main10_on_baseline()
+    {
+        var probe = new ProbeResult
+        {
+            Streams = new[] { new Stream { Index = 0, CodecType = "video", CodecName = "hevc", Profile = "Main 10", PixFmt = "yuv420p10le" } },
+        };
+        TranscodingService.CanVaapiDecode(probe).Should().BeTrue();
+    }
+
+
     [Fact]
     public void CanVaapiDecode_with_null_probe_returns_false()
     {

@@ -136,6 +136,25 @@ public class TranscodingService
     /// </summary>
     private const string MusicDeviceId = "music";
 
+    /// <summary> HEVC MP4 sample entry Apple players require; ffmpeg defaults to hev1. </summary>
+    private const string AppleHevcSampleEntry = "hvc1";
+
+    /// <summary> Dolby Vision profile 5 HEVC sample entry (no compatible base layer). </summary>
+    private const string DolbyVisionHevcSampleEntry = "dvh1";
+
+    /// <summary> MP4 sample entries that carry a Dolby Vision HEVC stream. </summary>
+    private static readonly string[] DolbyVisionSampleEntries =
+        [DolbyVisionHevcSampleEntry, "dvhe"];
+
+    /// <summary>
+    ///     ffmpeg's MP4 muxer writes the Dolby Vision <c>dvcC</c> / <c>dvvC</c> box only at this
+    ///     compliance level; without it a copy silently drops to the base layer. At this level
+    ///     the muxer also emits the HEVC config extension and 3D / spherical boxes when a source
+    ///     carries them, and none of the audio encoders Snacks emits change behaviour.
+    /// </summary>
+    private static readonly string[] DolbyVisionMuxerArguments =
+        [Mp4SampleEntryOptions.ComplianceOption, Mp4SampleEntryOptions.DolbyVisionComplianceLevel];
+
     /// <summary>
     ///     Authoritative slot ledger, shared with <see cref="ClusterService"/>.
     ///     Master-local encodes reserve <c>(_localNodeId, deviceId)</c> entries
@@ -4102,10 +4121,15 @@ public class TranscodingService
         bool useQsv = !videoCopy && encoder.Contains("qsv");
         bool canHwDecode = !forceSwDecode && CanVaapiDecode(workItem.Probe);
         if ((useVaapi || useQsv) && hasFilter) canHwDecode = false;
-        if ((useVaapi || useQsv) && !canHwDecode && (forceSwDecode || hasFilter))
+        bool profileBlocksHwDecode = !IsHwDecodableVideoProfile(
+            workItem.Probe?.Streams?.FirstOrDefault(s => s.CodecType == "video"));
+        if ((useVaapi || useQsv) && !canHwDecode && (forceSwDecode || hasFilter || profileBlocksHwDecode))
         {
+            string why = profileBlocksHwDecode && !forceSwDecode && !hasFilter
+                ? "source profile has no hardware decoder"
+                : "hwaccel decode disabled";
             await LogAsync(workItem.Id,
-                $"Using software decode + {(useQsv ? "QSV" : "VAAPI")} encode (hwaccel decode disabled)");
+                $"Using software decode + {(useQsv ? "QSV" : "VAAPI")} encode ({why})");
         }
 
         string initFlags = useVaapi || useQsv
@@ -4124,10 +4148,15 @@ public class TranscodingService
         // hwdownload, so NVDEC surfaces can't feed them ("Impossible to convert
         // between the formats") — decode in software when a filter is active,
         // mirroring the VAAPI/QSV gate above.
+        // Same profile gate as the VAAPI/QSV path: h264_cuvid has no High 10 / 4:2:2 /
+        // 4:4:4 support, so leave the decoder unset and let -hwaccel cuda's auto-attach
+        // fall back to the software h264 decoder.
         if (isNvidia && !videoCopy && !forceSwDecode && !hasFilter && !encoder.StartsWith("lib"))
         {
-            var srcCodec = workItem.Probe?.Streams?.FirstOrDefault(s => s.CodecType == "video")?.CodecName;
-            string cuvid = GetNvidiaInputDecoder(srcCodec);
+            var srcStream = workItem.Probe?.Streams?.FirstOrDefault(s => s.CodecType == "video");
+            string cuvid = IsHwDecodableVideoProfile(srcStream)
+                ? GetNvidiaInputDecoder(srcStream?.CodecName)
+                : "";
             if (!string.IsNullOrEmpty(cuvid))
                 initFlags = $"{initFlags} {cuvid}";
         }
@@ -4192,6 +4221,22 @@ public class TranscodingService
         }
         if (advancedVideoArguments != null)
             literalVideoArguments.AddRange(advancedVideoArguments);
+        if (AdvancedProfileOwnsVideoTag(advancedVideoArguments))
+        {
+            await LogAsync(workItem.Id,
+                "Advanced profile owns the MP4 sample entry; not adding a video tag.");
+        }
+        else
+        {
+            var tagArguments = GetVideoTagArguments(
+                options.Format, videoCopy, encoder, workItem.Probe);
+            if (RaisesMuxerComplianceLevel(tagArguments))
+            {
+                await LogAsync(workItem.Id,
+                    "Dolby Vision source: keeping its configuration record in the MP4 copy.");
+            }
+            literalVideoArguments.AddRange(tagArguments);
+        }
 
         // On a mux pass that excludes audio (MuxStreams.Subtitles), keep every audio track as-is:
         // empty language list = keep all, preserve-only profile = no re-encode.
@@ -5415,6 +5460,116 @@ public class TranscodingService
       : FfprobeService.IsWebm(format)     ? "webm"
       : "mp4";
 
+    /// <summary>
+    ///     Returns the output arguments that fix an HEVC container's codec tag, or nothing
+    ///     when no adjustment is needed. ffmpeg's MP4 muxer defaults HEVC to <c>hev1</c>,
+    ///     which Apple's AVFoundation / VideoToolbox players refuse (black video, audio only); <c>hvc1</c>
+    ///     plays everywhere. A stream copy of a Dolby Vision source is tagged by its profile
+    ///     and keeps its configuration record, so the copy stays Dolby Vision. When copying
+    ///     a Dolby Vision MP4 into Matroska, replace the incompatible inherited codec tag.
+    /// </summary>
+    /// <param name="format"> Output container token. </param>
+    /// <param name="isVideoCopy"> Whether the video stream is stream-copied. </param>
+    /// <param name="encoder"> The ffmpeg video encoder name (ignored on a copy). </param>
+    /// <param name="probe"> Source probe; its first video stream is the one being mapped. </param>
+    /// <returns> The literal argument tokens to append after the video codec flags. </returns>
+    internal static IReadOnlyList<string> GetVideoTagArguments(
+        string format, bool isVideoCopy, string encoder, ProbeResult? probe)
+    {
+        if (!FfprobeService.IsMp4(format)
+            && !(isVideoCopy && FfprobeService.IsMatroska(format))) return [];
+
+        if (!isVideoCopy)
+        {
+            bool isHevcEncode = VideoEncoderRegistry.EncoderCodec(encoder) == "h265";
+            return isHevcEncode ? ["-tag:v", AppleHevcSampleEntry] : [];
+        }
+
+        return GetHevcCopyArguments(format, probe);
+    }
+
+    /// <summary>
+    ///     Whether an advanced profile's own arguments already decide the MP4 sample entry,
+    ///     either by passing a codec tag option outright or by driving a Dolby Vision encode
+    ///     (x265 <c>dolby-vision-*</c> params or ffmpeg <c>-dolbyvision</c>) whose tag and
+    ///     <c>-strict unofficial</c> the profile author must supply. Explicitly disabling
+    ///     Dolby Vision leaves automatic tagging enabled.
+    /// </summary>
+    /// <param name="advancedVideoArguments"> Literal tokens the advanced profile emitted. </param>
+    internal static bool AdvancedProfileOwnsVideoTag(IEnumerable<string>? advancedVideoArguments)
+    {
+        if (advancedVideoArguments == null) return false;
+
+        var arguments = advancedVideoArguments.ToArray();
+        return arguments.Any(Mp4SampleEntryOptions.IsVideoTagOption)
+            || Mp4SampleEntryOptions.EnablesDolbyVision(arguments);
+    }
+
+    /// <summary> Whether the sample entry arguments raise the muxer compliance level. </summary>
+    /// <param name="tagArguments"> Tokens returned by <see cref="GetVideoTagArguments" />. </param>
+    private static bool RaisesMuxerComplianceLevel(IReadOnlyList<string> tagArguments) =>
+        tagArguments.Any(Mp4SampleEntryOptions.IsComplianceOption);
+
+    /// <summary>
+    ///     The sample entry arguments for a stream-copied source, or nothing when the source is
+    ///     not HEVC or the muxer's own choice should stand. A Dolby Vision source also gets
+    ///     <see cref="DolbyVisionMuxerArguments" /> so its configuration record is written:
+    ///     profile 5 has no compatible base layer and must be <c>dvh1</c>; profile 8 is HDR10 /
+    ///     HLG-compatible and Apple wants <c>hvc1</c>. For MP4, dual-layer profile 7 (whose
+    ///     enhancement layer is not carried into MP4), legacy profiles, and sources whose only Dolby Vision
+    ///     signal is a <c>dvh1</c> / <c>dvhe</c> tag are left untouched.
+    /// </summary>
+    /// <param name="format"> Output container token. </param>
+    /// <param name="probe"> Source probe; its first video stream is the one being mapped. </param>
+    private static IReadOnlyList<string> GetHevcCopyArguments(string format, ProbeResult? probe)
+    {
+        var sourceVideoStream = probe?.Streams?
+            .FirstOrDefault(stream => stream.CodecType == "video");
+        if (sourceVideoStream == null) return [];
+
+        bool isHevcSource = string.Equals(
+            sourceVideoStream.CodecName, "hevc", StringComparison.OrdinalIgnoreCase);
+        if (!isHevcSource) return [];
+
+        bool hasDolbyVisionTag = DolbyVisionSampleEntries.Contains(
+            sourceVideoStream.CodecTagString ?? "", StringComparer.OrdinalIgnoreCase);
+
+        // Matroska rejects an inherited dvh1/dvhe tag. hvc1 selects its normal HEVC
+        // codec mapping without changing the video or Dolby Vision metadata; -tag:v 0
+        // does not work because FFmpeg then inherits the incompatible source tag again.
+        if (FfprobeService.IsMatroska(format))
+            return hasDolbyVisionTag ? ["-tag:v", AppleHevcSampleEntry] : [];
+
+        int? dolbyVisionProfile = GetDolbyVisionProfile(sourceVideoStream);
+        if (dolbyVisionProfile == null)
+            return hasDolbyVisionTag ? [] : ["-tag:v", AppleHevcSampleEntry];
+
+        string? dolbyVisionSampleEntry = dolbyVisionProfile switch
+        {
+            5 => DolbyVisionHevcSampleEntry,
+            8 => AppleHevcSampleEntry,
+            _ => null,
+        };
+        if (dolbyVisionSampleEntry == null) return [];
+
+        return [.. DolbyVisionMuxerArguments, "-tag:v", dolbyVisionSampleEntry];
+    }
+
+    /// <summary>
+    ///     The Dolby Vision profile from the stream's ffprobe side data, or <see langword="null" />
+    ///     when no configuration record is present. MKV sources carry Dolby Vision only here;
+    ///     their codec tag is always <c>[0][0][0][0]</c>.
+    /// </summary>
+    /// <param name="stream"> Source video stream. </param>
+    private static int? GetDolbyVisionProfile(Models.Stream stream)
+    {
+        var record = stream.SideDataList?.FirstOrDefault(sideData => string.Equals(
+            sideData.SideDataType,
+            Mp4SampleEntryOptions.DolbyVisionSideDataType,
+            StringComparison.OrdinalIgnoreCase));
+        return record?.DvProfile;
+    }
+
     /// <summary> Maps an output container token to its on-disk file extension. </summary>
     internal static string FormatExtension(string format) =>
         FfprobeService.IsMatroska(format) ? ".mkv"
@@ -6359,11 +6514,52 @@ public class TranscodingService
 
     internal static bool CanVaapiDecode(ProbeResult? probe, HashSet<string>? detectedDecodeCodecs)
     {
-        var codec = probe?.Streams?.FirstOrDefault(s => s.CodecType == "video")?.CodecName;
+        var stream = probe?.Streams?.FirstOrDefault(s => s.CodecType == "video");
+        var codec = stream?.CodecName;
         if (codec is null) return false;
+        // Codec support alone isn't enough — the codec's profile has to be one the
+        // decode engine handles (see IsHwDecodableVideoProfile). vainfo lists
+        // codec-level profiles, so the detected set can't answer this either.
+        if (!IsHwDecodableVideoProfile(stream)) return false;
         if (detectedDecodeCodecs != null) return detectedDecodeCodecs.Contains(codec);
         // J6412 (Elkhart Lake) VAAPI decode: h264, hevc, mpeg2, vp8, vp9, jpeg
         return codec is "h264" or "hevc" or "mpeg2video" or "vp8" or "vp9" or "mjpeg";
+    }
+
+    /// <summary>
+    ///     Returns <c>false</c> when the video stream's codec profile is one no consumer
+    ///     GPU decodes in hardware, regardless of vendor. Today that's H.264 outside
+    ///     8-bit 4:2:0: High 10 (yuv420p10le), High 4:2:2 and High 4:4:4 have no
+    ///     fixed-function decoder on Intel, AMD, or NVIDIA. Forcing the hwaccel path on
+    ///     such a source fails every packet (QSV: "Error querying IO surface:
+    ///     unsupported"; VAAPI: "Failed to get HW config"; cuvid: "Codec not
+    ///     supported") — the job never produces a frame, so route it to software
+    ///     decode up front instead. Unknown profile / pix_fmt is treated as decodable.
+    /// </summary>
+    internal static bool IsHwDecodableVideoProfile(Models.Stream? stream)
+    {
+        if (stream is null) return true;
+        if (!string.Equals(stream.CodecName, "h264", StringComparison.OrdinalIgnoreCase)) return true;
+
+        var profile = stream.Profile ?? "";
+        if (profile.Contains("10", StringComparison.Ordinal)
+            || profile.Contains("4:2:2", StringComparison.Ordinal)
+            || profile.Contains("4:4:4", StringComparison.Ordinal))
+            return false;
+
+        var pixFmt = stream.PixFmt ?? "";
+        // yuv420p is 8-bit 4:2:0; anything carrying a bit-depth suffix or a non-4:2:0
+        // sampling (yuv420p10le, yuv422p, yuv444p10le, ...) needs the High 10 / 4:2:2 /
+        // 4:4:4 profile even when ffprobe leaves the profile string blank.
+        if (pixFmt.Contains("10", StringComparison.Ordinal)
+            || pixFmt.Contains("12", StringComparison.Ordinal)
+            || pixFmt.Contains("14", StringComparison.Ordinal)
+            || pixFmt.Contains("16", StringComparison.Ordinal)
+            || pixFmt.Contains("422", StringComparison.Ordinal)
+            || pixFmt.Contains("444", StringComparison.Ordinal))
+            return false;
+
+        return true;
     }
 
     /// <summary>
@@ -7341,12 +7537,23 @@ public class TranscodingService
         }
 
         // Classify the failure once — order of the retry tiers below is driven by this.
-        bool isEncoderFeatureError =
+        // Decoder-side failures (hwaccel decoder rejected the stream: QSV "Error querying
+        // IO surface", the per-packet "Error submitting packet to decoder", cuvid "Codec
+        // not supported") must not be mistaken for encoder feature errors — the tail of
+        // that stderr also says "Function not implemented" / "not supported", and
+        // re-running with conservative *encoder* flags would replay the same decode.
+        bool isDecoderError =
+            reason.Contains("Error querying IO surface", StringComparison.OrdinalIgnoreCase) ||
+            reason.Contains("Error submitting packet to decoder", StringComparison.OrdinalIgnoreCase) ||
+            reason.Contains("Error while decoding", StringComparison.OrdinalIgnoreCase) ||
+            reason.Contains("[dec:", StringComparison.OrdinalIgnoreCase);
+
+        bool isEncoderFeatureError = !isDecoderError && (
             reason.Contains("not supported", StringComparison.OrdinalIgnoreCase) ||
             reason.Contains("Provided device doesn't support", StringComparison.OrdinalIgnoreCase) ||
             reason.Contains("Error while opening encoder", StringComparison.OrdinalIgnoreCase) ||
             reason.Contains("Invalid FrameType", StringComparison.OrdinalIgnoreCase) ||
-            reason.Contains("Function not implemented", StringComparison.OrdinalIgnoreCase);
+            reason.Contains("Function not implemented", StringComparison.OrdinalIgnoreCase));
 
         bool isHwEncoder = !options.HardwareAcceleration.Equals("none", StringComparison.OrdinalIgnoreCase);
 
@@ -7379,7 +7586,8 @@ public class TranscodingService
         // This tier runs BEFORE the subtitle tiers: a decode/filter format error has
         // nothing to do with sub streams, and stripping subs first meant the eventual
         // sw-decode success shipped without subtitles for no reason.
-        bool isHwaccelError = reason.Contains("hwaccel", StringComparison.OrdinalIgnoreCase)
+        bool isHwaccelError = isDecoderError
+            || reason.Contains("hwaccel", StringComparison.OrdinalIgnoreCase)
             || reason.Contains("filter graph", StringComparison.OrdinalIgnoreCase)
             || reason.Contains("Impossible to convert", StringComparison.OrdinalIgnoreCase)
             || reason.Contains("hwupload", StringComparison.OrdinalIgnoreCase)

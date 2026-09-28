@@ -44,13 +44,13 @@ RUN userdel -r ubuntu 2>/dev/null || true && \
     (usermod -aG render snacks || true)
 
 # TesseractOCR's LibraryLoader hardcodes Windows-DLL filenames and just appends
-# .so on Linux, so it dlopens "libleptonica-1.83.1.dll.so" / "libtesseract53.dll.so"
+# .so on Linux, so it dlopens "libleptonica-1.85.0.dll.so" / "libtesseract55.dll.so"
 # from a "x64/" subdir of CustomSearchPath. Noble ships the same ABI under different
 # names (liblept.so.5 from leptonica 1.82, libtesseract.so.5), so symlink them into
 # the names the loader expects. Mirrors electron-app/scripts/bundle-ocr-mac.sh.
 RUN mkdir -p /app/x64 && \
-    ln -sf /lib/x86_64-linux-gnu/liblept.so.5      /app/x64/libleptonica-1.83.1.dll.so && \
-    ln -sf /lib/x86_64-linux-gnu/libtesseract.so.5 /app/x64/libtesseract53.dll.so
+    ln -sf /lib/x86_64-linux-gnu/liblept.so.5      /app/x64/libleptonica-1.85.0.dll.so && \
+    ln -sf /lib/x86_64-linux-gnu/libtesseract.so.5 /app/x64/libtesseract55.dll.so
 
 # The loader uses [DllImport("libdl")] to call dlopen itself. glibc 2.34+ folded libdl
 # into libc.so.6 and only the libdl.so.2 compat stub remains; the unversioned libdl.so

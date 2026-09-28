@@ -308,6 +308,40 @@ public static class AdvancedVideoValidator
             if (TypedVideoOptions.Contains(option))
                 Warn(result, $"{optionPath}.option", "option_override", $"{option} overrides a typed profile setting because custom options are appended last.");
         }
+
+        WarnWhenDolbyVisionLeavesSampleEntryUnset(result, options, path);
+    }
+
+    /// <summary>
+    ///     Dolby Vision encodes make the profile responsible for the MP4 sample entry: Snacks
+    ///     stops adding its automatic <c>-tag:v hvc1</c>, and ffmpeg writes the Dolby Vision
+    ///     configuration box only under <c>-strict unofficial</c> or a more permissive level.
+    ///     Warn when the tag is missing or the effective compliance level drops the record.
+    /// </summary>
+    /// <param name="result"> Diagnostics sink for the profile being validated. </param>
+    /// <param name="options"> The profile's custom options. </param>
+    /// <param name="path"> Diagnostic path prefix of the profile. </param>
+    private static void WarnWhenDolbyVisionLeavesSampleEntryUnset(
+        AdvancedVideoValidationResult result, IReadOnlyList<CustomVideoOption> options, string path)
+    {
+        var arguments = new List<string>();
+        foreach (var custom in options)
+        {
+            if (custom == null) continue;
+            arguments.Add(custom.Option);
+            arguments.AddRange(custom.Values ?? []);
+        }
+        if (!Mp4SampleEntryOptions.EnablesDolbyVision(arguments)) return;
+
+        bool setsVideoTag = options.Any(custom =>
+            Mp4SampleEntryOptions.IsVideoTagOption(custom?.Option));
+        bool keepsConfiguration = Mp4SampleEntryOptions.AllowsDolbyVisionConfiguration(arguments);
+        if (setsVideoTag && keepsConfiguration) return;
+
+        Warn(result, $"{path}.customOptions", "dolby_vision_sample_entry",
+            "Dolby Vision options make this profile responsible for the MP4 sample entry: add "
+            + "-tag:v (dvh1 for profile 5, hvc1 for profile 8) and -strict unofficial so the "
+            + "Dolby Vision configuration box is written.");
     }
 
     private static void Error(AdvancedVideoValidationResult result, string path, string code, string message) =>
