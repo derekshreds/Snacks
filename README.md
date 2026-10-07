@@ -147,7 +147,7 @@ See the [complete Docker/NAS guide](https://snacksvideo.com/docs/#quick-start) o
 - Dry-run directory analysis before anything is queued
 - Distributed encoding with coordinator and worker roles
 - Plex and Jellyfin library rescans
-- Sonarr, Radarr, TMDb, and TheTVDB connectivity
+- Sonarr, Radarr, Lidarr, TMDb, and TheTVDB connectivity
 - Homarr dashboards through either a compact Snacks iFrame tile or the native Media Transcoding widget via a read-only Tdarr adapter
 - Webhook, Discord, ntfy, and Apprise notifications
 - API-key authentication, environment-variable configuration, OpenAPI, and health endpoints

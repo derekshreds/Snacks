@@ -46,9 +46,15 @@ public sealed class OriginalLanguageLookupTests : IDisposable
         svc.SaveConfig(new IntegrationConfig
         {
             Sonarr = new ArrIntegration { Enabled = true, BaseUrl = "http://sonarr.test:8989", ApiKey = "k" },
+            Radarr = new ArrIntegration { Enabled = true, BaseUrl = "http://radarr.test:7878", ApiKey = "k" },
         });
         return svc;
     }
+
+    private static StubHandler CatalogHandler(string json) => new(_ => new HttpResponseMessage(HttpStatusCode.OK)
+    {
+        Content = new StringContent(json, Encoding.UTF8, "application/json"),
+    });
 
 
     [Fact]
@@ -121,6 +127,37 @@ public sealed class OriginalLanguageLookupTests : IDisposable
         (await svc.LookupOriginalLanguageAsync(TvPath, "sonarr", CancellationToken.None)).Should().Be("en");
 
         handler.Calls.Should().Be(1);
+    }
+
+
+    /******************************************************************
+     *  Folder-name fallback (Arr paths that don't prefix the local path)
+     ******************************************************************/
+
+    [Theory]
+    [InlineData("sonarr", """[{"path":"/tv/Mr. Robot (2015)","originalLanguage":{"name":"English"}}]""",
+                "/mnt/media/TV/Mr. Robot (2015)/Season 01/Mr. Robot - S01E01.mkv", "en")]
+    [InlineData("radarr", """[{"path":"/movies/Mr. Nobody (2009)","originalLanguage":{"name":"French"}}]""",
+                "/mnt/media/Movies/Mr. Nobody (2009)/Mr. Nobody (2009) Bluray-1080p.mkv", "fr")]
+    public async Task Fallback_matches_folder_names_containing_dots(string provider, string catalog, string path, string expected)
+    {
+        // A dot in a directory name is not a file extension: "Mr. Robot (2015)" must not
+        // be compared as "Mr".
+        var svc = NewService(CatalogHandler(catalog));
+
+        (await svc.LookupOriginalLanguageAsync(path, provider, CancellationToken.None)).Should().Be(expected);
+    }
+
+
+    [Theory]
+    [InlineData(@"D:\Media\Movies\TRON - Legacy (2010).mkv")]
+    [InlineData("/mnt/media/Movies/TRON - Legacy (2010)/TRON - Legacy (2010).mkv")]
+    public async Task Fallback_still_matches_a_movie_file_named_like_the_arr_folder(string path)
+    {
+        // Flat layout (file directly in Movies) relies on the file name minus its extension.
+        var svc = NewService(CatalogHandler("""[{"path":"/movies/TRON - Legacy (2010)","originalLanguage":{"name":"English"}}]"""));
+
+        (await svc.LookupOriginalLanguageAsync(path, "radarr", CancellationToken.None)).Should().Be("en");
     }
 
 

@@ -1,5 +1,5 @@
 /**
- * Integrations settings panel (Plex / Jellyfin / Sonarr / Radarr / Luna).
+ * Integrations settings panel (Plex / Jellyfin / Sonarr / Radarr / Lidarr / Luna).
  *
  * Reads/writes the integration config via {@link integrationsApi}, exposes a
  * per-provider "Test" button that pings the backend to confirm the supplied
@@ -69,6 +69,11 @@ function buildConfig() {
             baseUrl: val('radarrBaseUrl'),
             apiKey:  val('radarrApiKey'),
         },
+        lidarr: {
+            enabled: chk('lidarrEnabled'),
+            baseUrl: val('lidarrBaseUrl'),
+            apiKey:  val('lidarrApiKey'),
+        },
         tvdb: {
             enabled: chk('tvdbEnabled'),
             apiKey:  val('tvdbApiKey'),
@@ -113,6 +118,10 @@ async function load() {
         setVal('radarrEnabled',   cfg.radarr?.enabled);
         setVal('radarrBaseUrl',   cfg.radarr?.baseUrl);
         setVal('radarrApiKey',    cfg.radarr?.apiKey);
+
+        setVal('lidarrEnabled',   cfg.lidarr?.enabled);
+        setVal('lidarrBaseUrl',   cfg.lidarr?.baseUrl);
+        setVal('lidarrApiKey',    cfg.lidarr?.apiKey);
 
         setVal('tvdbEnabled',     cfg.tvdb?.enabled);
         setVal('tvdbApiKey',      cfg.tvdb?.apiKey);
@@ -263,7 +272,7 @@ async function disconnectLuna() {
  * Issues a test-connection call against the named provider and paints the
  * result into its per-row `<span class="small">` element.
  *
- * @param {'plex'|'jellyfin'|'sonarr'|'radarr'|'tvdb'|'tmdb'} service
+ * @param {'plex'|'jellyfin'|'sonarr'|'radarr'|'lidarr'|'tvdb'|'tmdb'} service
  */
 async function test(service) {
     const result = document.getElementById(`${service}TestResult`);
@@ -284,6 +293,9 @@ async function test(service) {
                 break;
             case 'radarr':
                 data = await integrationsApi.testRadarr(  val('radarrBaseUrl'),   val('radarrApiKey'));
+                break;
+            case 'lidarr':
+                data = await integrationsApi.testLidarr(  val('lidarrBaseUrl'),   val('lidarrApiKey'));
                 break;
             case 'tvdb':
                 data = await integrationsApi.testTvdb(    val('tvdbApiKey'),      val('tvdbPin'));
@@ -315,6 +327,7 @@ export function initIntegrationsPanel() {
     document.getElementById('testJellyfin')?.addEventListener('click', () => test('jellyfin'));
     document.getElementById('testSonarr')  ?.addEventListener('click', () => test('sonarr'));
     document.getElementById('testRadarr')  ?.addEventListener('click', () => test('radarr'));
+    document.getElementById('testLidarr')  ?.addEventListener('click', () => test('lidarr'));
     document.getElementById('testTvdb')    ?.addEventListener('click', () => test('tvdb'));
     document.getElementById('testTmdb')    ?.addEventListener('click', () => test('tmdb'));
     document.getElementById('connectLuna')   ?.addEventListener('click', connectLuna);
