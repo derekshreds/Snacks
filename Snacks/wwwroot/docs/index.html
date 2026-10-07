@@ -419,7 +419,7 @@
         <div class="group">Contributors</div>
         <a href="#development">Development</a>
       </nav>
-      <div class="version">Documents Snacks v2.19.1 · updated 2026-08-28</div>
+      <div class="version">Documents Snacks v2.20.0 · updated 2026-10-06</div>
       </div>
     </aside>
 
@@ -623,6 +623,16 @@
             </tbody>
           </table>
         </div>
+        <h3>Tracks with undetermined language</h3>
+        <p>
+          Add <code>und</code> (Undetermined) to either <strong>Languages to Keep</strong> list
+          when you want to retain audio or subtitle tracks whose language tag is missing, empty,
+          <code>und</code>, <code>mul</code>, <code>zxx</code>, or otherwise unrecognized. Its
+          position in the list controls output order like any other language. A recognizable
+          language tag or a language-bearing title still wins, so an <code>und</code>-tagged track
+          titled “English SDH” is treated as English rather than undetermined. Leaving the keep
+          list empty continues to keep all tracks.
+        </p>
         <div class="callout">
           <strong>Presets are the safest way to experiment.</strong>
           Save a known-good baseline, create a second preset for the experiment, and export
@@ -891,10 +901,15 @@
         </ol>
         <h3>Exclusions</h3>
         <ul>
-          <li><code>filenamePatterns</code>: glob-style patterns such as <code>*REMUX*</code> or <code>sample?.mkv</code>.</li>
-          <li><code>minSizeGBToSkip</code>: skips files at or above the threshold.</li>
-          <li><code>excludeResolutions</code>: labels such as <code>2160p</code>, <code>1080p</code>, or <code>720p</code>.</li>
+          <li><code>filenamePatterns</code>: glob-style patterns such as <code>*REMUX*</code> or <code>sample?.mkv</code>; applies to video and music.</li>
+          <li><code>minSizeGBToSkip</code>: skips video or music files at or above the threshold.</li>
+          <li><code>excludeResolutions</code>: video-only labels such as <code>2160p</code>, <code>1080p</code>, or <code>720p</code>. Snacks classifies by the larger of the real height and the 16:9 height derived from the width, so widescreen 1920×1080 media is 1080p and an ultra-wide 1920×800 master still buckets as 1080p.</li>
         </ul>
+        <p>
+          Analyze uses the same exclusions as a real scan and reports excluded files without
+          queueing them. An explicit manual <strong>Process Item</strong> is a force-add and bypasses
+          exclusions, which lets you process a deliberately excluded file when needed.
+        </p>
         <div class="callout danger">
           <strong>“Clear history” is broad.</strong> It makes previously processed files eligible
           for discovery again. Prefer Re-evaluate after a settings change when that is your goal.
@@ -1186,8 +1201,10 @@ environment:
           </table>
         </div>
         <p>
-          Integration credentials are stored in plaintext JSON inside the Snacks config
-          directory. Protect that directory with host permissions, enable control-panel
+          Most integration credentials are stored in plaintext JSON inside the Snacks config
+          directory. Luna is different: your password is exchanged once and never saved, while
+          its restricted refresh credential is stored separately in <code>luna-connection.json</code>.
+          Protect the complete config directory with host permissions, enable control-panel
           authentication, and restrict network access to trusted clients.
         </p>
 
@@ -1358,7 +1375,8 @@ environment:
               <tr><td><code>config/autoscan.json</code></td><td>Watch folders, interval, pause state, exclusions.</td><td>Yes</td></tr>
               <tr><td><code>config/cluster.json</code></td><td>Role, identity, shared secret, discovery, shared paths.</td><td>Yes; sensitive</td></tr>
               <tr><td><code>config/node-settings.json</code></td><td>Per-node devices, schedules, and limits.</td><td>Yes</td></tr>
-              <tr><td><code>config/integrations.json</code></td><td>Third-party endpoints and credentials.</td><td>Yes; sensitive</td></tr>
+              <tr><td><code>config/integrations.json</code></td><td>Third-party endpoints, credentials, and non-secret Luna preferences.</td><td>Yes; sensitive</td></tr>
+              <tr><td><code>config/luna-connection.json</code> and <code>.bak</code></td><td>Luna connector identity and restricted refresh credential; removed on disconnect.</td><td>Yes; sensitive</td></tr>
               <tr><td><code>config/notifications.json</code></td><td>Notification destinations and event toggles.</td><td>Yes; sensitive</td></tr>
               <tr><td><code>config/auth.json</code></td><td>Password hash and session signing secret.</td><td>Yes; sensitive</td></tr>
               <tr><td><code>config/networking.json</code></td><td>Cluster transfer limits and chunk size.</td><td>Yes</td></tr>
@@ -1578,7 +1596,7 @@ docker exec snacks vainfo</code></pre>
         </p>
         <div class="callout warning">
           <strong>Compatibility note.</strong> The API is not URL-versioned. Treat this reference as
-          the v2.19.1 contract and test automation against new Snacks releases before deployment.
+          the v2.20.0 contract and test automation against new Snacks releases before deployment.
         </div>
         <p>
           The running app also publishes a generated, machine-readable OpenAPI document at
@@ -1812,6 +1830,7 @@ curl -fsS -b snacks.cookies \
               <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/integrations/test/jellyfin</code></td><td><code>{baseUrl,token}</code></td><td>Tests Jellyfin credentials/connectivity without saving.</td></tr>
               <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/integrations/test/sonarr</code></td><td><code>{baseUrl,apiKey}</code></td><td>Tests Sonarr credentials/connectivity without saving.</td></tr>
               <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/integrations/test/radarr</code></td><td><code>{baseUrl,apiKey}</code></td><td>Tests Radarr credentials/connectivity without saving.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/integrations/test/lidarr</code></td><td><code>{baseUrl,apiKey}</code></td><td>Tests Lidarr credentials/connectivity without saving.</td></tr>
               <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/integrations/test/tvdb</code></td><td><code>{apiKey,pin}</code></td><td>Tests TVDB authentication without saving.</td></tr>
               <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/integrations/test/tmdb</code></td><td><code>{apiKey}</code></td><td>Tests TMDb authentication without saving.</td></tr>
               <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/networking</code></td><td>—</td><td>Returns cluster transfer concurrency, rate, and chunk settings.</td></tr>
@@ -2054,7 +2073,7 @@ node scripts/sync-version.mjs
 
       <footer>
         <p>
-          Snacks documentation for v2.19.1. This file is self-contained: save or print it for
+          Snacks documentation for v2.20.0. This file is self-contained: save or print it for
           offline use. The running app serves it at <code>/docs/index.html</code>.
         </p>
       </footer>
