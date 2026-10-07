@@ -17,6 +17,9 @@ public sealed class IntegrationConfig
     /// <summary> Radarr integration settings. </summary>
     public ArrIntegration Radarr { get; set; } = new();
 
+    /// <summary> Lidarr integration settings — album-folder rescans after a music encode replaces its original. </summary>
+    public ArrIntegration Lidarr { get; set; } = new();
+
     /// <summary> TheTVDB v4 integration (project API key + optional user PIN). </summary>
     public TvdbIntegration Tvdb { get; set; } = new();
 
@@ -43,7 +46,7 @@ public sealed class MediaServerIntegration
     public bool Enabled { get; set; } = false;
 }
 
-/// <summary> Connection settings for a Sonarr or Radarr instance. </summary>
+/// <summary> Connection settings for a Sonarr, Radarr, or Lidarr instance. </summary>
 public sealed class ArrIntegration
 {
     /// <summary> Base URL of the Arr instance (e.g. "http://localhost:8989"). </summary>

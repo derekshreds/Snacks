@@ -6,9 +6,10 @@ using Snacks.Models;
 namespace Snacks.Services;
 
 /// <summary>
-///     Handles third-party integration persistence plus live test-connection calls
-///     and library-rescan triggers for Plex / Jellyfin. Sonarr / Radarr credentials
-///     are stored here so the (future) original-language lookup can consume them.
+///     Handles third-party integration persistence plus live test-connection calls,
+///     library-rescan triggers for Plex / Jellyfin, and per-item rescans in Sonarr / Radarr /
+///     Lidarr after an encode replaces its original. Sonarr / Radarr catalogues also feed the
+///     original-language lookup.
 /// </summary>
 public sealed class IntegrationService
 {
@@ -28,6 +29,7 @@ public sealed class IntegrationService
     private static readonly TimeSpan _arrFailureCacheTtl = TimeSpan.FromMinutes(3);
     private readonly Dictionary<string, (DateTime expires, IReadOnlyList<LibraryRoot> roots)> _plexRootsCache     = new();
     private readonly Dictionary<string, (DateTime expires, IReadOnlyList<LibraryRoot> roots)> _jellyfinRootsCache = new();
+    private readonly Dictionary<string, (DateTime expires, IReadOnlyList<LibraryRoot> roots)> _lidarrRootsCache   = new();
     private readonly object _rootsLock = new();
 
     public IntegrationService(ConfigFileService configFileService, IHttpClientFactory httpClientFactory)
@@ -68,7 +70,8 @@ public sealed class IntegrationService
             {
                 _plexRootsCache.Clear();
                 _jellyfinRootsCache.Clear();
-                _arrLangCache.Clear();
+                _lidarrRootsCache.Clear();
+                _arrCatalogCache.Clear();
             }
             // The TVDB bearer token isn't keyed to the API key — a changed key would
             // otherwise keep using the previous token until it expired or 401'd.
@@ -124,7 +127,7 @@ public sealed class IntegrationService
             http.Timeout = TimeSpan.FromSeconds(10);
             var url      = baseUrl.TrimEnd('/') + "/System/Info";
             var req      = new HttpRequestMessage(HttpMethod.Get, url);
-            req.Headers.TryAddWithoutValidation("X-Emby-Token", apiKey);
+            AddJellyfinAuth(req, apiKey);
             using var resp = await http.SendAsync(req);
             if (!resp.IsSuccessStatusCode) return (false, $"HTTP {(int)resp.StatusCode}");
             return (true, "Jellyfin connection OK");
@@ -136,13 +139,14 @@ public sealed class IntegrationService
     }
 
     /// <summary>
-    ///     Sends a test request to the Sonarr or Radarr system-status endpoint and returns whether
-    ///     the connection succeeded along with a status message.
+    ///     Sends a test request to the Sonarr, Radarr, or Lidarr system-status endpoint and
+    ///     returns whether the connection succeeded along with a status message.
     /// </summary>
     /// <param name="baseUrl"> The base URL of the Arr instance. </param>
     /// <param name="apiKey"> The Arr API key. </param>
-    /// <param name="flavor"> Display name for logging ("Sonarr" or "Radarr"). </param>
-    public async Task<(bool ok, string message)> TestArrAsync(string baseUrl, string apiKey, string flavor)
+    /// <param name="flavor"> Display name for logging ("Sonarr", "Radarr", or "Lidarr"). </param>
+    /// <param name="apiVersion"> API path version — <c>"v3"</c> for Sonarr/Radarr, <c>"v1"</c> for Lidarr. </param>
+    public async Task<(bool ok, string message)> TestArrAsync(string baseUrl, string apiKey, string flavor, string apiVersion = "v3")
     {
         if (string.IsNullOrWhiteSpace(baseUrl) || string.IsNullOrWhiteSpace(apiKey))
             return (false, "Base URL and API key required");
@@ -150,7 +154,7 @@ public sealed class IntegrationService
         {
             var http     = _httpClientFactory.CreateClient();
             http.Timeout = TimeSpan.FromSeconds(10);
-            var url      = baseUrl.TrimEnd('/') + "/api/v3/system/status";
+            var url      = baseUrl.TrimEnd('/') + $"/api/{apiVersion}/system/status";
             var req      = new HttpRequestMessage(HttpMethod.Get, url);
             req.Headers.TryAddWithoutValidation("X-Api-Key", apiKey);
             using var resp = await http.SendAsync(req);
@@ -173,22 +177,25 @@ public sealed class IntegrationService
     ///     attempts a per-item scan scoped to that file (remapping the path through the
     ///     server's own library roots so Docker/bind-mount layouts work); if the scoped
     ///     call fails or no matching library root is found, falls back to a full refresh.
+    ///     Only libraries of the file's kind are considered (music libraries for music), and
+    ///     a server with no library of that kind is skipped rather than fully refreshed.
     ///     Best-effort: logs and swallows individual errors.
     /// </summary>
     /// <param name="completedFilePath">
     ///     Absolute path of the file that just finished encoding <i>as Snacks sees it</i>.
     ///     <see langword="null"/> or empty triggers a full library refresh on each server.
     /// </param>
-    public async Task TriggerRescansAsync(string? completedFilePath = null)
+    /// <param name="kind"> Whether the file is music or video, which decides the libraries it can belong to. </param>
+    public async Task TriggerRescansAsync(string? completedFilePath, MediaKind kind)
     {
         IntegrationConfig cfg;
         lock (_lock) cfg = _config;
 
         var tasks = new List<Task>();
         if (cfg.Plex.Enabled && cfg.Plex.RescanOnComplete && !string.IsNullOrWhiteSpace(cfg.Plex.BaseUrl))
-            tasks.Add(PlexRescanAsync(cfg.Plex, completedFilePath));
+            tasks.Add(PlexRescanAsync(cfg.Plex, completedFilePath, kind));
         if (cfg.Jellyfin.Enabled && cfg.Jellyfin.RescanOnComplete && !string.IsNullOrWhiteSpace(cfg.Jellyfin.BaseUrl))
-            tasks.Add(JellyfinRescanAsync(cfg.Jellyfin, completedFilePath));
+            tasks.Add(JellyfinRescanAsync(cfg.Jellyfin, completedFilePath, kind));
 
         if (tasks.Count == 0) return;
         try
@@ -201,7 +208,7 @@ public sealed class IntegrationService
         }
     }
 
-    private async Task PlexRescanAsync(MediaServerIntegration p, string? snacksFilePath)
+    private async Task PlexRescanAsync(MediaServerIntegration p, string? snacksFilePath, MediaKind kind)
     {
         try
         {
@@ -213,11 +220,17 @@ public sealed class IntegrationService
             // Plex's library roots, then refresh only that directory.
             if (!string.IsNullOrWhiteSpace(snacksFilePath))
             {
-                var roots = await GetPlexRootsAsync(http, baseUrl, p.Token);
-                var hit   = MapPath(snacksFilePath, roots);
+                var roots = RootsForKind(await GetPlexRootsAsync(http, baseUrl, p.Token), kind, PlexMusicSectionType);
+                if (roots == null)
+                {
+                    Log.Information($"Plex: no {KindLabel(kind)} library; skipping rescan for '{snacksFilePath}'");
+                    return;
+                }
+
+                var hit = MapPath(snacksFilePath, roots);
                 if (hit != null)
                 {
-                    var scopeDir = GetDirectorySafe(hit.MappedPath) ?? hit.Root.Path;
+                    var scopeDir = ParentDirectory(hit.MappedPath) ?? hit.Root.Path;
                     var scoped   = $"{baseUrl}/library/sections/{hit.Root.Id}/refresh?path={Uri.EscapeDataString(scopeDir)}";
                     var sReq     = new HttpRequestMessage(HttpMethod.Get, scoped);
                     sReq.Headers.TryAddWithoutValidation("X-Plex-Token", p.Token);
@@ -245,7 +258,7 @@ public sealed class IntegrationService
         }
     }
 
-    private async Task JellyfinRescanAsync(MediaServerIntegration j, string? snacksFilePath)
+    private async Task JellyfinRescanAsync(MediaServerIntegration j, string? snacksFilePath, MediaKind kind)
     {
         try
         {
@@ -257,8 +270,14 @@ public sealed class IntegrationService
             // Jellyfin's library roots, then notify Jellyfin about that single file.
             if (!string.IsNullOrWhiteSpace(snacksFilePath))
             {
-                var roots = await GetJellyfinRootsAsync(http, baseUrl, j.Token);
-                var hit   = MapPath(snacksFilePath, roots);
+                var roots = RootsForKind(await GetJellyfinRootsAsync(http, baseUrl, j.Token), kind, JellyfinMusicCollectionType);
+                if (roots == null)
+                {
+                    Log.Information($"Jellyfin: no {KindLabel(kind)} library; skipping rescan for '{snacksFilePath}'");
+                    return;
+                }
+
+                var hit = MapPath(snacksFilePath, roots);
                 if (hit != null)
                 {
                     var body = JsonSerializer.Serialize(new
@@ -270,7 +289,7 @@ public sealed class IntegrationService
                     {
                         Content = new StringContent(body, Encoding.UTF8, "application/json"),
                     };
-                    req.Headers.TryAddWithoutValidation("X-Emby-Token", j.Token);
+                    AddJellyfinAuth(req, j.Token);
                     using var resp = await http.SendAsync(req);
                     if (resp.IsSuccessStatusCode) return;
                     Log.Warning($"Jellyfin scoped rescan failed (HTTP {(int)resp.StatusCode}); falling back to full refresh");
@@ -284,7 +303,7 @@ public sealed class IntegrationService
             // Fallback: full library refresh.
             var fullUrl = baseUrl + "/Library/Refresh";
             var fullReq = new HttpRequestMessage(HttpMethod.Post, fullUrl);
-            fullReq.Headers.TryAddWithoutValidation("X-Emby-Token", j.Token);
+            AddJellyfinAuth(fullReq, j.Token);
             using var fullResp = await http.SendAsync(fullReq);
             if (!fullResp.IsSuccessStatusCode)
                 Log.Warning($"Jellyfin rescan failed: HTTP {(int)fullResp.StatusCode}");
@@ -302,7 +321,38 @@ public sealed class IntegrationService
     /// <summary> A single filesystem root scanned by a media server library/section. </summary>
     /// <param name="Id">   Opaque identifier used in scoped-refresh URLs (Plex section key; Jellyfin virtual-folder name). </param>
     /// <param name="Path"> Filesystem path as the media server sees it.                                                   </param>
-    private sealed record LibraryRoot(string Id, string Path);
+    /// <param name="Type"> The library's content type as the server reports it (Plex section type; Jellyfin CollectionType). </param>
+    private sealed record LibraryRoot(string Id, string Path, string? Type = null);
+
+    // Content types that mark a music library: Plex section type, Jellyfin CollectionType.
+    private const string PlexMusicSectionType        = "artist";
+    private const string JellyfinMusicCollectionType = "music";
+
+    /// <summary>
+    ///     The library roots a file of <paramref name="kind"/> can live in: music libraries for
+    ///     music, every other library for video. <see langword="null"/> when the server lists
+    ///     libraries but none of that kind, so the file can't be in it and a full refresh would
+    ///     rescan everything for nothing. An empty list (the lookup failed) passes through so
+    ///     the caller keeps its full-refresh fallback.
+    /// </summary>
+    private static IReadOnlyList<LibraryRoot>? RootsForKind(IReadOnlyList<LibraryRoot> roots, MediaKind kind, string musicType)
+    {
+        if (roots.Count == 0) return roots;
+        var forKind = roots
+            .Where(r => string.Equals(r.Type, musicType, StringComparison.OrdinalIgnoreCase) == (kind == MediaKind.Music))
+            .ToList();
+        return forKind.Count > 0 ? forKind : null;
+    }
+
+    private static string KindLabel(MediaKind kind) => kind == MediaKind.Music ? "music" : "video";
+
+    /// <summary>
+    ///     Authenticates a Jellyfin request. Current Jellyfin ships with legacy authorization
+    ///     disabled and answers the old <c>X-Emby-Token</c> header with 401; this header form
+    ///     works on current and older releases alike.
+    /// </summary>
+    private static void AddJellyfinAuth(HttpRequestMessage req, string apiKey) =>
+        req.Headers.TryAddWithoutValidation("Authorization", $"MediaBrowser Token=\"{apiKey}\"");
 
     /// <summary> Result of a path-remap attempt. </summary>
     /// <param name="Root">       The library root that matched.                 </param>
@@ -396,18 +446,6 @@ public sealed class IntegrationService
         return trimmed + sep + string.Join(sep, remainder);
     }
 
-    private static string? GetDirectorySafe(string filePath)
-    {
-        try
-        {
-            // Path.GetDirectoryName strips a trailing separator and handles both
-            // Windows and POSIX layouts; it returns null/empty if there's no parent.
-            var d = Path.GetDirectoryName(filePath);
-            return string.IsNullOrEmpty(d) ? null : d;
-        }
-        catch { return null; }
-    }
-
     /******************************************************************
      *  Plex Library Roots
      ******************************************************************/
@@ -471,13 +509,14 @@ public sealed class IntegrationService
 
             foreach (var d in dirs.EnumerateArray())
             {
-                var key = d.TryGetProperty("key", out var k) ? k.GetString() : null;
+                var key  = d.TryGetProperty("key", out var k) ? k.GetString() : null;
                 if (string.IsNullOrEmpty(key)) continue;
+                var type = d.TryGetProperty("type", out var t) ? t.GetString() : null;
                 if (!d.TryGetProperty("Location", out var locs) || locs.ValueKind != JsonValueKind.Array) continue;
 
                 foreach (var loc in locs.EnumerateArray())
                     if (loc.TryGetProperty("path", out var p) && p.GetString() is { Length: > 0 } path)
-                        list.Add(new LibraryRoot(key!, path));
+                        list.Add(new LibraryRoot(key!, path, type));
             }
         }
         catch (Exception ex)
@@ -510,7 +549,7 @@ public sealed class IntegrationService
         {
             var url = baseUrl + "/Library/VirtualFolders";
             var req = new HttpRequestMessage(HttpMethod.Get, url);
-            req.Headers.TryAddWithoutValidation("X-Emby-Token", apiKey);
+            AddJellyfinAuth(req, apiKey);
             using var resp = await http.SendAsync(req);
             if (resp.IsSuccessStatusCode)
             {
@@ -551,11 +590,14 @@ public sealed class IntegrationService
             foreach (var folder in doc.RootElement.EnumerateArray())
             {
                 var name = folder.TryGetProperty("Name", out var n) ? n.GetString() ?? "" : "";
+                var type = folder.TryGetProperty("CollectionType", out var ct) && ct.ValueKind == JsonValueKind.String
+                    ? ct.GetString()
+                    : null;
                 if (!folder.TryGetProperty("Locations", out var locs) || locs.ValueKind != JsonValueKind.Array) continue;
 
                 foreach (var loc in locs.EnumerateArray())
                     if (loc.GetString() is { Length: > 0 } path)
-                        list.Add(new LibraryRoot(name, path));
+                        list.Add(new LibraryRoot(name, path, type));
             }
         }
         catch (Exception ex)
@@ -566,11 +608,435 @@ public sealed class IntegrationService
     }
 
     /******************************************************************
+     *  Arr Rescans
+     ******************************************************************/
+
+    /// <summary>
+    ///     How long a series, movie, or album folder must go without another replaced file
+    ///     before its Arr is asked to rescan it, so a season or album coalesces into one
+    ///     scan. Settable for tests.
+    /// </summary>
+    internal TimeSpan RescanQuietPeriod { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary> Gap between Radarr command-status polls while waiting to restore monitoring. Settable for tests. </summary>
+    internal TimeSpan ArrCommandPollInterval { get; set; } = TimeSpan.FromSeconds(2);
+
+    // Bounds the re-arms after an Arr merges a request into a scan that's already running.
+    private const int ArrRescanMaxRearms = 5;
+
+    // How long to wait for a Radarr rescan (which may queue behind other Radarr work)
+    // before giving up on restoring the movie's monitored flag.
+    private static readonly TimeSpan _arrCommandWaitLimit = TimeSpan.FromMinutes(5);
+
+    /// <summary>
+    ///     A resolved rescan: the Arr to ask and the command that rescans only the replaced
+    ///     file's series, movie, or album folder.
+    /// </summary>
+    /// <param name="Flavor">        "Sonarr", "Radarr", or "Lidarr" (logging).                  </param>
+    /// <param name="Arr">           Connection the command is posted to.                       </param>
+    /// <param name="ApiVersion">    <c>"v3"</c> for Sonarr/Radarr, <c>"v1"</c> for Lidarr.        </param>
+    /// <param name="Scope">         What gets rescanned, as the Arr names it (series/movie/album folder). </param>
+    /// <param name="Command">       Body for <c>POST /api/{ApiVersion}/command</c>.                </param>
+    /// <param name="RadarrMovieId"> The Radarr movie being rescanned, so its monitored flag can be guarded. </param>
+    private sealed record ArrRescanTarget(string Flavor, ArrIntegration Arr, string ApiVersion, string Scope, object Command,
+                                          int? RadarrMovieId = null);
+
+    // Debounce state per scope key ("{flavor}|{baseUrl}|{scope}"). Ticket identifies the newest
+    // pending request (only it fires); LastCommandId is the command an Arr last returned for
+    // the scope, which tells a merged response apart from a freshly queued scan.
+    private sealed class RescanState
+    {
+        public long     Ticket;
+        public int?     LastCommandId;
+        public DateTime Touched;
+    }
+    private readonly Dictionary<string, RescanState> _rescanStates = new();
+    private readonly object _rescanLock = new();
+    private long _rescanTicketSeq;
+
+    /// <summary>
+    ///     Asks the owning Arr to rescan the series, movie, or album of a file whose original
+    ///     was just replaced. The Arrs track individual files, so a replacement (new extension,
+    ///     or new size and codec under the same name) reads as missing or stale until that folder
+    ///     is rescanned; the scan drops the old file record and imports the new file in place.
+    ///     Each command is scoped to one item — never a library-wide scan — and debounced per
+    ///     item by <see cref="RescanQuietPeriod"/>. Fire-and-forget; no-op when no relevant
+    ///     Arr is enabled.
+    /// </summary>
+    /// <param name="originalPath"> Path of the replaced original <i>as Snacks sees it</i>. </param>
+    /// <param name="kind">         Music goes to Lidarr; video to Sonarr or Radarr.     </param>
+    public void QueueArrRescan(string originalPath, MediaKind kind)
+    {
+        if (string.IsNullOrWhiteSpace(originalPath)) return;
+
+        IntegrationConfig cfg;
+        lock (_lock) cfg = _config;
+        _ = RescanAsync(originalPath, kind, cfg);
+    }
+
+    private async Task RescanAsync(string path, MediaKind kind, IntegrationConfig cfg)
+    {
+        // The filename pattern decides which of Sonarr/Radarr is asked first; the other is
+        // tried when the first has no match, so an episode without SxxEyy naming (or a
+        // movie that looks like one) still finds its owner.
+        (string flavor, ArrIntegration arr)[] candidates = kind == MediaKind.Music
+            ? [("Lidarr", cfg.Lidarr)]
+            : MediaTypeDetector.Classify(path) == MediaTypeDetector.MediaKind.Tv
+                ? [("Sonarr", cfg.Sonarr), ("Radarr", cfg.Radarr)]
+                : [("Radarr", cfg.Radarr), ("Sonarr", cfg.Sonarr)];
+        var usable = candidates
+            .Where(c => c.arr.Enabled && !string.IsNullOrWhiteSpace(c.arr.BaseUrl) && !string.IsNullOrWhiteSpace(c.arr.ApiKey))
+            .ToList();
+        if (usable.Count == 0) return;
+
+        try
+        {
+            ArrRescanTarget? target = null;
+            foreach (var (flavor, arr) in usable)
+            {
+                target = await ResolveRescanTargetAsync(flavor, arr, path);
+                if (target != null) break;
+            }
+
+            if (target == null)
+            {
+                // No library-wide fallback as with Plex/Jellyfin: a full scan per encode would
+                // be heavy on large libraries, and an unmatched path isn't in the Arr anyway.
+                var sought = usable.Select(c => c.flavor switch
+                {
+                    "Sonarr" => "Sonarr series",
+                    "Radarr" => "Radarr movie",
+                    _        => "Lidarr root folder",
+                });
+                Log.Information($"No {string.Join(" or ", sought)} matched '{path}'; skipping rescan");
+                return;
+            }
+
+            await DebouncedRescanAsync(target, rearms: 0);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning($"Arr rescan error: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    ///     Finds what <paramref name="flavor"/> should rescan for <paramref name="path"/>:
+    ///     Lidarr's album folder (by mapping onto its root folders) or the Sonarr series /
+    ///     Radarr movie whose folder lines up with the path. <see langword="null"/> when nothing matches.
+    /// </summary>
+    private async Task<ArrRescanTarget?> ResolveRescanTargetAsync(string flavor, ArrIntegration arr, string path)
+    {
+        if (flavor == "Lidarr")
+        {
+            var http     = _httpClientFactory.CreateClient();
+            http.Timeout = TimeSpan.FromSeconds(10);
+            var roots    = await GetLidarrRootsAsync(http, arr.BaseUrl.TrimEnd('/'), arr.ApiKey);
+            var hit      = MapPath(path, roots);
+            if (hit == null) return null;
+
+            var folder = ParentDirectory(hit.MappedPath) ?? hit.Root.Path;
+            return new ArrRescanTarget(flavor, arr, "v1", folder, new
+            {
+                name          = "RescanFolders",
+                folders       = new[] { folder },
+                // The command's own default is true (the scheduled-task setting); rescanning an
+                // existing album folder must never add artists as a side effect.
+                addNewArtists = false,
+            });
+        }
+
+        // Same anchor matching as library roots, with each series/movie folder as a root:
+        // the entry whose trailing directory names appear deepest in the Snacks path wins,
+        // so mounts that differ between Snacks and the Arr still line up.
+        var isSeries = flavor == "Sonarr";
+        var catalog  = await GetArrCatalogAsync(arr, isSeries, CancellationToken.None);
+        var match    = MapPath(path, catalog.Select(e => new LibraryRoot(e.Id.ToString(), e.Path)).ToList());
+        if (match == null) return null;
+
+        var id = int.Parse(match.Root.Id);
+        return isSeries
+            ? new ArrRescanTarget(flavor, arr, "v3", match.Root.Path, new { name = "RescanSeries", seriesId = id })
+            : new ArrRescanTarget(flavor, arr, "v3", match.Root.Path, new { name = "RescanMovie",  movieId  = id },
+                                  RadarrMovieId: id);
+    }
+
+    /// <summary>
+    ///     Waits out <see cref="RescanQuietPeriod"/> for <paramref name="key"/>.
+    /// </summary>
+    /// <returns> <see langword="false"/> when a later request for the same key re-armed the timer — that one fires instead. </returns>
+    private async Task<bool> WaitForQuietAsync(string key)
+    {
+        long ticket;
+        lock (_rescanLock)
+        {
+            var stale = _rescanStates.Where(kv => kv.Value.Touched < DateTime.UtcNow.AddHours(-1)).Select(kv => kv.Key).ToList();
+            foreach (var k in stale) _rescanStates.Remove(k);
+
+            if (!_rescanStates.TryGetValue(key, out var state)) _rescanStates[key] = state = new RescanState();
+            state.Ticket  = ticket = ++_rescanTicketSeq;
+            state.Touched = DateTime.UtcNow;
+        }
+
+        await Task.Delay(RescanQuietPeriod);
+
+        lock (_rescanLock)
+            return _rescanStates.TryGetValue(key, out var state) && state.Ticket == ticket;
+    }
+
+    private async Task DebouncedRescanAsync(ArrRescanTarget target, int rearms)
+    {
+        var key = $"{target.Flavor}|{target.Arr.BaseUrl.TrimEnd('/')}|{target.Scope}";
+        if (!await WaitForQuietAsync(key)) return;
+
+        int? lastCommandId;
+        lock (_rescanLock)
+            lastCommandId = _rescanStates.TryGetValue(key, out var state) ? state.LastCommandId : null;
+
+        // With "Unmonitor Deleted Movies" on, Radarr unmonitors a movie as soon as its old
+        // file is found missing — even though this same scan imports the replacement
+        // (Sonarr defers that decision until after the scan; Radarr doesn't). Note the
+        // flag first so it can be put back.
+        var restoreMonitoring = target.RadarrMovieId is int movieId
+                                && await GetRadarrMonitoredAsync(target.Arr, movieId) == true;
+
+        var command = await PostArrCommandAsync(target);
+        if (command == null) return;
+
+        lock (_rescanLock)
+        {
+            if (_rescanStates.TryGetValue(key, out var state))
+            {
+                state.LastCommandId = command.Value.id;
+                state.Touched       = DateTime.UtcNow;
+            }
+        }
+
+        // Without a command id the scan can't be followed, so there's nothing to wait on.
+        if (restoreMonitoring && command.Value.id is int commandId)
+            await RestoreRadarrMonitoringAsync(target, commandId);
+
+        // The Arrs fold a new command into an identical one that is queued *or already
+        // running* and answer with that command. Getting our previous id back as "started"
+        // means the scan may have listed the folder before this file landed, so re-arm for
+        // a fresh scan once it's done.
+        if (command.Value.id is int id && id == lastCommandId
+            && string.Equals(command.Value.status, "started", StringComparison.OrdinalIgnoreCase)
+            && rearms < ArrRescanMaxRearms)
+        {
+            await DebouncedRescanAsync(target, rearms + 1);
+        }
+    }
+
+    /// <summary> Posts <paramref name="target"/>'s command. </summary>
+    /// <returns>
+    ///     The command id (<see langword="null"/> if the response had none) and status the Arr
+    ///     answered with, or <see langword="null"/> when the post failed.
+    /// </returns>
+    private async Task<(int? id, string status)?> PostArrCommandAsync(ArrRescanTarget target)
+    {
+        var http     = _httpClientFactory.CreateClient();
+        http.Timeout = TimeSpan.FromSeconds(10);
+
+        var req = new HttpRequestMessage(HttpMethod.Post, $"{target.Arr.BaseUrl.TrimEnd('/')}/api/{target.ApiVersion}/command")
+        {
+            Content = new StringContent(JsonSerializer.Serialize(target.Command), Encoding.UTF8, "application/json"),
+        };
+        req.Headers.TryAddWithoutValidation("X-Api-Key", target.Arr.ApiKey);
+        using var resp = await http.SendAsync(req);
+        if (!resp.IsSuccessStatusCode)
+        {
+            Log.Warning($"{target.Flavor} rescan of '{target.Scope}' failed: HTTP {(int)resp.StatusCode}");
+            return null;
+        }
+
+        using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+        int? id    = doc.RootElement.TryGetProperty("id", out var idEl) && idEl.TryGetInt32(out var i) ? i : null;
+        var status = doc.RootElement.TryGetProperty("status", out var stEl) ? stEl.GetString() ?? "" : "";
+        Log.Information($"{target.Flavor}: rescan of '{target.Scope}' requested (command {id?.ToString() ?? "without id"}, {status})");
+        return (id, status);
+    }
+
+    /// <summary>
+    ///     Waits for Radarr's rescan to finish, then re-monitors the movie if the scan
+    ///     unmonitored it. Only called when the movie was monitored before the rescan.
+    /// </summary>
+    private async Task RestoreRadarrMonitoringAsync(ArrRescanTarget target, int commandId)
+    {
+        var movieId  = target.RadarrMovieId!.Value;
+        var baseUrl  = target.Arr.BaseUrl.TrimEnd('/');
+        var deadline = DateTime.UtcNow + _arrCommandWaitLimit;
+
+        string? status = null;
+        var misses     = 0;
+        while (DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(ArrCommandPollInterval);
+            status = await GetArrJsonStringAsync(target.Arr, $"{baseUrl}/api/v3/command/{commandId}", "status");
+            if (status == null)
+            {
+                if (++misses < 3) continue; // transient read failure — ask again
+            }
+            else
+            {
+                misses = 0;                 // only failures in a row count
+            }
+            if (status is not ("queued" or "started")) break;
+        }
+
+        if (status is "queued" or "started")
+        {
+            Log.Warning($"Radarr: rescan of '{target.Scope}' still {status} after {_arrCommandWaitLimit.TotalMinutes:F0} min; " +
+                        "not checking whether it unmonitored the movie");
+            return;
+        }
+
+        if (await GetRadarrMonitoredAsync(target.Arr, movieId) != false) return;
+
+        var http     = _httpClientFactory.CreateClient();
+        http.Timeout = TimeSpan.FromSeconds(10);
+        var req = new HttpRequestMessage(HttpMethod.Put, $"{baseUrl}/api/v3/movie/editor")
+        {
+            // The editor endpoint changes only the fields it is given.
+            Content = new StringContent(JsonSerializer.Serialize(new { movieIds = new[] { movieId }, monitored = true }),
+                                        Encoding.UTF8, "application/json"),
+        };
+        req.Headers.TryAddWithoutValidation("X-Api-Key", target.Arr.ApiKey);
+        using var resp = await http.SendAsync(req);
+        if (resp.IsSuccessStatusCode)
+            Log.Information($"Radarr: re-monitored '{target.Scope}' after the rescan unmonitored it for the replaced file");
+        else
+            Log.Warning($"Radarr: could not re-monitor '{target.Scope}': HTTP {(int)resp.StatusCode}");
+    }
+
+    /// <summary>
+    ///     Reads a Radarr movie's monitored flag; <see langword="null"/> when it can't be read,
+    ///     so a failed read skips the monitoring guard instead of the rescan.
+    /// </summary>
+    private async Task<bool?> GetRadarrMonitoredAsync(ArrIntegration arr, int movieId)
+    {
+        try
+        {
+            var http     = _httpClientFactory.CreateClient();
+            http.Timeout = TimeSpan.FromSeconds(10);
+            var req = new HttpRequestMessage(HttpMethod.Get, $"{arr.BaseUrl.TrimEnd('/')}/api/v3/movie/{movieId}");
+            req.Headers.TryAddWithoutValidation("X-Api-Key", arr.ApiKey);
+            using var resp = await http.SendAsync(req);
+            if (!resp.IsSuccessStatusCode) return null;
+
+            using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+            return doc.RootElement.TryGetProperty("monitored", out var m) && m.ValueKind is JsonValueKind.True or JsonValueKind.False
+                ? m.GetBoolean()
+                : null;
+        }
+        catch (Exception ex) when (ex is HttpRequestException or OperationCanceledException or JsonException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary> GETs <paramref name="url"/> and returns a top-level string property, lower-cased; <see langword="null"/> on failure. </summary>
+    private async Task<string?> GetArrJsonStringAsync(ArrIntegration arr, string url, string property)
+    {
+        try
+        {
+            var http     = _httpClientFactory.CreateClient();
+            http.Timeout = TimeSpan.FromSeconds(10);
+            var req = new HttpRequestMessage(HttpMethod.Get, url);
+            req.Headers.TryAddWithoutValidation("X-Api-Key", arr.ApiKey);
+            using var resp = await http.SendAsync(req);
+            if (!resp.IsSuccessStatusCode) return null;
+
+            using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+            return doc.RootElement.TryGetProperty(property, out var v) ? v.GetString()?.ToLowerInvariant() : null;
+        }
+        catch (Exception ex) when (ex is HttpRequestException or OperationCanceledException or JsonException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    ///     Returns Lidarr's root folders, cached for <see cref="_rootCacheTtl"/>. Empty list on
+    ///     failure (the caller then skips the rescan).
+    /// </summary>
+    private async Task<IReadOnlyList<LibraryRoot>> GetLidarrRootsAsync(HttpClient http, string baseUrl, string apiKey)
+    {
+        var cacheKey = baseUrl + "|" + apiKey;
+        lock (_rootsLock)
+        {
+            if (_lidarrRootsCache.TryGetValue(cacheKey, out var entry) && entry.expires > DateTime.UtcNow)
+                return entry.roots;
+        }
+
+        IReadOnlyList<LibraryRoot> fetched = Array.Empty<LibraryRoot>();
+        try
+        {
+            var req = new HttpRequestMessage(HttpMethod.Get, baseUrl + "/api/v1/rootfolder");
+            req.Headers.TryAddWithoutValidation("X-Api-Key", apiKey);
+            using var resp = await http.SendAsync(req);
+            if (resp.IsSuccessStatusCode)
+                fetched = ParseLidarrRoots(await resp.Content.ReadAsStringAsync());
+            else
+                Log.Warning($"Lidarr root folder lookup failed: HTTP {(int)resp.StatusCode}");
+        }
+        catch (Exception ex)
+        {
+            Log.Warning($"Lidarr root folder lookup error: {ex.Message}");
+        }
+
+        lock (_rootsLock)
+        {
+            _lidarrRootsCache[cacheKey] = (DateTime.UtcNow + _rootCacheTtl, fetched);
+        }
+        return fetched;
+    }
+
+    /// <summary> Flattens the <c>/api/v1/rootfolder</c> array into one <see cref="LibraryRoot"/> per root. </summary>
+    private static IReadOnlyList<LibraryRoot> ParseLidarrRoots(string json)
+    {
+        var list = new List<LibraryRoot>();
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.ValueKind != JsonValueKind.Array) return list;
+
+            foreach (var root in doc.RootElement.EnumerateArray())
+            {
+                var id = root.TryGetProperty("id", out var idEl) ? idEl.ToString() : "";
+                if (root.TryGetProperty("path", out var p) && p.GetString() is { Length: > 0 } path)
+                    list.Add(new LibraryRoot(id, path));
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warning($"Lidarr root folder parse error: {ex.Message}");
+        }
+        return list;
+    }
+
+    /// <summary>
+    ///     Parent of a remote server's path, kept in that server's own separator style.
+    ///     <see cref="Path.GetDirectoryName(string?)"/> applies Snacks' host rules instead: on
+    ///     Windows it rewrites <c>/</c> to <c>\</c> (a Linux Plex answers 200 and scans a folder
+    ///     that doesn't exist), and on Linux it finds no parent in a <c>\</c> path at all.
+    /// </summary>
+    private static string? ParentDirectory(string path)
+    {
+        var cut = path.TrimEnd('/', '\\').LastIndexOfAny(['/', '\\']);
+        return cut > 0 ? path[..cut] : null;
+    }
+
+    /******************************************************************
      *  Original-Language Lookups
      ******************************************************************/
 
-    // Cache prefix-map from integration (provider, baseUrl+key) to {series/movie path, originalLanguage}.
-    private readonly Dictionary<string, (DateTime expires, IReadOnlyList<(string path, string lang)> map)> _arrLangCache = new();
+    /// <summary> One Sonarr series or Radarr movie: its id, its folder as the Arr sees it, and its original language when reported. </summary>
+    private sealed record ArrCatalogEntry(int Id, string Path, string? Lang);
+
+    // Sonarr series / Radarr movie catalogue per (provider, baseUrl+key). Shared by the
+    // original-language lookup and the post-replacement rescans.
+    private readonly Dictionary<string, (DateTime expires, IReadOnlyList<ArrCatalogEntry> entries)> _arrCatalogCache = new();
     private (string token, DateTime expires)? _tvdbToken;
     private readonly object _tvdbLock = new();
 
@@ -630,70 +1096,10 @@ public sealed class IntegrationService
         if (!arr.Enabled || string.IsNullOrWhiteSpace(arr.BaseUrl) || string.IsNullOrWhiteSpace(arr.ApiKey))
             return null;
 
-        var cacheKey = (isSeries ? "sonarr|" : "radarr|") + arr.BaseUrl + "|" + arr.ApiKey;
-        IReadOnlyList<(string path, string lang)>? cached = null;
-        lock (_rootsLock)
-        {
-            if (_arrLangCache.TryGetValue(cacheKey, out var entry) && entry.expires > DateTime.UtcNow)
-                cached = entry.map;
-        }
-
-        if (cached == null)
-        {
-            try
-            {
-                var http     = _httpClientFactory.CreateClient();
-                http.Timeout = TimeSpan.FromSeconds(15);
-                var baseUrl  = arr.BaseUrl.TrimEnd('/');
-                var url      = baseUrl + (isSeries ? "/api/v3/series" : "/api/v3/movie");
-                var req      = new HttpRequestMessage(HttpMethod.Get, url);
-                req.Headers.TryAddWithoutValidation("X-Api-Key", arr.ApiKey);
-                using var resp = await http.SendAsync(req, ct);
-                if (!resp.IsSuccessStatusCode)
-                {
-                    CacheArrFailure(cacheKey, isSeries, $"HTTP {(int)resp.StatusCode}");
-                    return null;
-                }
-                var json = await resp.Content.ReadAsStringAsync(ct);
-
-                var list = new List<(string path, string lang)>();
-                using var doc = JsonDocument.Parse(json);
-                if (doc.RootElement.ValueKind == JsonValueKind.Array)
-                {
-                    foreach (var item in doc.RootElement.EnumerateArray())
-                    {
-                        var path = item.TryGetProperty("path", out var pEl) ? pEl.GetString() : null;
-                        if (string.IsNullOrEmpty(path)) continue;
-
-                        string? lang = null;
-                        if (item.TryGetProperty("originalLanguage", out var ol))
-                        {
-                            if (ol.ValueKind == JsonValueKind.Object && ol.TryGetProperty("name", out var nEl))
-                                lang = nEl.GetString();
-                            else if (ol.ValueKind == JsonValueKind.String)
-                                lang = ol.GetString();
-                        }
-                        if (!string.IsNullOrEmpty(lang))
-                            list.Add((path!, lang));
-                    }
-                }
-                cached = list;
-                lock (_rootsLock)
-                {
-                    _arrLangCache[cacheKey] = (DateTime.UtcNow + _rootCacheTtl, cached);
-                }
-            }
-            // Genuine caller cancellation propagates; a timeout (also an OCE when the
-            // token isn't cancelled), connection failure, or malformed payload is
-            // negative-cached so a struggling Arr instance isn't re-fetched on every
-            // dispatch of a busy queue.
-            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
-            catch (Exception ex) when (ex is HttpRequestException or OperationCanceledException or JsonException)
-            {
-                CacheArrFailure(cacheKey, isSeries, ex.Message);
-                return null;
-            }
-        }
+        var cached = (await GetArrCatalogAsync(arr, isSeries, ct))
+            .Where(e => !string.IsNullOrEmpty(e.Lang))
+            .Select(e => (path: e.Path, lang: e.Lang!))
+            .ToList();
 
         // Longest-prefix match so nested series roots pick the deepest entry.
         var norm  = filePath.Replace('\\', '/');
@@ -709,9 +1115,12 @@ public sealed class IntegrationService
         // ("Title (year)") and collides rarely in practice.
         if (string.IsNullOrEmpty(hit.lang))
         {
-            var sourceSegments = norm
-                .Split('/', StringSplitOptions.RemoveEmptyEntries)
-                .Select(s => Path.GetFileNameWithoutExtension(s))
+            // Only the file name loses its extension (the flat "Movies/Title (year).mkv"
+            // layout above); directory names are compared whole — a dot in "Mr. Robot (2015)"
+            // isn't an extension.
+            var parts          = norm.Split('/', StringSplitOptions.RemoveEmptyEntries);
+            var sourceSegments = parts.SkipLast(1)
+                .Append(parts.Length > 0 ? Path.GetFileNameWithoutExtension(parts[^1]) : "")
                 .Where(s => !string.IsNullOrEmpty(s))
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
@@ -728,19 +1137,84 @@ public sealed class IntegrationService
     }
 
     /// <summary>
-    ///     Negative-caches a failed Arr catalogue fetch: an empty map under the short
-    ///     failure TTL makes every lookup miss (→ null → callers fall back to the
+    ///     Returns the Sonarr series or Radarr movie catalogue, cached for <see cref="_rootCacheTtl"/>.
+    ///     A failed fetch yields an empty, negative-cached list; genuine caller cancellation propagates.
+    /// </summary>
+    private async Task<IReadOnlyList<ArrCatalogEntry>> GetArrCatalogAsync(ArrIntegration arr, bool isSeries, CancellationToken ct)
+    {
+        var cacheKey = (isSeries ? "sonarr|" : "radarr|") + arr.BaseUrl + "|" + arr.ApiKey;
+        lock (_rootsLock)
+        {
+            if (_arrCatalogCache.TryGetValue(cacheKey, out var entry) && entry.expires > DateTime.UtcNow)
+                return entry.entries;
+        }
+
+        try
+        {
+            var http     = _httpClientFactory.CreateClient();
+            http.Timeout = TimeSpan.FromSeconds(15);
+            var baseUrl  = arr.BaseUrl.TrimEnd('/');
+            var url      = baseUrl + (isSeries ? "/api/v3/series" : "/api/v3/movie");
+            var req      = new HttpRequestMessage(HttpMethod.Get, url);
+            req.Headers.TryAddWithoutValidation("X-Api-Key", arr.ApiKey);
+            using var resp = await http.SendAsync(req, ct);
+            if (!resp.IsSuccessStatusCode)
+                return CacheArrFailure(cacheKey, isSeries, $"HTTP {(int)resp.StatusCode}");
+            var json = await resp.Content.ReadAsStringAsync(ct);
+
+            var list = new List<ArrCatalogEntry>();
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var item in doc.RootElement.EnumerateArray())
+                {
+                    var path = item.TryGetProperty("path", out var pEl) ? pEl.GetString() : null;
+                    if (string.IsNullOrEmpty(path)) continue;
+                    var id = item.TryGetProperty("id", out var idEl) && idEl.TryGetInt32(out var i) ? i : 0;
+
+                    string? lang = null;
+                    if (item.TryGetProperty("originalLanguage", out var ol))
+                    {
+                        if (ol.ValueKind == JsonValueKind.Object && ol.TryGetProperty("name", out var nEl))
+                            lang = nEl.GetString();
+                        else if (ol.ValueKind == JsonValueKind.String)
+                            lang = ol.GetString();
+                    }
+                    list.Add(new ArrCatalogEntry(id, path!, string.IsNullOrEmpty(lang) ? null : lang));
+                }
+            }
+            lock (_rootsLock)
+            {
+                _arrCatalogCache[cacheKey] = (DateTime.UtcNow + _rootCacheTtl, list);
+            }
+            return list;
+        }
+        // Genuine caller cancellation propagates; a timeout (also an OCE when the
+        // token isn't cancelled), connection failure, or malformed payload is
+        // negative-cached so a struggling Arr instance isn't re-fetched on every
+        // dispatch of a busy queue.
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (Exception ex) when (ex is HttpRequestException or OperationCanceledException or JsonException)
+        {
+            return CacheArrFailure(cacheKey, isSeries, ex.Message);
+        }
+    }
+
+    /// <summary>
+    ///     Negative-caches a failed Arr catalogue fetch: an empty list under the short
+    ///     failure TTL makes every lookup and rescan miss (lookups then fall back to the
     ///     configured keep lists) without re-hitting the endpoint per dispatch.
     ///     A config save clears the cache, so credential/URL fixes apply immediately.
     /// </summary>
-    private void CacheArrFailure(string cacheKey, bool isSeries, string reason)
+    private IReadOnlyList<ArrCatalogEntry> CacheArrFailure(string cacheKey, bool isSeries, string reason)
     {
         Log.Warning($"{(isSeries ? "Sonarr" : "Radarr")} catalogue fetch failed ({reason}) — " +
-                    $"suppressing original-language lookups for {_arrFailureCacheTtl.TotalMinutes:F0} min");
+                    $"suppressing original-language lookups and rescans for {_arrFailureCacheTtl.TotalMinutes:F0} min");
         lock (_rootsLock)
         {
-            _arrLangCache[cacheKey] = (DateTime.UtcNow + _arrFailureCacheTtl, Array.Empty<(string, string)>());
+            _arrCatalogCache[cacheKey] = (DateTime.UtcNow + _arrFailureCacheTtl, Array.Empty<ArrCatalogEntry>());
         }
+        return Array.Empty<ArrCatalogEntry>();
     }
 
     private async Task<string?> LookupTmdbLangAsync(string filePath, TmdbIntegration tmdb, MediaTypeDetector.MediaKind kind, CancellationToken ct)

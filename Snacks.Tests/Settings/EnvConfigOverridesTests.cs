@@ -244,13 +244,15 @@ public sealed class EnvConfigOverridesTests : IDisposable
     public void Integration_sections_lock_via_section_and_property()
     {
         SetEnv(("SNACKS_INTEG_Sonarr__ApiKey", "xyz"),
-               ("SNACKS_INTEG_Radarr__Enabled", "true"));
+               ("SNACKS_INTEG_Radarr__Enabled", "true"),
+               ("SNACKS_INTEG_Lidarr__BaseUrl", "http://lidarr:8686"));
 
         var config = EnvConfigOverrides.Apply(new IntegrationConfig(), EnvConfigOverrides.IntegrationsPrefix);
 
         config.Sonarr.ApiKey.Should().Be("xyz");
         config.Radarr.Enabled.Should().BeTrue();
+        config.Lidarr.BaseUrl.Should().Be("http://lidarr:8686");
         EnvConfigOverrides.LockedPaths(EnvConfigOverrides.IntegrationsPrefix, typeof(IntegrationConfig))
-            .Should().BeEquivalentTo("sonarr.apiKey", "radarr.enabled");
+            .Should().BeEquivalentTo("sonarr.apiKey", "radarr.enabled", "lidarr.baseUrl");
     }
 }

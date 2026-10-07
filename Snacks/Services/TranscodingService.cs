@@ -3597,7 +3597,11 @@ public class TranscodingService
                     if (_notificationService != null)
                         _ = _notificationService.NotifyEncodeCompletedAsync(Path.GetFileName(workItem.Path), workItem.OutputSize);
                     if (_integrationService != null)
-                        _ = _integrationService.TriggerRescansAsync(workItem.Path);
+                    {
+                        _ = _integrationService.TriggerRescansAsync(workItem.Path, workItem.Kind);
+                        if (ReplacesOriginal(workItem, options))
+                            _integrationService.QueueArrRescan(workItem.Path, workItem.Kind);
+                    }
                 }
 
                 // Append to the analytics ledger. Failure is non-fatal — the
@@ -3713,8 +3717,17 @@ public class TranscodingService
                     noSavings ? MediaFileStatus.NoSavings : MediaFileStatus.Completed,
                     DateTime.UtcNow);
 
-                if (!noSavings && _notificationService != null && ShouldDispatchExternal)
-                    _ = _notificationService.NotifyEncodeCompletedAsync(Path.GetFileName(workItem.Path), workItem.OutputSize);
+                if (!noSavings && ShouldDispatchExternal)
+                {
+                    if (_notificationService != null)
+                        _ = _notificationService.NotifyEncodeCompletedAsync(Path.GetFileName(workItem.Path), workItem.OutputSize);
+                    if (_integrationService != null)
+                    {
+                        _ = _integrationService.TriggerRescansAsync(workItem.Path, workItem.Kind);
+                        if (ReplacesOriginal(workItem, options))
+                            _integrationService.QueueArrRescan(workItem.Path, workItem.Kind);
+                    }
+                }
 
                 _ = RecordLocalEncodeHistoryAsync(workItem, options, active.DeviceId);
             }
@@ -3778,7 +3791,11 @@ public class TranscodingService
     ///     On output ≥ source the encode is classified as no-savings and the
     ///     output is discarded — same semantics as the video path.
     /// </summary>
-    private async Task ConvertMusicAsync(WorkItem workItem, EncoderOptions options, CancellationToken cancellationToken)
+    /// <param name="skipPlacement">
+    ///     <see langword="true"/> on a cluster worker: the <c>[snacks]</c>-tagged output must
+    ///     stay where the worker's <c>*[snacks]*</c> glob finds it; the master places it after download.
+    /// </param>
+    private async Task ConvertMusicAsync(WorkItem workItem, EncoderOptions options, CancellationToken cancellationToken, bool skipPlacement = false)
     {
         if (workItem.Probe == null)
             workItem.Probe = await _ffprobeService.ProbeAsync(workItem.Path, cancellationToken);
@@ -3845,19 +3862,8 @@ public class TranscodingService
             return;
         }
 
-        // Optional: delete original after successful encode.
-        if (options.Music.DeleteOriginalFile)
-        {
-            try
-            {
-                await _fileService.FileDeleteAsync(workItem.Path);
-                await LogAsync(workItem.Id, $"Deleted original: {workItem.FileName}");
-            }
-            catch (Exception ex)
-            {
-                await LogAsync(workItem.Id, $"Failed to delete original: {ex.Message}");
-            }
-        }
+        if (!skipPlacement)
+            await HandleOutputPlacement(outputPath, workItem, options);
     }
 
     /// <summary>
@@ -8424,9 +8430,20 @@ public class TranscodingService
                 // FileNotFoundException and surface as "Finalize failed: Could not find file …".
                 _ = _notificationService.NotifyEncodeCompletedAsync(Path.GetFileName(workItem.Path), workItem.OutputSize);
             if (_integrationService != null && keep)
-                _ = _integrationService.TriggerRescansAsync(workItem.Path);
+            {
+                _ = _integrationService.TriggerRescansAsync(workItem.Path, workItem.Kind);
+                if (ReplacesOriginal(workItem, options))
+                    _integrationService.QueueArrRescan(workItem.Path, workItem.Kind);
+            }
         }
     }
+
+    /// <summary>
+    ///     Whether placing a kept output replaces its source, per the settings for the item's
+    ///     kind — music has its own delete-original toggle, separate from video's.
+    /// </summary>
+    private static bool ReplacesOriginal(WorkItem workItem, EncoderOptions options) =>
+        workItem.Kind == MediaKind.Music ? options.Music.DeleteOriginalFile : options.DeleteOriginalFile;
 
     /// <summary>
     ///     Marks a work item as failed and records the error in the database.
@@ -8541,10 +8558,10 @@ public class TranscodingService
     ///     Music counterpart to <see cref="ConvertVideoForRemoteAsync"/>. Steers
     ///     the encoder's output into the worker's scratch dir
     ///     (<see cref="EncoderOptions.EncodeDirectory"/>) so the master's
-    ///     <c>GetOutputFileForJob</c> glob (<c>*[snacks]*</c>) finds it, and
-    ///     forces <c>DeleteOriginalFile=false</c> so the worker never touches
-    ///     the master-uploaded source — placement and source lifecycle are the
-    ///     master's job.
+    ///     <c>GetOutputFileForJob</c> glob (<c>*[snacks]*</c>) finds it, forces
+    ///     <c>DeleteOriginalFile=false</c> so the worker never touches the
+    ///     master-uploaded source, and skips placement so the tag isn't stripped
+    ///     — placement and source lifecycle are the master's job.
     /// </summary>
     /// <param name="workItem">The music work item to encode.</param>
     /// <param name="options">Encoding options from the master's job assignment. Mutated: Music.OutputDirectory and Music.DeleteOriginalFile are overridden.</param>
@@ -8559,7 +8576,7 @@ public class TranscodingService
 
         try
         {
-            await ConvertMusicAsync(workItem, options, cancellationToken);
+            await ConvertMusicAsync(workItem, options, cancellationToken, skipPlacement: true);
         }
         finally
         {
@@ -8574,6 +8591,14 @@ public class TranscodingService
     /// </summary>
     private async Task HandleOutputPlacement(string outputPath, WorkItem workItem, EncoderOptions options)
     {
+        // Music has its own output-directory and delete-original settings; the video ones
+        // below must never decide where an audio file lands or whether its source survives.
+        if (workItem.Kind == MediaKind.Music)
+        {
+            await HandleMusicOutputPlacement(outputPath, workItem, options.Music);
+            return;
+        }
+
         // Route FileService retry messages into the work-item log so a multi-minute
         // backoff against an external lock (AV, indexer) is visible to the user instead
         // of looking like a silent hang followed by a generic failure.
@@ -8654,6 +8679,54 @@ public class TranscodingService
             // distinguish e.g. IOException sharing-violation from access-denied or disk-full,
             // and the preceding "Deleting original: ..." / "Moving encoded output: ..." log line
             // identifies which file operation was in flight.
+            string suffix = ex.InnerException != null ? $" -> {ex.InnerException.Message}" : "";
+            await LogAsync(workItem.Id, $"Error handling output placement [{ex.GetType().Name}]: {ex.Message}{suffix}");
+            throw;
+        }
+    }
+
+    /// <summary>
+    ///     Music counterpart to <see cref="HandleOutputPlacement"/>, driven by
+    ///     <see cref="MusicEncoderOptions"/> rather than the video settings, with the same
+    ///     semantics. With <see cref="MusicEncoderOptions.DeleteOriginalFile"/> on, the output
+    ///     drops its <c>[snacks]</c> tag and replaces the source in the source's directory via
+    ///     <see cref="ReplaceOriginalAsync"/> (the clean name may be the source's own path, e.g.
+    ///     mp3 → mp3); <see cref="MusicEncoderOptions.OutputDirectory"/> is only where it was
+    ///     staged. Otherwise it keeps the tag in the music output directory, or beside the
+    ///     untouched source when none is set. Either way an output staged elsewhere — a cluster
+    ///     download lands in the master's encode or video output directory — is moved into place.
+    /// </summary>
+    private async Task HandleMusicOutputPlacement(string outputPath, WorkItem workItem, MusicEncoderOptions music)
+    {
+        Func<string, Task> log = msg => LogAsync(workItem.Id, msg);
+
+        try
+        {
+            string originalDir = _fileService.GetDirectory(workItem.Path);
+
+            if (music.DeleteOriginalFile)
+            {
+                // Replace in place, as video does: the track stays where the library (and
+                // Lidarr/Plex/Jellyfin) expects it, under the original's name.
+                await LogAsync(workItem.Id, "Replacing original with transcoded version");
+                string finalPath = Path.Combine(originalDir, Path.GetFileName(GetCleanOutputName(outputPath)));
+                await ReplaceOriginalAsync(outputPath, finalPath, workItem, log);
+                return;
+            }
+
+            // Keep both — original untouched, transcoded file keeps [snacks] tag.
+            string finalDir = !string.IsNullOrEmpty(music.OutputDirectory) ? music.OutputDirectory : originalDir;
+            string keptPath = Path.Combine(finalDir, Path.GetFileName(outputPath));
+            if (!string.Equals(Path.GetFullPath(outputPath), Path.GetFullPath(keptPath), StringComparison.OrdinalIgnoreCase))
+            {
+                await LogAsync(workItem.Id, $"Moving encoded output: {outputPath} -> {keptPath}");
+                await _fileService.FileMoveAsync(outputPath, keptPath, log);
+            }
+            await LogAsync(workItem.Id, $"Original kept at: {workItem.Path}");
+            await LogAsync(workItem.Id, $"Transcoded file at: {keptPath}");
+        }
+        catch (Exception ex)
+        {
             string suffix = ex.InnerException != null ? $" -> {ex.InnerException.Message}" : "";
             await LogAsync(workItem.Id, $"Error handling output placement [{ex.GetType().Name}]: {ex.Message}{suffix}");
             throw;

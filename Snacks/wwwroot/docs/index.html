@@ -402,6 +402,7 @@
         <a href="#hardware-containers">Hardware &amp; containers</a>
         <a href="#luna-integration">Luna integration</a>
         <a href="#integrations">Other integrations</a>
+        <a href="#arr-sync">Arr library sync</a>
         <a href="#homarr">Homarr dashboards</a>
         <a href="#data-backups">Data &amp; backups</a>
         <a href="#observability">Logs &amp; metrics</a>
@@ -835,6 +836,7 @@
               <tr><td>Output directory; replacement off</td><td>The tagged output is kept in that directory and the original stays in place.</td></tr>
               <tr><td>Scratch/encode directory configured</td><td>Temporary output is created there, then moved to the requested final destination after validation.</td></tr>
               <tr><td>Replacement on</td><td>The validated output is moved into the source directory with the <code>[snacks]</code> tag removed; replacement happens only during final placement.</td></tr>
+              <tr><td>Music: <strong>Delete original file after success</strong> on</td><td>Works like video replacement: the output drops the <code>[snacks]</code> tag and replaces the source in its own folder, under the source's name; a music output directory only holds the encode until then. Music always follows its own output-directory and delete settings, including for cluster encodes; the video <strong>Replace original files</strong> toggle does not apply to it.</td></tr>
             </tbody>
           </table>
         </div>
@@ -1172,10 +1174,11 @@ environment:
           <table>
             <thead><tr><th>Integration</th><th>Purpose</th><th>Credential</th></tr></thead>
             <tbody>
-              <tr><td>Plex</td><td>Connection test and optional library rescan after completion.</td><td>Server token</td></tr>
-              <tr><td>Jellyfin</td><td>Connection test and optional library rescan after completion.</td><td>API key</td></tr>
+              <tr><td>Plex</td><td>Connection test and optional library rescan after completion, scoped to the file's folder in a library of the same kind (music libraries for music). A server with no library of that kind is skipped; a path that lines up with none of its libraries falls back to refreshing every library.</td><td>Server token</td></tr>
+              <tr><td>Jellyfin</td><td>Connection test and optional rescan after completion: Jellyfin is told about the file in a library of the same kind (music libraries for music), with the same skip and fallback rules as Plex. Jellyfin applies its own change delay (60 seconds by default) before updating.</td><td>API key</td></tr>
               <tr><td>Luna</td><td>Outbound typed tasks for private Sonarr/Radarr recommendations and explicit additions.</td><td>Restricted Luna connector session</td></tr>
-              <tr><td>Sonarr / Radarr</td><td>Media-manager connectivity, Luna tasks, and metadata workflow support.</td><td>API key</td></tr>
+              <tr><td>Sonarr / Radarr</td><td>Media-manager connectivity, Luna tasks, metadata workflow support, and a series/movie rescan after an encode replaces its original.</td><td>API key</td></tr>
+              <tr><td>Lidarr</td><td>Album-folder rescan after a music encode replaces its original.</td><td>API key</td></tr>
               <tr><td>TheTVDB / TMDb</td><td>Original-language and metadata lookups used by language-aware processing.</td><td>API key; TVDB PIN optional</td></tr>
               <tr><td>Homarr</td><td>Compact Snacks iFrame tile, or Homarr's native Media Transcoding widget through a read-only Tdarr adapter.</td><td>Scoped iframe token or Snacks API key</td></tr>
               <tr><td>Notifications</td><td>Webhook, ntfy, or Apprise destinations for encode/scan/node events.</td><td>Destination-specific</td></tr>
@@ -1187,6 +1190,33 @@ environment:
           directory. Protect that directory with host permissions, enable control-panel
           authentication, and restrict network access to trusted clients.
         </p>
+
+        <h3 id="arr-sync">Sonarr, Radarr &amp; Lidarr: keep replaced files in sync</h3>
+        <p>
+          The Arr apps track individual files, so an episode, movie, or track whose original Snacks
+          replaced (for example <code>Movie.mp4</code> → <code>Movie.mkv</code>) shows as missing until
+          the app rescans its folder. With the connection enabled, Snacks requests that rescan itself.
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>App</th><th>What is rescanned</th><th>Command</th></tr></thead>
+            <tbody>
+              <tr><td>Sonarr</td><td>The one series that owns the replaced episode.</td><td><code>RescanSeries</code> with <code>seriesId</code></td></tr>
+              <tr><td>Radarr</td><td>The one movie that owns the replaced file.</td><td><code>RescanMovie</code> with <code>movieId</code></td></tr>
+              <tr><td>Lidarr</td><td>The album folder of the replaced track.</td><td><code>RescanFolders</code> with that folder</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <ul>
+          <li>Every command names a single series, movie, or folder; Snacks never requests a library-wide scan. The scoped scan drops the stale file record, imports the new file in place, and re-reads media details only for files that are new or changed.</li>
+          <li>It fires only when an encode replaced its original: <strong>Replace original files</strong> for video, <strong>Delete original file after success</strong> for music. Keep-both encodes are not reported, though an app's own scheduled scans may still notice a <code>[snacks]</code> copy beside the original.</li>
+          <li>Requests are batched per series, movie, or album and sent once it has had no replaced file for 30 seconds, so a season or an album becomes one command.</li>
+          <li>Snacks finds the owner by folder names, so paths may differ between Snacks and the app — Snacks' <code>/mnt/media/tv/Show (2020)/Season 01</code> matches Sonarr's <code>/tv/Show (2020)</code>, and Snacks' <code>/mnt/media/music/Artist/Album</code> lines up with Lidarr's <code>/music</code> root. Video is offered to Sonarr or Radarr first by its file name pattern, then to the other. When nothing matches, nothing is sent and the Snacks log says so.</li>
+          <li>The app records the new file at its new quality. If the profile allows upgrades and its cutoff is above the Snacks output (for example a lossless music cutoff with AAC output), the app treats the item as below cutoff and may search for a replacement — choose a profile whose cutoff the Snacks output meets, or turn upgrades off.</li>
+          <li>Radarr: with <strong>Unmonitor Deleted Movies</strong> enabled, Radarr unmonitors a movie as soon as its old file is found missing, even though the same scan imports the replacement. Snacks reads the movie's monitored flag before its rescan and, if the rescan switched a monitored movie off, switches it back on once the scan finishes. Radarr's own scheduled rescans get no such correction. Sonarr needs none: an episode re-imported in the same scan stays monitored.</li>
+          <li>Lidarr: keep <strong>Copy metadata &amp; cover art</strong> enabled. Lidarr identifies the new file from its artist, album, title, and track-number tags.</li>
+          <li>Only the master contacts these apps; cluster workers never do.</li>
+        </ul>
 
         <h3 id="homarr">Homarr dashboards: choose a setup</h3>
         <p>

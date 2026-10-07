@@ -208,7 +208,8 @@ public sealed class ClusterController : ControllerBase
     ///
     ///     <para>The response omits <c>SharedSecret</c> (cluster-level, not an integration)
     ///     and forces <c>RescanOnComplete</c> to <c>false</c> — rescans are triggered centrally
-    ///     by the master.</para>
+    ///     by the master. Lidarr is omitted for the same reason: its only job is the master's
+    ///     post-placement folder rescan.</para>
     /// </summary>
     [HttpGet("integrations")]
     [ServiceFilter(typeof(LocalNetworkOnlyFilter))]

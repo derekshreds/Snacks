@@ -6,7 +6,7 @@ namespace Snacks.Controllers;
 
 /// <summary>
 ///     Configuration and live test-connection endpoints for third-party integrations
-///     (Plex, Jellyfin, Sonarr, Radarr).
+///     (Plex, Jellyfin, Sonarr, Radarr, Lidarr).
 /// </summary>
 [Route("api/integrations")]
 [ApiController]
@@ -100,6 +100,15 @@ public sealed class IntegrationsController : ControllerBase
     public async Task<IActionResult> TestRadarr([FromBody] ArrIntegration req)
     {
         var (ok, msg) = await _integrations.TestArrAsync(req?.BaseUrl ?? "", req?.ApiKey ?? "", "Radarr");
+        return new JsonResult(new { success = ok, message = msg });
+    }
+
+    /// <summary> Tests connectivity to a Lidarr instance using the supplied credentials. </summary>
+    /// <param name="req"> Base URL and API key for the Lidarr instance. </param>
+    [HttpPost("test/lidarr")]
+    public async Task<IActionResult> TestLidarr([FromBody] ArrIntegration req)
+    {
+        var (ok, msg) = await _integrations.TestArrAsync(req?.BaseUrl ?? "", req?.ApiKey ?? "", "Lidarr", apiVersion: "v1");
         return new JsonResult(new { success = ok, message = msg });
     }
 
