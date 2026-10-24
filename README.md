@@ -117,6 +117,7 @@ Then open `http://YOUR-SERVER-IP:6767`.
 - QNAP commonly requires `privileged: true` for `/dev/dri` access.
 - NVIDIA in Docker requires the NVIDIA Container Toolkit and runtime configuration.
 - Host networking allows automatic cluster discovery across the LAN.
+- Until sign-in is enabled (**Settings → Security**), Snacks only answers clients on local-network addresses. Enable it before port-forwarding or reverse-proxying Snacks to the internet.
 
 See the [complete Docker/NAS guide](https://snacksvideo.com/docs/#quick-start) or the included [`deploy-compose.yml`](deploy-compose.yml). Unraid users can start with [`unraid/snacks.xml`](unraid/snacks.xml).
 

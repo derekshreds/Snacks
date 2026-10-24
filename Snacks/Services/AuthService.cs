@@ -74,7 +74,8 @@ public sealed class AuthService
 
     /// <summary>
     ///     Updates auth config. If <paramref name="newPassword"/> is non-empty it is hashed;
-    ///     otherwise the existing hash is preserved. Disabling auth clears the credentials.
+    ///     otherwise the existing hash is preserved. Disabling auth or changing the password
+    ///     rotates the session secret so every outstanding cookie stops working.
     /// </summary>
     /// <param name="enabled"> Whether authentication is required. </param>
     /// <param name="username"> The username to require at login. </param>
@@ -97,9 +98,10 @@ public sealed class AuthService
             if (!string.IsNullOrEmpty(newPassword))
                 cfg.PasswordHash = HashPassword(newPassword);
 
-            if (!enabled)
+            if (!enabled || !string.IsNullOrEmpty(newPassword))
             {
-                // Rotate session secret on disable so existing cookies are invalidated.
+                // Rotate on disable and on password change so cookies issued under the old
+                // credentials (including any held by whoever prompted the change) stop working.
                 cfg.SessionSecret = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));
             }
 

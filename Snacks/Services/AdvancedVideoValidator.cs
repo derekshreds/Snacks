@@ -29,7 +29,7 @@ public static class AdvancedVideoValidator
         "--", "-i", "-f", "-y", "-n", "-progress", "-report", "-stdin", "-nostdin",
         "-stats", "-nostats", "-loglevel", "-v", "-hide_banner", "-benchmark", "-benchmark_all",
         "-t", "-to", "-ss", "-sseof", "-fs", "-shortest", "-vframes", "-pass",
-        "-vf", "-filter:v", "-filter_complex", "-filter_script", "-filter_complex_script",
+        "-vf", "-filter", "-filter:v", "-filter_complex", "-filter_script", "-filter_complex_script",
         "-c", "-codec", "-c:v", "-codec:v", "-vcodec", "-vn", "-an", "-sn", "-dn",
         "-b:a", "-q:a", "-ac", "-ar", "-sample_fmt", "-channel_layout", "-profile:a",
         "-b:s", "-q:s", "-movflags", "-max_muxing_queue_size", "-copyts", "-start_at_zero",
@@ -263,6 +263,21 @@ public static class AdvancedVideoValidator
         }
     }
 
+    /// <summary>
+    ///     True when <paramref name="token"/> is, or is another spelling of, an option Snacks
+    ///     reserves. A stream specifier doesn't change what an option does ("-filter:v:0" is
+    ///     still a filter graph, "-c:v:0" still picks the encoder), so the base name before the
+    ///     first ':' is checked too; "-/name" makes FFmpeg 7+ read the value from a file.
+    /// </summary>
+    private static bool IsReservedToken(string token)
+    {
+        if (token.StartsWith("-/", StringComparison.Ordinal)) return true;
+        var baseName = token.Split(':', 2)[0];
+        return DeniedExact.Contains(token, StringComparer.OrdinalIgnoreCase)
+            || DeniedExact.Contains(baseName, StringComparer.OrdinalIgnoreCase)
+            || DeniedPrefixes.Any(prefix => token.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
+    }
+
     private static IEnumerable<string> SplitUnescaped(string value, char separator)
     {
         var start = 0;
@@ -291,8 +306,7 @@ public static class AdvancedVideoValidator
                 Error(result, $"{optionPath}.option", "option_shape", "A custom entry must contain one FFmpeg option token beginning with '-'.");
                 continue;
             }
-            if (DeniedExact.Contains(option, StringComparer.OrdinalIgnoreCase)
-                || DeniedPrefixes.Any(prefix => option.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)))
+            if (IsReservedToken(option))
                 Error(result, $"{optionPath}.option", "option_reserved", $"{option} controls command structure and is reserved by Snacks.");
             if ((custom.Values ?? new List<string>()).Any(v => v.Contains('\0') || v.Contains('\r') || v.Contains('\n')))
                 Error(result, $"{optionPath}.values", "option_value", "Custom option values cannot contain NUL or newlines.");
@@ -301,8 +315,7 @@ public static class AdvancedVideoValidator
             foreach (var value in custom.Values ?? [])
             {
                 var token = value.Trim();
-                if (DeniedExact.Contains(token, StringComparer.OrdinalIgnoreCase)
-                    || DeniedPrefixes.Any(prefix => token.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)))
+                if (IsReservedToken(token))
                     Error(result, $"{optionPath}.values", "option_value_reserved", $"{token} cannot be smuggled through an option value.");
             }
             if (TypedVideoOptions.Contains(option))

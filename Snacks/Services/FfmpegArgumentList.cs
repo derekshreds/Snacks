@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Text;
 
 namespace Snacks.Services;
@@ -41,6 +42,16 @@ public sealed class FfmpegArgumentList
     {
         foreach (var argument in _arguments) startInfo.ArgumentList.Add(argument);
     }
+
+    /// <summary>
+    ///     True when <paramref name="value"/> is a plain option value — an encoder name, preset,
+    ///     or level — that a legacy fragment carries as exactly one token. Whitespace, quotes,
+    ///     and a leading dash would let a settings value become additional FFmpeg options.
+    /// </summary>
+    public static bool IsPlainValue([NotNullWhen(true)] string? value) =>
+        !string.IsNullOrEmpty(value)
+        && value[0] != '-'
+        && value.All(c => char.IsAsciiLetterOrDigit(c) || c is '_' or '.' or '-');
 
     public override string ToString() => FormatForDisplay(_arguments);
 

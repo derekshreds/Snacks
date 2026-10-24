@@ -12,12 +12,15 @@ namespace Snacks.Controllers;
 [ApiController]
 public sealed class AuthApiController : ControllerBase
 {
-    private readonly AuthService _auth;
+    private readonly AuthService   _auth;
+    private readonly LoginThrottle _throttle;
 
-    public AuthApiController(AuthService auth)
+    public AuthApiController(AuthService auth, LoginThrottle throttle)
     {
         ArgumentNullException.ThrowIfNull(auth);
-        _auth = auth;
+        ArgumentNullException.ThrowIfNull(throttle);
+        _auth     = auth;
+        _throttle = throttle;
     }
 
     /******************************************************************
@@ -45,6 +48,23 @@ public sealed class AuthApiController : ControllerBase
             var existing = _auth.GetConfig();
             if (req.Enabled && string.IsNullOrEmpty(existing.PasswordHash) && string.IsNullOrEmpty(req.Password))
                 return new JsonResult(new { success = false, error = "Password required to enable auth" });
+
+            // Once a password protects the panel, a session cookie or API key alone can't take it
+            // over: changing who can sign in, or turning sign-in off, needs the current password.
+            bool changesCredentials = !req.Enabled
+                || !string.IsNullOrEmpty(req.Password)
+                || !string.Equals(req.Username, existing.Username, StringComparison.Ordinal);
+            if (_auth.IsAuthRequired() && changesCredentials)
+            {
+                var client = ClientNetwork.GetRateLimitKey(HttpContext);
+                if (_throttle.RetryAfterSeconds(client) > 0)
+                    return new JsonResult(new { success = false, error = "Too many incorrect password attempts. Wait a few minutes and try again." });
+                if (!_auth.VerifyPassword(req.CurrentPassword ?? ""))
+                {
+                    _throttle.RecordFailure(client);
+                    return new JsonResult(new { success = false, error = "Current password is incorrect" });
+                }
+            }
 
             _auth.UpdateConfig(req.Enabled, req.Username, req.Password);
 

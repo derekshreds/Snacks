@@ -20,6 +20,12 @@
                 <div class="form-text">Stored as a PBKDF2 hash; never displayed back.</div>
             </div>
 
+            <div class="mb-3" id="authCurrentPasswordGroup" style="display:none;">
+                <label for="authCurrentPassword" class="form-label">Current password</label>
+                <input type="password" class="form-control" id="authCurrentPassword" autocomplete="current-password">
+                <div class="form-text">Required to change the username or password, or to turn sign-in off.</div>
+            </div>
+
             <div class="d-flex gap-2 align-items-center">
                 <button class="btn btn-primary" id="saveAuthConfig"><i class="fas fa-save me-1"></i>Save</button>
                 <button class="btn btn-outline-secondary" id="signOutBtn" type="button"><i class="fas fa-sign-out-alt me-1"></i>Sign out</button>

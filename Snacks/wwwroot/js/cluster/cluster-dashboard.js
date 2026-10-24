@@ -448,10 +448,10 @@ export class ClusterDashboard {
                         <div class="mt-1">Jobs: ${node.completedJobs || 0} done, ${node.failedJobs || 0} failed</div>
                         ${canControl ? `
                             <div class="d-flex gap-1 mt-1">
-                                <button class="btn btn-sm ${node.isPaused ? 'btn-outline-success' : 'btn-outline-warning'} flex-grow-1 cluster-node-pause" data-node-id="${node.nodeId}" data-paused="${node.isPaused}">
+                                <button class="btn btn-sm ${node.isPaused ? 'btn-outline-success' : 'btn-outline-warning'} flex-grow-1 cluster-node-pause" data-node-id="${escapeHtml(node.nodeId)}" data-paused="${node.isPaused}">
                                     <i class="fas fa-${node.isPaused ? 'play' : 'pause'} me-1"></i>${node.isPaused ? 'Resume' : 'Pause'}
                                 </button>
-                                <button class="btn btn-sm btn-outline-secondary cluster-node-settings" data-node-id="${node.nodeId}" data-hostname="${escapeHtml(node.hostname)}" title="Node settings">
+                                <button class="btn btn-sm btn-outline-secondary cluster-node-settings" data-node-id="${escapeHtml(node.nodeId)}" data-hostname="${escapeHtml(node.hostname)}" title="Node settings">
                                     <i class="fas fa-cog"></i>
                                 </button>
                             </div>` : ''}

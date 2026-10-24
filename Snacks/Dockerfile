@@ -10,15 +10,18 @@ RUN apt-get update && apt-get install -y curl gnupg && \
     printf "Types: deb\nURIs: https://repo.jellyfin.org/ubuntu\nSuites: noble\nComponents: main\nArchitectures: amd64\nSigned-By: /etc/apt/keyrings/jellyfin.gpg\n" \
     > /etc/apt/sources.list.d/jellyfin.sources
 
-# Install jellyfin-ffmpeg7 (latest available for Noble), Intel VAAPI drivers, supporting
-# libraries, and the runtime deps that SkiaSharp needs for its native bitmap decoder
-# (libfontconfig1, libfreetype6). The TesseractOCR NuGet only ships native libs for
-# Windows; on Linux its LibraryLoader dlopens the system libtesseract.so.5 /
-# libleptonica.so.6, so libtesseract5 + libleptonica must be present.
+# Install jellyfin-ffmpeg7, Intel VAAPI drivers, supporting libraries, and the runtime
+# deps that SkiaSharp needs for its native bitmap decoder (libfontconfig1, libfreetype6).
+# jellyfin-ffmpeg7 7.1.4-1 is the floor: it carries Jellyfin's backport of the MagicYUV
+# decoder fix (PixelSmash, CVE-2026-8461), which matters because Snacks probes every file
+# it scans. Stay on the 7.1 line — jellyfin-ffmpeg8 is a different FFmpeg major version.
+# The TesseractOCR NuGet only ships native libs for Windows; on Linux its LibraryLoader
+# dlopens the system libtesseract.so.5 / libleptonica.so.6, so libtesseract5 +
+# libleptonica must be present.
 RUN apt-get update && apt-get install -y \
     coreutils \
     gosu \
-    jellyfin-ffmpeg7=7.1.3-5* \
+    jellyfin-ffmpeg7=7.1.4-3* \
     intel-media-va-driver-non-free \
     i965-va-driver \
     mesa-va-drivers \

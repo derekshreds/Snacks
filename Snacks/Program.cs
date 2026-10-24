@@ -227,7 +227,9 @@ builder.Services.AddHttpClient("LunaConnector")
     .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler
     {
         AllowAutoRedirect = false,
-        AutomaticDecompression = System.Net.DecompressionMethods.All,
+        // Brotli is deliberately excluded: the decoder bundled with .NET 10 is affected by
+        // CVE-2026-111497. Without it, "br" is neither advertised nor decoded.
+        AutomaticDecompression = System.Net.DecompressionMethods.GZip | System.Net.DecompressionMethods.Deflate,
     });
 builder.Services.AddSingleton<NotificationService>();
 builder.Services.AddSingleton<IntegrationService>();
@@ -264,6 +266,8 @@ builder.Services.AddSingleton<NetworkingSettingsService>();
 builder.Services.AddSingleton<Snacks.Services.Cluster.TransferThrottle>();
 builder.Services.AddScoped<ClusterAuthFilter>();
 builder.Services.AddScoped<LocalNetworkOnlyFilter>();
+
+builder.Services.AddSingleton<LoginThrottle>();
 builder.Services.AddSingleton<AutoScanService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<AutoScanService>());
 builder.Services.AddHostedService<LogRetentionService>();
@@ -284,6 +288,29 @@ if (app.Environment.IsDevelopment())
 {
     app.UseHttpsRedirection();
 }
+
+// Baseline browser hardening. No X-Frame-Options: dashboards such as Organizr embed the
+// full UI in a frame, and /iframe/* manages its own frame-ancestors allowlist.
+app.Use(async (ctx, next) =>
+{
+    var headers = ctx.Response.Headers;
+    headers.XContentTypeOptions = "nosniff";
+    headers["Referrer-Policy"]  = "same-origin";
+    await next();
+});
+
+// Snacks never decompresses request bodies. Refuse encoded ones outright so no current or
+// future middleware can hand client data to a decoder (Brotli: CVE-2026-111497).
+app.Use(async (ctx, next) =>
+{
+    var encoding = ctx.Request.Headers.ContentEncoding.ToString();
+    if (encoding.Length > 0 && !encoding.Equals("identity", StringComparison.OrdinalIgnoreCase))
+    {
+        ctx.Response.StatusCode = StatusCodes.Status415UnsupportedMediaType;
+        return;
+    }
+    await next();
+});
 
 app.UseStaticFiles(new StaticFileOptions
 {

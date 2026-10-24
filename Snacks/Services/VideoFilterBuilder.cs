@@ -80,19 +80,14 @@ public static class VideoFilterBuilder
 
     /// <summary>
     ///     Standard zscale/tonemap recipe for HDR (PQ/HLG) → SDR bt709. Requires an
-    ///     ffmpeg build with <c>libzimg</c>. Callers should verify availability; a
-    ///     <c>colorspace</c>+<c>tonemap</c> fallback applies when libzimg is absent.
+    ///     ffmpeg build with <c>libzimg</c>: jellyfin-ffmpeg (Docker), the gyan.dev full
+    ///     build (Windows), and the macOS build from <c>build-ffmpeg-mac.sh</c> all have it.
+    ///     There is no stock-filter substitute — <c>colorspace</c> can't linearize PQ or HLG,
+    ///     and <c>tonemap</c> needs linear light.
     /// </summary>
     public const string TonemapSwChain =
         "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p";
 
     private const string TonemapSwChainBeforeOutputFormat =
         "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv";
-
-    /// <summary>
-    ///     Fallback tonemap chain using <c>colorspace</c>+<c>tonemap</c>. Lossier
-    ///     than the zscale version but bundled with every stock ffmpeg build.
-    /// </summary>
-    public const string TonemapSwChainFallback =
-        "colorspace=iall=bt2020nc:all=bt709:format=yuv420p,tonemap=tonemap=hable:desat=0";
 }

@@ -918,7 +918,7 @@ async function applyTemplate(key) {
     if (staged.profiles.length || staged.rules.length) {
         const ok = await showConfirmModal(
             'Load Template',
-            `Load "${name}"? This replaces the current advanced video draft. Nothing is saved until you press Validate & Apply.`,
+            `Load "${escapeHtml(name)}"? This replaces the current advanced video draft. Nothing is saved until you press Validate & Apply.`,
             'Load');
         if (!ok) return;
     }
@@ -968,7 +968,7 @@ async function importPolicyFile(file) {
     }
     if (staged.profiles.length || staged.rules.length) {
         const ok = await showConfirmModal('Import Policy',
-            `Import "${file.name}"? This replaces the current advanced video draft. Nothing is saved until you press Validate & Apply.`, 'Import');
+            `Import "${escapeHtml(file.name)}"? This replaces the current advanced video draft. Nothing is saved until you press Validate & Apply.`, 'Import');
         if (!ok) return;
     }
     const built = materializePolicy(raw);
@@ -1454,7 +1454,7 @@ function bindEvents() {
         const del = event.target.closest('[data-template-delete]');
         if (del) {
             const name = del.dataset.templateDelete;
-            const ok = await showConfirmModal('Delete Template', `Delete the saved template "${name}"?`, 'Delete');
+            const ok = await showConfirmModal('Delete Template', `Delete the saved template "${escapeHtml(name)}"?`, 'Delete');
             if (!ok) return;
             try {
                 const result = await settingsApi.advancedVideoTemplates.remove(name);

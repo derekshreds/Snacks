@@ -519,8 +519,7 @@ public sealed class ClusterController : ControllerBase
             {
                 var rawFileName = Request.Headers["X-Original-FileName"].FirstOrDefault() ?? "input.mkv";
                 try { rawFileName = Uri.UnescapeDataString(rawFileName); } catch (UriFormatException) { }
-                fileName = Path.GetFileName(rawFileName);
-                if (string.IsNullOrWhiteSpace(fileName)) fileName = "input.mkv";
+                fileName = ToUploadFileName(rawFileName) ?? "input.mkv";
             }
 
             filePath = Path.Combine(tempDir, fileName);
@@ -1109,8 +1108,8 @@ public sealed class ClusterController : ControllerBase
 
             var raw = metadata.FileName;
             try { raw = Uri.UnescapeDataString(raw); } catch (UriFormatException) { }
-            var sanitized = Path.GetFileName(raw);
-            if (string.IsNullOrWhiteSpace(sanitized)) return false;
+            var sanitized = ToUploadFileName(raw);
+            if (sanitized == null) return false;
 
             fileName = sanitized;
             return true;
@@ -1119,6 +1118,23 @@ public sealed class ClusterController : ControllerBase
         catch (JsonException)               { return false; }
         catch (UnauthorizedAccessException) { return false; }
     }
+
+    /// <summary>
+    ///     Reduces a caller-supplied name to a bare file name inside the job's temp directory.
+    ///     The job's control files live in the same directory, so an upload named after one is
+    ///     prefixed rather than allowed to overwrite it — a forged <c>_shared.json</c> would
+    ///     otherwise point the worker's output placement at an unvalidated path. Every other
+    ///     name, including media that happens to start with an underscore, is kept as-is.
+    /// </summary>
+    internal static string? ToUploadFileName(string? raw)
+    {
+        var name = Path.GetFileName(raw);
+        if (string.IsNullOrWhiteSpace(name)) return null;
+        return ReservedJobFileNames.Contains(name) ? "input" + name : name;
+    }
+
+    private static readonly HashSet<string> ReservedJobFileNames =
+        new(StringComparer.OrdinalIgnoreCase) { "_metadata.json", "_shared.json" };
 
     /******************************************************************
      *  Dashboard mirror (RPC for worker dashboards)

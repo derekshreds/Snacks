@@ -180,11 +180,14 @@ function showToast(message, type = 'info') {
         <div class="d-flex">
             <div class="toast-body d-flex align-items-center">
                 <i class="fas ${icon} me-2 fa-lg"></i>
-                <span>${message}</span>
+                <span></span>
             </div>
             <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" aria-label="Close"></button>
         </div>
     `;
+    // Messages are plain text and routinely carry file, folder, preset, and node names
+    // that come from media or remote nodes — never parse them as markup.
+    toast.querySelector('.toast-body span').textContent = message;
 
     toastContainer.appendChild(toast);
 

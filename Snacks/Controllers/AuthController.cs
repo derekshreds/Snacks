@@ -1,3 +1,4 @@
+using System.Globalization;
 using Microsoft.AspNetCore.Mvc;
 using Snacks.Services;
 
@@ -9,12 +10,15 @@ namespace Snacks.Controllers;
 /// </summary>
 public sealed class AuthController : Controller
 {
-    private readonly AuthService _auth;
+    private readonly AuthService   _auth;
+    private readonly LoginThrottle _throttle;
 
-    public AuthController(AuthService auth)
+    public AuthController(AuthService auth, LoginThrottle throttle)
     {
         ArgumentNullException.ThrowIfNull(auth);
-        _auth = auth;
+        ArgumentNullException.ThrowIfNull(throttle);
+        _auth     = auth;
+        _throttle = throttle;
     }
 
     /******************************************************************
@@ -49,9 +53,21 @@ public sealed class AuthController : Controller
             return View();
         }
 
+        var client     = ClientNetwork.GetRateLimitKey(HttpContext);
+        var retryAfter = _throttle.RetryAfterSeconds(client);
+        if (retryAfter > 0)
+        {
+            Response.StatusCode         = StatusCodes.Status429TooManyRequests;
+            Response.Headers.RetryAfter = retryAfter.ToString(CultureInfo.InvariantCulture);
+            ViewData["Error"]     = $"Too many failed sign-in attempts. Try again in {Math.Max(1, (retryAfter + 59) / 60)} minute(s).";
+            ViewData["ReturnUrl"] = NormalizeReturnUrl(returnUrl);
+            return View();
+        }
+
         if (!string.Equals(cfg.Username, username?.Trim(), StringComparison.OrdinalIgnoreCase)
             || !_auth.VerifyPassword(password ?? ""))
         {
+            _throttle.RecordFailure(client);
             ViewData["Error"]     = "Invalid username or password";
             ViewData["ReturnUrl"] = NormalizeReturnUrl(returnUrl);
             return View();
@@ -62,7 +78,9 @@ public sealed class AuthController : Controller
         {
             HttpOnly = true,
             SameSite = SameSiteMode.Lax,
-            Secure   = Request.IsHttps
+            // Behind a TLS-terminating proxy Kestrel only sees HTTP. A forged header can only
+            // make the cookie stricter, so trusting it needs no proxy allowlist.
+            Secure   = Request.IsHttps || IsForwardedHttps(Request)
         });
 
         return LocalRedirect(NormalizeReturnUrl(returnUrl));
@@ -104,5 +122,11 @@ public sealed class AuthController : Controller
         }
 
         return "/";
+    }
+
+    private static bool IsForwardedHttps(HttpRequest request)
+    {
+        var proto = request.Headers["X-Forwarded-Proto"].ToString().Split(',')[0].Trim();
+        return string.Equals(proto, "https", StringComparison.OrdinalIgnoreCase);
     }
 }

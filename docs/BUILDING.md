@@ -136,18 +136,24 @@ code-signing certificate.
 - Homebrew packages used only on the build machine:
 
 ```bash
-brew install ffmpeg tesseract leptonica
+brew install tesseract leptonica
 ```
 
-Copy FFmpeg and FFprobe into the package staging directory:
+Build FFmpeg and stage it in `electron-app/ffmpeg` (rerun only when FFmpeg is updated):
 
 ```bash
-mkdir -p electron-app/ffmpeg
-cp "$(brew --prefix ffmpeg)/bin/ffmpeg" electron-app/ffmpeg/
-cp "$(brew --prefix ffmpeg)/bin/ffprobe" electron-app/ffmpeg/
-chmod +x electron-app/ffmpeg/ffmpeg electron-app/ffmpeg/ffprobe
-xattr -d com.apple.quarantine electron-app/ffmpeg/* 2>/dev/null || true
+electron-app/scripts/build-ffmpeg-mac.sh
 ```
+
+The script builds the FFmpeg release Homebrew's `ffmpeg@8` formula ships, with the same
+configure options and Homebrew dependency libraries, plus `libzimg` (the `zscale` filter used
+for HDR→SDR tonemapping) and `libvorbis` (Ogg Vorbis music). Stock Homebrew FFmpeg has neither,
+and plain `ffmpeg` is now FFmpeg 9, which the desktop build has not been validated against. It
+installs the Homebrew build dependencies, verifies the source tarball's SHA-256, builds in
+`~/Library/Caches/snacks-ffmpeg-build` (override with `SNACKS_FFMPEG_BUILD_DIR`; the path must
+not contain spaces), and bundles the result with `bundle-ffmpeg-mac.sh`. `build-mac.sh` refuses
+an FFmpeg older than 8.1.2 — the release that fixes the MagicYUV decoder overflow (PixelSmash,
+CVE-2026-8461) — or one without `zscale` and `libvorbis`.
 
 ### DMG build
 

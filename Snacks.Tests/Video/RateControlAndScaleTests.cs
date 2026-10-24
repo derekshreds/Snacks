@@ -579,6 +579,45 @@ public sealed class RateControlAndScaleTests
         TranscodingService.IsVideoProfileValidForEncoder(encoder, profile).Should().Be(expected);
     }
 
+    // libx264 / libx265 reject an 8-bit-only profile on a 10/12-bit source ("high profile
+    // doesn't support a bit depth of 10"), so the simple path drops those profiles there.
+    [Theory]
+    [InlineData("baseline", true)]
+    [InlineData("main",     true)]
+    [InlineData("HIGH",     true)]
+    [InlineData("mainstillpicture", true)]
+    [InlineData("high10",   false)]
+    [InlineData("high422",  false)]
+    [InlineData("high444",  false)]
+    [InlineData("main10",   false)]
+    [InlineData("main12",   false)]
+    [InlineData(null,       false)]
+    public void IsEightBitOnlyProfile_flags_profiles_without_high_bit_depth(string? profile, bool expected)
+    {
+        TranscodingService.IsEightBitOnlyProfile(profile).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData("yuv420p10le", null,        true)]
+    [InlineData("p010le",      null,        true)]
+    [InlineData("yuv444p12le", null,        true)]
+    [InlineData("gray16be",    null,        true)]
+    [InlineData(null,          "Main 10",   true)]
+    [InlineData(null,          "High 10",   true)]
+    [InlineData("yuv420p",     "High",      false)]
+    [InlineData("yuvj420p",    "Main",      false)]
+    [InlineData("nv12",        null,        false)]
+    [InlineData("rgb24",       null,        false)]
+    public void IsHighBitDepthSource_reads_pixel_format_and_profile(string? pixFmt, string? profile, bool expected)
+    {
+        var probe = new ProbeResult
+        {
+            Streams = [new Stream { Index = 0, CodecType = "video", CodecName = "hevc", PixFmt = pixFmt, Profile = profile }],
+        };
+
+        TranscodingService.IsHighBitDepthSource(probe).Should().Be(expected);
+    }
+
 
     // =====================================================================
     //  ComputeFpsCapExpr — caps output frame rate for level-conformant

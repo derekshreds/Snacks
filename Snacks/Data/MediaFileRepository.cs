@@ -786,6 +786,20 @@ public class MediaFileRepository
         ///     <paramref name="cap"/>. Used by the "delete all" cleanup to act on every match
         ///     across pages, not just what's currently on screen.
         /// </summary>
+        /// <summary>
+        ///     Whether <paramref name="filePath"/> currently appears on the Library Health page
+        ///     under any category — the only files the page offers to delete.
+        /// </summary>
+        public async Task<bool> IsHealthFlaggedAsync(string filePath)
+        {
+            var fullPath = Path.GetFullPath(filePath);
+            using var context = await _contextFactory.CreateDbContextAsync();
+            return await ApplyHealthCategory(
+                    context.MediaFiles.Where(f => f.LastScannedAt != null && (f.FilePath == filePath || f.FilePath == fullPath)),
+                    category: null)
+                .AnyAsync();
+        }
+
         public async Task<List<string>> GetHealthPathsAsync(string? category, string? search, int cap)
         {
             using var context = await _contextFactory.CreateDbContextAsync();

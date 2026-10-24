@@ -42,6 +42,32 @@ public sealed class SubtitleMappingTests
 
 
     [Fact]
+    public void Mkv_copy_flags_are_unchanged_when_no_track_needs_conversion()
+    {
+        var probe = new ProbeBuilder()
+            .Video()
+            .Subtitle(codec: "subrip", lang: "eng")
+            .Subtitle(codec: "ass", lang: "eng")
+            .Build();
+
+        _svc.MapSub(probe, new[] { "en" }, container: "mkv").Should().Be("-map 0:1 -map 0:2 -c:s copy");
+    }
+
+    [Fact]
+    public void Mkv_converts_mp4_timed_text_to_subrip()
+    {
+        // Matroska has no codec ID for mov_text, so copying it aborts the mux.
+        var probe = new ProbeBuilder()
+            .Video()
+            .Subtitle(codec: "subrip",   lang: "eng")
+            .Subtitle(codec: "mov_text", lang: "eng")
+            .Build();
+
+        _svc.MapSub(probe, new[] { "en" }, container: "mkv")
+            .Should().Be("-map 0:1 -map 0:2 -c:s copy -c:s:1 srt");
+    }
+
+    [Fact]
     public void Mkv_drops_bitmap_subs_by_default()
     {
         var probe = new ProbeBuilder()

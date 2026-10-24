@@ -457,6 +457,9 @@ public sealed class LibraryController : ControllerBase
         if (string.IsNullOrEmpty(request.FilePath)) return BadRequest("File path is required");
         if (!_fileService.IsFilePathAllowed(request.FilePath))
             return BadRequest("File is not within allowed library path");
+        // Only files the health page lists — this endpoint must not double as "delete any media file".
+        if (!await _mediaFileRepo.IsHealthFlaggedAsync(request.FilePath))
+            return BadRequest("File is not flagged in Library Health");
 
         return await TryDeleteFlaggedAsync(request.FilePath)
             ? new JsonResult(new { success = true })
