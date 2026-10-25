@@ -1130,11 +1130,28 @@ public sealed class ClusterController : ControllerBase
     {
         var name = Path.GetFileName(raw);
         if (string.IsNullOrWhiteSpace(name)) return null;
-        return ReservedJobFileNames.Contains(name) ? "input" + name : name;
+        return MayOpenJobFile(name) ? "input" + name : name;
+    }
+
+    /// <summary>
+    ///     Windows opens <c>_shared.json.</c>, <c>_shared.json </c>, and <c>_shared.json::$DATA</c>
+    ///     as <c>_shared.json</c> itself, and an 8.3 short name such as <c>_SHARE~1.JSO</c> as
+    ///     whichever file it was generated for. Names are compared in that resolved form on every
+    ///     platform; a Linux or macOS name that only matches after it is merely prefixed.
+    /// </summary>
+    private static bool MayOpenJobFile(string name)
+    {
+        var colon = name.IndexOf(':');
+        var stem  = (colon >= 0 ? name[..colon] : name).TrimEnd('.', ' ');
+        return ReservedJobFileNames.Contains(stem) || ShortNameAlias.IsMatch(stem);
     }
 
     private static readonly HashSet<string> ReservedJobFileNames =
         new(StringComparer.OrdinalIgnoreCase) { "_metadata.json", "_shared.json" };
+
+    /// <summary> An 8.3 short name: up to eight characters including a <c>~</c>, an optional extension of up to three. </summary>
+    private static readonly System.Text.RegularExpressions.Regex ShortNameAlias =
+        new(@"^(?=[^.]*~)[^.]{1,8}(\.[^.]{1,3})?$", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
 
     /******************************************************************
      *  Dashboard mirror (RPC for worker dashboards)

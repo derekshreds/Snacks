@@ -67,10 +67,12 @@ node scripts/validate-openapi.mjs http://127.0.0.1:16767/openapi/v1.json
 ### Requirements
 
 - Windows 10 or 11, x64
-- .NET 10 SDK
+- .NET 10 SDK that bundles runtime 10.0.13 or newer (SDK 10.0.402 / 10.0.113 or later; check with
+  `dotnet msbuild Snacks/Snacks.csproj -getProperty:BundledNETCoreAppPackageVersion`)
 - Node.js 22 or newer
 - Current NVIDIA, Intel, or AMD drivers when testing hardware encoding
-- A Windows `ffmpeg-release-full` build from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/)
+- gyan.dev's FFmpeg 8.1.x `full_build` (8.1.2 or newer), e.g. `ffmpeg-8.1.2-full_build.zip` from
+  the [release archive](https://github.com/GyanD/codexffmpeg/releases)
 
 Place both executables here:
 
@@ -78,6 +80,13 @@ Place both executables here:
 electron-app/ffmpeg/ffmpeg.exe
 electron-app/ffmpeg/ffprobe.exe
 ```
+
+Use a numbered 8.1.x release, not gyan.dev's `ffmpeg-release-full` link or a git build:
+`release-full` is now FFmpeg 9, which the desktop build has not been validated against.
+`build-installer.bat` and `build-electron.bat` run `scripts/validate-ffmpeg-version.mjs`, which
+refuses an FFmpeg older than 8.1.2 — the release that fixes the MagicYUV decoder overflow
+(PixelSmash, CVE-2026-8461) — a git build whose version can't be compared, or one without
+`zscale` and `libvorbis`.
 
 Native package builds run `scripts/validate-ffmpeg-inventory.mjs` before packaging and fail if
 the staged FFmpeg does not advertise the baseline `libx264`, `libx265`, and `libsvtav1`

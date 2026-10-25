@@ -110,7 +110,39 @@ public sealed class ArgumentInjectionTests
     [InlineData("../../_shared.json", "input_shared.json")]
     [InlineData("Movie (2024).mkv", "Movie (2024).mkv")]
     [InlineData("_Movie (2024).mkv", "_Movie (2024).mkv")]
+    [InlineData("_shared.json.", "input_shared.json.")]
+    [InlineData("_shared.json .", "input_shared.json .")]
+    [InlineData("_shared.json::$DATA", "input_shared.json::$DATA")]
+    [InlineData("_metadata.json:x", "input_metadata.json:x")]
+    [InlineData("_SHARE~1.JSO", "input_SHARE~1.JSO")]
+    [InlineData("_METAD~2.JSO", "input_METAD~2.JSO")]
+    [InlineData("Movie~Cut (2024).mkv", "Movie~Cut (2024).mkv")]
     [InlineData("", null)]
     public void Upload_names_cannot_replace_job_control_files(string raw, string? expected)
         => ClusterController.ToUploadFileName(raw).Should().Be(expected);
+
+    [Theory]
+    [InlineData("_shared.json.")]
+    [InlineData("_shared.json ")]
+    [InlineData("_shared.json::$DATA")]
+    [InlineData("_SHARE~1.JSO")]
+    public void Windows_aliases_of_a_control_file_are_stored_elsewhere(string raw)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        var dir = Directory.CreateTempSubdirectory("snacks-upload-").FullName;
+        try
+        {
+            var control = Path.Combine(dir, "_shared.json");
+            File.WriteAllText(control, "control");
+
+            File.WriteAllText(Path.Combine(dir, ClusterController.ToUploadFileName(raw)!), "upload");
+
+            File.ReadAllText(control).Should().Be("control");
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+    }
 }
