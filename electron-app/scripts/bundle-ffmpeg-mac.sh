@@ -54,6 +54,12 @@ resolve_src() {
     if [[ "$dep" == /* && -e "$dep" ]]; then
         echo "$dep"; return 0
     fi
+    # Already bundled by an earlier run (build-mac.sh re-runs this on every build): keep the
+    # copy that's here. Looking the name up again would swap in whatever Homebrew has under
+    # that name — e.g. stock libavfilter over the zimg-enabled one build-ffmpeg-mac.sh staged.
+    if [[ "$dep" == @* && -e "$TARGET/$depbase" ]]; then
+        echo ""; return 0
+    fi
     local guess
     for guess in \
         "/opt/homebrew/lib/$depbase" \
