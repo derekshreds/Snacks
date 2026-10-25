@@ -147,7 +147,10 @@ public sealed class FullCommandScenarioTests
         if (!videoCopy && encoder.StartsWith("lib"))
         {
             if (!string.IsNullOrWhiteSpace(options.VideoProfile)
-                && TranscodingService.IsVideoProfileValidForEncoder(encoder, options.VideoProfile))
+                && TranscodingService.IsVideoProfileValidForEncoder(encoder, options.VideoProfile)
+                && (tonemap
+                    || !TranscodingService.IsEightBitOnlyProfile(options.VideoProfile)
+                    || !TranscodingService.IsHighBitDepthSource(probe)))
                 profileLevel += $"-profile:v {options.VideoProfile} ";
             if (!string.IsNullOrWhiteSpace(options.VideoLevel))
                 profileLevel += $"-level {options.VideoLevel} ";

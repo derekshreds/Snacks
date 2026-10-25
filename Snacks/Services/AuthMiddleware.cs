@@ -6,16 +6,34 @@ namespace Snacks.Services;
 ///     Gates the UI behind cookie-based login when <see cref="AuthConfig.Enabled"/> is true.
 ///     Login page, static files, health checks, and cluster (master↔node) traffic are always allowed.
 ///     Cluster nodes authenticate via the shared secret handled separately by ClusterAuthMiddleware.
+///     When no login is configured, only local-network clients (or API-key callers) get through —
+///     a port-forwarded or reverse-proxied instance must not hand anonymous internet visitors
+///     full control. <see cref="AllowRemoteWithoutAuthVariable"/> opts out for deployments whose
+///     upstream proxy already authenticates users.
 /// </summary>
 public sealed class AuthMiddleware
 {
+    public const string AllowRemoteWithoutAuthVariable = "SNACKS_ALLOW_REMOTE_WITHOUT_AUTH";
+
+    private const string RemoteAccessRequiresLoginMessage =
+        "Remote access requires a login. Snacks has no password configured, so it only accepts " +
+        "requests from local network addresses. Open Snacks from your local network and enable " +
+        "authentication under Settings > System > Security, or set " + AllowRemoteWithoutAuthVariable +
+        "=true if an upstream proxy already authenticates users.";
+
     private static readonly string[] AllowlistPrefixes =
     {
         "/Auth/",             // login form
         "/api/cluster/",      // inter-node RPC (secret-authenticated)
         "/api/health",        // liveness probe
-        "/lib/", "/css/", "/js/", "/img/", "/favicon",
+        "/lib/", "/css/", "/js/", "/img/", "/images/", "/webfonts/", "/docs/", "/favicon",
     };
+
+    private static readonly bool AllowRemoteWithoutAuth =
+        (Environment.GetEnvironmentVariable(AllowRemoteWithoutAuthVariable) ?? "")
+            .Trim().ToLowerInvariant() is "1" or "true" or "yes" or "on";
+
+    private static long _lastRemoteRejectionLog;
 
     private readonly RequestDelegate _next;
 
@@ -38,13 +56,28 @@ public sealed class AuthMiddleware
     /// <param name="auth"> The auth service resolved per-request from DI. </param>
     public async Task InvokeAsync(HttpContext ctx, AuthService auth)
     {
+        var path = ctx.Request.Path.Value ?? "";
+
         if (!auth.IsAuthRequired())
         {
-            await _next(ctx);
+            if (IsAllowlisted(path)
+                || AllowRemoteWithoutAuth
+                || ClientNetwork.IsLocalClient(ctx)
+                || (path.StartsWith("/api/", StringComparison.OrdinalIgnoreCase)
+                    && auth.ValidateApiKey(ExtractApiKey(ctx, path)))
+                || (path.StartsWith("/iframe/", StringComparison.OrdinalIgnoreCase)
+                    && auth.ValidateEmbedToken(ctx.Request.Query["embedToken"].FirstOrDefault())))
+            {
+                await _next(ctx);
+                return;
+            }
+
+            LogRemoteRejection(ctx, path);
+            ctx.Response.StatusCode  = StatusCodes.Status403Forbidden;
+            ctx.Response.ContentType = "text/plain; charset=utf-8";
+            await ctx.Response.WriteAsync(RemoteAccessRequiresLoginMessage);
             return;
         }
-
-        var path = ctx.Request.Path.Value ?? "";
 
         if (IsAllowlisted(path))
         {
@@ -129,13 +162,31 @@ public sealed class AuthMiddleware
         // "/metrics/..." management route can't silently ship unauthenticated.
         if (string.Equals(path, "/metrics", StringComparison.OrdinalIgnoreCase)) return true;
 
+        // The published API contract (linked from the offline guide). It describes routes
+        // that are already public in the source; exact match keeps it to this one document.
+        if (string.Equals(path, "/openapi/v1.json", StringComparison.OrdinalIgnoreCase)) return true;
+
+        // Static files are served by UseStaticFiles before this middleware runs, so only
+        // these known asset prefixes need listing. Never allow by file extension: the
+        // conventional route accepts a dotted {id}, which turned "/Home/Index/x.y" into
+        // an unauthenticated route.
         foreach (var prefix in AllowlistPrefixes)
             if (path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) return true;
 
-        // Static files (anything with an extension and not an /api/ call).
-        if (path.Contains('.', StringComparison.Ordinal)
-            && !path.StartsWith("/api/", StringComparison.OrdinalIgnoreCase)) return true;
-
         return false;
+    }
+
+    /// <summary> Logs blocked remote access at most once a minute so a scanner can't flood the log. </summary>
+    private static void LogRemoteRejection(HttpContext ctx, string path)
+    {
+        var now  = Environment.TickCount64;
+        var last = Interlocked.Read(ref _lastRemoteRejectionLog);
+        if (last != 0 && now - last < 60_000) return;
+        if (Interlocked.CompareExchange(ref _lastRemoteRejectionLog, now, last) != last) return;
+
+        Log.Warning(
+            "Blocked {Path} from non-local client {Remote}: no login is configured. Enable authentication " +
+            "under Settings > System > Security, or set {Variable}=true if an upstream proxy authenticates users",
+            path, ctx.Connection.RemoteIpAddress, AllowRemoteWithoutAuthVariable);
     }
 }

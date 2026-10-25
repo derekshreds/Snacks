@@ -14,6 +14,9 @@ public sealed class AuthMiddlewareTests
     [InlineData("/metrics")]
     [InlineData("/css/site.css")]
     [InlineData("/docs/index.html")]
+    [InlineData("/webfonts/fa-solid-900.woff2")]
+    [InlineData("/images/snacks.ico")]
+    [InlineData("/openapi/v1.json")]
     public void Public_infrastructure_routes_remain_allowlisted(string path)
     {
         AuthMiddleware.IsAllowlisted(path).Should().BeTrue();
@@ -26,6 +29,10 @@ public sealed class AuthMiddlewareTests
     [InlineData("/iframe/homarr")]
     [InlineData("/transcodingHub")]
     [InlineData("/transcodingHub/negotiate")]
+    // A dot in the path once meant "static file"; the conventional route's {id} made that a bypass.
+    [InlineData("/Home/Index/anything.css")]
+    [InlineData("/openapi/v2.json")]
+    [InlineData("/dashboard.json")]
     public void User_data_and_realtime_routes_require_the_session_when_auth_is_enabled(string path)
     {
         AuthMiddleware.IsAllowlisted(path).Should().BeFalse();

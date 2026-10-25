@@ -318,6 +318,25 @@ function createWindow(port) {
         },
     });
 
+    // The UI only ever talks to its own backend. Refusing every other origin keeps
+    // Chromium's response decoders (Brotli included — CVE-2026-111497) away from
+    // content Snacks didn't serve; external links still open in the system browser.
+    const isBackendUrl = (url) => {
+        try {
+            const u = new URL(url);
+            return (u.protocol === "http:" || u.protocol === "ws:")
+                && u.hostname === "localhost"
+                && u.port === String(port)
+                && !u.username && !u.password;
+        } catch {
+            return false;
+        }
+    };
+    mainWindow.webContents.session.webRequest.onBeforeRequest(
+        { urls: ["http://*/*", "https://*/*", "ws://*/*", "wss://*/*"] },
+        (details, callback) => callback({ cancel: !isBackendUrl(details.url) }),
+    );
+
     mainWindow.loadURL(`http://localhost:${port}`);
 
     // F12 toggles DevTools (we explicitly don't install a full menu).
@@ -335,7 +354,9 @@ function createWindow(port) {
         return { action: "deny" };
     });
     const interceptNav = (event, url) => {
-        if (url.startsWith(`http://localhost:${port}`)) return;
+        // Parsed, not a prefix match: "http://localhost:6767@evil.example/" starts with
+        // the backend origin but navigates to another host.
+        if (isBackendUrl(url)) return;
         event.preventDefault();
         openExternal(url);
     };

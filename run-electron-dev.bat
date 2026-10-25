@@ -30,7 +30,7 @@ REM Step 2: Check for FFmpeg binaries
 echo [2/3] Checking for FFmpeg...
 if not exist "electron-app\ffmpeg\ffmpeg.exe" (
     echo FFmpeg not found in electron-app/ffmpeg/
-    echo Download ffmpeg-release-full from https://www.gyan.dev/ffmpeg/builds/
+    echo Download ffmpeg-8.1.x-full_build.zip ^(8.1.2 or newer^) from https://github.com/GyanD/codexffmpeg/releases
     echo Place ffmpeg.exe and ffprobe.exe in electron-app/ffmpeg/
     pause
     exit /b 1

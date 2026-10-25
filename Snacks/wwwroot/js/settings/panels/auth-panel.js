@@ -25,6 +25,12 @@ async function load() {
         document.getElementById('authUsername').value  = cfg.username || '';
         document.getElementById('authPassword').value  = '';
 
+        // Only an active password gate asks for the current password (see AuthApiController.Save).
+        const currentGroup = document.getElementById('authCurrentPasswordGroup');
+        if (currentGroup) currentGroup.style.display = cfg.enabled && cfg.hasPassword ? '' : 'none';
+        const currentInput = document.getElementById('authCurrentPassword');
+        if (currentInput) currentInput.value = '';
+
         document.getElementById('authEnabledHint').textContent = cfg.hasPassword
             ? 'A password is set. Leave the password field blank to keep it.'
             : 'No password set yet. Enter one below to enable sign-in.';
@@ -72,9 +78,10 @@ async function save() {
     const enabled  = document.getElementById('authEnabled').checked;
     const username = document.getElementById('authUsername').value.trim();
     const password = document.getElementById('authPassword').value;
+    const current  = document.getElementById('authCurrentPassword')?.value || null;
 
     try {
-        const data = await authApi.save(enabled, username, password || null);
+        const data = await authApi.save(enabled, username, password || null, current);
 
         if (!data.success) {
             showToast(data.error || 'Save failed', 'danger');

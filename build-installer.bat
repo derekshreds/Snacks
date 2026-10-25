@@ -60,8 +60,8 @@ if not exist "electron-app\ffmpeg\ffmpeg.exe" (
     echo.
     echo  FFmpeg not found in electron-app\ffmpeg\
     echo.
-    echo  Download ffmpeg-release-full from:
-    echo    https://www.gyan.dev/ffmpeg/builds/
+    echo  Download ffmpeg-8.1.x-full_build.zip ^(8.1.2 or newer^) from:
+    echo    https://github.com/GyanD/codexffmpeg/releases
     echo.
     echo  Extract and place ffmpeg.exe and ffprobe.exe in:
     echo    electron-app\ffmpeg\
@@ -77,7 +77,13 @@ if not exist "electron-app\ffmpeg\ffprobe.exe" (
     pause
     exit /b 1
 )
-echo FFmpeg found.
+node scripts\validate-ffmpeg-version.mjs electron-app\ffmpeg\ffmpeg.exe
+if %errorlevel% neq 0 (
+    echo.
+    echo ERROR: FFmpeg is unpatched for PixelSmash ^(CVE-2026-8461^) or lacks zscale / libvorbis.
+    pause
+    exit /b 1
+)
 node scripts\validate-ffmpeg-inventory.mjs electron-app\ffmpeg\ffmpeg.exe
 if %errorlevel% neq 0 (
     echo.

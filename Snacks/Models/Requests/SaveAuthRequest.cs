@@ -11,4 +11,10 @@ public sealed class SaveAuthRequest
 
     /// <summary> New plain-text password to hash and store, or <see langword="null"/> to keep the existing hash. </summary>
     public string? Password { get; set; }
+
+    /// <summary>
+    ///     The password currently protecting the panel. Required only while sign-in is active and
+    ///     the save changes the username or password, or turns sign-in off.
+    /// </summary>
+    public string? CurrentPassword { get; set; }
 }

@@ -12,8 +12,11 @@ REPO_ROOT="$(cd "$E2E_ROOT/.." && pwd)"
 BUILD_DIR="$E2E_ROOT/.build"
 RUNS_DIR="$E2E_ROOT/.runs"
 
-# PIDs started via start_instance — killed by the EXIT trap installed below.
+# PIDs started via start_instance — killed by the EXIT trap installed below. Scenarios
+# call start_instance inside $(...), a subshell whose E2E_PIDS appends never reach this
+# shell, so every PID is also recorded in E2E_PID_FILE for the trap to read.
 E2E_PIDS=()
+E2E_PID_FILE="$(mktemp "${TMPDIR:-/tmp}/snacks-e2e-pids.XXXXXX")"
 
 require() {
     for tool in "$@"; do
@@ -51,6 +54,7 @@ start_instance() {
     local pid
     pid="$(cat "$workdir/app.pid")"
     E2E_PIDS+=("$pid")
+    echo "$pid" >>"$E2E_PID_FILE"
     wait_health "$port" 60 "$name"
     echo "$pid"
 }
@@ -150,14 +154,17 @@ assert_le() {
 }
 
 cleanup_instances() {
-    for pid in "${E2E_PIDS[@]:-}"; do
+    local pids=("${E2E_PIDS[@]:-}") pid
+    while read -r pid; do pids+=("$pid"); done <"$E2E_PID_FILE" 2>/dev/null || true
+    for pid in "${pids[@]:-}"; do
         [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
     done
     # Give SIGTERM a moment, then force anything still alive.
     sleep 2
-    for pid in "${E2E_PIDS[@]:-}"; do
+    for pid in "${pids[@]:-}"; do
         [[ -n "$pid" ]] && kill -9 "$pid" 2>/dev/null || true
     done
+    rm -f "$E2E_PID_FILE"
 }
 trap cleanup_instances EXIT
 

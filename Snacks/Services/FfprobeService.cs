@@ -575,6 +575,14 @@ public class FfprobeService
         string.Equals(container, "mkv", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
+    ///     True for a text subtitle codec Matroska can't store. MP4's timed text (<c>mov_text</c>)
+    ///     has no Matroska codec ID, so stream-copying it aborts the mux ("Subtitle codec mov_text
+    ///     is not supported"); such tracks are converted to SubRip instead.
+    /// </summary>
+    internal static bool NeedsSrtForMatroska(string? codecName) =>
+        string.Equals(codecName, "mov_text", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
     ///     Whether <paramref name="container"/> can stream-copy a source audio codec. Used during
     ///     pass-through to decide between <c>-c:a copy</c> and a re-encode fallback. Matroska is
     ///     permissive enough that we don't gate copies for it; MP4 and WebM both have strict
@@ -694,6 +702,8 @@ public class FfprobeService
         var sb = new StringBuilder();
         foreach (var s in keepSubs) sb.Append("-map 0:").Append(s.Index).Append(' ');
         sb.Append("-c:s copy");
+        for (int i = 0; i < keepSubs.Count; i++)
+            if (NeedsSrtForMatroska(keepSubs[i].CodecName)) sb.Append(" -c:s:").Append(i).Append(" srt");
 
         if (autoSetDefault)
         {

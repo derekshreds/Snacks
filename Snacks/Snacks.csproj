@@ -4,10 +4,19 @@
     <TargetFramework>net10.0</TargetFramework>
     <!-- Single source of truth for release tooling and runtime version output.
          Run `node scripts/sync-version.mjs` after changing it. -->
-    <Version>2.20.0</Version>
+    <Version>2.20.1</Version>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <!-- Desktop builds publish self-contained and ship whatever runtime the building SDK
+         bundles. Raise this floor when a .NET servicing release fixes something reachable
+         from the web listener (10.0.13 = October 2026 ASP.NET Core security update). -->
+    <MinimumSelfContainedRuntimeVersion>10.0.13</MinimumSelfContainedRuntimeVersion>
   </PropertyGroup>
+
+  <Target Name="RequirePatchedSelfContainedRuntime" BeforeTargets="Build"
+          Condition="'$(SelfContained)' == 'true' And $([MSBuild]::VersionLessThan('$(BundledNETCoreAppPackageVersion)', '$(MinimumSelfContainedRuntimeVersion)'))">
+    <Error Text="This SDK bundles .NET runtime $(BundledNETCoreAppPackageVersion), older than the required $(MinimumSelfContainedRuntimeVersion). Update the .NET 10 SDK before publishing a self-contained build." />
+  </Target>
 
   <ItemGroup>
     <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.10" />

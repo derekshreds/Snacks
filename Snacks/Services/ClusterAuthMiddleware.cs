@@ -4,12 +4,13 @@ using Microsoft.AspNetCore.Mvc.Filters;
 namespace Snacks.Services;
 
 /// <summary>
-///     ASP.NET MVC action filter that authenticates inter-node cluster requests.
+///     ASP.NET MVC authorization filter that authenticates inter-node cluster requests.
 ///     Applied to all endpoints on <see cref="Controllers.ClusterController"/>.
 ///     Validates the <c>X-Snacks-Secret</c> header using constant-time comparison
-///     to prevent timing-based secret enumeration.
+///     to prevent timing-based secret enumeration. Runs before model binding, so an
+///     unauthenticated caller never gets its request body parsed.
 /// </summary>
-public sealed class ClusterAuthFilter : IActionFilter
+public sealed class ClusterAuthFilter : IAuthorizationFilter
 {
     private readonly ClusterService _clusterService;
 
@@ -22,15 +23,15 @@ public sealed class ClusterAuthFilter : IActionFilter
     }
 
     /******************************************************************
-     *  IActionFilter
+     *  IAuthorizationFilter
      ******************************************************************/
 
     /// <summary>
-    ///     Validates the <c>X-Snacks-Secret</c> header before the action executes.
+    ///     Validates the <c>X-Snacks-Secret</c> header before model binding and the action run.
     ///     Short-circuits the request with 401 Unauthorized if the header is missing or invalid.
     /// </summary>
-    /// <param name="context">The action execution context.</param>
-    public void OnActionExecuting(ActionExecutingContext context)
+    /// <param name="context">The authorization filter context.</param>
+    public void OnAuthorization(AuthorizationFilterContext context)
     {
         ArgumentNullException.ThrowIfNull(context);
 
@@ -85,11 +86,5 @@ public sealed class ClusterAuthFilter : IActionFilter
             decoded = "";
             return false;
         }
-    }
-
-    /// <summary> No-op post-execution hook required by <see cref="IActionFilter"/>. </summary>
-    /// <param name="context">The action executed context.</param>
-    public void OnActionExecuted(ActionExecutedContext context)
-    {
     }
 }

@@ -28,12 +28,17 @@ REM Step 2: Check for FFmpeg binaries
 echo [2/4] Checking for FFmpeg...
 if not exist "electron-app\ffmpeg\ffmpeg.exe" (
     echo FFmpeg not found in electron-app/ffmpeg/
-    echo Download ffmpeg-release-full from https://www.gyan.dev/ffmpeg/builds/
+    echo Download ffmpeg-8.1.x-full_build.zip ^(8.1.2 or newer^) from https://github.com/GyanD/codexffmpeg/releases
     echo Place ffmpeg.exe and ffprobe.exe in electron-app/ffmpeg/
     pause
     exit /b 1
 )
-echo FFmpeg found.
+node scripts\validate-ffmpeg-version.mjs electron-app\ffmpeg\ffmpeg.exe
+if %errorlevel% neq 0 (
+    echo ERROR: FFmpeg is unpatched for PixelSmash ^(CVE-2026-8461^) or lacks zscale / libvorbis.
+    pause
+    exit /b 1
+)
 echo.
 
 REM Step 3: Install npm dependencies

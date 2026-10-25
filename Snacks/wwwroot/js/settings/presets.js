@@ -249,7 +249,7 @@ function renderUserPresets() {
 async function confirmAndApplyPreset(options, label, builtIn = false) {
     const ok = await showConfirmModal(
         'Apply Preset',
-        `Apply the "${label}" preset? This overwrites your current encoder settings.`,
+        `Apply the "${escapeHtml(label)}" preset? This overwrites your current encoder settings.`,
         'Apply');
     if (ok) applyPreset(options, label, builtIn);
 }
@@ -321,7 +321,7 @@ async function onUserPresetAction(group, action) {
         try { await streamDownload(presetsApi.exportUrl(name), btn, `${name}.snacks-preset.json`); }
         catch { /* streamDownload already toasts */ }
     } else if (action === 'delete') {
-        const ok = await showConfirmModal('Delete Preset', `Delete the preset "${name}"? This cannot be undone.`, 'Delete');
+        const ok = await showConfirmModal('Delete Preset', `Delete the preset "${escapeHtml(name)}"? This cannot be undone.`, 'Delete');
         if (!ok) return;
         try {
             await presetsApi.remove(name);

@@ -56,15 +56,9 @@ if [[ ! -x electron-app/ffmpeg/ffmpeg || ! -x electron-app/ffmpeg/ffprobe ]]; th
 
   ffmpeg or ffprobe not found (or not executable) in electron-app/ffmpeg/
 
-  Get arm64 macOS builds from one of:
-    - https://evermeet.cx/ffmpeg/   (download the arm64 zips)
-    - brew install ffmpeg          (then copy the binaries:
-                                    cp "$(brew --prefix ffmpeg)/bin/ffmpeg"  electron-app/ffmpeg/
-                                    cp "$(brew --prefix ffmpeg)/bin/ffprobe" electron-app/ffmpeg/)
-
-  Then make them executable and clear quarantine:
-    chmod +x electron-app/ffmpeg/ffmpeg electron-app/ffmpeg/ffprobe
-    xattr -d com.apple.quarantine electron-app/ffmpeg/* 2>/dev/null || true
+  Build and stage them (FFmpeg 8.1.x with Homebrew's ffmpeg@8 options plus libzimg and
+  libvorbis, which HDR tonemapping and Ogg Vorbis music need):
+    electron-app/scripts/build-ffmpeg-mac.sh
 
 EOF
     exit 1
@@ -73,7 +67,46 @@ fi
 xattr -d com.apple.quarantine electron-app/ffmpeg/ffmpeg  2>/dev/null || true
 xattr -d com.apple.quarantine electron-app/ffmpeg/ffprobe 2>/dev/null || true
 chmod +x electron-app/ffmpeg/ffmpeg electron-app/ffmpeg/ffprobe
-echo "FFmpeg found."
+
+# PixelSmash (CVE-2026-8461): the MagicYUV decoder overflows the heap on a crafted file,
+# and Snacks probes every file it sees. Fixed in 8.1.2 and 7.1.5 — refuse to bundle an
+# older FFmpeg. SNACKS_ALLOW_UNPATCHED_FFMPEG=1 overrides for an emergency build.
+FFMPEG_VERSION="$(electron-app/ffmpeg/ffmpeg -hide_banner -version 2>/dev/null | awk 'NR==1 {print $3}')"
+FFMPEG_PATCHED=0
+if [[ "$FFMPEG_VERSION" =~ ^n?([0-9]+)\.([0-9]+)(\.([0-9]+))? ]]; then
+    FF_MAJOR=${BASH_REMATCH[1]}; FF_MINOR=${BASH_REMATCH[2]}; FF_PATCH=${BASH_REMATCH[4]:-0}
+    if (( FF_MAJOR > 8 )) \
+        || (( FF_MAJOR == 8 && FF_MINOR > 1 )) \
+        || (( FF_MAJOR == 8 && FF_MINOR == 1 && FF_PATCH >= 2 )) \
+        || (( FF_MAJOR == 7 && FF_MINOR == 1 && FF_PATCH >= 5 )); then
+        FFMPEG_PATCHED=1
+    fi
+    if (( FF_MAJOR != 8 )); then
+        echo "WARNING: bundling FFmpeg $FFMPEG_VERSION — Snacks' desktop build is validated against FFmpeg 8.1.x."
+    fi
+fi
+if (( FFMPEG_PATCHED == 0 )) && [[ "${SNACKS_ALLOW_UNPATCHED_FFMPEG:-}" != "1" ]]; then
+    echo "ERROR: electron-app/ffmpeg is FFmpeg '${FFMPEG_VERSION:-unknown}', which predates the PixelSmash"
+    echo "       (CVE-2026-8461) fix. Rebuild it with electron-app/scripts/build-ffmpeg-mac.sh."
+    exit 1
+fi
+
+# HDR→SDR tonemapping uses the zscale filter (libzimg) and Ogg Vorbis music uses libvorbis.
+# Stock Homebrew FFmpeg has neither; build-ffmpeg-mac.sh adds both. Capture the lists before
+# searching them: piping ffmpeg into `grep -q` lets grep exit early, ffmpeg dies of SIGPIPE,
+# and pipefail turns that into a false "missing".
+FFMPEG_FILTERS="$(electron-app/ffmpeg/ffmpeg -hide_banner -filters 2>/dev/null || true)"
+FFMPEG_ENCODERS="$(electron-app/ffmpeg/ffmpeg -hide_banner -encoders 2>/dev/null || true)"
+FFMPEG_MISSING=""
+grep -q ' zscale ' <<<"$FFMPEG_FILTERS" || FFMPEG_MISSING="zscale (libzimg)"
+grep -q ' libvorbis ' <<<"$FFMPEG_ENCODERS" \
+    || FFMPEG_MISSING="${FFMPEG_MISSING:+$FFMPEG_MISSING, }libvorbis"
+if [[ -n "$FFMPEG_MISSING" ]]; then
+    echo "ERROR: electron-app/ffmpeg lacks $FFMPEG_MISSING. Rebuild it with"
+    echo "       electron-app/scripts/build-ffmpeg-mac.sh"
+    exit 1
+fi
+echo "FFmpeg $FFMPEG_VERSION found."
 echo "  bundling ffmpeg/ffprobe dylib deps (so end users don't need Homebrew)..."
 bash electron-app/scripts/bundle-ffmpeg-mac.sh electron-app/ffmpeg
 node scripts/validate-ffmpeg-inventory.mjs electron-app/ffmpeg/ffmpeg

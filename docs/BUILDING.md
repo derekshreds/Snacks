@@ -67,10 +67,12 @@ node scripts/validate-openapi.mjs http://127.0.0.1:16767/openapi/v1.json
 ### Requirements
 
 - Windows 10 or 11, x64
-- .NET 10 SDK
+- .NET 10 SDK that bundles runtime 10.0.13 or newer (SDK 10.0.402 / 10.0.113 or later; check with
+  `dotnet msbuild Snacks/Snacks.csproj -getProperty:BundledNETCoreAppPackageVersion`)
 - Node.js 22 or newer
 - Current NVIDIA, Intel, or AMD drivers when testing hardware encoding
-- A Windows `ffmpeg-release-full` build from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/)
+- gyan.dev's FFmpeg 8.1.x `full_build` (8.1.2 or newer), e.g. `ffmpeg-8.1.2-full_build.zip` from
+  the [release archive](https://github.com/GyanD/codexffmpeg/releases)
 
 Place both executables here:
 
@@ -78,6 +80,13 @@ Place both executables here:
 electron-app/ffmpeg/ffmpeg.exe
 electron-app/ffmpeg/ffprobe.exe
 ```
+
+Use a numbered 8.1.x release, not gyan.dev's `ffmpeg-release-full` link or a git build:
+`release-full` is now FFmpeg 9, which the desktop build has not been validated against.
+`build-installer.bat` and `build-electron.bat` run `scripts/validate-ffmpeg-version.mjs`, which
+refuses an FFmpeg older than 8.1.2 — the release that fixes the MagicYUV decoder overflow
+(PixelSmash, CVE-2026-8461) — a git build whose version can't be compared, or one without
+`zscale` and `libvorbis`.
 
 Native package builds run `scripts/validate-ffmpeg-inventory.mjs` before packaging and fail if
 the staged FFmpeg does not advertise the baseline `libx264`, `libx265`, and `libsvtav1`
@@ -136,18 +145,24 @@ code-signing certificate.
 - Homebrew packages used only on the build machine:
 
 ```bash
-brew install ffmpeg tesseract leptonica
+brew install tesseract leptonica
 ```
 
-Copy FFmpeg and FFprobe into the package staging directory:
+Build FFmpeg and stage it in `electron-app/ffmpeg` (rerun only when FFmpeg is updated):
 
 ```bash
-mkdir -p electron-app/ffmpeg
-cp "$(brew --prefix ffmpeg)/bin/ffmpeg" electron-app/ffmpeg/
-cp "$(brew --prefix ffmpeg)/bin/ffprobe" electron-app/ffmpeg/
-chmod +x electron-app/ffmpeg/ffmpeg electron-app/ffmpeg/ffprobe
-xattr -d com.apple.quarantine electron-app/ffmpeg/* 2>/dev/null || true
+electron-app/scripts/build-ffmpeg-mac.sh
 ```
+
+The script builds the FFmpeg release Homebrew's `ffmpeg@8` formula ships, with the same
+configure options and Homebrew dependency libraries, plus `libzimg` (the `zscale` filter used
+for HDR→SDR tonemapping) and `libvorbis` (Ogg Vorbis music). Stock Homebrew FFmpeg has neither,
+and plain `ffmpeg` is now FFmpeg 9, which the desktop build has not been validated against. It
+installs the Homebrew build dependencies, verifies the source tarball's SHA-256, builds in
+`~/Library/Caches/snacks-ffmpeg-build` (override with `SNACKS_FFMPEG_BUILD_DIR`; the path must
+not contain spaces), and bundles the result with `bundle-ffmpeg-mac.sh`. `build-mac.sh` refuses
+an FFmpeg older than 8.1.2 — the release that fixes the MagicYUV decoder overflow (PixelSmash,
+CVE-2026-8461) — or one without `zscale` and `libvorbis`.
 
 ### DMG build
 

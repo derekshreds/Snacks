@@ -519,8 +519,7 @@ public sealed class ClusterController : ControllerBase
             {
                 var rawFileName = Request.Headers["X-Original-FileName"].FirstOrDefault() ?? "input.mkv";
                 try { rawFileName = Uri.UnescapeDataString(rawFileName); } catch (UriFormatException) { }
-                fileName = Path.GetFileName(rawFileName);
-                if (string.IsNullOrWhiteSpace(fileName)) fileName = "input.mkv";
+                fileName = ToUploadFileName(rawFileName) ?? "input.mkv";
             }
 
             filePath = Path.Combine(tempDir, fileName);
@@ -1109,8 +1108,8 @@ public sealed class ClusterController : ControllerBase
 
             var raw = metadata.FileName;
             try { raw = Uri.UnescapeDataString(raw); } catch (UriFormatException) { }
-            var sanitized = Path.GetFileName(raw);
-            if (string.IsNullOrWhiteSpace(sanitized)) return false;
+            var sanitized = ToUploadFileName(raw);
+            if (sanitized == null) return false;
 
             fileName = sanitized;
             return true;
@@ -1119,6 +1118,40 @@ public sealed class ClusterController : ControllerBase
         catch (JsonException)               { return false; }
         catch (UnauthorizedAccessException) { return false; }
     }
+
+    /// <summary>
+    ///     Reduces a caller-supplied name to a bare file name inside the job's temp directory.
+    ///     The job's control files live in the same directory, so an upload named after one is
+    ///     prefixed rather than allowed to overwrite it — a forged <c>_shared.json</c> would
+    ///     otherwise point the worker's output placement at an unvalidated path. Every other
+    ///     name, including media that happens to start with an underscore, is kept as-is.
+    /// </summary>
+    internal static string? ToUploadFileName(string? raw)
+    {
+        var name = Path.GetFileName(raw);
+        if (string.IsNullOrWhiteSpace(name)) return null;
+        return MayOpenJobFile(name) ? "input" + name : name;
+    }
+
+    /// <summary>
+    ///     Windows opens <c>_shared.json.</c>, <c>_shared.json </c>, and <c>_shared.json::$DATA</c>
+    ///     as <c>_shared.json</c> itself, and an 8.3 short name such as <c>_SHARE~1.JSO</c> as
+    ///     whichever file it was generated for. Names are compared in that resolved form on every
+    ///     platform; a Linux or macOS name that only matches after it is merely prefixed.
+    /// </summary>
+    private static bool MayOpenJobFile(string name)
+    {
+        var colon = name.IndexOf(':');
+        var stem  = (colon >= 0 ? name[..colon] : name).TrimEnd('.', ' ');
+        return ReservedJobFileNames.Contains(stem) || ShortNameAlias.IsMatch(stem);
+    }
+
+    private static readonly HashSet<string> ReservedJobFileNames =
+        new(StringComparer.OrdinalIgnoreCase) { "_metadata.json", "_shared.json" };
+
+    /// <summary> An 8.3 short name: up to eight characters including a <c>~</c>, an optional extension of up to three. </summary>
+    private static readonly System.Text.RegularExpressions.Regex ShortNameAlias =
+        new(@"^(?=[^.]*~)[^.]{1,8}(\.[^.]{1,3})?$", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
 
     /******************************************************************
      *  Dashboard mirror (RPC for worker dashboards)

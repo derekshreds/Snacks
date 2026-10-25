@@ -36,6 +36,8 @@ public sealed class MusicEncoderOptions
     ///     Optional VBR quality value. When non-<see langword="null"/>, replaces the bitrate
     ///     flag with <c>-q:a</c>. Codec-specific scale: 0–9 for libmp3lame (lower is better),
     ///     0–10 for libvorbis (higher is better). <see langword="null"/> means CBR/ABR via bitrate.
+    ///     Ignored for Opus, which has no quality scale and is always VBR toward
+    ///     <see cref="BitrateKbps"/>.
     /// </summary>
     public int? VbrQuality { get; set; }
 

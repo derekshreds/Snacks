@@ -419,7 +419,7 @@
         <div class="group">Contributors</div>
         <a href="#development">Development</a>
       </nav>
-      <div class="version">Documents Snacks v2.20.0 · updated 2026-10-06</div>
+      <div class="version">Documents Snacks v2.20.1 · updated 2026-10-24</div>
       </div>
     </aside>
 
@@ -1596,7 +1596,7 @@ docker exec snacks vainfo</code></pre>
         </p>
         <div class="callout warning">
           <strong>Compatibility note.</strong> The API is not URL-versioned. Treat this reference as
-          the v2.20.0 contract and test automation against new Snacks releases before deployment.
+          the v2.20.1 contract and test automation against new Snacks releases before deployment.
         </div>
         <p>
           The running app also publishes a generated, machine-readable OpenAPI document at
@@ -1641,6 +1641,27 @@ curl -fsS -b snacks.cookies "$BASE/api/queue/stats"</code></pre>
           signed session. Iframe pages use a separate scoped <code>?embedToken=</code> credential.
         </p>
         <pre><code>curl -fsS -H "X-Api-Key: $SNACKS_API_KEY" "$BASE/api/queue/stats"</code></pre>
+        <p>
+          <strong>Remote access requires sign-in.</strong> While no password is configured, Snacks
+          only serves clients on loopback, private (RFC1918), CGNAT/Tailscale, link-local, and IPv6
+          unique-local addresses, plus the IPv6 prefixes of the machine's own network interfaces
+          (so dual-stack LAN clients keep working). Requests from public addresses — including
+          clients relayed by a reverse proxy that sends <code>X-Forwarded-For</code>,
+          <code>Forwarded</code>, <code>X-Real-IP</code>, or <code>CF-Connecting-IP</code> — receive
+          <code>403</code> unless they present a valid API key (or, on <code>/iframe/*</code>, the
+          embed token). The routes listed above as outside cookie authentication stay reachable.
+          Enable sign-in before exposing Snacks beyond the LAN. To treat additional ranges as local,
+          list them in <code>SNACKS_LOCAL_NETWORKS</code> (for example
+          <code>203.0.113.0/24, 2001:db8:1::/48</code>). If an upstream proxy (Authelia, Authentik,
+          and similar) already authenticates every user, set
+          <code>SNACKS_ALLOW_REMOTE_WITHOUT_AUTH=true</code> to restore open access.
+        </p>
+        <p>
+          After 10 failed sign-in attempts from one client within 5 minutes, further attempts are
+          refused until the window passes; successful sign-ins never count. While sign-in is active,
+          changing the username or password, or turning sign-in off, requires the current password
+          (<code>currentPassword</code> on <code>POST /api/auth/config</code>).
+        </p>
 
         <h3>Conventions</h3>
         <ul>
@@ -1726,7 +1747,7 @@ curl -fsS -b snacks.cookies \
               <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/library/health/verify</code></td><td><code>{filePath}</code></td><td>Runs bounded FFmpeg decode samples; returns <code>{ok,issues}</code>.</td></tr>
               <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/library/health/reset-verify-file</code></td><td><code>{filePath}</code></td><td>Clears one failed-verification flag without deleting the file.</td></tr>
               <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/library/health/reset-verify</code></td><td><code>{filter,q}</code></td><td>Bulk-clears verification flags matching the current health view.</td></tr>
-              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/library/health/delete</code></td><td><code>{filePath}</code></td><td><span class="risk">Destructive:</span> deletes a flagged file and its catalog row.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/library/health/delete</code></td><td><code>{filePath}</code></td><td><span class="risk">Destructive:</span> deletes a flagged file and its catalog row. Files not currently listed on the Library Health page are refused with <code>400</code>.</td></tr>
               <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/library/health/delete-all</code></td><td><code>{filter,q}</code></td><td><span class="risk">Destructive:</span> bulk-deletes matching flagged files; returns deleted/failed/capped counts.</td></tr>
             </tbody>
           </table>
@@ -1810,7 +1831,7 @@ curl -fsS -b snacks.cookies \
             <thead><tr><th>Method</th><th>Path</th><th>Inputs</th><th>Purpose / response</th></tr></thead>
             <tbody>
               <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/auth/config</code></td><td>—</td><td>Returns only <code>enabled</code>, <code>username</code>, and <code>hasPassword</code>.</td></tr>
-              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/auth/config</code></td><td><code>{enabled,username,password}</code></td><td>Saves auth; null/empty password preserves the existing hash. Clears the current cookie.</td></tr>
+              <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/auth/config</code></td><td><code>{enabled,username,password,currentPassword}</code></td><td>Saves auth; null/empty password preserves the existing hash. While sign-in is active, <code>currentPassword</code> is required to change the username or password or to disable sign-in. Clears the current cookie and ends every other session when the password changes.</td></tr>
               <tr class="api-row"><td><span class="method get">GET</span></td><td><code>/api/auth/apikey</code></td><td>—</td><td>Returns the stored API key. A key supplied via <code>SNACKS_API_KEY</code> is never exposed here.</td></tr>
               <tr class="api-row"><td><span class="method post">POST</span></td><td><code>/api/auth/apikey/generate</code></td><td>—</td><td>Generates and persists a new stored API key, replacing any previous one.</td></tr>
               <tr class="api-row"><td><span class="method delete">DELETE</span></td><td><code>/api/auth/apikey</code></td><td>—</td><td>Removes the stored API key. A key set via <code>SNACKS_API_KEY</code> stays valid.</td></tr>
@@ -2040,8 +2061,8 @@ node scripts/sync-version.mjs
           <div class="card">
             <h4>Apple silicon macOS</h4>
             <ol>
-              <li>Install .NET 10, Node.js 22+, Xcode tools, and <code>brew install ffmpeg tesseract leptonica</code>.</li>
-              <li>Copy the Homebrew FFmpeg and FFprobe binaries into <code>electron-app/ffmpeg/</code>.</li>
+              <li>Install .NET 10, Node.js 22+, Xcode tools, and <code>brew install tesseract leptonica</code>.</li>
+              <li>Run <code>electron-app/scripts/build-ffmpeg-mac.sh</code> once per FFmpeg update. It builds FFmpeg 8.1.x with Homebrew's <code>ffmpeg@8</code> options plus <code>libzimg</code> (HDR tonemapping) and <code>libvorbis</code> (Ogg Vorbis music) and stages it in <code>electron-app/ffmpeg/</code>; <code>build-mac.sh</code> refuses an FFmpeg older than 8.1.2 or one missing either library.</li>
               <li>Run <code>./build-mac.sh</code>; it bundles non-system FFmpeg/OCR dylibs and produces a self-contained DMG.</li>
               <li>Optional distribution signing uses <code>CSC_NAME</code>, <code>APPLE_ID</code>, <code>APPLE_APP_SPECIFIC_PASSWORD</code>, and <code>APPLE_TEAM_ID</code> from <code>electron-app/.env.mac.local</code>.</li>
             </ol>
@@ -2073,7 +2094,7 @@ node scripts/sync-version.mjs
 
       <footer>
         <p>
-          Snacks documentation for v2.20.0. This file is self-contained: save or print it for
+          Snacks documentation for v2.20.1. This file is self-contained: save or print it for
           offline use. The running app serves it at <code>/docs/index.html</code>.
         </p>
       </footer>

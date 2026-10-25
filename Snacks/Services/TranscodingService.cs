@@ -3952,7 +3952,7 @@ public class TranscodingService
         }
 
         // Resolve the actual encoder — verify it works, fall back to software if not
-        string encoder = videoCopy ? "copy" : exactEncoder ?? GetEncoder(options);
+        string encoder = videoCopy ? "copy" : RequirePlainEncoder(exactEncoder ?? GetEncoder(options));
         string hwAccel = options.HardwareAcceleration;
         if (!videoCopy && VideoEncoderRegistry.Describe(encoder, options.Codec).DeviceId != "cpu" && encoder != "copy")
         {
@@ -4081,7 +4081,7 @@ public class TranscodingService
             await LogAsync(workItem.Id,
                 "Active filter (crop/downscale/tonemap) — re-encoding despite videoCopy eligibility.");
             videoCopy = false;
-            encoder = exactEncoder ?? GetEncoder(options);
+            encoder = RequirePlainEncoder(exactEncoder ?? GetEncoder(options));
             if (VideoEncoderRegistry.Describe(encoder, options.Codec).DeviceId != "cpu" && encoder != "copy")
             {
                 string testHwFlags = GetInitFlags(hwAccel, options.HardwareDevicePath);
@@ -4176,6 +4176,18 @@ public class TranscodingService
         bool isAmf    = encoder.Contains("amf");
         bool isVideoToolbox = encoder.Contains("videotoolbox");
         bool isNvenc  = encoder.Contains("nvenc");
+
+        // The preset reaches the string fragments below from settings, imported presets,
+        // per-request options, and cluster job metadata. A value that isn't one plain token
+        // would be split into extra FFmpeg options, so fall back to the default instead.
+        var qualityPreset = options.FfmpegQualityPreset?.Trim();
+        if (!FfmpegArgumentList.IsPlainValue(qualityPreset))
+        {
+            if (!string.IsNullOrEmpty(qualityPreset))
+                await LogAsync(workItem.Id, $"Ignoring quality preset '{qualityPreset}' — not a plain FFmpeg value; using medium.");
+            qualityPreset = "medium";
+        }
+
         string presetFlag = advancedProfile != null ? ""
             : useVaapi
             ? (useLowPower ? "-low_power 1 " : "")
@@ -4183,10 +4195,10 @@ public class TranscodingService
             // before the encoder opens (masked by TestEncoderAsync, which never sends
             // a preset, so detection reports VT as working).
             : isVideoToolbox ? ""
-            : isSvtAv1 ? $"-preset {MapSvtAv1Preset(options.FfmpegQualityPreset)} "
-            : isAmf    ? $"-quality {MapAmfPreset(options.FfmpegQualityPreset)} "
-            : isNvenc  ? $"-preset {MapNvencPreset(options.FfmpegQualityPreset)} "
-                        : $"-preset {options.FfmpegQualityPreset} ";
+            : isSvtAv1 ? $"-preset {MapSvtAv1Preset(qualityPreset)} "
+            : isAmf    ? $"-quality {MapAmfPreset(qualityPreset)} "
+            : isNvenc  ? $"-preset {MapNvencPreset(qualityPreset)} "
+                        : $"-preset {qualityPreset} ";
         // H.264/H.265 profile + level — only for software encoders (libx264/libx265).
         // Hardware encoders (NVENC/VAAPI/QSV/AMF) accept different profile value sets,
         // so we gate to the lib* path to avoid passing incompatible values.
@@ -4199,14 +4211,24 @@ public class TranscodingService
                 // main/main10/…. Passing an H.264 profile to libx265 makes it hard-fail, so
                 // drop an incompatible pairing (encoder default) instead of emitting a
                 // command that can't run.
-                if (IsVideoProfileValidForEncoder(encoder, options.VideoProfile))
-                    profileLevel += $"-profile:v {options.VideoProfile} ";
-                else
+                if (!IsVideoProfileValidForEncoder(encoder, options.VideoProfile))
                     await LogAsync(workItem.Id,
                         $"Ignoring video profile '{options.VideoProfile}' — not valid for {encoder}.");
+                // An 8-bit-only profile (H.264 baseline/main/high, HEVC main) makes libx264 and
+                // libx265 hard-fail on a 10/12-bit source. Tonemapping already ends in 8-bit
+                // yuv420p, so only untonemapped high-bit-depth sources drop it — the encoder then
+                // picks High 10 / Main 10, exactly as it does when no profile is configured.
+                else if (!tonemap && IsEightBitOnlyProfile(options.VideoProfile) && IsHighBitDepthSource(workItem.Probe))
+                    await LogAsync(workItem.Id,
+                        $"Ignoring video profile '{options.VideoProfile}' — it allows only 8-bit video and this source is higher bit depth; {encoder} picks a matching profile.");
+                else
+                    profileLevel += $"-profile:v {options.VideoProfile} ";
             }
-            if (!string.IsNullOrWhiteSpace(options.VideoLevel))
-                profileLevel += $"-level {options.VideoLevel} ";
+            if (FfmpegArgumentList.IsPlainValue(options.VideoLevel?.Trim()))
+                profileLevel += $"-level {options.VideoLevel!.Trim()} ";
+            else if (!string.IsNullOrWhiteSpace(options.VideoLevel))
+                await LogAsync(workItem.Id,
+                    $"Ignoring video level '{options.VideoLevel}' — not a plain FFmpeg value.");
         }
         string videoFlags = videoCopy ?
             $"{_ffprobeService.MapVideo(workItem.Probe!)} -c:v copy " :
@@ -4396,9 +4418,10 @@ public class TranscodingService
                 // subrip/ass — ffmpeg aborts with "could not find tag" — so source text
                 // subs are transcoded to the container's native text codec instead.
                 // (Bitmap subs only reach this loop on the Matroska pass-through path.)
-                codecs += FfprobeService.IsMatroska(options.Format)
-                    ? $"-c:s:{outSubIndex} copy "
-                    : $"-c:s:{outSubIndex} {ocrCodec} ";
+                // Matroska can copy every kept codec except MP4's mov_text, which becomes SubRip.
+                codecs += !FfprobeService.IsMatroska(options.Format) ? $"-c:s:{outSubIndex} {ocrCodec} "
+                    : FfprobeService.NeedsSrtForMatroska(s.CodecName) ? $"-c:s:{outSubIndex} srt "
+                    : $"-c:s:{outSubIndex} copy ";
                 // Matroska's language element and Plex/Jellyfin auto-select both key on
                 // ISO 639-2/B. Map the 2-letter tag if we can, otherwise pass through.
                 var tag = LanguageMatcher.ToThreeLetterB(s.Lang) ?? s.Lang;
@@ -5746,6 +5769,27 @@ public class TranscodingService
     ///     (nothing is emitted). Used to drop an incompatible codec+profile pairing rather
     ///     than assemble a command ffmpeg refuses to run.
     /// </summary>
+    private static readonly HashSet<string> _eightBitOnlyProfiles =
+        new(StringComparer.OrdinalIgnoreCase) { "baseline", "main", "high", "mainstillpicture", "msp" };
+
+    // FFmpeg pixel formats with more than 8 bits per sample end in their depth plus an
+    // endianness suffix: yuv420p10le, yuv444p12le, p010le, gray16le.
+    private static readonly Regex _highBitDepthPixFmt = new(@"(?:9|1[0-6])(?:le|be)$", RegexOptions.Compiled);
+
+    /// <summary> True for the H.264 / HEVC profiles that only allow 8-bit samples. </summary>
+    internal static bool IsEightBitOnlyProfile(string? profile) =>
+        profile != null && _eightBitOnlyProfiles.Contains(profile.Trim());
+
+    /// <summary>
+    ///     True when the source video carries more than 8 bits per sample — by pixel format
+    ///     (<c>yuv420p10le</c>, <c>p010le</c>, 12-bit, …) or by a "10" / "12" profile name.
+    /// </summary>
+    internal static bool IsHighBitDepthSource(ProbeResult? probe) =>
+        probe?.Streams?.Any(s => s.CodecType == "video"
+            && (_highBitDepthPixFmt.IsMatch(s.PixFmt ?? "")
+                || s.Profile?.Contains("10") == true
+                || s.Profile?.Contains("12") == true)) == true;
+
     internal static bool IsVideoProfileValidForEncoder(string encoder, string? profile)
     {
         if (string.IsNullOrWhiteSpace(profile)) return true;
@@ -6698,6 +6742,21 @@ public class TranscodingService
         => GetEncoder(options, RuntimeInformation.IsOSPlatform(OSPlatform.Windows), LinuxIntelUsesQsv);
 
     /// <summary>
+    ///     The encoder name comes from settings, imported presets, per-request options, and
+    ///     cluster job metadata, then rides string fragments (encoder probes, <c>-c:v</c>).
+    ///     Refuse anything that isn't one plain token instead of letting it become extra
+    ///     FFmpeg options.
+    /// </summary>
+    internal static string RequirePlainEncoder(string encoder)
+    {
+        // Trimmed: surrounding whitespace was always harmless (the fragment tokenizer drops it).
+        var trimmed = encoder.Trim();
+        return FfmpegArgumentList.IsPlainValue(trimmed)
+            ? trimmed
+            : throw new InvalidOperationException($"'{encoder}' is not a valid FFmpeg encoder name.");
+    }
+
+    /// <summary>
     ///     Pure overload that takes the OS gate and Linux-QSV preference explicitly so unit
     ///     tests can exercise every branch (QSV / VAAPI / AMF / NVENC / VideoToolbox)
     ///     independently of the test host. <paramref name="linuxIntelQsv"/> only matters
@@ -7125,19 +7184,23 @@ public class TranscodingService
         int actualDuration = Math.Min(sampleDuration, Math.Max(5, (int)workItem.Length));
         string seekTime = FormatSeekTime(seekSeconds);
 
-        string command = $"-y -ss {seekTime} -i \"{workItem.Path}\" -t {actualDuration} " +
-            $"-c:v copy -an -sn -f null -";
+        // The path is a discrete argument: a quote in a media file name must not be able
+        // to end the token and append options of its own.
+        var command = new FfmpegArgumentList()
+            .AddLegacyFragment($"-y -ss {seekTime}")
+            .Add("-i", workItem.Path)
+            .AddLegacyFragment($"-t {actualDuration} -c:v copy -an -sn -f null -");
 
         try
         {
             var psi = new ProcessStartInfo(_ffmpegPath)
             {
-                Arguments = command,
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 CreateNoWindow = true
             };
+            command.ApplyTo(psi);
 
             using var process = new Process { StartInfo = psi };
             process.Start();
@@ -7186,9 +7249,12 @@ public class TranscodingService
     private async Task<long> RunTestEncodeAsync(string inputPath, string initFlags, string encoder, string hwFilter, string lpFlag, int qp, string seekTime, int duration, int gop)
     {
         // Same -g as the real encode — GOP length changes the measured bitrate.
-        string command = $"{initFlags} -ss {seekTime} -i \"{inputPath}\" -t {duration} " +
-            $"-c:v {encoder} {lpFlag}{hwFilter} -g {gop} -rc_mode CQP -global_quality:v {qp} " +
-            $"-an -sn -f null -";
+        var command = new FfmpegArgumentList()
+            .AddLegacyFragment($"{initFlags} -ss {seekTime}")
+            .Add("-i", inputPath)
+            .AddLegacyFragment(
+                $"-t {duration} -c:v {encoder} {lpFlag}{hwFilter} -g {gop} -rc_mode CQP -global_quality:v {qp} " +
+                $"-an -sn -f null -");
 
         Log.Information($"Calibration command: ffmpeg {command}");
 
@@ -7196,12 +7262,12 @@ public class TranscodingService
         {
             var psi = new ProcessStartInfo(_ffmpegPath)
             {
-                Arguments = command,
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 CreateNoWindow = true
             };
+            command.ApplyTo(psi);
 
             using var process = new Process { StartInfo = psi };
             process.Start();
@@ -7270,19 +7336,21 @@ public class TranscodingService
         string initFlags = hwDecodeSafeForCropdetect
             ? GetInitFlags(options.HardwareAcceleration, options.HardwareDevicePath) + " "
             : "";
-        string command = $"{initFlags}-ss {startTime} -i \"{inputPath}\" " +
-                        $"-t {duration} -vf cropdetect=24:2:8 -f null -";
+        var command = new FfmpegArgumentList()
+            .AddLegacyFragment($"{initFlags}-ss {startTime}")
+            .Add("-i", inputPath)
+            .AddLegacyFragment($"-t {duration} -vf cropdetect=24:2:8 -f null -");
 
         var cropValues = new ConcurrentDictionary<string, int>();
 
         var processStartInfo = new ProcessStartInfo(_ffmpegPath)
         {
-            Arguments = command,
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             CreateNoWindow = true
         };
+        command.ApplyTo(processStartInfo);
 
         using var process = new Process { StartInfo = processStartInfo };
 

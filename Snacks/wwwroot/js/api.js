@@ -433,7 +433,8 @@ export const authApi = {
      * @param {string}      username
      * @param {string|null} password Passing null keeps the existing password unchanged.
      */
-    save: (enabled, username, password) => postJson('/api/auth/config', { enabled, username, password }),
+    save: (enabled, username, password, currentPassword = null) =>
+        postJson('/api/auth/config', { enabled, username, password, currentPassword }),
 
     /** Fetches the stored API key ("" when none). Env-provided keys are never returned. */
     getApiKey: () => getJson('/api/auth/apikey'),

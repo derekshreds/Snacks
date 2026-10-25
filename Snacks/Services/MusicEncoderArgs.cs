@@ -102,22 +102,24 @@ public static class MusicEncoderArgs
         probe.Streams.FirstOrDefault(s => s.CodecType == "audio")?.Channels ?? 0;
 
     /// <summary>
-    ///     Builds the full ffmpeg arg string for a music encode. Caller supplies
+    ///     Builds the full ffmpeg argument vector for a music encode. Caller supplies
     ///     the input and output paths; everything else comes from
     ///     <paramref name="opts"/> and <paramref name="probe"/>.
     /// </summary>
-    /// <param name="inputPath"> Source file path (already quoted-escape-safe by caller). </param>
-    /// <param name="outputPath"> Destination file path (already quoted-escape-safe by caller). </param>
+    /// <param name="inputPath"> Source file path, passed through as one literal argument. </param>
+    /// <param name="outputPath"> Destination file path, passed through as one literal argument. </param>
     /// <param name="opts"> Music encoder options. </param>
     /// <param name="probe"> Source probe; used to detect cover-art video streams. </param>
-    public static string Build(string inputPath, string outputPath, MusicEncoderOptions opts, ProbeResult probe)
+    public static FfmpegArgumentList Build(string inputPath, string outputPath, MusicEncoderOptions opts, ProbeResult probe)
     {
+        // Paths stay literal tokens — never quoted into a string that is re-tokenized —
+        // so a quote in a downloaded file name can't inject options.
         var args = new List<string>
         {
             "-y",
             "-hide_banner",
             "-loglevel", "info",
-            "-i", $"\"{inputPath}\"",
+            "-i", inputPath,
             "-map", "0:a",
         };
 
@@ -146,7 +148,9 @@ public static class MusicEncoderArgs
 
         if (!IsLossless(encoder))
         {
-            if (opts.VbrQuality.HasValue)
+            // libopus has no quality scale — FFmpeg rejects -q:a for it — and is always VBR,
+            // steered by -b:a, so the bitrate is its VBR target whether or not VbrQuality is set.
+            if (opts.VbrQuality.HasValue && encoder != "libopus")
             {
                 args.Add("-q:a");
                 args.Add(opts.VbrQuality.Value.ToString());
@@ -177,7 +181,7 @@ public static class MusicEncoderArgs
             args.Add("0");
         }
 
-        args.Add($"\"{outputPath}\"");
-        return string.Join(" ", args);
+        args.Add(outputPath);
+        return new FfmpegArgumentList().AddRange(args);
     }
 }
