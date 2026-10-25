@@ -110,7 +110,12 @@ cp "$PREFIX/bin/ffmpeg" "$PREFIX/bin/ffprobe" "$STAGE/"
 chmod +x "$STAGE/ffmpeg" "$STAGE/ffprobe"
 bash "$REPO_ROOT/electron-app/scripts/bundle-ffmpeg-mac.sh" "$STAGE"
 
-"$STAGE/ffmpeg" -hide_banner -version | head -1
-"$STAGE/ffmpeg" -hide_banner -filters 2>/dev/null | grep -q ' zscale ' || { echo "zscale missing from the build" >&2; exit 1; }
-"$STAGE/ffmpeg" -hide_banner -encoders 2>/dev/null | grep -q ' libvorbis ' || { echo "libvorbis missing from the build" >&2; exit 1; }
+# Capture before reading: under pipefail, piping ffmpeg into `head` or `grep -q` fails when
+# the reader exits early and ffmpeg dies of SIGPIPE.
+VERSION_INFO="$("$STAGE/ffmpeg" -hide_banner -version 2>/dev/null || true)"
+echo "${VERSION_INFO%%$'\n'*}"
+FILTERS="$("$STAGE/ffmpeg" -hide_banner -filters 2>/dev/null || true)"
+ENCODERS="$("$STAGE/ffmpeg" -hide_banner -encoders 2>/dev/null || true)"
+grep -q ' zscale ' <<<"$FILTERS" || { echo "zscale missing from the build" >&2; exit 1; }
+grep -q ' libvorbis ' <<<"$ENCODERS" || { echo "libvorbis missing from the build" >&2; exit 1; }
 echo "Staged FFmpeg $FFMPEG_VERSION with zscale and libvorbis in electron-app/ffmpeg."

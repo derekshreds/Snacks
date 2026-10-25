@@ -92,10 +92,14 @@ if (( FFMPEG_PATCHED == 0 )) && [[ "${SNACKS_ALLOW_UNPATCHED_FFMPEG:-}" != "1" ]
 fi
 
 # HDR→SDR tonemapping uses the zscale filter (libzimg) and Ogg Vorbis music uses libvorbis.
-# Stock Homebrew FFmpeg has neither; build-ffmpeg-mac.sh adds both.
+# Stock Homebrew FFmpeg has neither; build-ffmpeg-mac.sh adds both. Capture the lists before
+# searching them: piping ffmpeg into `grep -q` lets grep exit early, ffmpeg dies of SIGPIPE,
+# and pipefail turns that into a false "missing".
+FFMPEG_FILTERS="$(electron-app/ffmpeg/ffmpeg -hide_banner -filters 2>/dev/null || true)"
+FFMPEG_ENCODERS="$(electron-app/ffmpeg/ffmpeg -hide_banner -encoders 2>/dev/null || true)"
 FFMPEG_MISSING=""
-electron-app/ffmpeg/ffmpeg -hide_banner -filters 2>/dev/null | grep -q ' zscale ' || FFMPEG_MISSING="zscale (libzimg)"
-electron-app/ffmpeg/ffmpeg -hide_banner -encoders 2>/dev/null | grep -q ' libvorbis ' \
+grep -q ' zscale ' <<<"$FFMPEG_FILTERS" || FFMPEG_MISSING="zscale (libzimg)"
+grep -q ' libvorbis ' <<<"$FFMPEG_ENCODERS" \
     || FFMPEG_MISSING="${FFMPEG_MISSING:+$FFMPEG_MISSING, }libvorbis"
 if [[ -n "$FFMPEG_MISSING" ]]; then
     echo "ERROR: electron-app/ffmpeg lacks $FFMPEG_MISSING. Rebuild it with"
